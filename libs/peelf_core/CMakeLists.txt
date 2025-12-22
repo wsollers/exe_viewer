@@ -14,7 +14,7 @@ target_include_directories(peelf_core
 
 target_compile_features(peelf_core PUBLIC cxx_std_23)
 
-include(${CMAKE_SOURCE_DIR}/cmake/ProjectOptions.cmake)
+
 peelf_apply_project_warnings(peelf_core)
 
 if(PEELF_BUILD_SHARED)
