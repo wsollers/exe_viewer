@@ -5,6 +5,9 @@
 #include <fstream>
 #include <vector>
 
+
+#include"../include/pe/pe_parser.h"
+
 namespace peelf {
 
 

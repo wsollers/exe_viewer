@@ -1,12 +1,14 @@
 #pragma once
 
+#include <memory>
+#include <optional>
+#include <string>
+
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
 #include "vulkan/vulkan_manager.h"
-
-#include <memory>
-#include <string>
+#include <nfd.h>
 
 namespace viewer {
 
@@ -35,6 +37,9 @@ namespace viewer {
 
         void process_input();
         void render_ui();
+
+        std::optional<std::string> open_file_dialog();
+        void load_file(const std::string& path);
 
         static void glfw_error_callback(int error, const char* description);
         static void glfw_framebuffer_resize_callback(GLFWwindow* window, int width, int height);

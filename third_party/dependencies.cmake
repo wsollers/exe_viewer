@@ -49,6 +49,13 @@ target_include_directories(imgui PUBLIC
         ${imgui_src_SOURCE_DIR}/backends
 )
 
-#target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_DOCKING)
+# Native File Dialog Extended
+FetchContent_Declare(
+        nfd
+        GIT_REPOSITORY https://github.com/btzy/nativefiledialog-extended.git
+        GIT_TAG        v1.2.1
+        GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(nfd)
 
 target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)

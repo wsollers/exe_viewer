@@ -2,8 +2,13 @@ add_library(peelf_core
   src/pe/pe_parser.cpp
   src/elf/elf_parser.cpp
   src/file_reader.cpp
-        include/elf/elf_definitions.h
-        include/pe/pe_definitions.h
+  include/elf/elf_definitions.h
+  include/pe/pe_definitions.h
+  include/mapping/file_mapping.hpp
+  src/mapping/map_errors.cpp
+  src/mapping/file_mapping_posix.cpp
+  src/mapping/file_mapping_win32.cpp
+        include/pe/pe_parser.h
 )
 
 add_library(peelf::core ALIAS peelf_core)

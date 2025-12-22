@@ -21,6 +21,8 @@ add_executable(peelf_viewer
         src/application.cpp
         src/vulkan/vulkan_manager.h
         src/vulkan/vulkan_manager.cpp
+        src/gui/gui.h
+        src/gui/gui.cpp
 )
 
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)
@@ -31,4 +33,5 @@ target_link_libraries(peelf_viewer PRIVATE
         glfw
         imgui
         Vulkan::Vulkan
+        nfd
 )

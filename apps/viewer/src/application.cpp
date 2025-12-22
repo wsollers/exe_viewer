@@ -8,7 +8,13 @@
 #include <stdexcept>
 
 #include "application.h"
+
+#include "gui/gui.h"
 #include "vulkan/vulkan_manager.h"
+#include "peelf/peelf.hpp"
+#include "mapping/file_mapping.hpp"
+#include "pe/pe_parser.h"
+
 
 namespace viewer {
 
@@ -56,6 +62,7 @@ void Application::init_glfw(const AppConfig& config) {
     }
 
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+    glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
 
     window_ = glfwCreateWindow(
         static_cast<int>(config.width),
@@ -184,11 +191,13 @@ void Application::process_input() {
 }
 
 void Application::render_ui() {
-    // Main menu bar
+     // Main menu bar
     if (ImGui::BeginMainMenuBar()) {
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Open", "Ctrl+O")) {
-                // TODO: Open file dialog
+                if (auto path = open_file_dialog()) {
+                    load_file(*path);
+                }
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -218,12 +227,12 @@ void Application::render_ui() {
     ImGui::SetNextWindowSize(viewport->WorkSize);
     ImGui::SetNextWindowViewport(viewport->ID);
 
-    ImGuiWindowFlags window_flags = 
-        ImGuiWindowFlags_NoTitleBar | 
+    ImGuiWindowFlags window_flags =
+        ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoResize | 
+        ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoBringToFrontOnFocus | 
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
         ImGuiWindowFlags_NoNavFocus |
         ImGuiWindowFlags_NoBackground;
 
@@ -261,6 +270,56 @@ void Application::render_ui() {
     if (show_demo) {
         ImGui::ShowDemoWindow(&show_demo);
     }
-}
+   // Placeholder for GUI rendering code
 
+    Gui gui { window_};
+    gui.displayGui();
+}
+    std::optional<std::string> Application::open_file_dialog() {
+    NFD_Init();
+
+    nfdchar_t* out_path = nullptr;
+    nfdfilteritem_t filters[2] = {
+        { "Executables", "exe,dll,so,elf" },
+        { "All Files", "*" }
+    };
+
+    nfdresult_t result = NFD_OpenDialog(&out_path, filters, 2, nullptr);
+
+    std::optional<std::string> path;
+
+    if (result == NFD_OKAY) {
+        path = std::string(out_path);
+        NFD_FreePath(out_path);
+    } else if (result == NFD_CANCEL) {
+        // User cancelled - not an error
+    } else {
+        fprintf(stderr, "File dialog error: %s\n", NFD_GetError());
+    }
+
+    NFD_Quit();
+    return path;
+}
+    void Application::load_file(const std::string& path) {
+    // TODO: Use your peelf_core library to parse the file
+
+    bool file_loaded_ = true;
+
+    printf("Loading file: %s\n", path.c_str());
+
+    // Example:
+    try {
+        std::filesystem::path fileToOpen(path);
+        peelf::FileMapping<std::uint8_t, peelf::NativeFileMappingBackend> map(fileToOpen,peelf::MapMode::read_only);
+
+        size_t size = map.size();
+        size_t sizeBytes = map.size_bytes();
+        const std::span<std::uint8_t> data = map.view();
+        auto rc = peelf::parse_pe_bytes(data);
+         // Store parsed data...
+    } catch (const std::exception& e) {
+         fprintf(stderr, "Failed to load file: %s\n", e.what());
+        file_loaded_ = false;
+    }
+}
 } // namespace viewer
