@@ -1,6 +1,7 @@
 include(${CMAKE_SOURCE_DIR}/cmake/ProjectOptions.cmake)
 
 
+
 # Debug: see what targets exist
 if(TARGET Vulkan::Vulkan)
   message(STATUS "Vulkan::Vulkan exists")
@@ -21,8 +22,9 @@ add_executable(peelf_viewer
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)
 peelf_apply_project_warnings(peelf_viewer)
 
-target_link_libraries(peelf_viewer PRIVATE peelf::core
+target_link_libraries(peelf_viewer PRIVATE
+        peelf::core
         glfw
         imgui
-        Vulkan::Headers
+        Vulkan::Vulkan
 )

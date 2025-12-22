@@ -2,7 +2,13 @@
 
 #include <cstdint>
 
+#include "elf/elf_definitions.h"
+
 namespace peelf {
+
+
+
+
 
 static std::uint16_t read_u16_le(std::span<const std::uint8_t> b, std::size_t off) {
     return static_cast<std::uint16_t>(b[off] | (static_cast<std::uint16_t>(b[off + 1]) << 8));

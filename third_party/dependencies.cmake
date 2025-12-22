@@ -1,5 +1,5 @@
 ﻿include(FetchContent)
-
+find_package(Vulkan REQUIRED)
 # GLFW
 FetchContent_Declare(
         glfw
@@ -14,13 +14,13 @@ set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 
 # Vulkan-Headers
-FetchContent_Declare(
-        vulkan_headers
-        GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-        GIT_TAG        v1.3.290
-        GIT_SHALLOW    TRUE
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE  # <-- Add this to each
-)
+#FetchContent_Declare(
+#        vulkan_headers
+#        GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+#        GIT_TAG        v1.4.335
+#        GIT_SHALLOW    TRUE
+#        DOWNLOAD_EXTRACT_TIMESTAMP TRUE  # <-- Add this to each
+#)
 
 # Dear ImGui
 FetchContent_Declare(
@@ -31,7 +31,7 @@ FetchContent_Declare(
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE  # <-- Add this to each
 )
 
-FetchContent_MakeAvailable(glfw vulkan_headers imgui_src)
+FetchContent_MakeAvailable(glfw imgui_src)
 
 # Build ImGui as a library
 add_library(imgui STATIC
@@ -49,4 +49,4 @@ target_include_directories(imgui PUBLIC
         ${imgui_src_SOURCE_DIR}/backends
 )
 
-target_link_libraries(imgui PUBLIC glfw Vulkan::Headers)
+target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
