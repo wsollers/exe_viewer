@@ -306,7 +306,7 @@ void Application::render_ui() {
     bool file_loaded_ = true;
 
     printf("Loading file: %s\n", path.c_str());
-
+//
     // Example:
     try {
         std::filesystem::path fileToOpen(path);
