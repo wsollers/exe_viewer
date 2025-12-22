@@ -17,6 +17,10 @@ add_executable(peelf_viewer
   src/main.cpp
   src/gui/app_gui.cpp
   src/gui/imgui_impl_stub.cpp
+        src/application.h
+        src/application.cpp
+        src/vulkan/vulkan_manager.h
+        src/vulkan/vulkan_manager.cpp
 )
 
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)

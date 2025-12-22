@@ -26,7 +26,7 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
         imgui_src
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG        v1.91.6
+        GIT_TAG docking
         GIT_SHALLOW    TRUE
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE  # <-- Add this to each
 )
@@ -48,5 +48,7 @@ target_include_directories(imgui PUBLIC
         ${imgui_src_SOURCE_DIR}
         ${imgui_src_SOURCE_DIR}/backends
 )
+
+#target_compile_definitions(imgui PUBLIC IMGUI_ENABLE_DOCKING)
 
 target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
