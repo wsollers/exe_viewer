@@ -15,14 +15,35 @@ endif()
 
 add_executable(peelf_viewer
   src/main.cpp
-  src/gui/app_gui.cpp
-  src/gui/imgui_impl_stub.cpp
         src/application.h
         src/application.cpp
         src/vulkan/vulkan_manager.h
         src/vulkan/vulkan_manager.cpp
         src/gui/gui.h
         src/gui/gui.cpp
+        src/model/pe_model.hpp
+        src/model/binary_model.hpp
+        src/model/pe_parser.cpp
+        src/model/pe_parser.hpp
+        src/model/binary_model.cpp
+        src/ui/ui_panel.hpp
+        src/ui/ui_panels.hpp
+        src/ui/ui_app.hpp
+        src/ui/ui_app.cpp
+        src/ui/ui_panels_file.cpp
+        src/ui/ui_panels_pe_headers.cpp
+        src/ui/ui_panels_pe_imports.cpp
+        src/ui/ui_panels_pe_exports.cpp
+        src/ui/ui_panels_sections.cpp
+        src/ui/ui_panels_hex.cpp
+        src/ui/ui_panels_disasm.cpp
+        src/ui/ui_panels_log.cpp
+        src/ui/logger.hpp
+        src/ui/logger.cpp
+)
+
+target_include_directories(peelf_viewer PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)

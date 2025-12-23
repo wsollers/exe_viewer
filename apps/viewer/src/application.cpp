@@ -1,19 +1,19 @@
 #include "application.h"
 
-#include <imgui.h>
-#include <imgui_impl_glfw.h>
-#include <imgui_impl_vulkan.h>
-
 #include <cstdio>
 #include <stdexcept>
 
-#include "application.h"
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_vulkan.h>
+#include <nfd.h>
 
 #include "gui/gui.h"
 #include "vulkan/vulkan_manager.h"
 #include "peelf/peelf.hpp"
 #include "mapping/file_mapping.hpp"
 #include "pe/pe_parser.h"
+#include "ui/logger.hpp"
 
 
 namespace viewer {
@@ -44,6 +44,14 @@ void Application::init(const AppConfig& config) {
     vk_config.height = config.height;
 
     vulkan_.init(window_, vk_config);
+
+    // Initialize model/UI
+    ui_ = new UiApp(model_);
+    ui_->set_open_file_callback([this]() {
+        open_file_dialog();
+    });
+    Logger::init(&ui_->log_panel());
+
     init_imgui();
 
     running_ = true;
@@ -191,91 +199,11 @@ void Application::process_input() {
 }
 
 void Application::render_ui() {
-     // Main menu bar
-    if (ImGui::BeginMainMenuBar()) {
-        if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Open", "Ctrl+O")) {
-                if (auto path = open_file_dialog()) {
-                    load_file(*path);
-                }
-            }
-            ImGui::Separator();
-            if (ImGui::MenuItem("Exit", "Alt+F4")) {
-                glfwSetWindowShouldClose(window_, GLFW_TRUE);
-            }
-            ImGui::EndMenu();
-        }
-
-        if (ImGui::BeginMenu("View")) {
-            ImGui::MenuItem("Demo Window", nullptr, false);
-            ImGui::EndMenu();
-        }
-
-        if (ImGui::BeginMenu("Help")) {
-            if (ImGui::MenuItem("About")) {
-                // TODO: Show about dialog
-            }
-            ImGui::EndMenu();
-        }
-
-        ImGui::EndMainMenuBar();
-    }
-
-    // Main dockspace
-    ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(viewport->WorkPos);
-    ImGui::SetNextWindowSize(viewport->WorkSize);
-    ImGui::SetNextWindowViewport(viewport->ID);
-
-    ImGuiWindowFlags window_flags =
-        ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove |
-        ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus |
-        ImGuiWindowFlags_NoBackground;
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-
-    ImGui::Begin("DockSpace", nullptr, window_flags);
-    ImGui::PopStyleVar(3);
-
-    ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
-    ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_PassthruCentralNode);
-
-    ImGui::End();
-
-    // File info panel
-    ImGui::Begin("File Info");
-    ImGui::Text("No file loaded");
-    ImGui::Separator();
-    ImGui::Text("Drag and drop a PE or ELF file to analyze");
-    ImGui::End();
-
-    // Sections panel
-    ImGui::Begin("Sections");
-    ImGui::Text("No sections to display");
-    ImGui::End();
-
-    // Hex view panel
-    ImGui::Begin("Hex View");
-    ImGui::Text("No data to display");
-    ImGui::End();
-
-    // Demo window for testing
-    static bool show_demo = false;
-    if (show_demo) {
-        ImGui::ShowDemoWindow(&show_demo);
-    }
-   // Placeholder for GUI rendering code
-
-    Gui gui { window_};
-    gui.displayGui();
+    ui_->render();
 }
-    std::optional<std::string> Application::open_file_dialog() {
+
+
+void Application::open_file_dialog() {
     NFD_Init();
 
     nfdchar_t* out_path = nullptr;
@@ -286,40 +214,17 @@ void Application::render_ui() {
 
     nfdresult_t result = NFD_OpenDialog(&out_path, filters, 2, nullptr);
 
-    std::optional<std::string> path;
-
     if (result == NFD_OKAY) {
-        path = std::string(out_path);
-        NFD_FreePath(out_path);
-    } else if (result == NFD_CANCEL) {
-        // User cancelled - not an error
-    } else {
-        fprintf(stderr, "File dialog error: %s\n", NFD_GetError());
-    }
+        std::string path(out_path);
+        free(out_path);
 
-    NFD_Quit();
-    return path;
-}
-    void Application::load_file(const std::string& path) {
-    // TODO: Use your peelf_core library to parse the file
-
-    bool file_loaded_ = true;
-
-    printf("Loading file: %s\n", path.c_str());
-//
-    // Example:
-    try {
-        std::filesystem::path fileToOpen(path);
-        peelf::FileMapping<std::uint8_t, peelf::NativeFileMappingBackend> map(fileToOpen,peelf::MapMode::read_only);
-
-        size_t size = map.size();
-        size_t sizeBytes = map.size_bytes();
-        const std::span<std::uint8_t> data = map.view();
-        auto rc = peelf::parse_pe_bytes(data);
-         // Store parsed data...
-    } catch (const std::exception& e) {
-         fprintf(stderr, "Failed to load file: %s\n", e.what());
-        file_loaded_ = false;
+        if (model_.load_file(path)) {
+            // Optional: log success
+            Logger::info("Loaded file: " + path);
+        } else {
+            Logger::error("Did not load file: " + path);
+        }
     }
 }
+
 } // namespace viewer

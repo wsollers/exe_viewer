@@ -7,8 +7,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include "ui/ui_app.hpp"
 #include "vulkan/vulkan_manager.h"
-#include <nfd.h>
 
 namespace viewer {
 
@@ -30,6 +30,8 @@ namespace viewer {
         void run();
         void shutdown();
 
+        void open_file_dialog();
+
     private:
         void init_glfw(const AppConfig& config);
         void init_imgui();
@@ -38,11 +40,11 @@ namespace viewer {
         void process_input();
         void render_ui();
 
-        std::optional<std::string> open_file_dialog();
-        void load_file(const std::string& path);
-
         static void glfw_error_callback(int error, const char* description);
         static void glfw_framebuffer_resize_callback(GLFWwindow* window, int width, int height);
+
+        BinaryModel model_;
+        UiApp* ui_ = nullptr;
 
         GLFWwindow* window_ = nullptr;
         VulkanManager vulkan_;
