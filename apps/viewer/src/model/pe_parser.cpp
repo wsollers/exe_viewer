@@ -1,6 +1,10 @@
-#include "pe_parser.hpp"
 #include <cstring>  // std::memcpy
 #include <algorithm>
+
+#include "pe_parser.hpp"
+#include "pe_machine_types.hpp"
+#include "pe_characteristics.hpp"
+#include "pe_optional_image.hpp"
 
 namespace viewer {
 
@@ -22,29 +26,32 @@ static constexpr std::uint32_t IMAGE_NUMBEROF_DIRECTORY_ENTRIES = 16;
 static constexpr std::uint32_t IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
 static constexpr std::uint32_t IMAGE_DIRECTORY_ENTRY_IMPORT = 1;
 
+constexpr uint16_t DOS_MAGIC = 0x5A4D;      // "MZ"
+constexpr uint32_t PE_SIGNATURE = 0x00004550; // "PE\0\0"
+
 // data structures (packed)
 #pragma pack(push, 1)
 
 struct IMAGE_DOS_HEADER_ {
-    std::uint16_t e_magic;
-    std::uint16_t e_cblp;
-    std::uint16_t e_cp;
-    std::uint16_t e_crlc;
-    std::uint16_t e_cparhdr;
-    std::uint16_t e_minalloc;
-    std::uint16_t e_maxalloc;
-    std::uint16_t e_ss;
-    std::uint16_t e_sp;
-    std::uint16_t e_csum;
-    std::uint16_t e_ip;
-    std::uint16_t e_cs;
-    std::uint16_t e_lfarlc;
-    std::uint16_t e_ovno;
-    std::uint16_t e_res[4];
-    std::uint16_t e_oemid;
-    std::uint16_t e_oeminfo;
-    std::uint16_t e_res2[10];
-    std::uint32_t e_lfanew;
+    uint16_t e_magic;       // 0x00: Magic number ("MZ" = 0x5A4D)
+    uint16_t e_cblp;        // 0x02: Bytes on last page of file
+    uint16_t e_cp;          // 0x04: Pages in file
+    uint16_t e_crlc;        // 0x06: Relocations
+    uint16_t e_cparhdr;     // 0x08: Size of header in paragraphs
+    uint16_t e_minalloc;    // 0x0A: Minimum extra paragraphs needed
+    uint16_t e_maxalloc;    // 0x0C: Maximum extra paragraphs needed
+    uint16_t e_ss;          // 0x0E: Initial (relative) SS value
+    uint16_t e_sp;          // 0x10: Initial SP value
+    uint16_t e_csum;        // 0x12: Checksum
+    uint16_t e_ip;          // 0x14: Initial IP value
+    uint16_t e_cs;          // 0x16: Initial (relative) CS value
+    uint16_t e_lfarlc;      // 0x18: File address of relocation table
+    uint16_t e_ovno;        // 0x1A: Overlay number
+    uint16_t e_res[4];      // 0x1C: Reserved words
+    uint16_t e_oemid;       // 0x24: OEM identifier
+    uint16_t e_oeminfo;     // 0x26: OEM information
+    uint16_t e_res2[10];    // 0x28: Reserved words
+    int32_t  e_lfanew;      // 0x3C: File address of PE header
 };
 
 struct IMAGE_FILE_HEADER_ {
@@ -269,7 +276,7 @@ bool PeParser::parse_optional_header(std::uint32_t nt_offset) {
 
 bool PeParser::parse_data_directories(std::uint32_t opt_offset,
                                       std::uint16_t magic,
-                                      std::uint16_t num_rva_and_sizes) {
+                                      std::uint32_t num_rva_and_sizes) {
     out_.data_directories.clear();
 
     if (num_rva_and_sizes > IMAGE_NUMBEROF_DIRECTORY_ENTRIES)
@@ -521,5 +528,68 @@ bool PeParser::parse_exports() {
 
     return true;
 }
+
+
+    // Calculates the PE checksum (same algorithm as Windows CheckSumMappedFile)
+    uint32_t calculate_checksum(const uint8_t* data, size_t size, size_t checksum_offset) {
+        uint64_t checksum = 0;
+
+        // Sum all 16-bit words, skipping the checksum field itself
+        for (size_t i = 0; i < size; i += 2) {
+            // Skip the 4-byte checksum field
+            if (i == checksum_offset || i == checksum_offset + 2) {
+                continue;
+            }
+
+            uint16_t word;
+            if (i + 1 < size) {
+                word = static_cast<uint16_t>(data[i]) |
+                       (static_cast<uint16_t>(data[i + 1]) << 8);
+            } else {
+                // Odd byte at end
+                word = data[i];
+            }
+
+            checksum += word;
+
+            // Fold carry bits
+            checksum = (checksum & 0xFFFF) + (checksum >> 16);
+        }
+
+        // Final fold
+        checksum = (checksum & 0xFFFF) + (checksum >> 16);
+
+        // Add file size
+        return static_cast<uint32_t>(checksum + size);
+    }
+
+    // Helper to validate a PE file's checksum
+    bool validate_checksum(const uint8_t* data, size_t size) {
+        auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER_*>(data);
+        if (dos->e_magic != DOS_MAGIC) {
+            return false;
+        }
+
+        // Get to optional header where checksum lives
+        size_t pe_offset = dos->e_lfanew;
+        size_t optional_header_offset = pe_offset + 4 + 20;  // Signature + FileHeader
+        size_t checksum_offset = optional_header_offset + 64; // CheckSum is at offset 64 in OptionalHeader
+
+        if (checksum_offset + 4 > size) {
+            return false;
+        }
+
+        uint32_t stored_checksum;
+        std::memcpy(&stored_checksum, data + checksum_offset, sizeof(stored_checksum));
+
+        // Zero checksum means not set (valid)
+        if (stored_checksum == 0) {
+            return true;
+        }
+
+        uint32_t calculated = calculate_checksum(data, size, checksum_offset);
+        return calculated == stored_checksum;
+    }
+
 
 } // namespace viewer

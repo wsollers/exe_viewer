@@ -40,6 +40,9 @@ add_executable(peelf_viewer
         src/ui/ui_panels_log.cpp
         src/ui/logger.hpp
         src/ui/logger.cpp
+        src/model/pe_machine_types.hpp
+        src/model/pe_characteristics.hpp
+        src/model/pe_optional_image.hpp
 )
 
 target_include_directories(peelf_viewer PRIVATE

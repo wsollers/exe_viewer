@@ -30,7 +30,7 @@ namespace viewer {
         bool parse_optional_header(std::uint32_t nt_offset);
         bool parse_section_headers(std::uint32_t nt_offset);
         bool parse_data_directories(std::uint32_t opt_offset, std::uint16_t magic,
-                                    std::uint16_t num_rva_and_sizes);
+                                    std::uint32_t num_rva_and_sizes);
         bool parse_imports();
         bool parse_exports();
 
