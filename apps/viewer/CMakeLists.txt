@@ -43,6 +43,10 @@ add_executable(peelf_viewer
         src/model/pe_machine_types.hpp
         src/model/pe_characteristics.hpp
         src/model/pe_optional_image.hpp
+        src/model/pe_subsystem.hpp
+        src/model/section_header_characteristics.hpp
+        src/model/image_delay_load_descriptor.hpp
+        src/dissassembler/dissassembler.hpp
 )
 
 target_include_directories(peelf_viewer PRIVATE
@@ -58,4 +62,6 @@ target_link_libraries(peelf_viewer PRIVATE
         imgui
         Vulkan::Vulkan
         nfd
+        capstone
 )
+

@@ -55,122 +55,121 @@ struct IMAGE_DOS_HEADER_ {
 };
 
 struct IMAGE_FILE_HEADER_ {
-    std::uint16_t Machine;
-    std::uint16_t NumberOfSections;
-    std::uint32_t TimeDateStamp;
-    std::uint32_t PointerToSymbolTable;
-    std::uint32_t NumberOfSymbols;
-    std::uint16_t SizeOfOptionalHeader;
-    std::uint16_t Characteristics;
+    std::uint16_t Machine;              // Target CPU type (e.g., x86, x64, ARM)
+    std::uint16_t NumberOfSections;     // Number of section table entries
+    std::uint32_t TimeDateStamp;        // Seconds since 1970-01-01 00:00:00
+    std::uint32_t PointerToSymbolTable; // File offset to COFF symbol table
+    std::uint32_t NumberOfSymbols;      // Number of COFF symbol entries
+    std::uint16_t SizeOfOptionalHeader; // Size of optional header in bytes
+    std::uint16_t Characteristics;      // File attribute flags
 };
 
 struct IMAGE_DATA_DIRECTORY_ {
-    std::uint32_t VirtualAddress;
-    std::uint32_t Size;
+    std::uint32_t VirtualAddress;       // RVA of the table
+    std::uint32_t Size;                 // Size of the table in bytes
 };
 
 struct IMAGE_OPTIONAL_HEADER32_ {
-    std::uint16_t Magic;
-    std::uint8_t  MajorLinkerVersion;
-    std::uint8_t  MinorLinkerVersion;
-    std::uint32_t SizeOfCode;
-    std::uint32_t SizeOfInitializedData;
-    std::uint32_t SizeOfUninitializedData;
-    std::uint32_t AddressOfEntryPoint;
-    std::uint32_t BaseOfCode;
-    std::uint32_t BaseOfData;
-    std::uint32_t ImageBase;
-    std::uint32_t SectionAlignment;
-    std::uint32_t FileAlignment;
-    std::uint16_t MajorOperatingSystemVersion;
-    std::uint16_t MinorOperatingSystemVersion;
-    std::uint16_t MajorImageVersion;
-    std::uint16_t MinorImageVersion;
-    std::uint16_t MajorSubsystemVersion;
-    std::uint16_t MinorSubsystemVersion;
-    std::uint32_t Win32VersionValue;
-    std::uint32_t SizeOfImage;
-    std::uint32_t SizeOfHeaders;
-    std::uint32_t CheckSum;
-    std::uint16_t Subsystem;
-    std::uint16_t DllCharacteristics;
-    std::uint32_t SizeOfStackReserve;
-    std::uint32_t SizeOfStackCommit;
-    std::uint32_t SizeOfHeapReserve;
-    std::uint32_t SizeOfHeapCommit;
-    std::uint32_t LoaderFlags;
-    std::uint32_t NumberOfRvaAndSizes;
+    std::uint16_t Magic;                       // PE32 (0x10B) or PE32+ (0x20B)
+    std::uint8_t  MajorLinkerVersion;          // Linker major version
+    std::uint8_t  MinorLinkerVersion;          // Linker minor version
+    std::uint32_t SizeOfCode;                  // Sum of all code sections
+    std::uint32_t SizeOfInitializedData;       // Sum of all initialized data sections
+    std::uint32_t SizeOfUninitializedData;     // Sum of all BSS sections
+    std::uint32_t AddressOfEntryPoint;         // RVA of entry point function
+    std::uint32_t BaseOfCode;                  // RVA of code section start
+    std::uint32_t BaseOfData;                  // RVA of data section start (PE32 only)
+    std::uint32_t ImageBase;                   // Preferred load address
+    std::uint32_t SectionAlignment;            // Section alignment in memory (bytes)
+    std::uint32_t FileAlignment;               // Section alignment on disk (bytes)
+    std::uint16_t MajorOperatingSystemVersion; // Required OS major version
+    std::uint16_t MinorOperatingSystemVersion; // Required OS minor version
+    std::uint16_t MajorImageVersion;           // Image major version (user-defined)
+    std::uint16_t MinorImageVersion;           // Image minor version (user-defined)
+    std::uint16_t MajorSubsystemVersion;       // Required subsystem major version
+    std::uint16_t MinorSubsystemVersion;       // Required subsystem minor version
+    std::uint32_t Win32VersionValue;           // Reserved, must be zero
+    std::uint32_t SizeOfImage;                 // Total image size in memory (bytes)
+    std::uint32_t SizeOfHeaders;               // Size of all headers (bytes)
+    std::uint32_t CheckSum;                    // Image checksum (required for drivers)
+    std::uint16_t Subsystem;                   // Target subsystem (GUI, CUI, etc.)
+    std::uint16_t DllCharacteristics;          // Security flags (ASLR, DEP, CFG, etc.)
+    std::uint32_t SizeOfStackReserve;          // Stack reserve size (bytes)
+    std::uint32_t SizeOfStackCommit;           // Stack commit size (bytes)
+    std::uint32_t SizeOfHeapReserve;           // Heap reserve size (bytes)
+    std::uint32_t SizeOfHeapCommit;            // Heap commit size (bytes)
+    std::uint32_t LoaderFlags;                 // Reserved, must be zero
+    std::uint32_t NumberOfRvaAndSizes;         // Number of data directory entries
     IMAGE_DATA_DIRECTORY_ DataDirectory[IMAGE_NUMBEROF_DIRECTORY_ENTRIES];
 };
 
 struct IMAGE_OPTIONAL_HEADER64_ {
-    std::uint16_t Magic;
-    std::uint8_t  MajorLinkerVersion;
-    std::uint8_t  MinorLinkerVersion;
-    std::uint32_t SizeOfCode;
-    std::uint32_t SizeOfInitializedData;
-    std::uint32_t SizeOfUninitializedData;
-    std::uint32_t AddressOfEntryPoint;
-    std::uint32_t BaseOfCode;
-    std::uint64_t ImageBase;
-    std::uint32_t SectionAlignment;
-    std::uint32_t FileAlignment;
-    std::uint16_t MajorOperatingSystemVersion;
-    std::uint16_t MinorOperatingSystemVersion;
-    std::uint16_t MajorImageVersion;
-    std::uint16_t MinorImageVersion;
-    std::uint16_t MajorSubsystemVersion;
-    std::uint16_t MinorSubsystemVersion;
-    std::uint32_t Win32VersionValue;
-    std::uint32_t SizeOfImage;
-    std::uint32_t SizeOfHeaders;
-    std::uint32_t CheckSum;
-    std::uint16_t Subsystem;
-    std::uint16_t DllCharacteristics;
-    std::uint64_t SizeOfStackReserve;
-    std::uint64_t SizeOfStackCommit;
-    std::uint64_t SizeOfHeapReserve;
-    std::uint64_t SizeOfHeapCommit;
-    std::uint32_t LoaderFlags;
-    std::uint32_t NumberOfRvaAndSizes;
+    std::uint16_t Magic;                       // PE32 (0x10B) or PE32+ (0x20B)
+    std::uint8_t  MajorLinkerVersion;          // Linker major version
+    std::uint8_t  MinorLinkerVersion;          // Linker minor version
+    std::uint32_t SizeOfCode;                  // Sum of all code sections
+    std::uint32_t SizeOfInitializedData;       // Sum of all initialized data sections
+    std::uint32_t SizeOfUninitializedData;     // Sum of all BSS sections
+    std::uint32_t AddressOfEntryPoint;         // RVA of entry point function
+    std::uint32_t BaseOfCode;                  // RVA of code section start
+    std::uint64_t ImageBase;                   // Preferred load address
+    std::uint32_t SectionAlignment;            // Section alignment in memory (bytes)
+    std::uint32_t FileAlignment;               // Section alignment on disk (bytes)
+    std::uint16_t MajorOperatingSystemVersion; // Required OS major version
+    std::uint16_t MinorOperatingSystemVersion; // Required OS minor version
+    std::uint16_t MajorImageVersion;           // Image major version (user-defined)
+    std::uint16_t MinorImageVersion;           // Image minor version (user-defined)
+    std::uint16_t MajorSubsystemVersion;       // Required subsystem major version
+    std::uint16_t MinorSubsystemVersion;       // Required subsystem minor version
+    std::uint32_t Win32VersionValue;           // Reserved, must be zero
+    std::uint32_t SizeOfImage;                 // Total image size in memory (bytes)
+    std::uint32_t SizeOfHeaders;               // Size of all headers (bytes)
+    std::uint32_t CheckSum;                    // Image checksum (required for drivers)
+    std::uint16_t Subsystem;                   // Target subsystem (GUI, CUI, etc.)
+    std::uint16_t DllCharacteristics;          // Security flags (ASLR, DEP, CFG, etc.)
+    std::uint64_t SizeOfStackReserve;          // Stack reserve size (bytes)
+    std::uint64_t SizeOfStackCommit;           // Stack commit size (bytes)
+    std::uint64_t SizeOfHeapReserve;           // Heap reserve size (bytes)
+    std::uint64_t SizeOfHeapCommit;            // Heap commit size (bytes)
+    std::uint32_t LoaderFlags;                 // Reserved, must be zero
+    std::uint32_t NumberOfRvaAndSizes;         // Number of data directory entries
     IMAGE_DATA_DIRECTORY_ DataDirectory[IMAGE_NUMBEROF_DIRECTORY_ENTRIES];
 };
 
 struct IMAGE_SECTION_HEADER_ {
-    char          Name[8];
-    std::uint32_t VirtualSize;
-    std::uint32_t VirtualAddress;
-    std::uint32_t SizeOfRawData;
-    std::uint32_t PointerToRawData;
-    std::uint32_t PointerToRelocations;
-    std::uint32_t PointerToLinenumbers;
-    std::uint16_t NumberOfRelocations;
-    std::uint16_t NumberOfLinenumbers;
-    std::uint32_t Characteristics;
+    char          Name[8];              // Section name (null-padded, not null-terminated if 8 chars)
+    std::uint32_t VirtualSize;          // Size in memory (before padding)
+    std::uint32_t VirtualAddress;       // RVA of section start
+    std::uint32_t SizeOfRawData;        // Size on disk (aligned to FileAlignment)
+    std::uint32_t PointerToRawData;     // File offset to section data
+    std::uint32_t PointerToRelocations; // File offset to relocations (object files)
+    std::uint32_t PointerToLinenumbers; // File offset to line numbers (deprecated)
+    std::uint16_t NumberOfRelocations;  // Number of relocation entries
+    std::uint16_t NumberOfLinenumbers;  // Number of line number entries (deprecated)
+    std::uint32_t Characteristics;      // Section flags (RWX, code, data, etc.)
 };
 
 struct IMAGE_IMPORT_DESCRIPTOR_ {
-    std::uint32_t OriginalFirstThunk;
-    std::uint32_t TimeDateStamp;
-    std::uint32_t ForwarderChain;
-    std::uint32_t Name;
-    std::uint32_t FirstThunk;
+    std::uint32_t OriginalFirstThunk;   // RVA to Import Name Table (INT)
+    std::uint32_t TimeDateStamp;        // Timestamp if bound, 0 otherwise
+    std::uint32_t ForwarderChain;       // Index of first forwarder reference
+    std::uint32_t Name;                 // RVA to DLL name string
+    std::uint32_t FirstThunk;           // RVA to Import Address Table (IAT)
 };
 
 struct IMAGE_EXPORT_DIRECTORY_ {
-    std::uint32_t Characteristics;
-    std::uint32_t TimeDateStamp;
-    std::uint16_t MajorVersion;
-    std::uint16_t MinorVersion;
-    std::uint32_t Name;
-    std::uint32_t Base;
-    std::uint32_t NumberOfFunctions;
-    std::uint32_t NumberOfNames;
-    std::uint32_t AddressOfFunctions;
-    std::uint32_t AddressOfNames;
-    std::uint32_t AddressOfNameOrdinals;
+    std::uint32_t Characteristics;      // Reserved, must be zero
+    std::uint32_t TimeDateStamp;        // Export table creation time
+    std::uint16_t MajorVersion;         // User-defined major version
+    std::uint16_t MinorVersion;         // User-defined minor version
+    std::uint32_t Name;                 // RVA to DLL name string
+    std::uint32_t Base;                 // Starting ordinal number
+    std::uint32_t NumberOfFunctions;    // Number of entries in EAT
+    std::uint32_t NumberOfNames;        // Number of named exports
+    std::uint32_t AddressOfFunctions;   // RVA to Export Address Table (EAT)
+    std::uint32_t AddressOfNames;       // RVA to Export Name Table
+    std::uint32_t AddressOfNameOrdinals;// RVA to ordinal table
 };
-
 #pragma pack(pop)
 
 PeParser::PeParser(const std::vector<std::uint8_t>& data, PeModel& out)

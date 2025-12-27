@@ -9,7 +9,8 @@
 
 #include "ui/ui_app.hpp"
 #include "vulkan/vulkan_manager.h"
-
+#include "dissassembler/dissassembler.hpp"
+#include "model/pe_model.hpp"
 namespace viewer {
 
     struct AppConfig {
@@ -32,6 +33,9 @@ namespace viewer {
 
         void open_file_dialog();
 
+
+
+
     private:
         void init_glfw(const AppConfig& config);
         void init_imgui();
@@ -43,6 +47,8 @@ namespace viewer {
         static void glfw_error_callback(int error, const char* description);
         static void glfw_framebuffer_resize_callback(GLFWwindow* window, int width, int height);
 
+        ImVec4 get_mnemonic_color(const std::string& mnemonic) const;
+
         BinaryModel model_;
         UiApp* ui_ = nullptr;
 
@@ -50,6 +56,8 @@ namespace viewer {
         VulkanManager vulkan_;
         bool running_ = false;
         bool framebuffer_resized_ = false;
+
+
     };
 
 } // namespace viewer

@@ -1,8 +1,12 @@
 #pragma once
+#include <complex.h>
+
 #include "ui_panel.hpp"
 #include "model/binary_model.hpp"
 #include <vector>
 #include <string>
+
+#include "dissassembler/dissassembler.hpp"
 
 namespace viewer {
 
@@ -44,12 +48,17 @@ namespace viewer {
 
     class DisassemblyPanel : public UiPanel {
     public:
-        explicit DisassemblyPanel(BinaryModel& model);
+        explicit DisassemblyPanel(BinaryModel& model, std::vector<Instruction>& instructions);
+        std::vector<Instruction>& current_instructions_;
     protected:
         void draw_contents() override;
+
+
     private:
         BinaryModel& model_;
         size_t selected_instr_ = 0;
+
+
     };
 
     class LogPanel : public UiPanel {

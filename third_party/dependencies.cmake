@@ -59,3 +59,23 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nfd)
 
 target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
+
+# Capstone
+FetchContent_Declare(
+        capstone
+        GIT_REPOSITORY https://github.com/capstone-engine/capstone.git
+        GIT_TAG        5.0.6
+        GIT_SHALLOW    TRUE
+)
+set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_STATIC ON CACHE BOOL "" FORCE)
+
+# Enable only architectures you need
+set(CAPSTONE_ARCHITECTURE_DEFAULT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)      # x86/x64 with SSE/AVX/AVX-512
+set(CAPSTONE_ARM_SUPPORT ON CACHE BOOL "" FORCE)      # ARM32/ARMv7
+set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)    # ARM64/ARMv8
+
+FetchContent_MakeAvailable(capstone)

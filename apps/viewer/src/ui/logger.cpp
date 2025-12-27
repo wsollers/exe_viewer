@@ -2,9 +2,6 @@
 
 namespace viewer {
 
-    void Logger::init(LogPanel* panel) {
-        panel_ = panel;
-    }
 
     void Logger::info(const std::string& msg) {
         if (!panel_) return;
