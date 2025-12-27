@@ -284,7 +284,7 @@ void UiApp::render_dockspace() {
                 (pe_model_.entry_point_rva - section->virtual_address);
             max_size = std::min(max_size, section_remaining);
         }
-//TODO Read file!
+
         const auto code = model_.bytes();
         //const uint8_t* code = pe_model_.data_at_offset(*offset, max_size);
         if (code.size() < 0) {
