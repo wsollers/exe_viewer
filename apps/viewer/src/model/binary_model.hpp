@@ -5,6 +5,8 @@
 #include <memory>
 #include "pe_model.hpp"
 
+#include <peelf/binary_image.hpp>
+
 namespace viewer {
 
     enum class BinaryFormat {
@@ -47,14 +49,20 @@ namespace viewer {
 
         const PeModel* pe() const { return pe_.get(); }
 
+        // Unified core image (format-agnostic identity). Non-null once a PE or ELF
+        // file parses; the migration target as panels move onto it (ToDo.md P1-6).
+        const peelf::IBinaryImage* image() const { return image_.get(); }
+
     private:
         BinaryFormat format_ = BinaryFormat::None;
         FileInfo file_info_;
         std::vector<std::uint8_t> bytes_;
         std::vector<SectionInfo> sections_;
         std::unique_ptr<PeModel> pe_;
+        std::unique_ptr<peelf::IBinaryImage> image_;
 
         bool load_pe(const std::string& path);
+        bool load_elf(const std::string& path);
     };
 
 } // namespace viewer
