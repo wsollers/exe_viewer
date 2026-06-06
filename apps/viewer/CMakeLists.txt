@@ -19,8 +19,6 @@ add_executable(peelf_viewer
         src/application.cpp
         src/vulkan/vulkan_manager.h
         src/vulkan/vulkan_manager.cpp
-        src/gui/gui.h
-        src/gui/gui.cpp
         src/model/pe_model.hpp
         src/model/binary_model.hpp
         src/model/pe_parser.cpp
@@ -46,7 +44,7 @@ add_executable(peelf_viewer
         src/model/pe_subsystem.hpp
         src/model/section_header_characteristics.hpp
         src/model/image_delay_load_descriptor.hpp
-        src/dissassembler/dissassembler.hpp
+        src/disasm/disassembler.hpp
 )
 
 target_include_directories(peelf_viewer PRIVATE

@@ -31,4 +31,4 @@ namespace peelf {
         return {static_cast<int>(e), map_error_category()};
     }
 
-} // namespace ws::fs
+} // namespace peelf

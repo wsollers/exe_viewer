@@ -1,3 +1,13 @@
+# =============================================================================
+# LEGACY / UNSUPPORTED - DO NOT RUN
+#
+# This script is from an earlier dependency-vendoring approach and is no longer
+# used by the build. Dependencies are fetched automatically via CMake
+# FetchContent (see third_party/dependencies.cmake). Running this will NOT set
+# the project up correctly and fetches versions that disagree with the build.
+# Kept for historical reference only. See scripts/README.md.
+# =============================================================================
+
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")

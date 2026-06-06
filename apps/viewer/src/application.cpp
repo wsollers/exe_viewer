@@ -8,13 +8,12 @@
 #include <imgui_impl_vulkan.h>
 #include <nfd.h>
 
-#include "gui/gui.h"
 #include "vulkan/vulkan_manager.h"
 #include "peelf/peelf.hpp"
 #include "mapping/file_mapping.hpp"
 #include "pe/pe_parser.h"
 #include "ui/logger.hpp"
-#include "dissassembler/dissassembler.hpp"
+#include "disasm/disassembler.hpp"
 
 namespace viewer {
     Application::~Application() {
@@ -52,6 +51,12 @@ namespace viewer {
         Logger::instance().init(&ui_->log_panel());
 
         init_imgui();
+
+        if (NFD_Init() == NFD_OKAY) {
+            nfd_initialized_ = true;
+        } else {
+            Log().error("Failed to initialize native file dialog (NFD)");
+        }
 
         running_ = true;
     }
@@ -154,6 +159,11 @@ namespace viewer {
         shutdown_imgui();
         vulkan_.shutdown();
 
+        if (nfd_initialized_) {
+            NFD_Quit();
+            nfd_initialized_ = false;
+        }
+
         if (window_) {
             glfwDestroyWindow(window_);
             window_ = nullptr;
@@ -205,7 +215,10 @@ namespace viewer {
 
 
     void Application::open_file_dialog() {
-        NFD_Init();
+        if (!nfd_initialized_) {
+            Log().error("Cannot open file dialog: NFD not initialized");
+            return;
+        }
 
         nfdchar_t *out_path = nullptr;
         nfdfilteritem_t filters[2] = {
@@ -217,17 +230,18 @@ namespace viewer {
 
         if (result == NFD_OKAY) {
             std::string path(out_path);
-            free(out_path);
+            NFD_FreePath(out_path);
 
             if (model_.load_file(path)) {
-                // Optional: log success
                 Log().info("Loaded file: " + path);
                 ui_->on_file_loaded();
-
             } else {
                 Log().error("Did not load file: " + path);
             }
+        } else if (result == NFD_ERROR) {
+            Log().error(std::string("File dialog error: ") + NFD_GetError());
         }
+        // NFD_CANCEL: user cancelled; nothing to do.
     }
 
 

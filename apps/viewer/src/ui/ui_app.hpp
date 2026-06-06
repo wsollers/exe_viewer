@@ -4,7 +4,7 @@
 
 #include "model/binary_model.hpp"
 #include "ui_panels.hpp"
-#include "dissassembler/dissassembler.hpp"
+#include "disasm/disassembler.hpp"
 
 namespace viewer {
 

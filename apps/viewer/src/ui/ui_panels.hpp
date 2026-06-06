@@ -6,7 +6,7 @@
 #include <vector>
 #include <string>
 
-#include "dissassembler/dissassembler.hpp"
+#include "disasm/disassembler.hpp"
 
 namespace viewer {
 

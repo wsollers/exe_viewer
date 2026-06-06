@@ -11,10 +11,6 @@
 
 namespace peelf {
 
-static std::error_code posix_ec(int err) noexcept {
-    return std::error_code(err, std::generic_category());
-}
-
 std::error_code PosixFileMappingBackend::open_and_map(PosixFileMappingBackend& self,
                                                      const std::string& path,
                                                      MapMode mode,
@@ -81,6 +77,6 @@ std::error_code PosixFileMappingBackend::flush(PosixFileMappingBackend&,
     return {};
 }
 
-} // namespace ws::fs
+} // namespace peelf
 
 #endif

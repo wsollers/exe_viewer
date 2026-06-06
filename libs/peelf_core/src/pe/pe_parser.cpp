@@ -16,22 +16,22 @@ static std::uint32_t read_u32_le(std::span<const std::uint8_t> b, std::size_t of
         (static_cast<std::uint32_t>(b[off + 3]) << 24));
 }
 
-std::expected<FileInfo, Error> parse_pe_bytes(std::span<const std::uint8_t> bytes) {
+Result<FileInfo> parse_pe_bytes(std::span<const std::uint8_t> bytes) {
     if (bytes.size() < 0x40) {
-        return std::unexpected(Error{"PE file too small for DOS header"});
+        return make_error("PE file too small for DOS header");
     }
     if (!(bytes[0] == 'M' && bytes[1] == 'Z')) {
-        return std::unexpected(Error{"Missing MZ header"});
+        return make_error("Missing MZ header");
     }
 
     const std::uint32_t e_lfanew = read_u32_le(bytes, 0x3C);
     if (e_lfanew + 4 + 20 > bytes.size()) {
-        return std::unexpected(Error{"Invalid e_lfanew (out of range)"});
+        return make_error("Invalid e_lfanew (out of range)");
     }
 
     if (!(bytes[e_lfanew + 0] == 'P' && bytes[e_lfanew + 1] == 'E' &&
           bytes[e_lfanew + 2] == 0 && bytes[e_lfanew + 3] == 0)) {
-        return std::unexpected(Error{"Missing PE signature"});
+        return make_error("Missing PE signature");
     }
 
     const std::size_t coff = e_lfanew + 4;
@@ -42,7 +42,7 @@ std::expected<FileInfo, Error> parse_pe_bytes(std::span<const std::uint8_t> byte
 
     const std::size_t opt = coff + 20;
     if (opt + size_of_optional_header > bytes.size() || size_of_optional_header < 2) {
-        return std::unexpected(Error{"Invalid optional header size"});
+        return make_error("Invalid optional header size");
     }
     const std::uint16_t optional_magic = read_u16_le(bytes, opt + 0);
 

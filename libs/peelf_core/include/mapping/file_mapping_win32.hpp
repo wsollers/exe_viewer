@@ -31,6 +31,6 @@ namespace peelf {
                                      std::size_t size) noexcept;
     };
 
-} // namespace ws::fs
+} // namespace peelf
 
 #endif

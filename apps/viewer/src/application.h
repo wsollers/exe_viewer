@@ -9,7 +9,7 @@
 
 #include "ui/ui_app.hpp"
 #include "vulkan/vulkan_manager.h"
-#include "dissassembler/dissassembler.hpp"
+#include "disasm/disassembler.hpp"
 #include "model/pe_model.hpp"
 namespace viewer {
 
@@ -56,6 +56,7 @@ namespace viewer {
         VulkanManager vulkan_;
         bool running_ = false;
         bool framebuffer_resized_ = false;
+        bool nfd_initialized_ = false;
 
 
     };

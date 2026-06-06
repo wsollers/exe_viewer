@@ -23,12 +23,21 @@ set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
 #)
 
 # Dear ImGui
+# Pinned to a specific docking-branch commit for reproducibility (ToDo.md P0-2)
+# instead of tracking the moving `docking` tip.
+#   commit 2af6dd9694288e6befe1edb7ce25510911693c22 (docking, 2026-06-04)
+# Verified to contain the Vulkan-backend ImGui_ImplVulkan_InitInfo fields the
+# viewer uses (PipelineInfoMain/PipelineInfoForViewports, ApiVersion,
+# DescriptorPoolSize, MinAllocationSize, CustomShaderVert/FragCreateInfo).
+# To advance the pin: pick a newer docking commit and re-verify those fields in
+# backends/imgui_impl_vulkan.h before bumping. GIT_SHALLOW is FALSE because a
+# shallow clone cannot reliably check out an arbitrary commit SHA.
 FetchContent_Declare(
         imgui_src
         GIT_REPOSITORY https://github.com/ocornut/imgui.git
-        GIT_TAG docking
-        GIT_SHALLOW    TRUE
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE  # <-- Add this to each
+        GIT_TAG        2af6dd9694288e6befe1edb7ce25510911693c22
+        GIT_SHALLOW    FALSE
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 )
 
 FetchContent_MakeAvailable(glfw imgui_src)

@@ -1,4 +1,14 @@
 #!/usr/bin/env pwsh
+# =============================================================================
+# LEGACY / UNSUPPORTED - DO NOT RUN
+#
+# This script is from an earlier dependency-vendoring approach and is no longer
+# used by the build. Dependencies are fetched automatically via CMake
+# FetchContent (see third_party/dependencies.cmake). It also references a
+# 'vendor_dependencies.ps1' that does not exist and would generate a different
+# dependencies.cmake/README than the build uses. Do not run it.
+# Kept for historical reference only. See scripts/README.md.
+# =============================================================================
 <#
 .SYNOPSIS
     Vendors GLFW, ImGui, and Vulkan SDK components into the third_party directory.

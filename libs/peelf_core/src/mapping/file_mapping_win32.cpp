@@ -8,11 +8,6 @@
 
 namespace peelf {
 
-
-static std::error_code win32_ec(DWORD e) noexcept {
-    return std::error_code(static_cast<int>(e), std::system_category());
-}
-
 std::error_code Win32FileMappingBackend::open_and_map(Win32FileMappingBackend& self,
                                                      const std::string& path,
                                                      MapMode mode,
@@ -108,6 +103,6 @@ std::error_code Win32FileMappingBackend::flush(Win32FileMappingBackend&,
     return {};
 }
 
-} // namespace ws::fs
+} // namespace peelf
 
 #endif

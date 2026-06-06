@@ -1,0 +1,33 @@
+# clang-tidy configuration for peelf_explorer (ToDo.md P0-10).
+#
+# This is a starting baseline. It is NOT gating yet: diagnostics are surfaced but
+# not turned into errors (WarningsAsErrors is empty). P7-4 tightens the check set
+# and works through the backlog; P7-3 runs it in CI.
+#
+# clang-tidy runs via the Ninja-based clang18 presets (the Visual Studio generator
+# ignores CXX_CLANG_TIDY). Enable with: cmake --preset clang18-debug -DPEELF_ENABLE_CLANG_TIDY=ON
+#
+# HeaderFilterRegex restricts diagnostics to our own headers so third-party code
+# pulled in via FetchContent (glfw/imgui/capstone/nfd/gtest) is not reported.
+
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  modernize-*,
+  misc-*,
+  clang-analyzer-*,
+  readability-*,
+  -modernize-use-trailing-return-type,
+  -modernize-use-nodiscard,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -readability-braces-around-statements,
+  -misc-non-private-member-variables-in-classes,
+  -misc-include-cleaner,
+  -bugprone-easily-swappable-parameters
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '(libs/peelf_core|apps/viewer/src|tests)/.*'
+FormatStyle: file

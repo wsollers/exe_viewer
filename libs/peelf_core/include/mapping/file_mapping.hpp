@@ -12,8 +12,6 @@
 
 #define NOMINMAX
 
-#include "file_mapping_win32.hpp"
-#include "mapping/file_mapping.hpp"
 #include "mapping/map_errors.hpp"
 
 namespace peelf {
@@ -44,17 +42,28 @@ enum class MapMode {
     read_only,
     read_write
 };
-    // forward decls (must be inside peelf)
-    struct PosixFileMappingBackend;
-    struct Win32FileMappingBackend;
+} // namespace peelf
+
 // -------------------------
 // OS backend selection
+//
+// These includes are at GLOBAL scope on purpose. Each backend header opens its
+// own `namespace peelf`, so including it here defines the backend at the correct
+// scope (peelf::Win32FileMappingBackend / peelf::PosixFileMappingBackend).
+// Including it inside an already-open `namespace peelf` would nest it as
+// peelf::peelf::... and leave NativeFileMappingBackend bound to an incomplete
+// type. MapMode is defined above so the backend declarations can see it.
 // -------------------------
 #if defined(_WIN32)
-    #include "file_mapping_win32.hpp"  // must define Win32FileMappingBackend
+    #include "file_mapping_win32.hpp"  // defines peelf::Win32FileMappingBackend
+#else
+    #include "file_mapping_posix.hpp"  // defines peelf::PosixFileMappingBackend
+#endif
+
+namespace peelf {
+#if defined(_WIN32)
     using NativeFileMappingBackend = Win32FileMappingBackend;
 #else
-    #include "file_mapping_posix.hpp"  // must define PosixFileMappingBackend
     using NativeFileMappingBackend = PosixFileMappingBackend;
 #endif
 
@@ -71,9 +80,11 @@ public:
 
     FileMapping() = default;
 
-    explicit FileMapping(std::filesystem::path path, MapMode mode = MapMode::read_only)
+    explicit FileMapping(const std::filesystem::path& path, MapMode mode = MapMode::read_only)
     {
-        auto rc = open(std::move(path.string()), mode);
+        if (std::error_code ec = open(path.string(), mode); ec) {
+            throw std::system_error(ec, "FileMapping: failed to map '" + path.string() + "'");
+        }
     }
 
     ~FileMapping() { close(); }
@@ -87,6 +98,7 @@ public:
         if (this != &other) {
             close();
             backend_ = std::exchange(other.backend_, {});
+            data_ = std::exchange(other.data_, nullptr);
             byte_size_ = std::exchange(other.byte_size_, 0);
             mode_ = other.mode_;
         }
@@ -166,4 +178,4 @@ private:
     MapMode mode_ = MapMode::read_only;
 };
 
-} // namespace ws::fs
+} // namespace peelf
