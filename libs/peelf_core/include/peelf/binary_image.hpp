@@ -112,6 +112,17 @@ struct ElfHeader {
     std::uint16_t section_name_string_table_index = 0;
 };
 
+struct ElfProgramHeader {
+    std::uint32_t type = 0;
+    std::uint32_t flags = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t virtual_address = 0;
+    std::uint64_t physical_address = 0;
+    std::uint64_t file_size = 0;
+    std::uint64_t memory_size = 0;
+    std::uint64_t alignment = 0;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -131,6 +142,7 @@ public:
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

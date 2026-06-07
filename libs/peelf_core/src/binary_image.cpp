@@ -72,6 +72,10 @@ public:
     [[nodiscard]] const std::vector<ImportEntry>& imports() const noexcept override { return imports_; }
     [[nodiscard]] const std::vector<ExportEntry>& exports() const noexcept override { return exports_; }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
+    [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
+        static const std::vector<ElfProgramHeader> empty;
+        return empty;
+    }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -121,10 +125,14 @@ protected:
 class ElfImage final : public ImageBase {
 public:
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return &elf_header_; }
+    [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
+        return program_headers_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
     ElfHeader elf_header_;
+    std::vector<ElfProgramHeader> program_headers_;
 };
 
 class PeImage final : public ImageBase {
@@ -206,7 +214,8 @@ std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& s
 
 void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t phoff, std::uint16_t phentsize,
-                        std::uint16_t phnum, std::vector<Segment>& out) {
+                        std::uint16_t phnum, std::vector<ElfProgramHeader>& headers_out,
+                        std::vector<Segment>& segments_out) {
     if (phoff == 0 || phnum == 0 || phentsize == 0) {
         return;
     }
@@ -219,34 +228,45 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
         return;
     }
 
-    out.reserve(phnum);
+    headers_out.reserve(phnum);
+    segments_out.reserve(phnum);
     for (std::uint16_t i = 0; i < phnum; ++i) {
         const std::uint64_t hdr64 = phoff + static_cast<std::uint64_t>(i) * phentsize;
         const std::size_t hdr = static_cast<std::size_t>(hdr64);
 
-        Segment seg;
+        ElfProgramHeader phdr;
         if (is64) {
-            seg.type            = rd32(b, hdr + 0x00, big);
-            const std::uint32_t flags = rd32(b, hdr + 0x04, big);
-            seg.file_offset     = rd64(b, hdr + 0x08, big);
-            seg.virtual_address = rd64(b, hdr + 0x10, big);
-            seg.file_size       = rd64(b, hdr + 0x20, big);
-            seg.virtual_size    = rd64(b, hdr + 0x28, big);
-            seg.executable = (flags & 0x1u) != 0;  // PF_X
-            seg.writable   = (flags & 0x2u) != 0;  // PF_W
-            seg.readable   = (flags & 0x4u) != 0;  // PF_R
+            phdr.type             = rd32(b, hdr + 0x00, big);
+            phdr.flags            = rd32(b, hdr + 0x04, big);
+            phdr.offset           = rd64(b, hdr + 0x08, big);
+            phdr.virtual_address  = rd64(b, hdr + 0x10, big);
+            phdr.physical_address = rd64(b, hdr + 0x18, big);
+            phdr.file_size        = rd64(b, hdr + 0x20, big);
+            phdr.memory_size      = rd64(b, hdr + 0x28, big);
+            phdr.alignment        = rd64(b, hdr + 0x30, big);
         } else {
-            seg.type            = rd32(b, hdr + 0x00, big);
-            seg.file_offset     = rd32(b, hdr + 0x04, big);
-            seg.virtual_address = rd32(b, hdr + 0x08, big);
-            seg.file_size       = rd32(b, hdr + 0x10, big);
-            seg.virtual_size    = rd32(b, hdr + 0x14, big);
-            const std::uint32_t flags = rd32(b, hdr + 0x18, big);
-            seg.executable = (flags & 0x1u) != 0;  // PF_X
-            seg.writable   = (flags & 0x2u) != 0;  // PF_W
-            seg.readable   = (flags & 0x4u) != 0;  // PF_R
+            phdr.type             = rd32(b, hdr + 0x00, big);
+            phdr.offset           = rd32(b, hdr + 0x04, big);
+            phdr.virtual_address  = rd32(b, hdr + 0x08, big);
+            phdr.physical_address = rd32(b, hdr + 0x0C, big);
+            phdr.file_size        = rd32(b, hdr + 0x10, big);
+            phdr.memory_size      = rd32(b, hdr + 0x14, big);
+            phdr.flags            = rd32(b, hdr + 0x18, big);
+            phdr.alignment        = rd32(b, hdr + 0x1C, big);
         }
-        out.push_back(seg);
+
+        Segment seg;
+        seg.type            = phdr.type;
+        seg.file_offset     = phdr.offset;
+        seg.virtual_address = phdr.virtual_address;
+        seg.file_size       = phdr.file_size;
+        seg.virtual_size    = phdr.memory_size;
+        seg.executable = (phdr.flags & 0x1u) != 0;  // PF_X
+        seg.writable   = (phdr.flags & 0x2u) != 0;  // PF_W
+        seg.readable   = (phdr.flags & 0x4u) != 0;  // PF_R
+
+        headers_out.push_back(phdr);
+        segments_out.push_back(seg);
     }
 }
 
@@ -520,7 +540,8 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     };
 
     // Sections (P2-1), best-effort: identity above is already valid.
-    parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum, img->segments_);
+    parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
+                       img->program_headers_, img->segments_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                        img->sections_, img->symbols_, img->imports_);
 

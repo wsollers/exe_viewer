@@ -180,6 +180,8 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_EQ(img.endianness(), peelf::Endianness::Little);
     EXPECT_EQ(img.kind(), peelf::ImageKind::Executable);
     EXPECT_EQ(img.entry_point(), 0x140000000ULL + 0x1000);
+    EXPECT_EQ(img.elf_header(), nullptr);
+    EXPECT_TRUE(img.elf_program_headers().empty());
 
     ASSERT_EQ(img.sections().size(), 1u);
     const auto& sec = img.sections().front();
@@ -396,6 +398,54 @@ TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
         EXPECT_EQ(header->section_header_entry_size, expected.section_header_entry_size) << expected.name;
         EXPECT_EQ(header->section_header_count, expected.section_header_count) << expected.name;
         EXPECT_EQ(header->section_name_string_table_index, 2u) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesElfProgramHeadersAcrossFixtureMatrix) {
+    constexpr std::array<const char*, 14> fixtures{{
+        "known-linux-x64.elf",
+        "known-linux-arm64.elf",
+        "known-linux-riscv64.elf",
+        "known-linux-x86-elf32-le.elf",
+        "known-linux-mips-elf32-be.elf",
+        "known-linux-mips64-elf64-be.elf",
+        "known-linux-arm-elf32-le.elf",
+        "known-linux-arm-elf32-be.elf",
+        "known-linux-arm64-elf64-be.elf",
+        "known-linux-riscv32-elf32-le.elf",
+        "known-linux-riscv32-elf32-be.elf",
+        "known-linux-riscv64-elf64-be.elf",
+        "known-linux-ppc-elf32-be.elf",
+        "known-linux-ppc64-elf64-be.elf",
+    }};
+
+    for (const char* name : fixtures) {
+        const auto path = fixture_path(name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << name;
+
+        const auto& headers = (**result).elf_program_headers();
+        ASSERT_EQ(headers.size(), 1u) << name;
+        const peelf::ElfProgramHeader& header = headers.front();
+        EXPECT_EQ(header.type, 1u) << name;   // PT_LOAD
+        EXPECT_EQ(header.flags, 5u) << name;  // PF_R | PF_X
+        EXPECT_EQ(header.offset, 0x80u) << name;
+        EXPECT_EQ(header.virtual_address, 0x400080u) << name;
+        EXPECT_EQ(header.physical_address, 0x400080u) << name;
+        EXPECT_EQ(header.file_size, 0x10u) << name;
+        EXPECT_EQ(header.memory_size, 0x10u) << name;
+        EXPECT_EQ(header.alignment, 0x1000u) << name;
+
+        ASSERT_EQ((**result).segments().size(), 1u) << name;
+        const peelf::Segment& segment = (**result).segments().front();
+        EXPECT_EQ(segment.type, header.type) << name;
+        EXPECT_EQ(segment.file_offset, header.offset) << name;
+        EXPECT_EQ(segment.virtual_address, header.virtual_address) << name;
+        EXPECT_EQ(segment.file_size, header.file_size) << name;
+        EXPECT_EQ(segment.virtual_size, header.memory_size) << name;
     }
 }
 
