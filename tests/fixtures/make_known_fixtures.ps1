@@ -168,17 +168,33 @@ function New-Pe64Fixture {
     Put-U16LE $Bytes ($Opt + 0) 0x020b
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U64LE $Bytes ($Opt + 24) 0x140000000
+    Put-U32LE $Bytes ($Opt + 0x6C) 16
+    Put-U32LE $Bytes ($Opt + 0x70) 0x1100
+    Put-U32LE $Bytes ($Opt + 0x74) 0x80
 
     $Sect = [UInt32]($Opt + 0x00f0)
     Put-Ascii $Bytes $Sect ".text"
-    Put-U32LE $Bytes ($Sect + 8) 0x100
+    Put-U32LE $Bytes ($Sect + 8) 0x200
     Put-U32LE $Bytes ($Sect + 12) 0x1000
-    Put-U32LE $Bytes ($Sect + 16) 0x20
+    Put-U32LE $Bytes ($Sect + 16) 0x200
     Put-U32LE $Bytes ($Sect + 20) 0x200
     Put-U32LE $Bytes ($Sect + 36) 0x60000020
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
+
+    Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
+    Put-U32LE $Bytes 0x310 1       # Base
+    Put-U32LE $Bytes 0x314 1       # NumberOfFunctions
+    Put-U32LE $Bytes 0x318 1       # NumberOfNames
+    Put-U32LE $Bytes 0x31C 0x1150  # AddressOfFunctions
+    Put-U32LE $Bytes 0x320 0x1154  # AddressOfNames
+    Put-U32LE $Bytes 0x324 0x1158  # AddressOfNameOrdinals
+    Put-Ascii $Bytes 0x340 "known-win-x64.exe"
+    Put-U32LE $Bytes 0x350 0x1000  # exported function RVA
+    Put-U32LE $Bytes 0x354 0x1160  # export name RVA
+    Put-U16LE $Bytes 0x358 0       # ordinal index
+    Put-Ascii $Bytes 0x360 "known_export"
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

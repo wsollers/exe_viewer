@@ -48,6 +48,7 @@ namespace viewer {
         HexViewPanel    hex_panel_;
         DisassemblyPanel disasm_panel_;
         ImportsPanel    imports_panel_;
+        ExportsPanel    exports_panel_;
         SymbolsPanel    symbols_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;

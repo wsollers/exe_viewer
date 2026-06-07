@@ -72,6 +72,13 @@ struct ImportEntry {
     std::uint64_t address = 0;
 };
 
+struct ExportEntry {
+    std::string   name;
+    std::uint32_t ordinal = 0;
+    std::uint64_t virtual_address = 0;
+    std::string   forwarder;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -89,6 +96,7 @@ public:
     [[nodiscard]] virtual const std::vector<Segment>& segments() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Symbol>& symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

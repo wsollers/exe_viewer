@@ -1,5 +1,6 @@
 #include <peelf/binary_image.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -69,6 +70,7 @@ public:
     [[nodiscard]] const std::vector<Segment>& segments() const noexcept override { return segments_; }
     [[nodiscard]] const std::vector<Symbol>& symbols() const noexcept override { return symbols_; }
     [[nodiscard]] const std::vector<ImportEntry>& imports() const noexcept override { return imports_; }
+    [[nodiscard]] const std::vector<ExportEntry>& exports() const noexcept override { return exports_; }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -112,6 +114,7 @@ protected:
     std::vector<Segment> segments_;
     std::vector<Symbol> symbols_;
     std::vector<ImportEntry> imports_;
+    std::vector<ExportEntry> exports_;
 };
 
 class ElfImage final : public ImageBase {
@@ -156,6 +159,43 @@ Architecture pe_arch(std::uint16_t machine) noexcept {
         case 0xaa64: return Architecture::ARM64;   // IMAGE_FILE_MACHINE_ARM64
         default:     return Architecture::Unknown;
     }
+}
+
+std::string read_c_string(std::span<const std::uint8_t> b, std::uint64_t offset,
+                          std::uint64_t max_len = 256) {
+    if (offset >= b.size()) {
+        return {};
+    }
+    std::string result;
+    const std::uint64_t remaining = static_cast<std::uint64_t>(b.size()) - offset;
+    const std::uint64_t max_end = offset + std::min(max_len, remaining);
+    for (std::uint64_t i = offset; i < max_end && b[static_cast<std::size_t>(i)] != 0; ++i) {
+        result.push_back(static_cast<char>(b[static_cast<std::size_t>(i)]));
+    }
+    return result;
+}
+
+std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& sections,
+                                                   std::uint64_t image_base,
+                                                   std::uint32_t rva) noexcept {
+    for (const Section& section : sections) {
+        if (section.virtual_address < image_base) {
+            continue;
+        }
+        const std::uint64_t section_rva = section.virtual_address - image_base;
+        const std::uint64_t mapped_size = section.virtual_size != 0 ? section.virtual_size : section.file_size;
+        if (mapped_size == 0) {
+            continue;
+        }
+        if (rva >= section_rva && static_cast<std::uint64_t>(rva) - section_rva < mapped_size) {
+            const std::uint64_t delta = static_cast<std::uint64_t>(rva) - section_rva;
+            if (delta >= section.file_size) {
+                return std::nullopt;
+            }
+            return checked_add_u64(section.file_offset, delta);
+        }
+    }
+    return std::nullopt;
 }
 
 void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
@@ -510,6 +550,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         image_base = rd32(b, opt + 28, false);
     }
     const std::uint32_t entry_rva = rd32(b, opt + 16, false);
+    const std::uint32_t export_dir_rva = (size_of_opt >= (is64 ? 0x78 : 0x68))
+                                             ? rd32(b, opt + (is64 ? 0x70 : 0x60), false)
+                                             : 0;
+    const std::uint32_t export_dir_size = (size_of_opt >= (is64 ? 0x78 : 0x68))
+                                              ? rd32(b, opt + (is64 ? 0x74 : 0x64), false)
+                                              : 0;
 
     auto img = std::unique_ptr<PeImage>(new PeImage());
     img->format_ = Format::PE;
@@ -552,6 +598,63 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         sec.readable   = (chars & 0x40000000u) != 0;  // IMAGE_SCN_MEM_READ
         sec.writable   = (chars & 0x80000000u) != 0;  // IMAGE_SCN_MEM_WRITE
         img->sections_.push_back(std::move(sec));
+    }
+
+    if (export_dir_rva != 0 && export_dir_size >= 40) {
+        const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);
+        if (export_off && fits_range(*export_off, 40, static_cast<std::uint64_t>(b.size()))) {
+            const std::size_t ed = static_cast<std::size_t>(*export_off);
+            const std::uint32_t ordinal_base = rd32(b, ed + 16, false);
+            const std::uint32_t number_of_functions = rd32(b, ed + 20, false);
+            const std::uint32_t number_of_names = rd32(b, ed + 24, false);
+            const std::uint32_t functions_rva = rd32(b, ed + 28, false);
+            const std::uint32_t names_rva = rd32(b, ed + 32, false);
+            const std::uint32_t ordinals_rva = rd32(b, ed + 36, false);
+
+            const auto functions_off = pe_rva_to_file_offset(img->sections_, image_base, functions_rva);
+            const auto names_off = pe_rva_to_file_offset(img->sections_, image_base, names_rva);
+            const auto ordinals_off = pe_rva_to_file_offset(img->sections_, image_base, ordinals_rva);
+            if (functions_off && names_off && ordinals_off) {
+                for (std::uint32_t i = 0; i < number_of_names; ++i) {
+                    const std::uint64_t name_ptr_off = *names_off + static_cast<std::uint64_t>(i) * 4;
+                    const std::uint64_t ordinal_off = *ordinals_off + static_cast<std::uint64_t>(i) * 2;
+                    if (!fits_range(name_ptr_off, 4, static_cast<std::uint64_t>(b.size())) ||
+                        !fits_range(ordinal_off, 2, static_cast<std::uint64_t>(b.size()))) {
+                        break;
+                    }
+
+                    const std::uint32_t name_rva = rd32(b, static_cast<std::size_t>(name_ptr_off), false);
+                    const std::uint16_t ordinal_index = rd16(b, static_cast<std::size_t>(ordinal_off), false);
+                    if (ordinal_index >= number_of_functions) {
+                        continue;
+                    }
+
+                    const auto name_off = pe_rva_to_file_offset(img->sections_, image_base, name_rva);
+                    const std::uint64_t function_off = *functions_off +
+                                                       static_cast<std::uint64_t>(ordinal_index) * 4;
+                    if (!name_off ||
+                        !fits_range(function_off, 4, static_cast<std::uint64_t>(b.size()))) {
+                        continue;
+                    }
+
+                    const std::uint32_t function_rva = rd32(b, static_cast<std::size_t>(function_off), false);
+                    ExportEntry entry;
+                    entry.name = read_c_string(b, *name_off);
+                    entry.ordinal = ordinal_base + ordinal_index;
+                    entry.virtual_address = image_base + function_rva;
+                    if (function_rva >= export_dir_rva &&
+                        static_cast<std::uint64_t>(function_rva) <
+                            static_cast<std::uint64_t>(export_dir_rva) + export_dir_size) {
+                        if (const auto forwarder_off = pe_rva_to_file_offset(img->sections_, image_base, function_rva)) {
+                            entry.forwarder = read_c_string(b, *forwarder_off);
+                        }
+                    }
+                    if (!entry.name.empty()) {
+                        img->exports_.push_back(std::move(entry));
+                    }
+                }
+            }
+        }
     }
 
     return std::unique_ptr<IBinaryImage>(std::move(img));

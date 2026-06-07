@@ -19,7 +19,8 @@ Small binary samples used by the unit tests.
   `.text` section, one `_start` function symbol, one `DT_NEEDED` library, and
   `EM_RISCV`.
 - `known-win-x64.exe` — deterministic minimal PE32+ executable fixture with a
-  `.text` section and `IMAGE_FILE_MACHINE_AMD64`.
+  `.text` section, one export named `known_export`, and
+  `IMAGE_FILE_MACHINE_AMD64`.
 - `make_known_fixtures.ps1` — regenerates the four `known-*` binary fixtures from
   explicit fixed-width field writes.
 

@@ -243,10 +243,18 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             ASSERT_EQ(img.imports().size(), 1u) << expected.name;
             EXPECT_EQ(img.imports().front().library, "libc.so.6") << expected.name;
             EXPECT_TRUE(img.imports().front().name.empty()) << expected.name;
+            EXPECT_TRUE(img.exports().empty()) << expected.name;
         } else {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
             EXPECT_TRUE(img.symbols().empty()) << expected.name;
             EXPECT_TRUE(img.imports().empty()) << expected.name;
+
+            ASSERT_EQ(img.exports().size(), 1u) << expected.name;
+            const peelf::ExportEntry& exported = img.exports().front();
+            EXPECT_EQ(exported.name, "known_export") << expected.name;
+            EXPECT_EQ(exported.ordinal, 1u) << expected.name;
+            EXPECT_EQ(exported.virtual_address, expected.text_virtual_address) << expected.name;
+            EXPECT_TRUE(exported.forwarder.empty()) << expected.name;
         }
     }
 }

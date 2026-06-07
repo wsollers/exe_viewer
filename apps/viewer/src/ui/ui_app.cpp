@@ -30,6 +30,7 @@ UiApp::UiApp(BinaryModel& model)
     , hex_panel_(model)
     , disasm_panel_(model,current_instructions_)
     , imports_panel_(model)
+    , exports_panel_(model)
     , symbols_panel_(model)
     , log_panel_()
     , pe_headers_panel_(model)
@@ -50,6 +51,7 @@ void UiApp::render() {
     hex_panel_.draw();
     disasm_panel_.draw();
     imports_panel_.draw();
+    exports_panel_.draw();
     symbols_panel_.draw();
     pe_headers_panel_.draw();
     pe_imports_panel_.draw();
@@ -84,6 +86,12 @@ void UiApp::render_main_menu() {
             bool v = imports_panel_.visible();
             if (ImGui::MenuItem(imports_panel_.name().c_str(), nullptr, &v))
                 imports_panel_.set_visible(v);
+        }
+
+        {
+            bool v = exports_panel_.visible();
+            if (ImGui::MenuItem(exports_panel_.name().c_str(), nullptr, &v))
+                exports_panel_.set_visible(v);
         }
 
         {
