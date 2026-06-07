@@ -182,6 +182,7 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_EQ(img.entry_point(), 0x140000000ULL + 0x1000);
     EXPECT_EQ(img.elf_header(), nullptr);
     EXPECT_TRUE(img.elf_program_headers().empty());
+    EXPECT_TRUE(img.elf_section_headers().empty());
 
     ASSERT_EQ(img.sections().size(), 1u);
     const auto& sec = img.sections().front();
@@ -446,6 +447,117 @@ TEST(BinaryImage, ParsesElfProgramHeadersAcrossFixtureMatrix) {
         EXPECT_EQ(segment.virtual_address, header.virtual_address) << name;
         EXPECT_EQ(segment.file_size, header.file_size) << name;
         EXPECT_EQ(segment.virtual_size, header.memory_size) << name;
+    }
+}
+
+TEST(BinaryImage, ParsesElfSectionHeadersAcrossFixtureMatrix) {
+    constexpr std::array<const char*, 14> fixtures{{
+        "known-linux-x64.elf",
+        "known-linux-arm64.elf",
+        "known-linux-riscv64.elf",
+        "known-linux-x86-elf32-le.elf",
+        "known-linux-mips-elf32-be.elf",
+        "known-linux-mips64-elf64-be.elf",
+        "known-linux-arm-elf32-le.elf",
+        "known-linux-arm-elf32-be.elf",
+        "known-linux-arm64-elf64-be.elf",
+        "known-linux-riscv32-elf32-le.elf",
+        "known-linux-riscv32-elf32-be.elf",
+        "known-linux-riscv64-elf64-be.elf",
+        "known-linux-ppc-elf32-be.elf",
+        "known-linux-ppc64-elf64-be.elf",
+    }};
+
+    for (const char* name : fixtures) {
+        const auto path = fixture_path(name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << name;
+
+        const auto& headers = (**result).elf_section_headers();
+        ASSERT_GE(headers.size(), 3u) << name;
+        EXPECT_EQ(headers.front().name_offset, 0u) << name;
+        EXPECT_TRUE(headers.front().name.empty()) << name;
+        EXPECT_EQ(headers.front().type, 0u) << name;  // SHT_NULL
+
+        const auto text = std::ranges::find_if(headers, [](const peelf::ElfSectionHeader& section) {
+            return section.name == ".text";
+        });
+        ASSERT_NE(text, headers.end()) << name;
+        EXPECT_EQ(text->name_offset, 1u) << name;
+        EXPECT_EQ(text->type, 1u) << name;   // SHT_PROGBITS
+        EXPECT_EQ(text->flags, 6u) << name;  // SHF_ALLOC | SHF_EXECINSTR
+        EXPECT_EQ(text->address, 0x400080u) << name;
+        EXPECT_EQ(text->offset, 0x80u) << name;
+        EXPECT_EQ(text->size, 0x10u) << name;
+        EXPECT_EQ(text->link, 0u) << name;
+        EXPECT_EQ(text->info, 0u) << name;
+        EXPECT_EQ(text->address_alignment, 0x10u) << name;
+        EXPECT_EQ(text->entry_size, 0u) << name;
+
+        const auto shstrtab = std::ranges::find_if(headers, [](const peelf::ElfSectionHeader& section) {
+            return section.name == ".shstrtab";
+        });
+        ASSERT_NE(shstrtab, headers.end()) << name;
+        EXPECT_EQ(shstrtab->type, 3u) << name;  // SHT_STRTAB
+        EXPECT_EQ(shstrtab->flags, 0u) << name;
+        EXPECT_EQ(shstrtab->address, 0u) << name;
+        EXPECT_EQ(shstrtab->address_alignment, 1u) << name;
+
+        const auto projected_text = std::ranges::find_if((**result).sections(), [](const peelf::Section& section) {
+            return section.name == ".text";
+        });
+        ASSERT_NE(projected_text, (**result).sections().end()) << name;
+        EXPECT_EQ(projected_text->virtual_address, text->address) << name;
+        EXPECT_EQ(projected_text->virtual_size, text->size) << name;
+        EXPECT_EQ(projected_text->file_offset, text->offset) << name;
+        EXPECT_EQ(projected_text->file_size, text->size) << name;
+    }
+}
+
+TEST(BinaryImage, ParsesRichElfSectionHeaders) {
+    constexpr std::array<const char*, 3> fixtures{{
+        "known-linux-x64.elf",
+        "known-linux-arm64.elf",
+        "known-linux-riscv64.elf",
+    }};
+
+    for (const char* name : fixtures) {
+        const auto path = fixture_path(name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << name;
+
+        const auto& headers = (**result).elf_section_headers();
+        ASSERT_EQ(headers.size(), 7u) << name;
+
+        const auto symtab = std::ranges::find_if(headers, [](const peelf::ElfSectionHeader& section) {
+            return section.name == ".symtab";
+        });
+        ASSERT_NE(symtab, headers.end()) << name;
+        EXPECT_EQ(symtab->type, 2u) << name;  // SHT_SYMTAB
+        EXPECT_EQ(symtab->offset, 0xD8u) << name;
+        EXPECT_EQ(symtab->size, 0x30u) << name;
+        EXPECT_EQ(symtab->link, 3u) << name;
+        EXPECT_EQ(symtab->info, 1u) << name;
+        EXPECT_EQ(symtab->address_alignment, 8u) << name;
+        EXPECT_EQ(symtab->entry_size, 0x18u) << name;
+
+        const auto dynamic = std::ranges::find_if(headers, [](const peelf::ElfSectionHeader& section) {
+            return section.name == ".dynamic";
+        });
+        ASSERT_NE(dynamic, headers.end()) << name;
+        EXPECT_EQ(dynamic->type, 6u) << name;  // SHT_DYNAMIC
+        EXPECT_EQ(dynamic->flags, 2u) << name;
+        EXPECT_EQ(dynamic->offset, 0x118u) << name;
+        EXPECT_EQ(dynamic->size, 0x20u) << name;
+        EXPECT_EQ(dynamic->link, 5u) << name;
+        EXPECT_EQ(dynamic->address_alignment, 8u) << name;
+        EXPECT_EQ(dynamic->entry_size, 0x10u) << name;
     }
 }
 

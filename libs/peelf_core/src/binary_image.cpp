@@ -76,6 +76,10 @@ public:
         static const std::vector<ElfProgramHeader> empty;
         return empty;
     }
+    [[nodiscard]] const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept override {
+        static const std::vector<ElfSectionHeader> empty;
+        return empty;
+    }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -128,11 +132,15 @@ public:
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         return program_headers_;
     }
+    [[nodiscard]] const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept override {
+        return section_headers_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
     ElfHeader elf_header_;
     std::vector<ElfProgramHeader> program_headers_;
+    std::vector<ElfSectionHeader> section_headers_;
 };
 
 class PeImage final : public ImageBase {
@@ -276,7 +284,8 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t shoff, std::uint16_t shentsize,
                         std::uint16_t shnum, std::uint16_t shstrndx,
-                        std::vector<Section>& out, std::vector<Symbol>& symbols_out,
+                        std::vector<ElfSectionHeader>& headers, std::vector<Section>& out,
+                        std::vector<Symbol>& symbols_out,
                         std::vector<ImportEntry>& imports_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
@@ -290,39 +299,32 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         return;  // truncated table
     }
 
-    struct ShFields {
-        std::uint32_t name = 0;
-        std::uint32_t type = 0;
-        std::uint64_t flags = 0;
-        std::uint64_t addr = 0;
-        std::uint64_t offset = 0;
-        std::uint64_t size = 0;
-        std::uint32_t link = 0;
-        std::uint64_t entsize = 0;
-    };
     const auto read_sh = [&](std::size_t hdr) {
-        ShFields s{};
-        s.name = rd32(b, hdr + 0, big);
+        ElfSectionHeader s{};
+        s.name_offset = rd32(b, hdr + 0, big);
         s.type = rd32(b, hdr + 4, big);
         if (is64) {
             s.flags  = rd64(b, hdr + 0x08, big);
-            s.addr   = rd64(b, hdr + 0x10, big);
+            s.address = rd64(b, hdr + 0x10, big);
             s.offset = rd64(b, hdr + 0x18, big);
             s.size   = rd64(b, hdr + 0x20, big);
             s.link   = rd32(b, hdr + 0x28, big);
-            s.entsize = rd64(b, hdr + 0x38, big);
+            s.info = rd32(b, hdr + 0x2C, big);
+            s.address_alignment = rd64(b, hdr + 0x30, big);
+            s.entry_size = rd64(b, hdr + 0x38, big);
         } else {
             s.flags  = rd32(b, hdr + 0x08, big);
-            s.addr   = rd32(b, hdr + 0x0C, big);
+            s.address = rd32(b, hdr + 0x0C, big);
             s.offset = rd32(b, hdr + 0x10, big);
             s.size   = rd32(b, hdr + 0x14, big);
             s.link   = rd32(b, hdr + 0x18, big);
-            s.entsize = rd32(b, hdr + 0x24, big);
+            s.info = rd32(b, hdr + 0x1C, big);
+            s.address_alignment = rd32(b, hdr + 0x20, big);
+            s.entry_size = rd32(b, hdr + 0x24, big);
         }
         return s;
     };
 
-    std::vector<ShFields> headers;
     headers.reserve(shnum);
     for (std::uint16_t i = 0; i < shnum; ++i) {
         const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(i) * shentsize;
@@ -364,8 +366,9 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     for (std::uint16_t i = 0; i < shnum; ++i) {
         const auto& sh = headers[i];
         Section sec;
-        sec.name            = read_section_name(sh.name);
-        sec.virtual_address = sh.addr;
+        headers[i].name = read_section_name(sh.name_offset);
+        sec.name            = headers[i].name;
+        sec.virtual_address = sh.address;
         sec.virtual_size    = sh.size;
         sec.file_offset     = sh.offset;
         sec.file_size       = (sh.type == 8) ? 0 : sh.size;  // SHT_NOBITS has no file data
@@ -384,7 +387,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         }
 
         const std::uint64_t min_sym = is64 ? 0x18 : 0x10;
-        const std::uint64_t entry_size = sh.entsize != 0 ? sh.entsize : min_sym;
+        const std::uint64_t entry_size = sh.entry_size != 0 ? sh.entry_size : min_sym;
         if (entry_size < min_sym || sh.link >= headers.size() ||
             !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
             continue;
@@ -435,7 +438,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             continue;
         }
         const std::uint64_t min_dyn = is64 ? 0x10 : 0x08;
-        const std::uint64_t entry_size = sh.entsize != 0 ? sh.entsize : min_dyn;
+        const std::uint64_t entry_size = sh.entry_size != 0 ? sh.entry_size : min_dyn;
         if (entry_size < min_dyn || sh.link >= headers.size() ||
             !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
             continue;
@@ -543,7 +546,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
                        img->program_headers_, img->segments_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
-                       img->sections_, img->symbols_, img->imports_);
+                       img->section_headers_, img->sections_, img->symbols_, img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
