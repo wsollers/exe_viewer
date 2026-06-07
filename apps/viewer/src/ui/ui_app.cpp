@@ -1,9 +1,27 @@
 #include "ui_app.hpp"
 #include <imgui.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
 #include "logger.hpp"
 
 namespace viewer {
+namespace {
+
+[[nodiscard]] std::optional<viewer::Architecture> disassembler_architecture(peelf::Architecture arch) {
+    switch (arch) {
+        case peelf::Architecture::X86:    return viewer::Architecture::X86_32;
+        case peelf::Architecture::X86_64: return viewer::Architecture::X86_64;
+        case peelf::Architecture::ARM:    return viewer::Architecture::ARM32;
+        case peelf::Architecture::ARM64:  return viewer::Architecture::ARM64;
+        default:                          return std::nullopt;
+    }
+}
+
+} // namespace
 
 UiApp::UiApp(BinaryModel& model)
     : model_(model)
@@ -15,7 +33,11 @@ UiApp::UiApp(BinaryModel& model)
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
     , pe_exports_panel_(model)
-{}
+{
+    hex_panel_.set_byte_activated_callback([this](std::size_t off) {
+        disassemble_at_offset(off);
+    });
+}
 
 void UiApp::render() {
     render_main_menu();
@@ -138,7 +160,7 @@ void UiApp::render_dockspace() {
             // Bytes
             ImGui::TableNextColumn();
             std::string bytes_str;
-            for (uint8_t b: inst.bytes) {
+            for (std::uint8_t b: inst.bytes) {
                 char buf[4];
                 snprintf(buf, sizeof(buf), "%02X ", b);
                 bytes_str += buf;
@@ -160,38 +182,45 @@ void UiApp::render_dockspace() {
 
     ImGui::End();
 }
-    // After loading a PE file
+    // Called after a file (PE or ELF) is loaded into the model.
     void UiApp::on_file_loaded() {
-        // Get machine type from PE header
-        pe_model_ = *model_.pe();
-        auto machine = pe_model_.machine;
-
-        auto arch = viewer::architecture_from_machine(machine);
-        if (!disasm_.init(arch)) {
-            Log().info("Failed to initialize disassembler: %s\n", disasm_.get_error());
+        const peelf::IBinaryImage* img = model_.image();
+        if (!img) {
+            file_loaded_ = false;
             return;
         }
 
-        Log().error("Disassembler initialized for %s\n",
-               arch == viewer::Architecture::X86_64
-                   ? "x64"
-                   : arch == viewer::Architecture::X86_32
-                         ? "x86"
-                         : arch == viewer::Architecture::ARM64
-                               ? "ARM64"
-                               : "ARM32");
-        file_loaded_ = true;
-        // Initialize disassembler for target architecture
-            // Disassemble entry point
-            disassemble_entry_point(4096);
-            Log().error("Dissassembled entry point successfully.\n");
+        // Map the unified architecture onto the disassembler's enum.
+        const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());
+        if (!arch) {
+            Log().error(std::string("Disassembly is not supported for architecture: ") +
+                        std::string(peelf::to_string(img->architecture())));
+            file_loaded_ = false;
+            current_instructions_.clear();
+            return;
+        }
 
+        if (!disasm_.init(*arch)) {
+            Log().error(std::string("Failed to initialize disassembler: ") + disasm_.get_error());
+            file_loaded_ = false;
+            return;
+        }
+        file_loaded_ = true;
+        current_instructions_.clear();
+
+        // PE keeps its entry-point disassembly via the legacy PeModel. ELF
+        // entry-point disassembly via the unified image is future work (P4);
+        // for now, click a byte in the Hex view to disassemble at that offset.
+        if (const PeModel* pe = model_.pe()) {
+            pe_model_ = *pe;
+            disassemble_entry_point(4096);
+        }
     }
 
 
 
 
-    void UiApp::disassemble_section(const std::string& section_name, size_t max_size) {
+    void UiApp::disassemble_section(const std::string& section_name, std::size_t max_size) {
         const auto* section = pe_model_.section_by_name(section_name);
         if (!section) {
             fprintf(stderr, "Section '%s' not found\n", section_name.c_str());
@@ -203,14 +232,14 @@ void UiApp::render_dockspace() {
             fprintf(stderr, "Warning: Section '%s' is not marked executable\n", section_name.c_str());
         }
 
-        size_t size = std::min(max_size, static_cast<size_t>(section->raw_size));
-        const uint8_t* code = pe_model_.data_at_offset(section->raw_offset, size);
+        std::size_t size = std::min(max_size, static_cast<std::size_t>(section->raw_size));
+        const std::uint8_t* code = pe_model_.data_at_offset(section->raw_offset, size);
         if (!code) {
             fprintf(stderr, "Failed to read section data\n");
             return;
         }
 
-        uint64_t va = pe_model_.rva_to_va(section->virtual_address);
+        std::uint64_t va = pe_model_.rva_to_va(section->virtual_address);
         auto instructions = disasm_.disassemble(code, size, va);
 
         printf("Section: %s (0x%llX - 0x%llX)\n",
@@ -219,7 +248,7 @@ void UiApp::render_dockspace() {
 
         for (const auto& inst : instructions) {
             std::string bytes_str;
-            for (uint8_t b : inst.bytes) {
+            for (std::uint8_t b : inst.bytes) {
                 char buf[4];
                 snprintf(buf, sizeof(buf), "%02X ", b);
                 bytes_str += buf;
@@ -231,23 +260,23 @@ void UiApp::render_dockspace() {
                    inst.to_string().c_str());
         }
     }
-    void UiApp::disassemble_at(uint64_t rva, size_t size) {
+    void UiApp::disassemble_at(std::uint64_t rva, std::size_t size) {
         // Get file offset from RVA
-        auto file_offset = pe_model_.rva_to_offset(static_cast<uint32_t>(rva));
+        auto file_offset = pe_model_.rva_to_offset(static_cast<std::uint32_t>(rva));
         if (!file_offset) {
             fprintf(stderr, "Failed to convert RVA 0x%llX to file offset\n", rva);
             return;
         }
 
         // Get pointer to code
-        const uint8_t* code = pe_model_.data_at_offset(*file_offset, size);
+        const std::uint8_t* code = pe_model_.data_at_offset(*file_offset, size);
         if (!code) {
             fprintf(stderr, "Failed to read %zu bytes at offset 0x%zX\n", size, *file_offset);
             return;
         }
 
         // Convert RVA to VA for disassembly
-        uint64_t va = pe_model_.rva_to_va(static_cast<uint32_t>(rva));
+        std::uint64_t va = pe_model_.rva_to_va(static_cast<std::uint32_t>(rva));
 
         // Disassemble
         auto instructions = disasm_.disassemble(code, size, va);
@@ -255,7 +284,7 @@ void UiApp::render_dockspace() {
         for (const auto& inst : instructions) {
             // Format bytes
             std::string bytes_str;
-            for (uint8_t b : inst.bytes) {
+            for (std::uint8_t b : inst.bytes) {
                 char buf[4];
                 snprintf(buf, sizeof(buf), "%02X ", b);
                 bytes_str += buf;
@@ -268,7 +297,23 @@ void UiApp::render_dockspace() {
         }
     }
 
-    void UiApp::disassemble_entry_point(size_t max_size) {
+    void UiApp::disassemble_at_offset(std::size_t file_offset) {
+        if (!file_loaded_ || !disasm_.is_initialized()) {
+            return;
+        }
+        const auto& bytes = model_.bytes();
+        if (file_offset >= bytes.size()) {
+            return;
+        }
+        constexpr std::size_t kWindow = 256;
+        const std::size_t avail = bytes.size() - file_offset;
+        const std::size_t size = std::min(kWindow, avail);
+        // Address shown == file offset (the Hex view's coordinate); a proper
+        // file-offset -> VA mapping arrives with the Phase 4 disassembly wiring.
+        current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, file_offset);
+    }
+
+    void UiApp::disassemble_entry_point(std::size_t max_size) {
         current_instructions_.clear();
         auto offset = pe_model_.entry_point_offset();
         if (!offset) {
@@ -280,28 +325,30 @@ void UiApp::render_dockspace() {
         const auto* section = pe_model_.entry_point_section();
         if (section) {
             // Don't read past section end
-            size_t section_remaining = section->raw_size -
-                (pe_model_.entry_point_rva - section->virtual_address);
+            const std::uint32_t offset_in_section = pe_model_.entry_point_rva - section->virtual_address;
+            if (offset_in_section >= section->raw_size) {
+                Log().error("Entry point is outside the section's raw bytes\n");
+                return;
+            }
+            std::size_t section_remaining = static_cast<std::size_t>(section->raw_size - offset_in_section);
             max_size = std::min(max_size, section_remaining);
         }
 
-        const auto code = model_.bytes();
-        //const uint8_t* code = pe_model_.data_at_offset(*offset, max_size);
-        if (code.size() < 0) {
+        const std::uint8_t* code = pe_model_.data_at_offset(*offset, max_size);
+        if (!code) {
             Log().error("Failed to read entry point code\n");
             return;
         }
 
-        uint64_t va = pe_model_.entry_point_va();
-        current_instructions_ = disasm_.disassemble(code.data(), max_size, va);
-        //current_instructions_ = disasm_.disassemble(code, max_size, va);
+        std::uint64_t va = pe_model_.entry_point_va();
+        current_instructions_ = disasm_.disassemble(code, max_size, va);
 
         Log().error("Entry Point: 0x%llX\n", va);
         printf("----------------------------------------\n");
 
         for (const auto& inst : current_instructions_) {
             std::string bytes_str;
-            for (uint8_t b : inst.bytes) {
+            for (std::uint8_t b : inst.bytes) {
                 char buf[4];
                 snprintf(buf, sizeof(buf), "%02X ", b);
                 bytes_str += buf;

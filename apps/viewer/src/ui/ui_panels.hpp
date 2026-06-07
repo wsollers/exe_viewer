@@ -1,12 +1,13 @@
 #pragma once
-#include <complex.h>
 
-#include "ui_panel.hpp"
-#include "model/binary_model.hpp"
-#include <vector>
+#include <cstddef>
+#include <functional>
 #include <string>
+#include <vector>
 
 #include "disasm/disassembler.hpp"
+#include "model/binary_model.hpp"
+#include "ui_panel.hpp"
 
 namespace viewer {
 
@@ -38,12 +39,15 @@ namespace viewer {
     class HexViewPanel : public UiPanel {
     public:
         explicit HexViewPanel(BinaryModel& model);
+        // Invoked with the file offset of the byte the user clicks.
+        void set_byte_activated_callback(std::function<void(std::size_t)> cb) { on_byte_activated_ = std::move(cb); }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
-        size_t selected_offset_ = 0;
-        size_t bytes_per_row_ = 16;
+        std::size_t selected_offset_ = 0;
+        std::size_t bytes_per_row_ = 16;
+        std::function<void(std::size_t)> on_byte_activated_;
     };
 
     class DisassemblyPanel : public UiPanel {
@@ -56,14 +60,14 @@ namespace viewer {
 
     private:
         BinaryModel& model_;
-        size_t selected_instr_ = 0;
+        std::size_t selected_instr_ = 0;
 
 
     };
 
     class LogPanel : public UiPanel {
     public:
-        explicit LogPanel(size_t capacity = 5000); // ring buffer capacity
+        explicit LogPanel(std::size_t capacity = 5000); // ring buffer capacity
 
         void add(LogLevel level, const std::string& msg);
 
@@ -78,9 +82,9 @@ namespace viewer {
         };
 
         std::vector<Entry> buffer_;
-        size_t capacity_;
-        size_t start_ = 0;   // ring buffer head
-        size_t count_ = 0;   // number of valid entries
+        std::size_t capacity_;
+        std::size_t start_ = 0;   // ring buffer head
+        std::size_t count_ = 0;   // number of valid entries
 
         bool auto_scroll_ = true;
     };

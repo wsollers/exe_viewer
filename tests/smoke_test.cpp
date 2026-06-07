@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 
@@ -48,13 +49,13 @@ TEST(ElfFixture, HasElfMagic) {
     std::ifstream file(path, std::ios::binary);
     ASSERT_TRUE(file.good()) << "could not open fixture: " << path.string();
 
-    std::array<unsigned char, 4> magic{};
+    std::array<std::uint8_t, 4> magic{};
     file.read(reinterpret_cast<char*>(magic.data()),
               static_cast<std::streamsize>(magic.size()));
     ASSERT_EQ(file.gcount(), static_cast<std::streamsize>(magic.size()));
 
     EXPECT_EQ(magic[0], 0x7Fu);
-    EXPECT_EQ(magic[1], static_cast<unsigned char>('E'));
-    EXPECT_EQ(magic[2], static_cast<unsigned char>('L'));
-    EXPECT_EQ(magic[3], static_cast<unsigned char>('F'));
+    EXPECT_EQ(magic[1], static_cast<std::uint8_t>('E'));
+    EXPECT_EQ(magic[2], static_cast<std::uint8_t>('L'));
+    EXPECT_EQ(magic[3], static_cast<std::uint8_t>('F'));
 }

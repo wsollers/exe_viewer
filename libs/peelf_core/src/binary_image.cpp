@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 namespace peelf {
@@ -40,6 +41,19 @@ std::uint64_t rd64(std::span<const std::uint8_t> b, std::size_t o, bool big) noe
            static_cast<std::uint64_t>(rd32(b, o, false));
 }
 
+[[nodiscard]] bool fits_range(std::uint64_t offset, std::uint64_t size,
+                              std::uint64_t total) noexcept {
+    return offset <= total && size <= (total - offset);
+}
+
+[[nodiscard]] std::optional<std::uint64_t> checked_add_u64(std::uint64_t lhs,
+                                                           std::uint64_t rhs) noexcept {
+    if (rhs > std::numeric_limits<std::uint64_t>::max() - lhs) {
+        return std::nullopt;
+    }
+    return lhs + rhs;
+}
+
 // ---------------------------------------------------------------------------
 // Common storage for the parsed identity, shared by the concrete images.
 // ---------------------------------------------------------------------------
@@ -52,6 +66,37 @@ public:
     [[nodiscard]] bool is_64bit() const noexcept override { return is_64_; }
     [[nodiscard]] std::uint64_t entry_point() const noexcept override { return entry_; }
     [[nodiscard]] const std::vector<Section>& sections() const noexcept override { return sections_; }
+    [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
+        std::uint64_t file_offset) const noexcept override {
+        for (const Section& section : sections_) {
+            if (section.file_size == 0) {
+                continue;
+            }
+            if (file_offset >= section.file_offset && file_offset - section.file_offset < section.file_size) {
+                return checked_add_u64(section.virtual_address, file_offset - section.file_offset);
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
+        std::uint64_t virtual_address) const noexcept override {
+        for (const Section& section : sections_) {
+            const std::uint64_t mapped_size = section.virtual_size != 0 ? section.virtual_size : section.file_size;
+            if (mapped_size == 0) {
+                continue;
+            }
+            if (virtual_address >= section.virtual_address &&
+                virtual_address - section.virtual_address < mapped_size) {
+                const std::uint64_t delta = virtual_address - section.virtual_address;
+                if (delta >= section.file_size) {
+                    return std::nullopt;
+                }
+                return checked_add_u64(section.file_offset, delta);
+            }
+        }
+        return std::nullopt;
+    }
 
 protected:
     Format       format_ = Format::Unknown;
@@ -121,8 +166,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     if (shentsize < min_sh) {
         return;
     }
-    const std::uint64_t table_end = shoff + static_cast<std::uint64_t>(shnum) * shentsize;
-    if (table_end > b.size()) {
+    const std::uint64_t table_size = static_cast<std::uint64_t>(shnum) * shentsize;
+    if (!fits_range(shoff, table_size, static_cast<std::uint64_t>(b.size()))) {
         return;  // truncated table
     }
 
@@ -155,17 +200,21 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     // Section-name string table = section[e_shstrndx].
     std::uint64_t strtab_off = 0;
     if (shstrndx != 0 && shstrndx < shnum && shstrndx != 0xFFFF) {
-        const auto sh = read_sh(static_cast<std::size_t>(shoff) +
-                                static_cast<std::size_t>(shstrndx) * shentsize);
+        const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(shstrndx) * shentsize;
+        const auto sh = read_sh(static_cast<std::size_t>(hdr));
         strtab_off = sh.offset;
     }
     const auto read_name = [&](std::uint32_t name_off) -> std::string {
         if (strtab_off == 0) {
             return {};
         }
+        if (!fits_range(strtab_off, name_off, static_cast<std::uint64_t>(b.size()))) {
+            return {};
+        }
         std::string s;
-        for (std::uint64_t i = strtab_off + name_off; i < b.size() && b[i] != 0; ++i) {
-            s.push_back(static_cast<char>(b[i]));
+        for (std::uint64_t i = strtab_off + name_off; i < b.size() && b[static_cast<std::size_t>(i)] != 0;
+             ++i) {
+            s.push_back(static_cast<char>(b[static_cast<std::size_t>(i)]));
             if (s.size() >= 256) {
                 break;
             }
@@ -175,8 +224,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
 
     out.reserve(shnum);
     for (std::uint16_t i = 0; i < shnum; ++i) {
-        const auto sh = read_sh(static_cast<std::size_t>(shoff) +
-                                static_cast<std::size_t>(i) * shentsize);
+        const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(i) * shentsize;
+        const auto sh = read_sh(static_cast<std::size_t>(hdr));
         Section sec;
         sec.name            = read_name(sh.name);
         sec.virtual_address = sh.addr;
@@ -249,7 +298,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
 
     const std::uint32_t e_lfanew = rd32(b, 0x3C, false);
     // Need the PE signature (4) + COFF file header (20).
-    if (static_cast<std::uint64_t>(e_lfanew) + 4 + 20 > b.size()) {
+    if (!fits_range(e_lfanew, 4 + 20, static_cast<std::uint64_t>(b.size()))) {
         return make_error("PE: e_lfanew out of range");
     }
     if (!(b[e_lfanew] == 'P' && b[e_lfanew + 1] == 'E' &&
@@ -263,26 +312,30 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint16_t characteristics = rd16(b, coff + 18, false);
 
     const std::size_t opt = coff + 20;
-    if (size_of_opt < 2 || opt + size_of_opt > b.size()) {
+    if (size_of_opt < 2 || !fits_range(opt, size_of_opt, static_cast<std::uint64_t>(b.size()))) {
         return make_error("PE: invalid optional header size");
     }
 
     const std::uint16_t magic = rd16(b, opt + 0, false); // 0x10b = PE32, 0x20b = PE32+
+    if (magic != 0x10b && magic != 0x20b) {
+        return make_error("PE: unsupported optional header magic");
+    }
     const bool is64 = (magic == 0x20b);
+    const std::uint16_t min_optional_size = is64 ? 32 : 32;
+    if (size_of_opt < min_optional_size) {
+        return make_error("PE: optional header too small for identity fields");
+    }
 
     // entry VA = ImageBase + AddressOfEntryPoint.
     // AddressOfEntryPoint: optional-header offset 16 (both PE32 and PE32+).
     // ImageBase: PE32 -> u32 @ offset 28; PE32+ -> u64 @ offset 24.
     std::uint64_t image_base = 0;
     if (is64) {
-        if (opt + 32 <= b.size()) image_base = rd64(b, opt + 24, false);
+        image_base = rd64(b, opt + 24, false);
     } else {
-        if (opt + 32 <= b.size()) image_base = rd32(b, opt + 28, false);
+        image_base = rd32(b, opt + 28, false);
     }
-    std::uint32_t entry_rva = 0;
-    if (opt + 20 <= b.size()) {
-        entry_rva = rd32(b, opt + 16, false);
-    }
+    const std::uint32_t entry_rva = rd32(b, opt + 16, false);
 
     auto img = std::unique_ptr<PeImage>(new PeImage());
     img->format_ = Format::PE;
@@ -299,10 +352,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     constexpr std::size_t kSectHdr = 0x28;  // 40-byte section header
     img->sections_.reserve(num_sections);
     for (std::uint16_t i = 0; i < num_sections; ++i) {
-        const std::size_t hdr = sect_table + static_cast<std::size_t>(i) * kSectHdr;
-        if (hdr + kSectHdr > b.size()) {
+        const std::uint64_t hdr64 = static_cast<std::uint64_t>(sect_table) +
+                                    static_cast<std::uint64_t>(i) * kSectHdr;
+        if (!fits_range(hdr64, kSectHdr, static_cast<std::uint64_t>(b.size()))) {
             break;  // truncated
         }
+        const std::size_t hdr = static_cast<std::size_t>(hdr64);
         std::string name;
         for (std::size_t j = 0; j < 8 && b[hdr + j] != 0; ++j) {
             name.push_back(static_cast<char>(b[hdr + j]));

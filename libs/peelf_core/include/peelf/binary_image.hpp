@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -58,6 +59,10 @@ public:
     // Entry-point virtual address (ELF e_entry; PE ImageBase + AddressOfEntryPoint).
     [[nodiscard]] virtual std::uint64_t entry_point()  const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Section>& sections() const noexcept = 0;
+    [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
+        std::uint64_t file_offset) const noexcept = 0;
+    [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(
+        std::uint64_t virtual_address) const noexcept = 0;
 };
 
 // Detect the container format from the leading magic bytes.

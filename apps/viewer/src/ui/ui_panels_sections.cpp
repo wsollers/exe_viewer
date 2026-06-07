@@ -13,8 +13,8 @@ namespace viewer {
     }
 
     void SectionsPanel::draw_contents() {
-        const auto& secs = model_.sections();
-        if (secs.empty()) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (!img || img->sections().empty()) {
             ImGui::TextUnformatted("No sections.");
             return;
         }
@@ -30,17 +30,24 @@ namespace viewer {
         ImGui::Text("Name"); ImGui::NextColumn();
         ImGui::Text("Address"); ImGui::NextColumn();
         ImGui::Text("Size"); ImGui::NextColumn();
-        ImGui::Text("Flags"); ImGui::NextColumn();
+        ImGui::Text("Perm"); ImGui::NextColumn();
         ImGui::Separator();
 
-        for (const auto& s : secs) {
+        for (const auto& s : img->sections()) {
             if (has_filter && s.name.find(filter) == std::string::npos)
                 continue;
 
+            // R/W/X permissions (avoid braced-init to dodge /permissive- narrowing).
+            char perms[4];
+            perms[0] = s.readable   ? 'R' : '-';
+            perms[1] = s.writable   ? 'W' : '-';
+            perms[2] = s.executable ? 'X' : '-';
+            perms[3] = '\0';
+
             ImGui::TextUnformatted(s.name.c_str()); ImGui::NextColumn();
-            ImGui::Text("0x%llX", (unsigned long long)s.address); ImGui::NextColumn();
-            ImGui::Text("0x%llX", (unsigned long long)s.size); ImGui::NextColumn();
-            ImGui::Text("0x%08X", s.flags); ImGui::NextColumn();
+            ImGui::Text("0x%llX", (unsigned long long)s.virtual_address); ImGui::NextColumn();
+            ImGui::Text("0x%llX", (unsigned long long)s.virtual_size); ImGui::NextColumn();
+            ImGui::TextUnformatted(perms); ImGui::NextColumn();
         }
 
         ImGui::Columns(1);

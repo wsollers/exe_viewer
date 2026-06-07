@@ -6,6 +6,7 @@
 #include <optional>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace viewer {
 
@@ -40,6 +41,19 @@ namespace viewer {
 
     class PeModel {
     public:
+        [[nodiscard]] static bool fits_range(std::size_t offset, std::size_t size,
+                                             std::size_t total) noexcept {
+            return offset <= total && size <= (total - offset);
+        }
+
+        [[nodiscard]] static std::optional<std::uint32_t> checked_add_u32(std::uint32_t lhs,
+                                                                           std::uint32_t rhs) noexcept {
+            if (rhs > std::numeric_limits<std::uint32_t>::max() - lhs) {
+                return std::nullopt;
+            }
+            return lhs + rhs;
+        }
+
         // File header fields
         std::uint16_t machine = 0;
         std::uint16_t num_sections = 0;
@@ -75,10 +89,14 @@ namespace viewer {
         // Convert RVA to file offset
         [[nodiscard]] std::optional<std::size_t> rva_to_offset(std::uint32_t rva) const {
             for (const auto& section : sections) {
-                std::uint32_t section_end = section.virtual_address +
-                    std::max(section.virtual_size, section.raw_size);
+                const auto section_end = checked_add_u32(
+                    section.virtual_address,
+                    std::max(section.virtual_size, section.raw_size));
+                if (!section_end) {
+                    continue;
+                }
 
-                if (rva >= section.virtual_address && rva < section_end) {
+                if (rva >= section.virtual_address && rva < *section_end) {
                     std::uint32_t offset_in_section = rva - section.virtual_address;
 
                     // Ensure within raw data bounds
@@ -100,10 +118,11 @@ namespace viewer {
         // Convert file offset to RVA
         [[nodiscard]] std::optional<std::uint32_t> offset_to_rva(std::size_t offset) const {
             for (const auto& section : sections) {
-                if (offset >= section.raw_offset &&
-                    offset < section.raw_offset + section.raw_size) {
+                const std::size_t raw_offset = section.raw_offset;
+                const std::size_t section_raw_size = section.raw_size;
+                if (offset >= raw_offset && offset - raw_offset < section_raw_size) {
                     std::uint32_t offset_in_section = static_cast<std::uint32_t>(offset - section.raw_offset);
-                    return section.virtual_address + offset_in_section;
+                    return checked_add_u32(section.virtual_address, offset_in_section);
                 }
             }
 
@@ -165,10 +184,14 @@ namespace viewer {
 
         [[nodiscard]] const PeSectionHeader* section_from_rva(std::uint32_t rva) const {
             for (const auto& section : sections) {
-                std::uint32_t section_end = section.virtual_address +
-                    std::max(section.virtual_size, section.raw_size);
+                const auto section_end = checked_add_u32(
+                    section.virtual_address,
+                    std::max(section.virtual_size, section.raw_size));
+                if (!section_end) {
+                    continue;
+                }
 
-                if (rva >= section.virtual_address && rva < section_end) {
+                if (rva >= section.virtual_address && rva < *section_end) {
                     return &section;
                 }
             }
@@ -183,8 +206,9 @@ namespace viewer {
 
         [[nodiscard]] const PeSectionHeader* section_from_offset(std::size_t offset) const {
             for (const auto& section : sections) {
-                if (offset >= section.raw_offset &&
-                    offset < section.raw_offset + section.raw_size) {
+                const std::size_t raw_offset = section.raw_offset;
+                const std::size_t section_raw_size = section.raw_size;
+                if (offset >= raw_offset && offset - raw_offset < section_raw_size) {
                     return &section;
                 }
             }
@@ -223,7 +247,7 @@ namespace viewer {
         // =====================================================================
 
         [[nodiscard]] const std::uint8_t* data_at_offset(std::size_t offset, std::size_t size = 1) const {
-            if (!raw_data || offset + size > raw_size) return nullptr;
+            if (!raw_data || !fits_range(offset, size, raw_size)) return nullptr;
             return raw_data + offset;
         }
 
@@ -241,7 +265,7 @@ namespace viewer {
 
         template<typename T>
         [[nodiscard]] const T* read_at_offset(std::size_t offset) const {
-            if (!raw_data || offset + sizeof(T) > raw_size) return nullptr;
+            if (!raw_data || !fits_range(offset, sizeof(T), raw_size)) return nullptr;
             return reinterpret_cast<const T*>(raw_data + offset);
         }
 
@@ -264,7 +288,7 @@ namespace viewer {
             if (!raw_data || offset >= raw_size) return {};
 
             std::size_t len = 0;
-            while (offset + len < raw_size && len < max_len && raw_data[offset + len] != 0) {
+            while (len < max_len && fits_range(offset, len + 1, raw_size) && raw_data[offset + len] != 0) {
                 ++len;
             }
             return std::string(reinterpret_cast<const char*>(raw_data + offset), len);

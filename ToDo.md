@@ -8,7 +8,7 @@ and raising overall code quality.
 > Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 > Task IDs (`P1-3`, `TD-2`, …) are referenced across sections so work can be tracked and cross-linked.
 >
-> **Progress (Phase 1):** Phase 0 complete (P0-1 … P0-10). Phase 1 in progress — P1-1 / P1-2 done; P1-3 / P1-4 implemented in the **core** (`PeImage` / `ElfImage` identity behind `IBinaryImage`, via `parse_image`), with the app-side migration (BinaryModel/panels onto `IBinaryImage`, removing the legacy parsers) still pending. Unit suite: 17 tests. The app load path now calls `parse_image()` (ELF files load; PE panels still on the legacy `PeModel`); full panel migration + legacy-parser removal pending. Phase 2 started: section tables parsed for PE/ELF (P2-1), ELF sections now shown in the app.
+> **Progress (Phase 1):** Phase 0 complete (P0-1 … P0-10). Phase 1 in progress — P1-1 / P1-2 done; P1-3 / P1-4 implemented in the **core** (`PeImage` / `ElfImage` identity behind `IBinaryImage`, via `parse_image`), with the app-side migration (BinaryModel/panels onto `IBinaryImage`, removing the legacy parsers) still pending. Unit suite: 20 tests. The app load path now calls `parse_image()` (ELF files load; PE panels still on the legacy `PeModel`); full panel migration + legacy-parser removal pending. Phase 2 started: section tables parsed for PE/ELF (P2-1), ELF sections now shown in the app, and `IBinaryImage` now exposes checked file-offset ↔ virtual-address mapping. Disassembler is now initialized from the unified image (PE **and** supported ELF architectures), clicking a byte in the Hex view disassembles a window at that offset (P4-1 partial), unsupported architectures no longer fall back to bogus x64 disassembly, and ARM64 Capstone mode setup was corrected; also fixed an ELF crash in `on_file_loaded` (unconditional null-`pe()` deref, exposed once ELF files began loading).
 
 ---
 
@@ -77,6 +77,7 @@ concrete type (downcast) or a `format_details()` `std::variant`.
 - [ ] **C2** — Naming/style: snake_case for funcs/locals, `PascalCase` types, trailing `_` for members; enforce via `.clang-format` (already present) + `.clang-tidy` (new).
 - [ ] **C3** — Warnings are errors in CI for our own targets (keep third-party warnings suppressed). Current flags already include `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion` / `/W4 /permissive-`.
 - [ ] **C4** — **Testing is mandatory and gating.** Every feature, fix, and refactor — current and new — ships with unit tests, and the complete `ctest` suite must build and pass before the change is considered complete. GoogleTest is the framework, wired in under `tests/` (gated by `PEELF_BUILD_TESTS`, discovered by CTest). Backfill tests for existing functionality as it is touched.
+- [~] **C5** — Fixed-width primitive cleanup: binary-facing data and parser/disassembler paths should use `std::uint*_t` / `std::size_t` rather than implementation-sized aliases. First pass covered the unified parser, disassembler wrapper, key UI disassembly paths, smoke-test byte handling, and PE address-map overflow helpers. Remaining: legacy PE parser structs/helpers, Vulkan/GLFW-required callback integers, and text-facing `char` buffers that must stay compatible with C APIs.
 
 ---
 
@@ -104,7 +105,7 @@ concrete type (downcast) or a `format_details()` `std::variant`.
 - [x] **P1-2** `detect_format()` dispatches on `\x7fELF` / `MZ` (unknown magic rejected gracefully by `parse_image`). `ImageKind` is populated from the PE `IMAGE_FILE_DLL` characteristic and the ELF `e_type` (`ET_EXEC`→Executable, `ET_DYN`→SharedLibrary, `ET_REL`→Object, `ET_CORE`→Core). _Caveat:_ PIE executables are `ET_DYN` and currently report as SharedLibrary; `DT_FLAGS_1`/`DF_1_PIE` disambiguation is deferred to Phase 3 (dynamic info).
 - [~] **P1-3** **PE parser (core done):** `PeImage` (internal to `binary_image.cpp`) parses DOS → PE signature → COFF → optional header (PE32/PE32+) for identity: machine→`Architecture`, `IMAGE_FILE_DLL`→`ImageKind`, magic→64-bit, entry VA = ImageBase + AddressOfEntryPoint, all bounds-checked. Tested via a synthetic PE32+ in `tests/binary_image_test.cpp`. **Remaining:** data directories + section table (Phase 2), and **removing the two legacy parsers** (`peelf::parse_pe_bytes`, `viewer::PeParser`) once the app's `BinaryModel` is migrated onto `IBinaryImage` (P1-6) — deferred because that step is GUI-coupled and not build-verifiable from here. (TD-5)
 - [~] **P1-4** **ELF parser (core done):** `ElfImage` parses the ELF identity for both ELF32/ELF64 and **little- and big-endian** — the endian-aware readers in `binary_image.cpp` restore the BE support the old `parse_elf_bytes` rejected: class→64-bit, data→endianness, `e_type`→`ImageKind`, `e_machine`→`Architecture`, `e_entry`→entry point, bounds-checked. Reachable via the public `parse_image()` and now **wired into the app** (`BinaryModel::load_file`, see P1-6) so ELF files load. Tested against `hello.elf`. **Remaining:** program headers (segments) + section headers (Phase 2). (TD-6)
-- [ ] **P1-5** Bounds-safety pass: every header/table read goes through checked accessors; fuzz the parsers against truncated/garbage input (ties into existing `fuzzing-experiments` interest).
+- [~] **P1-5** Bounds-safety pass: every header/table read goes through checked accessors; fuzz the parsers against truncated/garbage input (ties into existing `fuzzing-experiments` interest). **Progress:** unified PE/ELF parser section-table and optional-header arithmetic now uses subtractive/checked range logic; PE optional-header magic is validated; tests cover unsupported PE optional magic and an overflowing ELF section table. Remaining: convert all parser reads to a shared checked `ByteReader`/cursor and fuzz broadly.
 - [~] **P1-6** First slice done (additive, low-risk): `BinaryModel::load_file` now calls `peelf::parse_image()` and stores a `std::unique_ptr<peelf::IBinaryImage>`, exposed via `BinaryModel::image()`. **ELF files now load in the app for the first time** — the File panel shows format/arch/kind/endianness/64-bit/entry from the unified image, and the Hex view works (bytes are read). PE still flows through the legacy `PeModel`/`PeParser`, so the PE-specific panels are untouched; every PE panel already guards on `pe()==null`, so ELF is safe (those panels just show "No PE file loaded"). **Remaining:** migrate the PE-specific panels onto `IBinaryImage`, then delete the legacy parsers (`viewer::PeParser` + core `parse_pe_bytes`/`parse_elf_bytes`); and factor the viewer model into a small library so `BinaryModel` is unit-testable (today it's app-only, gated by the core tests + the viewer build).
 
 **Exit criteria:** load a PE exe, PE dll, ELF exe, and ELF .so and get correct headers + `ImageKind` + architecture for each.
@@ -112,8 +113,8 @@ concrete type (downcast) or a `format_details()` `std::variant`.
 ## 7. Phase 2 — Sections, segments & raw bytes
 
 - [~] **P2-1** Section **table** populated for both formats in `binary_image.cpp`, exposed via `IBinaryImage::sections()`: name (PE inline 8-char; ELF resolved via `.shstrtab`), virtual address (PE = ImageBase+RVA; ELF `sh_addr`), virtual size, file offset/size (ELF `SHT_NOBITS`→0), and R/W/X (PE `IMAGE_SCN_MEM_*`; ELF `SHF_ALLOC`/`WRITE`/`EXECINSTR`), all bounds-checked. Tested against `hello.elf` (finds an executable `.text`) and a synthetic PE32+ with a section. App: `BinaryModel::load_elf` feeds these into the Sections panel, so ELF sections are now visible. **Remaining:** ELF program-header **segments** + section↔segment mapping; migrating the Sections panel onto `IBinaryImage` (R/W/X chips, click-through to hex — P2-2).
-- [ ] **P2-2** Sections panel: sortable table, flag chips (R/W/X, code/data), click-through to the raw-byte view at that section's offset.
-- [ ] **P2-3** Raw-bytes/hex view: virtualized hex+ASCII for large files (use the existing `FileMapping` so we don't load everything into RAM), offset/RVA toggle, go-to-offset, selection, and "follow" links from other panels.
+- [~] **P2-2** Sections panel migrated onto `IBinaryImage`: reads `model_.image()->sections()` (one source for PE and ELF) and shows **R/W/X permission flags** instead of a raw hex value, uniformly across formats. `IBinaryImage` also now owns checked file-offset ↔ virtual-address mapping over parsed sections, covered by PE/ELF fixture tests. **Remaining:** sortable columns, code/data chips, and click-through to the hex view at the section's offset (needs cross-panel selection state — pairs with P2-3). _Note:_ `BinaryModel::sections()` (the legacy `SectionInfo` vector) is now read by no panel — a cleanup candidate once the remaining panels migrate.
+- [ ] **P2-3** Raw-bytes/hex view: virtualized hex+ASCII for large files (use the existing `FileMapping` so we don't load everything into RAM), offset/RVA toggle, go-to-offset, selection, and "follow" links from other panels. _(Fixed a pre-existing duplicate-ImGui-ID bug here: each byte cell's `Selectable` now carries a unique `##<offset>` suffix in its label.)_
 
 **Exit criteria:** select a section in any loaded binary and land on its bytes in the hex view.
 
@@ -130,10 +131,10 @@ concrete type (downcast) or a `format_details()` `std::variant`.
 
 The Capstone wrapper (`disassembler.hpp`) is solid; wire it into the model and UI.
 
-- [ ] **P4-1** Pick disassembly target from `IBinaryImage` (architecture + the executable section's bytes + correct base/RVA).
+- [~] **P4-1** Disassembler architecture is now selected from `IBinaryImage::architecture()` (mapped to the Capstone wrapper's enum) on load, for **both** PE and ELF. The Hex view's click-to-disassemble (`UiApp::disassemble_at_offset`) disassembles a 256-byte window of raw bytes at the clicked file offset (addresses shown are file offsets for now). **Remaining:** auto-pick the executable section's bytes with the correct base/RVA, and an ELF entry-point path (the entry-point disassembly is still PE-only via the legacy `PeModel`).
 - [ ] **P4-2** Disassembly panel: address / bytes / mnemonic / operands columns, syntax coloring (reuse the existing `is_branch/is_data_movement/is_simd/...` classifiers), and synchronized scrolling with the hex view.
 - [ ] **P4-3** Navigation: jump from an import/export/section to its disassembly; resolve call/branch targets to symbol names where known.
-- [ ] **P4-4** Verify Capstone ARM64 mode selection and add ARM/Thumb toggle hookup (TD-14).
+- [~] **P4-4** Verify Capstone ARM64 mode selection and add ARM/Thumb toggle hookup (TD-14). **Progress:** ARM64 initialization no longer uses the ARM32 mode flag; unsupported parser architectures such as ELF RISC-V64 do not fall back to x64 disassembly. Remaining: add focused disassembler unit tests and complete ARM/Thumb UI hookup.
 
 **Exit criteria:** open a binary, jump to entry point, see correctly disassembled code with working branch navigation.
 
@@ -153,13 +154,14 @@ The Capstone wrapper (`disassembler.hpp`) is solid; wire it into the model and U
 - [ ] **P6-3 (TD-8)** Make font-texture upload explicit and version-correct in `init_imgui` rather than relying on a comment/lazy init.
 - [ ] **P6-4** Docking layout with the five panels, persisted window state, recent-files list, and an About dialog (currently a TODO).
 - [ ] **P6-5** File-open robustness: surface parse errors to the log panel (the `Logger` already exists) instead of failing silently.
+- [ ] **P6-6 (TD-16)** Collapse the duplicate **Disassembly** window: both `DisassemblyPanel::draw()` and `UiApp::render_disassembly_panel()` call `ImGui::Begin("Disassembly")` each frame, so the same-named window is opened twice and content from both appends into one window. Pick a single renderer (the table view in `render_disassembly_panel()` is the richer one) and drop the other, or have the panel delegate to it. Also remove the dead `disasm_panel_.current_instructions_ = current_instructions_` self-assignment in `UiApp::render()` (it assigns a reference member to itself).
 
 **Exit criteria:** resize/minimize without crashes; consistent multi-panel layout; errors visible to the user.
 
 ## 12. Phase 7 — Quality, testing & CI
 
 - [x] **P7-1** GoogleTest wired in via FetchContent under `tests/` (option `PEELF_BUILD_TESTS`, discovered by CTest) with a hello-world smoke test and an ELF-magic fixture test against `tests/fixtures/hello.elf`. _Next:_ dedicated PE/ELF parser tests using small fixture binaries + truncated/corrupt inputs (every new parser feature adds tests here).
-- [ ] **P7-2** Golden-file tests comparing parsed summaries against known-good output for a handful of real exe/dll/so/elf samples.
+- [~] **P7-2** Golden-file tests comparing parsed summaries against known-good output for a handful of real exe/dll/so/elf samples. **Progress:** added deterministic non-executable parser fixtures for ELF64 x86-64, ELF64 ARM64, ELF64 RISC-V64, and PE32+ x86-64, plus tests for architecture, kind, entry point, `.text` permissions, and core address mapping. Remaining: real-world exe/dll/so samples and richer golden summaries.
 - [ ] **P7-3** CI (GitHub Actions): build matrix {MSVC, Clang18+Ninja} × {Debug, Release}, run tests, run `clang-format --dry-run` and `clang-tidy`. Warnings-as-errors for our targets (C3).
 - [ ] **P7-4 (TD-12)** Warning cleanup pass: resolve `-Wconversion`/`-Wsign-conversion` hits; replace C-style casts (e.g. in `vulkan_manager.cpp`) with named casts.
 - [ ] **P7-5** Address-/UB-sanitizer build target for the parsers; run the fuzzers from `fuzzing-experiments` against them in CI (nightly).
@@ -188,6 +190,7 @@ Each item is owned by a Phase-0/6/7 task above.
 | TD-13 | Single-frame-in-flight; reused semaphores | `vulkan_manager.cpp` | P6-2 |
 | TD-14 | Capstone ARM64 mode/option review | `disassembler.hpp` | P4-4 |
 | TD-15 | No tests, CI, or lint enforcement | repo-wide | P7-1..P7-3 |
+| TD-16 | Duplicate `Disassembly` ImGui window (`DisassemblyPanel::draw` + `render_disassembly_panel` both `Begin("Disassembly")`); plus a dead reference self-assign | `ui/ui_app.cpp`, `ui/ui_panels_disasm.cpp` | P6-6 |
 
 ## 14. Suggested sequencing
 

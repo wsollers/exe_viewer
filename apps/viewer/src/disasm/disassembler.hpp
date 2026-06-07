@@ -2,6 +2,7 @@
 #pragma once
 
 #include <capstone/capstone.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,8 +27,8 @@ enum class Architecture {
 };
 
 struct Instruction {
-    uint64_t address;
-    std::vector<uint8_t> bytes;
+    std::uint64_t address;
+    std::vector<std::uint8_t> bytes;
     std::string mnemonic;
     std::string operands;
     std::string comment;
@@ -88,7 +89,7 @@ public:
                 break;
             case Architecture::ARM64:
                 cs_architecture = CAPSTONE_ARM64_ARCH;
-                cs_mode_flags = CS_MODE_ARM;
+                cs_mode_flags = CS_MODE_LITTLE_ENDIAN;
                 break;
             default:
                 return false;
@@ -115,16 +116,17 @@ public:
     [[nodiscard]] bool is_initialized() const { return initialized_; }
     [[nodiscard]] Architecture architecture() const { return arch_; }
 
-    std::vector<Instruction> disassemble(const uint8_t* code, size_t size, uint64_t address) {
+    std::vector<Instruction> disassemble(const std::uint8_t* code, std::size_t size,
+                                         std::uint64_t address) {
         std::vector<Instruction> result;
         if (!initialized_) return result;
 
         cs_insn* insn;
-        size_t count = cs_disasm(handle_, code, size, address, 0, &insn);
+        std::size_t count = cs_disasm(handle_, code, size, address, 0, &insn);
 
         if (count > 0) {
             result.reserve(count);
-            for (size_t i = 0; i < count; ++i) {
+            for (std::size_t i = 0; i < count; ++i) {
                 Instruction inst;
                 inst.address = insn[i].address;
                 inst.bytes.assign(insn[i].bytes, insn[i].bytes + insn[i].size);
@@ -138,17 +140,17 @@ public:
         return result;
     }
 
-    std::vector<Instruction> disassemble_count(const uint8_t* code, size_t size,
-                                                uint64_t address, size_t count) {
+    std::vector<Instruction> disassemble_count(const std::uint8_t* code, std::size_t size,
+                                                std::uint64_t address, std::size_t count) {
         std::vector<Instruction> result;
         if (!initialized_) return result;
 
         cs_insn* insn;
-        size_t actual = cs_disasm(handle_, code, size, address, count, &insn);
+        std::size_t actual = cs_disasm(handle_, code, size, address, count, &insn);
 
         if (actual > 0) {
             result.reserve(actual);
-            for (size_t i = 0; i < actual; ++i) {
+            for (std::size_t i = 0; i < actual; ++i) {
                 Instruction inst;
                 inst.address = insn[i].address;
                 inst.bytes.assign(insn[i].bytes, insn[i].bytes + insn[i].size);
@@ -230,7 +232,7 @@ private:
     bool initialized_ = false;
 };
 
-inline Architecture architecture_from_machine(uint16_t machine) {
+inline Architecture architecture_from_machine(std::uint16_t machine) {
     switch (machine) {
         case 0x014C: return Architecture::X86_32;
         case 0x8664: return Architecture::X86_64;

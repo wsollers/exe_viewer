@@ -39,12 +39,18 @@ void HexViewPanel::draw_contents() {
             float hex_start = ImGui::GetCursorPosX();
 
             for (size_t i = start; i < end; ++i) {
-                char buf[4];
-                std::snprintf(buf, sizeof(buf), "%02X", bytes[i]);
+                // The "##<offset>" suffix isn't displayed but makes each cell's
+                // ImGui ID unique; without it, repeated byte values (e.g. many
+                // 0x00s) collide and ImGui reports a duplicate ID.
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), "%02X##%zu", bytes[i], i);
 
                 bool selected = (i == selected_offset_);
                 if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick)) {
                     selected_offset_ = i;
+                    if (on_byte_activated_) {
+                        on_byte_activated_(i);
+                    }
                 }
 
                 if (i + 1 < end)

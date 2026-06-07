@@ -8,9 +8,13 @@
 
 #include <peelf/binary_image.hpp>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <ranges>
 #include <vector>
 
 #ifndef PEELF_TEST_FIXTURES_DIR
@@ -51,6 +55,17 @@ void put64(std::vector<std::uint8_t>& b, std::size_t off, std::uint64_t v) {
         b[off + i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF);
     }
 }
+
+struct ExpectedImage {
+    const char* name;
+    peelf::Format format;
+    peelf::Architecture architecture;
+    peelf::ImageKind kind;
+    bool is_64bit;
+    std::uint64_t entry_point;
+    std::uint64_t text_file_offset;
+    std::uint64_t text_virtual_address;
+};
 
 }  // namespace
 
@@ -161,8 +176,96 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_FALSE(sec.writable);
 }
 
+TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
+    constexpr std::array<ExpectedImage, 4> fixtures{{
+        {"known-linux-x64.elf", peelf::Format::ELF, peelf::Architecture::X86_64,
+         peelf::ImageKind::Executable, true, 0x400080, 0x80, 0x400080},
+        {"known-linux-arm64.elf", peelf::Format::ELF, peelf::Architecture::ARM64,
+         peelf::ImageKind::Executable, true, 0x400080, 0x80, 0x400080},
+        {"known-linux-riscv64.elf", peelf::Format::ELF, peelf::Architecture::RISCV64,
+         peelf::ImageKind::Executable, true, 0x400080, 0x80, 0x400080},
+        {"known-win-x64.exe", peelf::Format::PE, peelf::Architecture::X86_64,
+         peelf::ImageKind::Executable, true, 0x140001000, 0x200, 0x140001000},
+    }};
+
+    for (const ExpectedImage& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::IBinaryImage& img = **result;
+        EXPECT_EQ(img.format(), expected.format) << expected.name;
+        EXPECT_EQ(img.architecture(), expected.architecture) << expected.name;
+        EXPECT_EQ(img.kind(), expected.kind) << expected.name;
+        EXPECT_EQ(img.is_64bit(), expected.is_64bit) << expected.name;
+        EXPECT_EQ(img.entry_point(), expected.entry_point) << expected.name;
+
+        ASSERT_FALSE(img.sections().empty()) << expected.name;
+        const auto text = std::ranges::find_if(img.sections(), [](const peelf::Section& section) {
+            return section.name == ".text";
+        });
+        ASSERT_NE(text, img.sections().end()) << expected.name;
+        EXPECT_TRUE(text->readable) << expected.name;
+        EXPECT_TRUE(text->executable) << expected.name;
+        EXPECT_FALSE(text->writable) << expected.name;
+
+        EXPECT_EQ(img.file_offset_to_virtual_address(expected.text_file_offset),
+                  std::optional<std::uint64_t>(expected.text_virtual_address)) << expected.name;
+        EXPECT_EQ(img.virtual_address_to_file_offset(expected.text_virtual_address),
+                  std::optional<std::uint64_t>(expected.text_file_offset)) << expected.name;
+    }
+}
+
 TEST(BinaryImage, RejectsUnknownFormat) {
     const std::vector<std::uint8_t> junk(64, 0);
     const auto result = peelf::parse_image(junk);
     EXPECT_FALSE(result.has_value());
+}
+
+TEST(BinaryImage, RejectsPeWithUnsupportedOptionalMagic) {
+    std::vector<std::uint8_t> b(0x200, 0);
+    b[0] = 'M';
+    b[1] = 'Z';
+
+    const std::uint32_t e_lfanew = 0x80;
+    put32(b, 0x3C, e_lfanew);
+    b[e_lfanew + 0] = 'P';
+    b[e_lfanew + 1] = 'E';
+
+    const std::size_t coff = e_lfanew + 4;
+    put16(b, coff + 0, 0x8664);
+    put16(b, coff + 16, 0x00F0);
+
+    const std::size_t opt = coff + 20;
+    put16(b, opt + 0, 0x9999);
+
+    const auto result = peelf::parse_image(b);
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(BinaryImage, IgnoresOverflowingElfSectionTable) {
+    std::vector<std::uint8_t> b(0x80, 0);
+    b[0] = 0x7F;
+    b[1] = 'E';
+    b[2] = 'L';
+    b[3] = 'F';
+    b[4] = 2;  // ELFCLASS64
+    b[5] = 1;  // little-endian
+    b[6] = 1;  // EV_CURRENT
+    put16(b, 0x10, 2);
+    put16(b, 0x12, 62);
+    put32(b, 0x14, 1);
+    put64(b, 0x18, 0x400000);
+    put64(b, 0x28, 0xFFFF'FFFF'FFFF'FFF0ULL);
+    put16(b, 0x34, 0x40);
+    put16(b, 0x3A, 0x40);
+    put16(b, 0x3C, 2);
+    put16(b, 0x3E, 1);
+
+    auto result = peelf::parse_image(b);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE((**result).sections().empty());
 }
