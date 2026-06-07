@@ -7,16 +7,6 @@
 #include <string>
 #include <vector>
 
-// Handle Capstone version differences for ARM64 architecture name
-#if defined(CS_ARCH_AARCH64)
-    #define CAPSTONE_ARM64_ARCH CS_ARCH_AARCH64
-#elif defined(CS_ARCH_ARM64)
-    #define CAPSTONE_ARM64_ARCH CS_ARCH_ARM64
-#else
-    // Fallback: try the numeric value (4 is typically ARM64)
-    #define CAPSTONE_ARM64_ARCH ((cs_arch)4)
-#endif
-
 namespace viewer {
 
 enum class Architecture {
@@ -88,7 +78,7 @@ public:
                 cs_mode_flags = CS_MODE_ARM;
                 break;
             case Architecture::ARM64:
-                cs_architecture = CAPSTONE_ARM64_ARCH;
+                cs_architecture = CS_ARCH_ARM64;
                 cs_mode_flags = CS_MODE_LITTLE_ENDIAN;
                 break;
             default:

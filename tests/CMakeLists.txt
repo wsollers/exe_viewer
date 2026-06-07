@@ -30,13 +30,19 @@ add_executable(peelf_tests
   peelf_core_test.cpp
   parsers_test.cpp
   binary_image_test.cpp
+  disassembler_test.cpp
 )
 
 target_compile_features(peelf_tests PRIVATE cxx_std_23)
 
 target_link_libraries(peelf_tests PRIVATE
   peelf::core
+  capstone
   GTest::gtest_main
+)
+
+target_include_directories(peelf_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src
 )
 
 # Absolute path to the test fixtures directory, available to the test code.

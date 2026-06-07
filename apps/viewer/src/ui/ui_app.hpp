@@ -38,6 +38,7 @@ namespace viewer {
         // Disassemble a window of raw bytes starting at a file offset (used by the
         // Hex view's click-to-disassemble). Format-agnostic.
         void disassemble_at_offset(std::size_t file_offset);
+        void disassemble_at_offset(std::size_t file_offset, std::uint64_t display_address);
 
 
     private:

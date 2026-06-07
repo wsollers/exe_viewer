@@ -238,6 +238,8 @@ void UiApp::render_dockspace() {
         if (const PeModel* pe = model_.pe()) {
             pe_model_ = *pe;
             disassemble_entry_point(4096);
+        } else if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
+            disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
         }
     }
 
@@ -322,6 +324,16 @@ void UiApp::render_dockspace() {
     }
 
     void UiApp::disassemble_at_offset(std::size_t file_offset) {
+        std::uint64_t display_address = file_offset;
+        if (const peelf::IBinaryImage* img = model_.image()) {
+            if (const auto va = img->file_offset_to_virtual_address(file_offset)) {
+                display_address = *va;
+            }
+        }
+        disassemble_at_offset(file_offset, display_address);
+    }
+
+    void UiApp::disassemble_at_offset(std::size_t file_offset, std::uint64_t display_address) {
         if (!file_loaded_ || !disasm_.is_initialized()) {
             return;
         }
@@ -332,9 +344,7 @@ void UiApp::render_dockspace() {
         constexpr std::size_t kWindow = 256;
         const std::size_t avail = bytes.size() - file_offset;
         const std::size_t size = std::min(kWindow, avail);
-        // Address shown == file offset (the Hex view's coordinate); a proper
-        // file-offset -> VA mapping arrives with the Phase 4 disassembly wiring.
-        current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, file_offset);
+        current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, display_address);
     }
 
     void UiApp::disassemble_entry_point(std::size_t max_size) {
