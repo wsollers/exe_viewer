@@ -174,6 +174,25 @@ struct ElfNote {
     bool from_program_header = false;
 };
 
+struct ElfSysvHashTable {
+    std::string section_name;
+    std::uint32_t bucket_count = 0;
+    std::uint32_t chain_count = 0;
+    std::vector<std::uint32_t> buckets;
+    std::vector<std::uint32_t> chains;
+};
+
+struct ElfGnuHashTable {
+    std::string section_name;
+    std::uint32_t bucket_count = 0;
+    std::uint32_t symbol_offset = 0;
+    std::uint32_t bloom_word_count = 0;
+    std::uint32_t bloom_shift = 0;
+    std::vector<std::uint64_t> bloom;
+    std::vector<std::uint32_t> buckets;
+    std::vector<std::uint32_t> chains;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -199,6 +218,8 @@ public:
     [[nodiscard]] virtual const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfRelocation>& elf_relocations() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfNote>& elf_notes() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept = 0;
     [[nodiscard]] virtual std::string_view elf_interpreter() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;

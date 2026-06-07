@@ -187,6 +187,8 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_TRUE(img.elf_dynamic_entries().empty());
     EXPECT_TRUE(img.elf_relocations().empty());
     EXPECT_TRUE(img.elf_notes().empty());
+    EXPECT_TRUE(img.elf_sysv_hash_tables().empty());
+    EXPECT_TRUE(img.elf_gnu_hash_tables().empty());
     EXPECT_TRUE(img.elf_interpreter().empty());
 
     ASSERT_EQ(img.sections().size(), 1u);
@@ -383,20 +385,20 @@ TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
 
 TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
     constexpr std::array<ExpectedElfHeader, 14> fixtures{{
-        {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
-        {"known-linux-arm64.elf", 2, peelf::Endianness::Little, 183, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
-        {"known-linux-riscv64.elf", 2, peelf::Endianness::Little, 243, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
-        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
-        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
-        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
-        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x400, 0x180, 0x34, 0x20, 0x28, 9},
-        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x400, 0x180, 0x40, 0x38, 0x40, 9},
+        {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
+        {"known-linux-arm64.elf", 2, peelf::Endianness::Little, 183, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
+        {"known-linux-riscv64.elf", 2, peelf::Endianness::Little, 243, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
+        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
+        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
+        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
+        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x480, 0x180, 0x34, 0x20, 0x28, 11},
+        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
     }};
 
     for (const ExpectedElfHeader& expected : fixtures) {
@@ -475,9 +477,9 @@ TEST(BinaryImage, ParsesElfProgramHeadersAcrossFixtureMatrix) {
         });
         ASSERT_NE(interp_header, headers.end()) << name;
         EXPECT_EQ(interp_header->flags, 4u) << name;  // PF_R
-        EXPECT_EQ(interp_header->offset, 0x160u) << name;
-        EXPECT_EQ(interp_header->virtual_address, 0x400160u) << name;
-        EXPECT_EQ(interp_header->physical_address, 0x400160u) << name;
+        EXPECT_EQ(interp_header->offset, 0x540u) << name;
+        EXPECT_EQ(interp_header->virtual_address, 0x400540u) << name;
+        EXPECT_EQ(interp_header->physical_address, 0x400540u) << name;
         EXPECT_EQ(interp_header->file_size, 0x11u) << name;
         EXPECT_EQ(interp_header->memory_size, 0x11u) << name;
         EXPECT_EQ(interp_header->alignment, 1u) << name;
@@ -487,9 +489,9 @@ TEST(BinaryImage, ParsesElfProgramHeadersAcrossFixtureMatrix) {
         });
         ASSERT_NE(note_header, headers.end()) << name;
         EXPECT_EQ(note_header->flags, 4u) << name;  // PF_R
-        EXPECT_EQ(note_header->offset, 0x4C0u) << name;
-        EXPECT_EQ(note_header->virtual_address, 0x4004C0u) << name;
-        EXPECT_EQ(note_header->physical_address, 0x4004C0u) << name;
+        EXPECT_EQ(note_header->offset, 0x560u) << name;
+        EXPECT_EQ(note_header->virtual_address, 0x400560u) << name;
+        EXPECT_EQ(note_header->physical_address, 0x400560u) << name;
         EXPECT_EQ(note_header->file_size, 0x18u) << name;
         EXPECT_EQ(note_header->memory_size, 0x18u) << name;
         EXPECT_EQ(note_header->alignment, 4u) << name;
@@ -582,9 +584,92 @@ TEST(BinaryImage, ParsesElfNotesAcrossFixtureMatrix) {
             });
         ASSERT_NE(note_section, (**result).elf_section_headers().end()) << name;
         EXPECT_EQ(note_section->type, 7u) << name;  // SHT_NOTE
-        EXPECT_EQ(note_section->offset, 0x4C0u) << name;
+        EXPECT_EQ(note_section->offset, 0x560u) << name;
         EXPECT_EQ(note_section->size, 0x18u) << name;
         EXPECT_EQ(note_section->address_alignment, 4u) << name;
+    }
+}
+
+TEST(BinaryImage, ParsesElfHashTablesAcrossFixtureMatrix) {
+    struct ExpectedHashFixture {
+        const char* name;
+        bool is_64bit;
+    };
+    constexpr std::array<ExpectedHashFixture, 14> fixtures{{
+        {"known-linux-x64.elf", true},
+        {"known-linux-arm64.elf", true},
+        {"known-linux-riscv64.elf", true},
+        {"known-linux-x86-elf32-le.elf", false},
+        {"known-linux-mips-elf32-be.elf", false},
+        {"known-linux-mips64-elf64-be.elf", true},
+        {"known-linux-arm-elf32-le.elf", false},
+        {"known-linux-arm-elf32-be.elf", false},
+        {"known-linux-arm64-elf64-be.elf", true},
+        {"known-linux-riscv32-elf32-le.elf", false},
+        {"known-linux-riscv32-elf32-be.elf", false},
+        {"known-linux-riscv64-elf64-be.elf", true},
+        {"known-linux-ppc-elf32-be.elf", false},
+        {"known-linux-ppc64-elf64-be.elf", true},
+    }};
+
+    for (const ExpectedHashFixture& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto& sysv_tables = (**result).elf_sysv_hash_tables();
+        ASSERT_EQ(sysv_tables.size(), 1u) << expected.name;
+        const peelf::ElfSysvHashTable& sysv = sysv_tables.front();
+        EXPECT_EQ(sysv.section_name, ".hash") << expected.name;
+        EXPECT_EQ(sysv.bucket_count, 1u) << expected.name;
+        EXPECT_EQ(sysv.chain_count, 2u) << expected.name;
+        ASSERT_EQ(sysv.buckets.size(), 1u) << expected.name;
+        ASSERT_EQ(sysv.chains.size(), 2u) << expected.name;
+        EXPECT_EQ(sysv.buckets[0], 1u) << expected.name;
+        EXPECT_EQ(sysv.chains[0], 0u) << expected.name;
+        EXPECT_EQ(sysv.chains[1], 0u) << expected.name;
+
+        const auto& gnu_tables = (**result).elf_gnu_hash_tables();
+        ASSERT_EQ(gnu_tables.size(), 1u) << expected.name;
+        const peelf::ElfGnuHashTable& gnu = gnu_tables.front();
+        EXPECT_EQ(gnu.section_name, ".gnu.hash") << expected.name;
+        EXPECT_EQ(gnu.bucket_count, 1u) << expected.name;
+        EXPECT_EQ(gnu.symbol_offset, 1u) << expected.name;
+        EXPECT_EQ(gnu.bloom_word_count, 1u) << expected.name;
+        EXPECT_EQ(gnu.bloom_shift, 5u) << expected.name;
+        ASSERT_EQ(gnu.bloom.size(), 1u) << expected.name;
+        ASSERT_EQ(gnu.buckets.size(), 1u) << expected.name;
+        ASSERT_EQ(gnu.chains.size(), 1u) << expected.name;
+        EXPECT_EQ(gnu.bloom[0], 1u) << expected.name;
+        EXPECT_EQ(gnu.buckets[0], 1u) << expected.name;
+        EXPECT_EQ(gnu.chains[0], 1u) << expected.name;
+
+        const auto hash_section = std::ranges::find_if(
+            (**result).elf_section_headers(), [](const peelf::ElfSectionHeader& section) {
+                return section.name == ".hash";
+            });
+        ASSERT_NE(hash_section, (**result).elf_section_headers().end()) << expected.name;
+        EXPECT_EQ(hash_section->type, 5u) << expected.name;  // SHT_HASH
+        EXPECT_EQ(hash_section->offset, 0x580u) << expected.name;
+        EXPECT_EQ(hash_section->size, 0x14u) << expected.name;
+        EXPECT_EQ(hash_section->link, 4u) << expected.name;
+        EXPECT_EQ(hash_section->address_alignment, 4u) << expected.name;
+        EXPECT_EQ(hash_section->entry_size, 4u) << expected.name;
+
+        const auto gnu_hash_section = std::ranges::find_if(
+            (**result).elf_section_headers(), [](const peelf::ElfSectionHeader& section) {
+                return section.name == ".gnu.hash";
+            });
+        ASSERT_NE(gnu_hash_section, (**result).elf_section_headers().end()) << expected.name;
+        EXPECT_EQ(gnu_hash_section->type, 0x6FFF'FFF6u) << expected.name;  // SHT_GNU_HASH
+        EXPECT_EQ(gnu_hash_section->offset, 0x5A0u) << expected.name;
+        EXPECT_EQ(gnu_hash_section->size, expected.is_64bit ? 0x20u : 0x1Cu) << expected.name;
+        EXPECT_EQ(gnu_hash_section->link, 4u) << expected.name;
+        EXPECT_EQ(gnu_hash_section->address_alignment, expected.is_64bit ? 8u : 4u) << expected.name;
+        EXPECT_EQ(gnu_hash_section->entry_size, 0u) << expected.name;
     }
 }
 
@@ -671,14 +756,14 @@ TEST(BinaryImage, ParsesRichElfSectionHeaders) {
         ASSERT_TRUE(result.has_value()) << "parse_image failed for " << name;
 
         const auto& headers = (**result).elf_section_headers();
-        ASSERT_EQ(headers.size(), 9u) << name;
+        ASSERT_EQ(headers.size(), 11u) << name;
 
         const auto symtab = std::ranges::find_if(headers, [](const peelf::ElfSectionHeader& section) {
             return section.name == ".symtab";
         });
         ASSERT_NE(symtab, headers.end()) << name;
         EXPECT_EQ(symtab->type, 2u) << name;  // SHT_SYMTAB
-        EXPECT_EQ(symtab->offset, 0xE8u) << name;
+        EXPECT_EQ(symtab->offset, 0x100u) << name;
         EXPECT_EQ(symtab->size, 0x30u) << name;
         EXPECT_EQ(symtab->link, 3u) << name;
         EXPECT_EQ(symtab->info, 1u) << name;
@@ -691,7 +776,7 @@ TEST(BinaryImage, ParsesRichElfSectionHeaders) {
         ASSERT_NE(dynamic, headers.end()) << name;
         EXPECT_EQ(dynamic->type, 6u) << name;  // SHT_DYNAMIC
         EXPECT_EQ(dynamic->flags, 2u) << name;
-        EXPECT_EQ(dynamic->offset, 0x128u) << name;
+        EXPECT_EQ(dynamic->offset, 0x148u) << name;
         EXPECT_EQ(dynamic->size, 0x20u) << name;
         EXPECT_EQ(dynamic->link, 5u) << name;
         EXPECT_EQ(dynamic->address_alignment, 8u) << name;

@@ -91,10 +91,36 @@ function Put-Note {
     $Bytes[$Offset + 0x17] = 0x44
 }
 
+function Put-SysvHash {
+    param([byte[]]$Bytes, [UInt32]$Offset, [bool]$BigEndian)
+    Put-U32 $Bytes ($Offset + 0x00) 1 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x04) 2 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x08) 1 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x0C) 0 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x10) 0 $BigEndian
+}
+
+function Put-GnuHash {
+    param([byte[]]$Bytes, [UInt32]$Offset, [bool]$BigEndian, [bool]$Elf64)
+    Put-U32 $Bytes ($Offset + 0x00) 1 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x04) 1 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x08) 1 $BigEndian
+    Put-U32 $Bytes ($Offset + 0x0C) 5 $BigEndian
+    if ($Elf64) {
+        Put-U64 $Bytes ($Offset + 0x10) 1 $BigEndian
+        Put-U32 $Bytes ($Offset + 0x18) 1 $BigEndian
+        Put-U32 $Bytes ($Offset + 0x1C) 1 $BigEndian
+    } else {
+        Put-U32 $Bytes ($Offset + 0x10) 1 $BigEndian
+        Put-U32 $Bytes ($Offset + 0x14) 1 $BigEndian
+        Put-U32 $Bytes ($Offset + 0x18) 1 $BigEndian
+    }
+}
+
 function New-Elf64Fixture {
     param([string]$Name, [UInt16]$Machine)
 
-    $Bytes = [byte[]]::new(0x580)
+    $Bytes = [byte[]]::new(0x680)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -107,57 +133,57 @@ function New-Elf64Fixture {
     Put-U16LE $Bytes 0x12 $Machine
     Put-U32LE $Bytes 0x14 1
     Put-U64LE $Bytes 0x18 0x400080
-    Put-U64LE $Bytes 0x20 0x400      # e_phoff
+    Put-U64LE $Bytes 0x20 0x480      # e_phoff
     Put-U64LE $Bytes 0x28 0x180      # e_shoff
     Put-U16LE $Bytes 0x34 0x40       # e_ehsize
     Put-U16LE $Bytes 0x36 0x38       # e_phentsize
     Put-U16LE $Bytes 0x38 3          # e_phnum
     Put-U16LE $Bytes 0x3a 0x40       # e_shentsize
-    Put-U16LE $Bytes 0x3c 9          # e_shnum
+    Put-U16LE $Bytes 0x3c 11         # e_shnum
     Put-U16LE $Bytes 0x3e 2          # e_shstrndx
 
-    Put-U32LE $Bytes 0x400 1          # PT_LOAD
-    Put-U32LE $Bytes 0x404 5          # PF_R | PF_X
-    Put-U64LE $Bytes 0x408 0x80       # p_offset
-    Put-U64LE $Bytes 0x410 0x400080   # p_vaddr
-    Put-U64LE $Bytes 0x418 0x400080   # p_paddr
-    Put-U64LE $Bytes 0x420 0x10       # p_filesz
-    Put-U64LE $Bytes 0x428 0x10       # p_memsz
-    Put-U64LE $Bytes 0x430 0x1000     # p_align
+    Put-U32LE $Bytes 0x480 1          # PT_LOAD
+    Put-U32LE $Bytes 0x484 5          # PF_R | PF_X
+    Put-U64LE $Bytes 0x488 0x80       # p_offset
+    Put-U64LE $Bytes 0x490 0x400080   # p_vaddr
+    Put-U64LE $Bytes 0x498 0x400080   # p_paddr
+    Put-U64LE $Bytes 0x4A0 0x10       # p_filesz
+    Put-U64LE $Bytes 0x4A8 0x10       # p_memsz
+    Put-U64LE $Bytes 0x4B0 0x1000     # p_align
 
-    Put-U32LE $Bytes 0x438 3          # PT_INTERP
-    Put-U32LE $Bytes 0x43C 4          # PF_R
-    Put-U64LE $Bytes 0x440 0x160      # p_offset
-    Put-U64LE $Bytes 0x448 0x400160   # p_vaddr
-    Put-U64LE $Bytes 0x450 0x400160   # p_paddr
-    Put-U64LE $Bytes 0x458 0x11       # p_filesz
-    Put-U64LE $Bytes 0x460 0x11       # p_memsz
-    Put-U64LE $Bytes 0x468 1          # p_align
+    Put-U32LE $Bytes 0x4B8 3          # PT_INTERP
+    Put-U32LE $Bytes 0x4BC 4          # PF_R
+    Put-U64LE $Bytes 0x4C0 0x540      # p_offset
+    Put-U64LE $Bytes 0x4C8 0x400540   # p_vaddr
+    Put-U64LE $Bytes 0x4D0 0x400540   # p_paddr
+    Put-U64LE $Bytes 0x4D8 0x11       # p_filesz
+    Put-U64LE $Bytes 0x4E0 0x11       # p_memsz
+    Put-U64LE $Bytes 0x4E8 1          # p_align
 
-    Put-U32LE $Bytes 0x470 4          # PT_NOTE
-    Put-U32LE $Bytes 0x474 4          # PF_R
-    Put-U64LE $Bytes 0x478 0x4C0      # p_offset
-    Put-U64LE $Bytes 0x480 0x4004C0   # p_vaddr
-    Put-U64LE $Bytes 0x488 0x4004C0   # p_paddr
-    Put-U64LE $Bytes 0x490 0x18       # p_filesz
-    Put-U64LE $Bytes 0x498 0x18       # p_memsz
-    Put-U64LE $Bytes 0x4A0 4          # p_align
+    Put-U32LE $Bytes 0x4F0 4          # PT_NOTE
+    Put-U32LE $Bytes 0x4F4 4          # PF_R
+    Put-U64LE $Bytes 0x4F8 0x560      # p_offset
+    Put-U64LE $Bytes 0x500 0x400560   # p_vaddr
+    Put-U64LE $Bytes 0x508 0x400560   # p_paddr
+    Put-U64LE $Bytes 0x510 0x18       # p_filesz
+    Put-U64LE $Bytes 0x518 0x18       # p_memsz
+    Put-U64LE $Bytes 0x520 4          # p_align
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
     }
 
-    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0, 46, 100, 121, 110, 115, 116, 114, 0, 46, 100, 121, 110, 97, 109, 105, 99, 0, 46, 114, 101, 108, 97, 46, 100, 121, 110, 0, 46, 110, 111, 116, 101, 46, 112, 101, 101, 108, 102, 0)
+    $Names = [Text.Encoding]::ASCII.GetBytes("`0.text`0.shstrtab`0.strtab`0.symtab`0.dynstr`0.dynamic`0.rela.dyn`0.note.peelf`0.hash`0.gnu.hash`0")
     for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
         $Bytes[0x90 + $Index] = $Names[$Index]
     }
 
     $SymNames = [byte[]](0, 95, 115, 116, 97, 114, 116, 0)
     for ($Index = [UInt32]0; $Index -lt $SymNames.Length; ++$Index) {
-        $Bytes[0xD8 + $Index] = $SymNames[$Index]
+        $Bytes[0xF0 + $Index] = $SymNames[$Index]
     }
 
-    $StartSym = [UInt32](0xE8 + 0x18)
+    $StartSym = [UInt32](0x100 + 0x18)
     Put-U32LE $Bytes ($StartSym + 0x00) 1        # st_name = "_start"
     $Bytes[$StartSym + 0x04] = 0x12              # STB_GLOBAL | STT_FUNC
     $Bytes[$StartSym + 0x05] = 0                 # st_other
@@ -167,19 +193,21 @@ function New-Elf64Fixture {
 
     $DynNames = [byte[]](0, 108, 105, 98, 99, 46, 115, 111, 46, 54, 0)
     for ($Index = [UInt32]0; $Index -lt $DynNames.Length; ++$Index) {
-        $Bytes[0x118 + $Index] = $DynNames[$Index]
+        $Bytes[0x138 + $Index] = $DynNames[$Index]
     }
 
-    Put-U64LE $Bytes 0x128 1      # DT_NEEDED
-    Put-U64LE $Bytes 0x130 1      # "libc.so.6"
-    Put-U64LE $Bytes 0x138 0      # DT_NULL
-    Put-U64LE $Bytes 0x140 0
+    Put-U64LE $Bytes 0x148 1      # DT_NEEDED
+    Put-U64LE $Bytes 0x150 1      # "libc.so.6"
+    Put-U64LE $Bytes 0x158 0      # DT_NULL
+    Put-U64LE $Bytes 0x160 0
 
-    Put-U64LE $Bytes 0x148 0x400088
-    Put-U64LE $Bytes 0x150 0x100000008
-    Put-U64LE $Bytes 0x158 4
-    Put-Ascii $Bytes 0x160 "/lib/ld-peelf.so"
-    Put-Note $Bytes 0x4C0 $false
+    Put-U64LE $Bytes 0x168 0x400088
+    Put-U64LE $Bytes 0x170 0x100000008
+    Put-U64LE $Bytes 0x178 4
+    Put-Ascii $Bytes 0x540 "/lib/ld-peelf.so"
+    Put-Note $Bytes 0x560 $false
+    Put-SysvHash $Bytes 0x580 $false
+    Put-GnuHash $Bytes 0x5A0 $false $true
 
     $Text = 0x180 + 0x40
     Put-U32LE $Bytes ($Text + 0x00) 1      # ".text"
@@ -200,14 +228,14 @@ function New-Elf64Fixture {
     $StringTable = 0x180 + 0xC0
     Put-U32LE $Bytes ($StringTable + 0x00) 17   # ".strtab"
     Put-U32LE $Bytes ($StringTable + 0x04) 3    # SHT_STRTAB
-    Put-U64LE $Bytes ($StringTable + 0x18) 0xD8
+    Put-U64LE $Bytes ($StringTable + 0x18) 0xF0
     Put-U64LE $Bytes ($StringTable + 0x20) ([UInt64]$SymNames.Length)
     Put-U64LE $Bytes ($StringTable + 0x30) 1
 
     $Symtab = 0x180 + 0x100
     Put-U32LE $Bytes ($Symtab + 0x00) 25        # ".symtab"
     Put-U32LE $Bytes ($Symtab + 0x04) 2         # SHT_SYMTAB
-    Put-U64LE $Bytes ($Symtab + 0x18) 0xE8
+    Put-U64LE $Bytes ($Symtab + 0x18) 0x100
     Put-U64LE $Bytes ($Symtab + 0x20) 0x30
     Put-U32LE $Bytes ($Symtab + 0x28) 3         # link -> .strtab
     Put-U32LE $Bytes ($Symtab + 0x2C) 1         # one local symbol (null)
@@ -217,7 +245,7 @@ function New-Elf64Fixture {
     $Dynstr = 0x180 + 0x140
     Put-U32LE $Bytes ($Dynstr + 0x00) 33        # ".dynstr"
     Put-U32LE $Bytes ($Dynstr + 0x04) 3         # SHT_STRTAB
-    Put-U64LE $Bytes ($Dynstr + 0x18) 0x118
+    Put-U64LE $Bytes ($Dynstr + 0x18) 0x138
     Put-U64LE $Bytes ($Dynstr + 0x20) ([UInt64]$DynNames.Length)
     Put-U64LE $Bytes ($Dynstr + 0x30) 1
 
@@ -225,7 +253,7 @@ function New-Elf64Fixture {
     Put-U32LE $Bytes ($Dynamic + 0x00) 41       # ".dynamic"
     Put-U32LE $Bytes ($Dynamic + 0x04) 6        # SHT_DYNAMIC
     Put-U64LE $Bytes ($Dynamic + 0x08) 2        # SHF_ALLOC
-    Put-U64LE $Bytes ($Dynamic + 0x18) 0x128
+    Put-U64LE $Bytes ($Dynamic + 0x18) 0x148
     Put-U64LE $Bytes ($Dynamic + 0x20) 0x20
     Put-U32LE $Bytes ($Dynamic + 0x28) 5        # link -> .dynstr
     Put-U64LE $Bytes ($Dynamic + 0x30) 8
@@ -234,7 +262,7 @@ function New-Elf64Fixture {
     $Rela = 0x180 + 0x1C0
     Put-U32LE $Bytes ($Rela + 0x00) 50          # ".rela.dyn"
     Put-U32LE $Bytes ($Rela + 0x04) 4           # SHT_RELA
-    Put-U64LE $Bytes ($Rela + 0x18) 0x148
+    Put-U64LE $Bytes ($Rela + 0x18) 0x168
     Put-U64LE $Bytes ($Rela + 0x20) 0x18
     Put-U32LE $Bytes ($Rela + 0x28) 4           # link -> .symtab
     Put-U32LE $Bytes ($Rela + 0x2C) 1           # info -> .text
@@ -244,9 +272,27 @@ function New-Elf64Fixture {
     $Note = 0x180 + 0x200
     Put-U32LE $Bytes ($Note + 0x00) 60          # ".note.peelf"
     Put-U32LE $Bytes ($Note + 0x04) 7           # SHT_NOTE
-    Put-U64LE $Bytes ($Note + 0x18) 0x4C0
+    Put-U64LE $Bytes ($Note + 0x18) 0x560
     Put-U64LE $Bytes ($Note + 0x20) 0x18
     Put-U64LE $Bytes ($Note + 0x30) 4
+
+    $Hash = 0x180 + 0x240
+    Put-U32LE $Bytes ($Hash + 0x00) 72          # ".hash"
+    Put-U32LE $Bytes ($Hash + 0x04) 5           # SHT_HASH
+    Put-U64LE $Bytes ($Hash + 0x18) 0x580
+    Put-U64LE $Bytes ($Hash + 0x20) 0x14
+    Put-U32LE $Bytes ($Hash + 0x28) 4           # link -> .symtab
+    Put-U64LE $Bytes ($Hash + 0x30) 4
+    Put-U64LE $Bytes ($Hash + 0x38) 4
+
+    $GnuHash = 0x180 + 0x280
+    Put-U32LE $Bytes ($GnuHash + 0x00) 78       # ".gnu.hash"
+    Put-U32LE $Bytes ($GnuHash + 0x04) 0x6ffffff6
+    Put-U64LE $Bytes ($GnuHash + 0x18) 0x5A0
+    Put-U64LE $Bytes ($GnuHash + 0x20) 0x20
+    Put-U32LE $Bytes ($GnuHash + 0x28) 4        # link -> .symtab
+    Put-U64LE $Bytes ($GnuHash + 0x30) 8
+    Put-U64LE $Bytes ($GnuHash + 0x38) 0
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }
@@ -317,7 +363,7 @@ function New-Pe64Fixture {
 function New-Elf32CompatibilityFixture {
     param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
 
-    $Bytes = [byte[]]::new(0x580)
+    $Bytes = [byte[]]::new(0x680)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -330,71 +376,73 @@ function New-Elf32CompatibilityFixture {
     Put-U16 $Bytes 0x12 $Machine $BigEndian
     Put-U32 $Bytes 0x14 1 $BigEndian
     Put-U32 $Bytes 0x18 0x400080 $BigEndian
-    Put-U32 $Bytes 0x1c 0x400 $BigEndian
+    Put-U32 $Bytes 0x1c 0x480 $BigEndian
     Put-U32 $Bytes 0x20 0x180 $BigEndian
     Put-U16 $Bytes 0x28 0x34 $BigEndian
     Put-U16 $Bytes 0x2a 0x20 $BigEndian
     Put-U16 $Bytes 0x2c 3 $BigEndian
     Put-U16 $Bytes 0x2e 0x28 $BigEndian
-    Put-U16 $Bytes 0x30 9 $BigEndian
+    Put-U16 $Bytes 0x30 11 $BigEndian
     Put-U16 $Bytes 0x32 2 $BigEndian
 
-    Put-U32 $Bytes 0x400 1 $BigEndian
-    Put-U32 $Bytes 0x404 0x80 $BigEndian
-    Put-U32 $Bytes 0x408 0x400080 $BigEndian
-    Put-U32 $Bytes 0x40C 0x400080 $BigEndian
-    Put-U32 $Bytes 0x410 0x10 $BigEndian
-    Put-U32 $Bytes 0x414 0x10 $BigEndian
-    Put-U32 $Bytes 0x418 5 $BigEndian
-    Put-U32 $Bytes 0x41C 0x1000 $BigEndian
+    Put-U32 $Bytes 0x480 1 $BigEndian
+    Put-U32 $Bytes 0x484 0x80 $BigEndian
+    Put-U32 $Bytes 0x488 0x400080 $BigEndian
+    Put-U32 $Bytes 0x48C 0x400080 $BigEndian
+    Put-U32 $Bytes 0x490 0x10 $BigEndian
+    Put-U32 $Bytes 0x494 0x10 $BigEndian
+    Put-U32 $Bytes 0x498 5 $BigEndian
+    Put-U32 $Bytes 0x49C 0x1000 $BigEndian
 
-    Put-U32 $Bytes 0x420 3 $BigEndian
-    Put-U32 $Bytes 0x424 0x160 $BigEndian
-    Put-U32 $Bytes 0x428 0x400160 $BigEndian
-    Put-U32 $Bytes 0x42C 0x400160 $BigEndian
-    Put-U32 $Bytes 0x430 0x11 $BigEndian
-    Put-U32 $Bytes 0x434 0x11 $BigEndian
-    Put-U32 $Bytes 0x438 4 $BigEndian
-    Put-U32 $Bytes 0x43C 1 $BigEndian
+    Put-U32 $Bytes 0x4A0 3 $BigEndian
+    Put-U32 $Bytes 0x4A4 0x540 $BigEndian
+    Put-U32 $Bytes 0x4A8 0x400540 $BigEndian
+    Put-U32 $Bytes 0x4AC 0x400540 $BigEndian
+    Put-U32 $Bytes 0x4B0 0x11 $BigEndian
+    Put-U32 $Bytes 0x4B4 0x11 $BigEndian
+    Put-U32 $Bytes 0x4B8 4 $BigEndian
+    Put-U32 $Bytes 0x4BC 1 $BigEndian
 
-    Put-U32 $Bytes 0x440 4 $BigEndian
-    Put-U32 $Bytes 0x444 0x4C0 $BigEndian
-    Put-U32 $Bytes 0x448 0x4004C0 $BigEndian
-    Put-U32 $Bytes 0x44C 0x4004C0 $BigEndian
-    Put-U32 $Bytes 0x450 0x18 $BigEndian
-    Put-U32 $Bytes 0x454 0x18 $BigEndian
-    Put-U32 $Bytes 0x458 4 $BigEndian
-    Put-U32 $Bytes 0x45C 4 $BigEndian
+    Put-U32 $Bytes 0x4C0 4 $BigEndian
+    Put-U32 $Bytes 0x4C4 0x560 $BigEndian
+    Put-U32 $Bytes 0x4C8 0x400560 $BigEndian
+    Put-U32 $Bytes 0x4CC 0x400560 $BigEndian
+    Put-U32 $Bytes 0x4D0 0x18 $BigEndian
+    Put-U32 $Bytes 0x4D4 0x18 $BigEndian
+    Put-U32 $Bytes 0x4D8 4 $BigEndian
+    Put-U32 $Bytes 0x4DC 4 $BigEndian
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
     }
 
-    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0, 46, 100, 121, 110, 115, 116, 114, 0, 46, 100, 121, 110, 97, 109, 105, 99, 0, 46, 114, 101, 108, 46, 100, 121, 110, 0, 46, 110, 111, 116, 101, 46, 112, 101, 101, 108, 102, 0)
+    $Names = [Text.Encoding]::ASCII.GetBytes("`0.text`0.shstrtab`0.strtab`0.symtab`0.dynstr`0.dynamic`0.rel.dyn`0.note.peelf`0.hash`0.gnu.hash`0")
     for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
         $Bytes[0x90 + $Index] = $Names[$Index]
     }
 
     $SymNames = [byte[]](0, 95, 115, 116, 97, 114, 116, 0)
     for ($Index = [UInt32]0; $Index -lt $SymNames.Length; ++$Index) {
-        $Bytes[0xD8 + $Index] = $SymNames[$Index]
+        $Bytes[0xF0 + $Index] = $SymNames[$Index]
     }
 
     $DynNames = [byte[]](0, 108, 105, 98, 99, 46, 115, 111, 46, 54, 0)
     for ($Index = [UInt32]0; $Index -lt $DynNames.Length; ++$Index) {
-        $Bytes[0x118 + $Index] = $DynNames[$Index]
+        $Bytes[0x138 + $Index] = $DynNames[$Index]
     }
 
-    Put-U32 $Bytes 0x128 1 $BigEndian
-    Put-U32 $Bytes 0x12C 1 $BigEndian
-    Put-U32 $Bytes 0x130 0 $BigEndian
-    Put-U32 $Bytes 0x134 0 $BigEndian
-    Put-U32 $Bytes 0x138 0x400084 $BigEndian
-    Put-U32 $Bytes 0x13C 0x101 $BigEndian
-    Put-Ascii $Bytes 0x160 "/lib/ld-peelf.so"
-    Put-Note $Bytes 0x4C0 $BigEndian
+    Put-U32 $Bytes 0x148 1 $BigEndian
+    Put-U32 $Bytes 0x14C 1 $BigEndian
+    Put-U32 $Bytes 0x150 0 $BigEndian
+    Put-U32 $Bytes 0x154 0 $BigEndian
+    Put-U32 $Bytes 0x158 0x400084 $BigEndian
+    Put-U32 $Bytes 0x15C 0x101 $BigEndian
+    Put-Ascii $Bytes 0x540 "/lib/ld-peelf.so"
+    Put-Note $Bytes 0x560 $BigEndian
+    Put-SysvHash $Bytes 0x580 $BigEndian
+    Put-GnuHash $Bytes 0x5A0 $BigEndian $false
 
-    $StartSym = [UInt32](0xE8 + 0x10)
+    $StartSym = [UInt32](0x100 + 0x10)
     Put-U32 $Bytes ($StartSym + 0x00) 1 $BigEndian
     Put-U32 $Bytes ($StartSym + 0x04) 0x400080 $BigEndian
     Put-U32 $Bytes ($StartSym + 0x08) 0x10 $BigEndian
@@ -421,14 +469,14 @@ function New-Elf32CompatibilityFixture {
     $StringTable = 0x180 + 0x78
     Put-U32 $Bytes ($StringTable + 0x00) 17 $BigEndian
     Put-U32 $Bytes ($StringTable + 0x04) 3 $BigEndian
-    Put-U32 $Bytes ($StringTable + 0x10) 0xD8 $BigEndian
+    Put-U32 $Bytes ($StringTable + 0x10) 0xF0 $BigEndian
     Put-U32 $Bytes ($StringTable + 0x14) ([UInt32]$SymNames.Length) $BigEndian
     Put-U32 $Bytes ($StringTable + 0x20) 1 $BigEndian
 
     $Symtab = 0x180 + 0xA0
     Put-U32 $Bytes ($Symtab + 0x00) 25 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x04) 2 $BigEndian
-    Put-U32 $Bytes ($Symtab + 0x10) 0xE8 $BigEndian
+    Put-U32 $Bytes ($Symtab + 0x10) 0x100 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x14) 0x20 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x18) 3 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x1C) 1 $BigEndian
@@ -438,7 +486,7 @@ function New-Elf32CompatibilityFixture {
     $Dynstr = 0x180 + 0xC8
     Put-U32 $Bytes ($Dynstr + 0x00) 33 $BigEndian
     Put-U32 $Bytes ($Dynstr + 0x04) 3 $BigEndian
-    Put-U32 $Bytes ($Dynstr + 0x10) 0x118 $BigEndian
+    Put-U32 $Bytes ($Dynstr + 0x10) 0x138 $BigEndian
     Put-U32 $Bytes ($Dynstr + 0x14) ([UInt32]$DynNames.Length) $BigEndian
     Put-U32 $Bytes ($Dynstr + 0x20) 1 $BigEndian
 
@@ -446,7 +494,7 @@ function New-Elf32CompatibilityFixture {
     Put-U32 $Bytes ($Dynamic + 0x00) 41 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x04) 6 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x08) 2 $BigEndian
-    Put-U32 $Bytes ($Dynamic + 0x10) 0x128 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x10) 0x148 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x14) 0x10 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x18) 5 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x20) 4 $BigEndian
@@ -455,7 +503,7 @@ function New-Elf32CompatibilityFixture {
     $Rel = 0x180 + 0x118
     Put-U32 $Bytes ($Rel + 0x00) 50 $BigEndian
     Put-U32 $Bytes ($Rel + 0x04) 9 $BigEndian
-    Put-U32 $Bytes ($Rel + 0x10) 0x138 $BigEndian
+    Put-U32 $Bytes ($Rel + 0x10) 0x158 $BigEndian
     Put-U32 $Bytes ($Rel + 0x14) 0x08 $BigEndian
     Put-U32 $Bytes ($Rel + 0x18) 4 $BigEndian
     Put-U32 $Bytes ($Rel + 0x1C) 1 $BigEndian
@@ -465,9 +513,27 @@ function New-Elf32CompatibilityFixture {
     $Note = 0x180 + 0x140
     Put-U32 $Bytes ($Note + 0x00) 59 $BigEndian
     Put-U32 $Bytes ($Note + 0x04) 7 $BigEndian
-    Put-U32 $Bytes ($Note + 0x10) 0x4C0 $BigEndian
+    Put-U32 $Bytes ($Note + 0x10) 0x560 $BigEndian
     Put-U32 $Bytes ($Note + 0x14) 0x18 $BigEndian
     Put-U32 $Bytes ($Note + 0x20) 4 $BigEndian
+
+    $Hash = 0x180 + 0x168
+    Put-U32 $Bytes ($Hash + 0x00) 71 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x04) 5 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x10) 0x580 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x14) 0x14 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x18) 4 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x20) 4 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x24) 4 $BigEndian
+
+    $GnuHash = 0x180 + 0x190
+    Put-U32 $Bytes ($GnuHash + 0x00) 77 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x04) 0x6ffffff6 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x10) 0x5A0 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x14) 0x1C $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x18) 4 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x20) 4 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x24) 0 $BigEndian
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }
@@ -475,7 +541,7 @@ function New-Elf32CompatibilityFixture {
 function New-Elf64CompatibilityFixture {
     param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
 
-    $Bytes = [byte[]]::new(0x580)
+    $Bytes = [byte[]]::new(0x680)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -488,72 +554,74 @@ function New-Elf64CompatibilityFixture {
     Put-U16 $Bytes 0x12 $Machine $BigEndian
     Put-U32 $Bytes 0x14 1 $BigEndian
     Put-U64 $Bytes 0x18 0x400080 $BigEndian
-    Put-U64 $Bytes 0x20 0x400 $BigEndian
+    Put-U64 $Bytes 0x20 0x480 $BigEndian
     Put-U64 $Bytes 0x28 0x180 $BigEndian
     Put-U16 $Bytes 0x34 0x40 $BigEndian
     Put-U16 $Bytes 0x36 0x38 $BigEndian
     Put-U16 $Bytes 0x38 3 $BigEndian
     Put-U16 $Bytes 0x3a 0x40 $BigEndian
-    Put-U16 $Bytes 0x3c 9 $BigEndian
+    Put-U16 $Bytes 0x3c 11 $BigEndian
     Put-U16 $Bytes 0x3e 2 $BigEndian
 
-    Put-U32 $Bytes 0x400 1 $BigEndian
-    Put-U32 $Bytes 0x404 5 $BigEndian
-    Put-U64 $Bytes 0x408 0x80 $BigEndian
-    Put-U64 $Bytes 0x410 0x400080 $BigEndian
-    Put-U64 $Bytes 0x418 0x400080 $BigEndian
-    Put-U64 $Bytes 0x420 0x10 $BigEndian
-    Put-U64 $Bytes 0x428 0x10 $BigEndian
-    Put-U64 $Bytes 0x430 0x1000 $BigEndian
+    Put-U32 $Bytes 0x480 1 $BigEndian
+    Put-U32 $Bytes 0x484 5 $BigEndian
+    Put-U64 $Bytes 0x488 0x80 $BigEndian
+    Put-U64 $Bytes 0x490 0x400080 $BigEndian
+    Put-U64 $Bytes 0x498 0x400080 $BigEndian
+    Put-U64 $Bytes 0x4A0 0x10 $BigEndian
+    Put-U64 $Bytes 0x4A8 0x10 $BigEndian
+    Put-U64 $Bytes 0x4B0 0x1000 $BigEndian
 
-    Put-U32 $Bytes 0x438 3 $BigEndian
-    Put-U32 $Bytes 0x43C 4 $BigEndian
-    Put-U64 $Bytes 0x440 0x160 $BigEndian
-    Put-U64 $Bytes 0x448 0x400160 $BigEndian
-    Put-U64 $Bytes 0x450 0x400160 $BigEndian
-    Put-U64 $Bytes 0x458 0x11 $BigEndian
-    Put-U64 $Bytes 0x460 0x11 $BigEndian
-    Put-U64 $Bytes 0x468 1 $BigEndian
+    Put-U32 $Bytes 0x4B8 3 $BigEndian
+    Put-U32 $Bytes 0x4BC 4 $BigEndian
+    Put-U64 $Bytes 0x4C0 0x540 $BigEndian
+    Put-U64 $Bytes 0x4C8 0x400540 $BigEndian
+    Put-U64 $Bytes 0x4D0 0x400540 $BigEndian
+    Put-U64 $Bytes 0x4D8 0x11 $BigEndian
+    Put-U64 $Bytes 0x4E0 0x11 $BigEndian
+    Put-U64 $Bytes 0x4E8 1 $BigEndian
 
-    Put-U32 $Bytes 0x470 4 $BigEndian
-    Put-U32 $Bytes 0x474 4 $BigEndian
-    Put-U64 $Bytes 0x478 0x4C0 $BigEndian
-    Put-U64 $Bytes 0x480 0x4004C0 $BigEndian
-    Put-U64 $Bytes 0x488 0x4004C0 $BigEndian
-    Put-U64 $Bytes 0x490 0x18 $BigEndian
-    Put-U64 $Bytes 0x498 0x18 $BigEndian
-    Put-U64 $Bytes 0x4A0 4 $BigEndian
+    Put-U32 $Bytes 0x4F0 4 $BigEndian
+    Put-U32 $Bytes 0x4F4 4 $BigEndian
+    Put-U64 $Bytes 0x4F8 0x560 $BigEndian
+    Put-U64 $Bytes 0x500 0x400560 $BigEndian
+    Put-U64 $Bytes 0x508 0x400560 $BigEndian
+    Put-U64 $Bytes 0x510 0x18 $BigEndian
+    Put-U64 $Bytes 0x518 0x18 $BigEndian
+    Put-U64 $Bytes 0x520 4 $BigEndian
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
     }
 
-    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0, 46, 100, 121, 110, 115, 116, 114, 0, 46, 100, 121, 110, 97, 109, 105, 99, 0, 46, 114, 101, 108, 97, 46, 100, 121, 110, 0, 46, 110, 111, 116, 101, 46, 112, 101, 101, 108, 102, 0)
+    $Names = [Text.Encoding]::ASCII.GetBytes("`0.text`0.shstrtab`0.strtab`0.symtab`0.dynstr`0.dynamic`0.rela.dyn`0.note.peelf`0.hash`0.gnu.hash`0")
     for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
         $Bytes[0x90 + $Index] = $Names[$Index]
     }
 
     $SymNames = [byte[]](0, 95, 115, 116, 97, 114, 116, 0)
     for ($Index = [UInt32]0; $Index -lt $SymNames.Length; ++$Index) {
-        $Bytes[0xD8 + $Index] = $SymNames[$Index]
+        $Bytes[0xF0 + $Index] = $SymNames[$Index]
     }
 
     $DynNames = [byte[]](0, 108, 105, 98, 99, 46, 115, 111, 46, 54, 0)
     for ($Index = [UInt32]0; $Index -lt $DynNames.Length; ++$Index) {
-        $Bytes[0x118 + $Index] = $DynNames[$Index]
+        $Bytes[0x138 + $Index] = $DynNames[$Index]
     }
 
-    Put-U64 $Bytes 0x128 1 $BigEndian
-    Put-U64 $Bytes 0x130 1 $BigEndian
-    Put-U64 $Bytes 0x138 0 $BigEndian
-    Put-U64 $Bytes 0x140 0 $BigEndian
-    Put-U64 $Bytes 0x148 0x400088 $BigEndian
-    Put-U64 $Bytes 0x150 0x100000008 $BigEndian
-    Put-U64 $Bytes 0x158 4 $BigEndian
-    Put-Ascii $Bytes 0x160 "/lib/ld-peelf.so"
-    Put-Note $Bytes 0x4C0 $BigEndian
+    Put-U64 $Bytes 0x148 1 $BigEndian
+    Put-U64 $Bytes 0x150 1 $BigEndian
+    Put-U64 $Bytes 0x158 0 $BigEndian
+    Put-U64 $Bytes 0x160 0 $BigEndian
+    Put-U64 $Bytes 0x168 0x400088 $BigEndian
+    Put-U64 $Bytes 0x170 0x100000008 $BigEndian
+    Put-U64 $Bytes 0x178 4 $BigEndian
+    Put-Ascii $Bytes 0x540 "/lib/ld-peelf.so"
+    Put-Note $Bytes 0x560 $BigEndian
+    Put-SysvHash $Bytes 0x580 $BigEndian
+    Put-GnuHash $Bytes 0x5A0 $BigEndian $true
 
-    $StartSym = [UInt32](0xE8 + 0x18)
+    $StartSym = [UInt32](0x100 + 0x18)
     Put-U32 $Bytes ($StartSym + 0x00) 1 $BigEndian
     $Bytes[$StartSym + 0x04] = 0x12
     $Bytes[$StartSym + 0x05] = 0
@@ -580,14 +648,14 @@ function New-Elf64CompatibilityFixture {
     $StringTable = 0x180 + 0xC0
     Put-U32 $Bytes ($StringTable + 0x00) 17 $BigEndian
     Put-U32 $Bytes ($StringTable + 0x04) 3 $BigEndian
-    Put-U64 $Bytes ($StringTable + 0x18) 0xD8 $BigEndian
+    Put-U64 $Bytes ($StringTable + 0x18) 0xF0 $BigEndian
     Put-U64 $Bytes ($StringTable + 0x20) ([UInt64]$SymNames.Length) $BigEndian
     Put-U64 $Bytes ($StringTable + 0x30) 1 $BigEndian
 
     $Symtab = 0x180 + 0x100
     Put-U32 $Bytes ($Symtab + 0x00) 25 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x04) 2 $BigEndian
-    Put-U64 $Bytes ($Symtab + 0x18) 0xE8 $BigEndian
+    Put-U64 $Bytes ($Symtab + 0x18) 0x100 $BigEndian
     Put-U64 $Bytes ($Symtab + 0x20) 0x30 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x28) 3 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x2C) 1 $BigEndian
@@ -597,7 +665,7 @@ function New-Elf64CompatibilityFixture {
     $Dynstr = 0x180 + 0x140
     Put-U32 $Bytes ($Dynstr + 0x00) 33 $BigEndian
     Put-U32 $Bytes ($Dynstr + 0x04) 3 $BigEndian
-    Put-U64 $Bytes ($Dynstr + 0x18) 0x118 $BigEndian
+    Put-U64 $Bytes ($Dynstr + 0x18) 0x138 $BigEndian
     Put-U64 $Bytes ($Dynstr + 0x20) ([UInt64]$DynNames.Length) $BigEndian
     Put-U64 $Bytes ($Dynstr + 0x30) 1 $BigEndian
 
@@ -605,7 +673,7 @@ function New-Elf64CompatibilityFixture {
     Put-U32 $Bytes ($Dynamic + 0x00) 41 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x04) 6 $BigEndian
     Put-U64 $Bytes ($Dynamic + 0x08) 2 $BigEndian
-    Put-U64 $Bytes ($Dynamic + 0x18) 0x128 $BigEndian
+    Put-U64 $Bytes ($Dynamic + 0x18) 0x148 $BigEndian
     Put-U64 $Bytes ($Dynamic + 0x20) 0x20 $BigEndian
     Put-U32 $Bytes ($Dynamic + 0x28) 5 $BigEndian
     Put-U64 $Bytes ($Dynamic + 0x30) 8 $BigEndian
@@ -614,7 +682,7 @@ function New-Elf64CompatibilityFixture {
     $Rela = 0x180 + 0x1C0
     Put-U32 $Bytes ($Rela + 0x00) 50 $BigEndian
     Put-U32 $Bytes ($Rela + 0x04) 4 $BigEndian
-    Put-U64 $Bytes ($Rela + 0x18) 0x148 $BigEndian
+    Put-U64 $Bytes ($Rela + 0x18) 0x168 $BigEndian
     Put-U64 $Bytes ($Rela + 0x20) 0x18 $BigEndian
     Put-U32 $Bytes ($Rela + 0x28) 4 $BigEndian
     Put-U32 $Bytes ($Rela + 0x2C) 1 $BigEndian
@@ -624,9 +692,27 @@ function New-Elf64CompatibilityFixture {
     $Note = 0x180 + 0x200
     Put-U32 $Bytes ($Note + 0x00) 60 $BigEndian
     Put-U32 $Bytes ($Note + 0x04) 7 $BigEndian
-    Put-U64 $Bytes ($Note + 0x18) 0x4C0 $BigEndian
+    Put-U64 $Bytes ($Note + 0x18) 0x560 $BigEndian
     Put-U64 $Bytes ($Note + 0x20) 0x18 $BigEndian
     Put-U64 $Bytes ($Note + 0x30) 4 $BigEndian
+
+    $Hash = 0x180 + 0x240
+    Put-U32 $Bytes ($Hash + 0x00) 72 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x04) 5 $BigEndian
+    Put-U64 $Bytes ($Hash + 0x18) 0x580 $BigEndian
+    Put-U64 $Bytes ($Hash + 0x20) 0x14 $BigEndian
+    Put-U32 $Bytes ($Hash + 0x28) 4 $BigEndian
+    Put-U64 $Bytes ($Hash + 0x30) 4 $BigEndian
+    Put-U64 $Bytes ($Hash + 0x38) 4 $BigEndian
+
+    $GnuHash = 0x180 + 0x280
+    Put-U32 $Bytes ($GnuHash + 0x00) 78 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x04) 0x6ffffff6 $BigEndian
+    Put-U64 $Bytes ($GnuHash + 0x18) 0x5A0 $BigEndian
+    Put-U64 $Bytes ($GnuHash + 0x20) 0x20 $BigEndian
+    Put-U32 $Bytes ($GnuHash + 0x28) 4 $BigEndian
+    Put-U64 $Bytes ($GnuHash + 0x30) 8 $BigEndian
+    Put-U64 $Bytes ($GnuHash + 0x38) 0 $BigEndian
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

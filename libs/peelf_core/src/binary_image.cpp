@@ -96,6 +96,14 @@ public:
         static const std::vector<ElfNote> empty;
         return empty;
     }
+    [[nodiscard]] const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept override {
+        static const std::vector<ElfSysvHashTable> empty;
+        return empty;
+    }
+    [[nodiscard]] const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept override {
+        static const std::vector<ElfGnuHashTable> empty;
+        return empty;
+    }
     [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
         return {};
     }
@@ -166,6 +174,12 @@ public:
     [[nodiscard]] const std::vector<ElfNote>& elf_notes() const noexcept override {
         return notes_;
     }
+    [[nodiscard]] const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept override {
+        return sysv_hash_tables_;
+    }
+    [[nodiscard]] const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept override {
+        return gnu_hash_tables_;
+    }
     [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
         return interpreter_;
     }
@@ -179,6 +193,8 @@ private:
     std::vector<ElfDynamicEntry> dynamic_entries_;
     std::vector<ElfRelocation> relocations_;
     std::vector<ElfNote> notes_;
+    std::vector<ElfSysvHashTable> sysv_hash_tables_;
+    std::vector<ElfGnuHashTable> gnu_hash_tables_;
     std::string interpreter_;
 };
 
@@ -312,6 +328,88 @@ void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t of
     }
 }
 
+void parse_elf_sysv_hash(std::span<const std::uint8_t> b, bool big,
+                         const ElfSectionHeader& sh,
+                         std::vector<ElfSysvHashTable>& hash_tables_out) {
+    if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size())) || sh.size < 8) {
+        return;
+    }
+
+    const std::size_t off = static_cast<std::size_t>(sh.offset);
+    const std::uint32_t bucket_count = rd32(b, off + 0x00, big);
+    const std::uint32_t chain_count = rd32(b, off + 0x04, big);
+    const std::uint64_t bucket_bytes = static_cast<std::uint64_t>(bucket_count) * 4u;
+    const std::uint64_t chain_bytes = static_cast<std::uint64_t>(chain_count) * 4u;
+    if (bucket_bytes > std::numeric_limits<std::uint64_t>::max() - 8u ||
+        chain_bytes > std::numeric_limits<std::uint64_t>::max() - 8u - bucket_bytes ||
+        8u + bucket_bytes + chain_bytes > sh.size) {
+        return;
+    }
+
+    ElfSysvHashTable table;
+    table.section_name = sh.name;
+    table.bucket_count = bucket_count;
+    table.chain_count = chain_count;
+    table.buckets.reserve(bucket_count);
+    table.chains.reserve(chain_count);
+    std::uint64_t cursor = sh.offset + 8u;
+    for (std::uint32_t i = 0; i < bucket_count; ++i, cursor += 4u) {
+        table.buckets.push_back(rd32(b, static_cast<std::size_t>(cursor), big));
+    }
+    for (std::uint32_t i = 0; i < chain_count; ++i, cursor += 4u) {
+        table.chains.push_back(rd32(b, static_cast<std::size_t>(cursor), big));
+    }
+    hash_tables_out.push_back(std::move(table));
+}
+
+void parse_elf_gnu_hash(std::span<const std::uint8_t> b, bool is64, bool big,
+                        const ElfSectionHeader& sh,
+                        std::vector<ElfGnuHashTable>& hash_tables_out) {
+    if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size())) || sh.size < 16) {
+        return;
+    }
+
+    const std::size_t off = static_cast<std::size_t>(sh.offset);
+    const std::uint32_t bucket_count = rd32(b, off + 0x00, big);
+    const std::uint32_t symbol_offset = rd32(b, off + 0x04, big);
+    const std::uint32_t bloom_word_count = rd32(b, off + 0x08, big);
+    const std::uint32_t bloom_shift = rd32(b, off + 0x0C, big);
+    const std::uint64_t bloom_word_size = is64 ? 8u : 4u;
+    const std::uint64_t bloom_bytes = static_cast<std::uint64_t>(bloom_word_count) * bloom_word_size;
+    const std::uint64_t bucket_bytes = static_cast<std::uint64_t>(bucket_count) * 4u;
+    if (bloom_bytes > std::numeric_limits<std::uint64_t>::max() - 16u ||
+        bucket_bytes > std::numeric_limits<std::uint64_t>::max() - 16u - bloom_bytes ||
+        16u + bloom_bytes + bucket_bytes > sh.size) {
+        return;
+    }
+
+    ElfGnuHashTable table;
+    table.section_name = sh.name;
+    table.bucket_count = bucket_count;
+    table.symbol_offset = symbol_offset;
+    table.bloom_word_count = bloom_word_count;
+    table.bloom_shift = bloom_shift;
+    table.bloom.reserve(bloom_word_count);
+    table.buckets.reserve(bucket_count);
+
+    std::uint64_t cursor = sh.offset + 16u;
+    for (std::uint32_t i = 0; i < bloom_word_count; ++i, cursor += bloom_word_size) {
+        table.bloom.push_back(is64 ? rd64(b, static_cast<std::size_t>(cursor), big)
+                                   : rd32(b, static_cast<std::size_t>(cursor), big));
+    }
+    for (std::uint32_t i = 0; i < bucket_count; ++i, cursor += 4u) {
+        table.buckets.push_back(rd32(b, static_cast<std::size_t>(cursor), big));
+    }
+
+    const std::uint64_t chain_bytes = sh.size - (cursor - sh.offset);
+    const std::uint64_t chain_count = chain_bytes / 4u;
+    table.chains.reserve(static_cast<std::size_t>(chain_count));
+    for (std::uint64_t i = 0; i < chain_count; ++i, cursor += 4u) {
+        table.chains.push_back(rd32(b, static_cast<std::size_t>(cursor), big));
+    }
+    hash_tables_out.push_back(std::move(table));
+}
+
 void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t phoff, std::uint16_t phentsize,
                         std::uint16_t phnum, std::vector<ElfProgramHeader>& headers_out,
@@ -388,6 +486,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::vector<ElfDynamicEntry>& dynamic_entries_out,
                         std::vector<ElfRelocation>& relocations_out,
                         std::vector<ElfNote>& notes_out,
+                        std::vector<ElfSysvHashTable>& sysv_hash_tables_out,
+                        std::vector<ElfGnuHashTable>& gnu_hash_tables_out,
                         std::vector<ImportEntry>& imports_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
@@ -603,6 +703,14 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     }
 
     for (const auto& sh : headers) {
+        if (sh.type == 5) {  // SHT_HASH
+            parse_elf_sysv_hash(b, big, sh, sysv_hash_tables_out);
+        } else if (sh.type == 0x6FFF'FFF6u) {  // SHT_GNU_HASH
+            parse_elf_gnu_hash(b, is64, big, sh, gnu_hash_tables_out);
+        }
+    }
+
+    for (const auto& sh : headers) {
         const bool has_addend = sh.type == 4;     // SHT_RELA
         const bool no_addend = sh.type == 9;      // SHT_REL
         if (!has_addend && !no_addend) {
@@ -722,7 +830,8 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
                        img->program_headers_, img->segments_, img->interpreter_, img->notes_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
-                       img->dynamic_entries_, img->relocations_, img->notes_, img->imports_);
+                       img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
+                       img->gnu_hash_tables_, img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
