@@ -61,6 +61,7 @@ struct ExpectedImage {
     peelf::Format format;
     peelf::Architecture architecture;
     peelf::ImageKind kind;
+    peelf::Endianness endianness;
     bool is_64bit;
     std::uint64_t entry_point;
     std::uint64_t text_file_offset;
@@ -179,13 +180,13 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
 TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
     constexpr std::array<ExpectedImage, 4> fixtures{{
         {"known-linux-x64.elf", peelf::Format::ELF, peelf::Architecture::X86_64,
-         peelf::ImageKind::Executable, true, 0x400080, 0x80, 0x400080},
+         peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x400080, 0x80, 0x400080},
         {"known-linux-arm64.elf", peelf::Format::ELF, peelf::Architecture::ARM64,
-         peelf::ImageKind::Executable, true, 0x400080, 0x80, 0x400080},
+         peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x400080, 0x80, 0x400080},
         {"known-linux-riscv64.elf", peelf::Format::ELF, peelf::Architecture::RISCV64,
-         peelf::ImageKind::Executable, true, 0x400080, 0x80, 0x400080},
+         peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x400080, 0x80, 0x400080},
         {"known-win-x64.exe", peelf::Format::PE, peelf::Architecture::X86_64,
-         peelf::ImageKind::Executable, true, 0x140001000, 0x200, 0x140001000},
+         peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x140001000, 0x200, 0x140001000},
     }};
 
     for (const ExpectedImage& expected : fixtures) {
@@ -200,6 +201,7 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
         EXPECT_EQ(img.format(), expected.format) << expected.name;
         EXPECT_EQ(img.architecture(), expected.architecture) << expected.name;
         EXPECT_EQ(img.kind(), expected.kind) << expected.name;
+        EXPECT_EQ(img.endianness(), expected.endianness) << expected.name;
         EXPECT_EQ(img.is_64bit(), expected.is_64bit) << expected.name;
         EXPECT_EQ(img.entry_point(), expected.entry_point) << expected.name;
 
@@ -260,6 +262,61 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             EXPECT_EQ(exported.ordinal, 1u) << expected.name;
             EXPECT_EQ(exported.virtual_address, expected.text_virtual_address) << expected.name;
             EXPECT_TRUE(exported.forwarder.empty()) << expected.name;
+        }
+    }
+}
+
+TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
+    constexpr std::array<ExpectedImage, 4> fixtures{{
+        {"known-linux-x86-elf32-le.elf", peelf::Format::ELF, peelf::Architecture::X86,
+         peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-mips-elf32-be.elf", peelf::Format::ELF, peelf::Architecture::MIPS,
+         peelf::ImageKind::Executable, peelf::Endianness::Big, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-ppc64-elf64-be.elf", peelf::Format::ELF, peelf::Architecture::PowerPC64,
+         peelf::ImageKind::Executable, peelf::Endianness::Big, true, 0x400080, 0x80, 0x400080},
+        {"known-win-x86.exe", peelf::Format::PE, peelf::Architecture::X86,
+         peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x401000, 0x200, 0x401000},
+    }};
+
+    for (const ExpectedImage& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::IBinaryImage& img = **result;
+        EXPECT_EQ(img.format(), expected.format) << expected.name;
+        EXPECT_EQ(img.architecture(), expected.architecture) << expected.name;
+        EXPECT_EQ(img.kind(), expected.kind) << expected.name;
+        EXPECT_EQ(img.endianness(), expected.endianness) << expected.name;
+        EXPECT_EQ(img.is_64bit(), expected.is_64bit) << expected.name;
+        EXPECT_EQ(img.entry_point(), expected.entry_point) << expected.name;
+
+        const auto text = std::ranges::find_if(img.sections(), [](const peelf::Section& section) {
+            return section.name == ".text";
+        });
+        ASSERT_NE(text, img.sections().end()) << expected.name;
+        EXPECT_EQ(text->file_offset, expected.text_file_offset) << expected.name;
+        EXPECT_EQ(text->virtual_address, expected.text_virtual_address) << expected.name;
+        EXPECT_TRUE(text->readable) << expected.name;
+        EXPECT_TRUE(text->executable) << expected.name;
+        EXPECT_FALSE(text->writable) << expected.name;
+
+        EXPECT_EQ(img.file_offset_to_virtual_address(expected.text_file_offset),
+                  std::optional<std::uint64_t>(expected.text_virtual_address)) << expected.name;
+        EXPECT_EQ(img.virtual_address_to_file_offset(expected.text_virtual_address),
+                  std::optional<std::uint64_t>(expected.text_file_offset)) << expected.name;
+
+        if (expected.format == peelf::Format::ELF) {
+            ASSERT_EQ(img.segments().size(), 1u) << expected.name;
+            EXPECT_EQ(img.segments().front().virtual_address, expected.text_virtual_address) << expected.name;
+            EXPECT_EQ(img.segments().front().file_offset, expected.text_file_offset) << expected.name;
+            EXPECT_TRUE(img.segments().front().readable) << expected.name;
+            EXPECT_TRUE(img.segments().front().executable) << expected.name;
+        } else {
+            EXPECT_TRUE(img.segments().empty()) << expected.name;
         }
     }
 }

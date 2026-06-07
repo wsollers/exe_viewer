@@ -18,10 +18,18 @@ Small binary samples used by the unit tests.
 - `known-linux-riscv64.elf` — deterministic minimal ELF64 executable fixture with a
   `.text` section, one `_start` function symbol, one `DT_NEEDED` library, and
   `EM_RISCV`.
+- `known-linux-x86-elf32-le.elf` — deterministic minimal ELF32 little-endian executable
+  fixture with a `.text` section, one load segment, and `EM_386`.
+- `known-linux-mips-elf32-be.elf` — deterministic minimal ELF32 big-endian executable
+  fixture with a `.text` section, one load segment, and `EM_MIPS`.
+- `known-linux-ppc64-elf64-be.elf` — deterministic minimal ELF64 big-endian executable
+  fixture with a `.text` section, one load segment, and `EM_PPC64`.
+- `known-win-x86.exe` — deterministic minimal PE32 executable fixture with a `.text`
+  section and `IMAGE_FILE_MACHINE_I386`.
 - `known-win-x64.exe` — deterministic minimal PE32+ executable fixture with a
   `.text` section, one import `KERNEL32.dll!ExitProcess`, one export named `known_export`, and
   `IMAGE_FILE_MACHINE_AMD64`.
-- `make_known_fixtures.ps1` — regenerates the four `known-*` binary fixtures from
+- `make_known_fixtures.ps1` — regenerates the `known-*` binary fixtures from
   explicit fixed-width field writes.
 
 > If `hello.elf` is not present, the `ElfFixture.HasElfMagic` test will *skip*
@@ -33,8 +41,8 @@ Small binary samples used by the unit tests.
 Prefer small, license-clean samples (compile your own where possible). Suggested
 additions as parsing features land:
 
-- a PE `.exe` and a PE `.dll` (32-bit and 64-bit)
-- a stripped ELF and a big-endian ELF
+- a PE `.dll` (32-bit and 64-bit)
+- a stripped ELF
 - truncated / corrupt inputs for negative tests
 
 Keep individual fixtures small and document what each one is for here.

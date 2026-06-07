@@ -22,6 +22,55 @@ function Put-U64LE {
     }
 }
 
+function Put-U16BE {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt16]$Value)
+    $Bytes[$Offset + 0] = [byte](($Value -shr 8) -band 0xff)
+    $Bytes[$Offset + 1] = [byte]($Value -band 0xff)
+}
+
+function Put-U32BE {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt32]$Value)
+    for ($Index = [UInt32]0; $Index -lt 4; ++$Index) {
+        $Shift = [Int32](8 * (3 - $Index))
+        $Bytes[$Offset + $Index] = [byte](($Value -shr $Shift) -band 0xff)
+    }
+}
+
+function Put-U64BE {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt64]$Value)
+    for ($Index = [UInt32]0; $Index -lt 8; ++$Index) {
+        $Shift = [Int32](8 * (7 - $Index))
+        $Bytes[$Offset + $Index] = [byte](($Value -shr $Shift) -band 0xff)
+    }
+}
+
+function Put-U16 {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt16]$Value, [bool]$BigEndian)
+    if ($BigEndian) {
+        Put-U16BE $Bytes $Offset $Value
+    } else {
+        Put-U16LE $Bytes $Offset $Value
+    }
+}
+
+function Put-U32 {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt32]$Value, [bool]$BigEndian)
+    if ($BigEndian) {
+        Put-U32BE $Bytes $Offset $Value
+    } else {
+        Put-U32LE $Bytes $Offset $Value
+    }
+}
+
+function Put-U64 {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt64]$Value, [bool]$BigEndian)
+    if ($BigEndian) {
+        Put-U64BE $Bytes $Offset $Value
+    } else {
+        Put-U64LE $Bytes $Offset $Value
+    }
+}
+
 function Put-Ascii {
     param([byte[]]$Bytes, [UInt32]$Offset, [string]$Text)
     $Data = [Text.Encoding]::ASCII.GetBytes($Text)
@@ -212,7 +261,170 @@ function New-Pe64Fixture {
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }
 
+function New-Elf32CompatibilityFixture {
+    param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
+
+    $Bytes = [byte[]]::new(0x200)
+    $Bytes[0] = 0x7f
+    $Bytes[1] = [byte][char]'E'
+    $Bytes[2] = [byte][char]'L'
+    $Bytes[3] = [byte][char]'F'
+    $Bytes[4] = 1
+    $Bytes[5] = if ($BigEndian) { 2 } else { 1 }
+    $Bytes[6] = 1
+
+    Put-U16 $Bytes 0x10 2 $BigEndian
+    Put-U16 $Bytes 0x12 $Machine $BigEndian
+    Put-U32 $Bytes 0x14 1 $BigEndian
+    Put-U32 $Bytes 0x18 0x400080 $BigEndian
+    Put-U32 $Bytes 0x1c 0x34 $BigEndian
+    Put-U32 $Bytes 0x20 0x100 $BigEndian
+    Put-U16 $Bytes 0x28 0x34 $BigEndian
+    Put-U16 $Bytes 0x2a 0x20 $BigEndian
+    Put-U16 $Bytes 0x2c 1 $BigEndian
+    Put-U16 $Bytes 0x2e 0x28 $BigEndian
+    Put-U16 $Bytes 0x30 3 $BigEndian
+    Put-U16 $Bytes 0x32 2 $BigEndian
+
+    Put-U32 $Bytes 0x34 1 $BigEndian
+    Put-U32 $Bytes 0x38 0x80 $BigEndian
+    Put-U32 $Bytes 0x3c 0x400080 $BigEndian
+    Put-U32 $Bytes 0x40 0x400080 $BigEndian
+    Put-U32 $Bytes 0x44 0x10 $BigEndian
+    Put-U32 $Bytes 0x48 0x10 $BigEndian
+    Put-U32 $Bytes 0x4c 5 $BigEndian
+    Put-U32 $Bytes 0x50 0x1000 $BigEndian
+
+    for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
+        $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
+    }
+
+    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0)
+    for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
+        $Bytes[0x90 + $Index] = $Names[$Index]
+    }
+
+    $Text = 0x100 + 0x28
+    Put-U32 $Bytes ($Text + 0x00) 1 $BigEndian
+    Put-U32 $Bytes ($Text + 0x04) 1 $BigEndian
+    Put-U32 $Bytes ($Text + 0x08) 6 $BigEndian
+    Put-U32 $Bytes ($Text + 0x0c) 0x400080 $BigEndian
+    Put-U32 $Bytes ($Text + 0x10) 0x80 $BigEndian
+    Put-U32 $Bytes ($Text + 0x14) 0x10 $BigEndian
+    Put-U32 $Bytes ($Text + 0x20) 0x10 $BigEndian
+
+    $Shstr = 0x100 + 0x50
+    Put-U32 $Bytes ($Shstr + 0x00) 7 $BigEndian
+    Put-U32 $Bytes ($Shstr + 0x04) 3 $BigEndian
+    Put-U32 $Bytes ($Shstr + 0x10) 0x90 $BigEndian
+    Put-U32 $Bytes ($Shstr + 0x14) ([UInt32]$Names.Length) $BigEndian
+    Put-U32 $Bytes ($Shstr + 0x20) 1 $BigEndian
+
+    [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
+}
+
+function New-Elf64CompatibilityFixture {
+    param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
+
+    $Bytes = [byte[]]::new(0x240)
+    $Bytes[0] = 0x7f
+    $Bytes[1] = [byte][char]'E'
+    $Bytes[2] = [byte][char]'L'
+    $Bytes[3] = [byte][char]'F'
+    $Bytes[4] = 2
+    $Bytes[5] = if ($BigEndian) { 2 } else { 1 }
+    $Bytes[6] = 1
+
+    Put-U16 $Bytes 0x10 2 $BigEndian
+    Put-U16 $Bytes 0x12 $Machine $BigEndian
+    Put-U32 $Bytes 0x14 1 $BigEndian
+    Put-U64 $Bytes 0x18 0x400080 $BigEndian
+    Put-U64 $Bytes 0x20 0x40 $BigEndian
+    Put-U64 $Bytes 0x28 0x100 $BigEndian
+    Put-U16 $Bytes 0x34 0x40 $BigEndian
+    Put-U16 $Bytes 0x36 0x38 $BigEndian
+    Put-U16 $Bytes 0x38 1 $BigEndian
+    Put-U16 $Bytes 0x3a 0x40 $BigEndian
+    Put-U16 $Bytes 0x3c 3 $BigEndian
+    Put-U16 $Bytes 0x3e 2 $BigEndian
+
+    Put-U32 $Bytes 0x40 1 $BigEndian
+    Put-U32 $Bytes 0x44 5 $BigEndian
+    Put-U64 $Bytes 0x48 0x80 $BigEndian
+    Put-U64 $Bytes 0x50 0x400080 $BigEndian
+    Put-U64 $Bytes 0x58 0x400080 $BigEndian
+    Put-U64 $Bytes 0x60 0x10 $BigEndian
+    Put-U64 $Bytes 0x68 0x10 $BigEndian
+    Put-U64 $Bytes 0x70 0x1000 $BigEndian
+
+    for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
+        $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
+    }
+
+    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0)
+    for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
+        $Bytes[0x90 + $Index] = $Names[$Index]
+    }
+
+    $Text = 0x100 + 0x40
+    Put-U32 $Bytes ($Text + 0x00) 1 $BigEndian
+    Put-U32 $Bytes ($Text + 0x04) 1 $BigEndian
+    Put-U64 $Bytes ($Text + 0x08) 6 $BigEndian
+    Put-U64 $Bytes ($Text + 0x10) 0x400080 $BigEndian
+    Put-U64 $Bytes ($Text + 0x18) 0x80 $BigEndian
+    Put-U64 $Bytes ($Text + 0x20) 0x10 $BigEndian
+    Put-U64 $Bytes ($Text + 0x30) 0x10 $BigEndian
+
+    $Shstr = 0x100 + 0x80
+    Put-U32 $Bytes ($Shstr + 0x00) 7 $BigEndian
+    Put-U32 $Bytes ($Shstr + 0x04) 3 $BigEndian
+    Put-U64 $Bytes ($Shstr + 0x18) 0x90 $BigEndian
+    Put-U64 $Bytes ($Shstr + 0x20) ([UInt64]$Names.Length) $BigEndian
+    Put-U64 $Bytes ($Shstr + 0x30) 1 $BigEndian
+
+    [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
+}
+
+function New-Pe32Fixture {
+    param([string]$Name)
+
+    $Bytes = [byte[]]::new(0x300)
+    $Bytes[0] = [byte][char]'M'
+    $Bytes[1] = [byte][char]'Z'
+    Put-U32LE $Bytes 0x3c 0x80
+
+    Put-Ascii $Bytes 0x80 "PE"
+    $Coff = [UInt32](0x80 + 4)
+    Put-U16LE $Bytes ($Coff + 0) 0x014c
+    Put-U16LE $Bytes ($Coff + 2) 1
+    Put-U16LE $Bytes ($Coff + 16) 0x00e0
+    Put-U16LE $Bytes ($Coff + 18) 0x0102
+
+    $Opt = [UInt32]($Coff + 20)
+    Put-U16LE $Bytes ($Opt + 0) 0x010b
+    Put-U32LE $Bytes ($Opt + 16) 0x1000
+    Put-U32LE $Bytes ($Opt + 28) 0x00400000
+    Put-U32LE $Bytes ($Opt + 0x5C) 16
+
+    $Sect = [UInt32]($Opt + 0x00e0)
+    Put-Ascii $Bytes $Sect ".text"
+    Put-U32LE $Bytes ($Sect + 8) 0x100
+    Put-U32LE $Bytes ($Sect + 12) 0x1000
+    Put-U32LE $Bytes ($Sect + 16) 0x100
+    Put-U32LE $Bytes ($Sect + 20) 0x200
+    Put-U32LE $Bytes ($Sect + 36) 0x60000020
+    for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
+        $Bytes[0x200 + $Index] = [byte](0xcc)
+    }
+
+    [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
+}
+
 New-Elf64Fixture "known-linux-x64.elf" 62
 New-Elf64Fixture "known-linux-arm64.elf" 183
 New-Elf64Fixture "known-linux-riscv64.elf" 243
+New-Elf32CompatibilityFixture "known-linux-x86-elf32-le.elf" 3 $false
+New-Elf32CompatibilityFixture "known-linux-mips-elf32-be.elf" 8 $true
+New-Elf64CompatibilityFixture "known-linux-ppc64-elf64-be.elf" 21 $true
+New-Pe32Fixture "known-win-x86.exe"
 New-Pe64Fixture "known-win-x64.exe"
