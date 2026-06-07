@@ -65,6 +65,16 @@ namespace viewer {
 
     };
 
+    class SymbolsPanel : public UiPanel {
+    public:
+        explicit SymbolsPanel(BinaryModel& model);
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        char filter_buf_[128] = {};
+    };
+
     class LogPanel : public UiPanel {
     public:
         explicit LogPanel(std::size_t capacity = 5000); // ring buffer capacity

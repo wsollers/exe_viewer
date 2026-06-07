@@ -67,6 +67,7 @@ public:
     [[nodiscard]] std::uint64_t entry_point() const noexcept override { return entry_; }
     [[nodiscard]] const std::vector<Section>& sections() const noexcept override { return sections_; }
     [[nodiscard]] const std::vector<Segment>& segments() const noexcept override { return segments_; }
+    [[nodiscard]] const std::vector<Symbol>& symbols() const noexcept override { return symbols_; }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -108,6 +109,7 @@ protected:
     std::uint64_t entry_ = 0;
     std::vector<Section> sections_;
     std::vector<Segment> segments_;
+    std::vector<Symbol> symbols_;
 };
 
 class ElfImage final : public ImageBase {
@@ -206,7 +208,7 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t shoff, std::uint16_t shentsize,
                         std::uint16_t shnum, std::uint16_t shstrndx,
-                        std::vector<Section>& out) {
+                        std::vector<Section>& out, std::vector<Symbol>& symbols_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
     }
@@ -226,6 +228,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         std::uint64_t addr = 0;
         std::uint64_t offset = 0;
         std::uint64_t size = 0;
+        std::uint32_t link = 0;
+        std::uint64_t entsize = 0;
     };
     const auto read_sh = [&](std::size_t hdr) {
         ShFields s{};
@@ -236,31 +240,45 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             s.addr   = rd64(b, hdr + 0x10, big);
             s.offset = rd64(b, hdr + 0x18, big);
             s.size   = rd64(b, hdr + 0x20, big);
+            s.link   = rd32(b, hdr + 0x28, big);
+            s.entsize = rd64(b, hdr + 0x38, big);
         } else {
             s.flags  = rd32(b, hdr + 0x08, big);
             s.addr   = rd32(b, hdr + 0x0C, big);
             s.offset = rd32(b, hdr + 0x10, big);
             s.size   = rd32(b, hdr + 0x14, big);
+            s.link   = rd32(b, hdr + 0x18, big);
+            s.entsize = rd32(b, hdr + 0x24, big);
         }
         return s;
     };
 
+    std::vector<ShFields> headers;
+    headers.reserve(shnum);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(i) * shentsize;
+        headers.push_back(read_sh(static_cast<std::size_t>(hdr)));
+    }
+
     // Section-name string table = section[e_shstrndx].
     std::uint64_t strtab_off = 0;
+    std::uint64_t strtab_size = 0;
     if (shstrndx != 0 && shstrndx < shnum && shstrndx != 0xFFFF) {
-        const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(shstrndx) * shentsize;
-        const auto sh = read_sh(static_cast<std::size_t>(hdr));
+        const auto& sh = headers[shstrndx];
         strtab_off = sh.offset;
+        strtab_size = sh.size;
     }
-    const auto read_name = [&](std::uint32_t name_off) -> std::string {
-        if (strtab_off == 0) {
+    const auto read_string = [&](std::uint64_t base, std::uint64_t size,
+                                 std::uint32_t name_off) -> std::string {
+        if (base == 0) {
             return {};
         }
-        if (!fits_range(strtab_off, name_off, static_cast<std::uint64_t>(b.size()))) {
+        if (name_off >= size || !fits_range(base, size, static_cast<std::uint64_t>(b.size()))) {
             return {};
         }
         std::string s;
-        for (std::uint64_t i = strtab_off + name_off; i < b.size() && b[static_cast<std::size_t>(i)] != 0;
+        const std::uint64_t end = base + size;
+        for (std::uint64_t i = base + name_off; i < end && b[static_cast<std::size_t>(i)] != 0;
              ++i) {
             s.push_back(static_cast<char>(b[static_cast<std::size_t>(i)]));
             if (s.size() >= 256) {
@@ -269,13 +287,15 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         }
         return s;
     };
+    const auto read_section_name = [&](std::uint32_t name_off) -> std::string {
+        return read_string(strtab_off, strtab_size, name_off);
+    };
 
     out.reserve(shnum);
     for (std::uint16_t i = 0; i < shnum; ++i) {
-        const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(i) * shentsize;
-        const auto sh = read_sh(static_cast<std::size_t>(hdr));
+        const auto& sh = headers[i];
         Section sec;
-        sec.name            = read_name(sh.name);
+        sec.name            = read_section_name(sh.name);
         sec.virtual_address = sh.addr;
         sec.virtual_size    = sh.size;
         sec.file_offset     = sh.offset;
@@ -284,6 +304,61 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         sec.writable   = (sh.flags & 0x1) != 0;  // SHF_WRITE
         sec.executable = (sh.flags & 0x4) != 0;  // SHF_EXECINSTR
         out.push_back(std::move(sec));
+    }
+
+    for (std::uint16_t section_index = 0; section_index < shnum; ++section_index) {
+        const auto& sh = headers[section_index];
+        const bool is_symtab = sh.type == 2;   // SHT_SYMTAB
+        const bool is_dynsym = sh.type == 11;  // SHT_DYNSYM
+        if (!is_symtab && !is_dynsym) {
+            continue;
+        }
+
+        const std::uint64_t min_sym = is64 ? 0x18 : 0x10;
+        const std::uint64_t entry_size = sh.entsize != 0 ? sh.entsize : min_sym;
+        if (entry_size < min_sym || sh.link >= headers.size() ||
+            !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        const auto& strings = headers[sh.link];
+        if (!fits_range(strings.offset, strings.size, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        const std::uint64_t count = sh.size / entry_size;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const std::uint64_t sym_off = sh.offset + i * entry_size;
+            if (!fits_range(sym_off, min_sym, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+
+            const std::size_t off = static_cast<std::size_t>(sym_off);
+            Symbol symbol;
+            std::uint32_t name_off = 0;
+            std::uint8_t info = 0;
+            if (is64) {
+                name_off = rd32(b, off + 0x00, big);
+                info = b[off + 0x04];
+                symbol.section_index = rd16(b, off + 0x06, big);
+                symbol.virtual_address = rd64(b, off + 0x08, big);
+                symbol.size = rd64(b, off + 0x10, big);
+            } else {
+                name_off = rd32(b, off + 0x00, big);
+                symbol.virtual_address = rd32(b, off + 0x04, big);
+                symbol.size = rd32(b, off + 0x08, big);
+                info = b[off + 0x0C];
+                symbol.section_index = rd16(b, off + 0x0E, big);
+            }
+            symbol.binding = static_cast<std::uint8_t>(info >> 4);
+            symbol.type = static_cast<std::uint8_t>(info & 0x0F);
+            symbol.dynamic = is_dynsym;
+            symbol.name = read_string(strings.offset, strings.size, name_off);
+
+            if (!symbol.name.empty()) {
+                symbols_out.push_back(std::move(symbol));
+            }
+        }
     }
 }
 
@@ -335,7 +410,8 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
         const std::uint16_t shnum     = rd16(b, is64 ? 0x3C : 0x30, big);
         const std::uint16_t shstrndx  = rd16(b, is64 ? 0x3E : 0x32, big);
         parse_elf_segments(b, is64, big, phoff, phentsize, phnum, img->segments_);
-        parse_elf_sections(b, is64, big, shoff, shentsize, shnum, shstrndx, img->sections_);
+        parse_elf_sections(b, is64, big, shoff, shentsize, shnum, shstrndx,
+                           img->sections_, img->symbols_);
     }
 
     return std::unique_ptr<IBinaryImage>(std::move(img));

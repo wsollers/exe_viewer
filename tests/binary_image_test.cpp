@@ -228,8 +228,20 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             EXPECT_TRUE(segment.readable) << expected.name;
             EXPECT_TRUE(segment.executable) << expected.name;
             EXPECT_FALSE(segment.writable) << expected.name;
+
+            const auto start_symbol = std::ranges::find_if(img.symbols(), [](const peelf::Symbol& symbol) {
+                return symbol.name == "_start";
+            });
+            ASSERT_NE(start_symbol, img.symbols().end()) << expected.name;
+            EXPECT_EQ(start_symbol->virtual_address, expected.text_virtual_address) << expected.name;
+            EXPECT_EQ(start_symbol->size, 0x10u) << expected.name;
+            EXPECT_EQ(start_symbol->binding, 1u) << expected.name;  // STB_GLOBAL
+            EXPECT_EQ(start_symbol->type, 2u) << expected.name;     // STT_FUNC
+            EXPECT_EQ(start_symbol->section_index, 1u) << expected.name;
+            EXPECT_FALSE(start_symbol->dynamic) << expected.name;
         } else {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
+            EXPECT_TRUE(img.symbols().empty()) << expected.name;
         }
     }
 }
