@@ -80,7 +80,30 @@ TEST(BinaryImage, ParsesElfFixtureIdentity) {
     EXPECT_EQ(img.endianness(), peelf::Endianness::Little);
     EXPECT_EQ(img.kind(), peelf::ImageKind::SharedLibrary);  // ET_DYN (PIE executable)
     EXPECT_GT(img.entry_point(), 0u);
-    EXPECT_TRUE(img.sections().empty());  // sections arrive in Phase 2
+    EXPECT_FALSE(img.sections().empty());  // sections parsed in Phase 2 (P2-1)
+}
+
+TEST(BinaryImage, ParsesElfFixtureSections) {
+    const auto path = fixture_path("hello.elf");
+    if (!std::filesystem::exists(path)) {
+        GTEST_SKIP() << "fixture not present yet: " << path.string();
+    }
+
+    const std::vector<std::uint8_t> bytes = read_all(path);
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value());
+
+    const auto& secs = (**result).sections();
+    ASSERT_FALSE(secs.empty());
+
+    bool found_text = false;
+    for (const auto& s : secs) {
+        if (s.name == ".text") {
+            found_text = true;
+            EXPECT_TRUE(s.executable);
+        }
+    }
+    EXPECT_TRUE(found_text) << "expected a .text section in hello.elf";
 }
 
 TEST(BinaryImage, ParsesSyntheticPe64Identity) {
@@ -99,11 +122,24 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     put16(b, coff + 0, 0x8664);    // Machine = AMD64
     put16(b, coff + 16, 0x00F0);   // SizeOfOptionalHeader
     put16(b, coff + 18, 0x0022);   // Characteristics: EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE (no DLL)
+    put16(b, coff + 2, 1);         // NumberOfSections
 
     const std::size_t opt = coff + 20;
     put16(b, opt + 0, 0x020B);                 // Magic = PE32+
     put32(b, opt + 16, 0x1000);                // AddressOfEntryPoint (RVA)
     put64(b, opt + 24, 0x140000000ULL);        // ImageBase (PE32+)
+
+    // One section header (".text") immediately after the optional header.
+    const std::size_t sect = opt + 0xF0;
+    const char* sname = ".text";
+    for (std::size_t i = 0; sname[i] != '\0'; ++i) {
+        b[sect + i] = static_cast<std::uint8_t>(sname[i]);
+    }
+    put32(b, sect + 8, 0x0100);        // VirtualSize
+    put32(b, sect + 12, 0x1000);       // VirtualAddress (RVA)
+    put32(b, sect + 16, 0x0100);       // SizeOfRawData
+    put32(b, sect + 20, 0x0400);       // PointerToRawData
+    put32(b, sect + 36, 0x60000020);   // CNT_CODE | MEM_EXECUTE | MEM_READ
 
     auto result = peelf::parse_image(b);
     ASSERT_TRUE(result.has_value()) << "parse_image failed on the synthetic PE";
@@ -115,6 +151,14 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_EQ(img.endianness(), peelf::Endianness::Little);
     EXPECT_EQ(img.kind(), peelf::ImageKind::Executable);
     EXPECT_EQ(img.entry_point(), 0x140000000ULL + 0x1000);
+
+    ASSERT_EQ(img.sections().size(), 1u);
+    const auto& sec = img.sections().front();
+    EXPECT_EQ(sec.name, ".text");
+    EXPECT_EQ(sec.virtual_address, 0x140000000ULL + 0x1000);
+    EXPECT_TRUE(sec.executable);
+    EXPECT_TRUE(sec.readable);
+    EXPECT_FALSE(sec.writable);
 }
 
 TEST(BinaryImage, RejectsUnknownFormat) {

@@ -107,6 +107,89 @@ Architecture pe_arch(std::uint16_t machine) noexcept {
     }
 }
 
+// Parse the ELF section header table into `out`. Best-effort and fully bounds-
+// checked: on any inconsistency it returns leaving `out` as-is (identity parsing
+// has already succeeded by the time this runs).
+void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
+                        std::uint64_t shoff, std::uint16_t shentsize,
+                        std::uint16_t shnum, std::uint16_t shstrndx,
+                        std::vector<Section>& out) {
+    if (shoff == 0 || shnum == 0 || shentsize == 0) {
+        return;
+    }
+    const std::uint16_t min_sh = is64 ? 0x40 : 0x28;
+    if (shentsize < min_sh) {
+        return;
+    }
+    const std::uint64_t table_end = shoff + static_cast<std::uint64_t>(shnum) * shentsize;
+    if (table_end > b.size()) {
+        return;  // truncated table
+    }
+
+    struct ShFields {
+        std::uint32_t name = 0;
+        std::uint32_t type = 0;
+        std::uint64_t flags = 0;
+        std::uint64_t addr = 0;
+        std::uint64_t offset = 0;
+        std::uint64_t size = 0;
+    };
+    const auto read_sh = [&](std::size_t hdr) {
+        ShFields s{};
+        s.name = rd32(b, hdr + 0, big);
+        s.type = rd32(b, hdr + 4, big);
+        if (is64) {
+            s.flags  = rd64(b, hdr + 0x08, big);
+            s.addr   = rd64(b, hdr + 0x10, big);
+            s.offset = rd64(b, hdr + 0x18, big);
+            s.size   = rd64(b, hdr + 0x20, big);
+        } else {
+            s.flags  = rd32(b, hdr + 0x08, big);
+            s.addr   = rd32(b, hdr + 0x0C, big);
+            s.offset = rd32(b, hdr + 0x10, big);
+            s.size   = rd32(b, hdr + 0x14, big);
+        }
+        return s;
+    };
+
+    // Section-name string table = section[e_shstrndx].
+    std::uint64_t strtab_off = 0;
+    if (shstrndx != 0 && shstrndx < shnum && shstrndx != 0xFFFF) {
+        const auto sh = read_sh(static_cast<std::size_t>(shoff) +
+                                static_cast<std::size_t>(shstrndx) * shentsize);
+        strtab_off = sh.offset;
+    }
+    const auto read_name = [&](std::uint32_t name_off) -> std::string {
+        if (strtab_off == 0) {
+            return {};
+        }
+        std::string s;
+        for (std::uint64_t i = strtab_off + name_off; i < b.size() && b[i] != 0; ++i) {
+            s.push_back(static_cast<char>(b[i]));
+            if (s.size() >= 256) {
+                break;
+            }
+        }
+        return s;
+    };
+
+    out.reserve(shnum);
+    for (std::uint16_t i = 0; i < shnum; ++i) {
+        const auto sh = read_sh(static_cast<std::size_t>(shoff) +
+                                static_cast<std::size_t>(i) * shentsize);
+        Section sec;
+        sec.name            = read_name(sh.name);
+        sec.virtual_address = sh.addr;
+        sec.virtual_size    = sh.size;
+        sec.file_offset     = sh.offset;
+        sec.file_size       = (sh.type == 8) ? 0 : sh.size;  // SHT_NOBITS has no file data
+        sec.readable   = (sh.flags & 0x2) != 0;  // SHF_ALLOC
+        sec.writable   = (sh.flags & 0x1) != 0;  // SHF_WRITE
+        sec.executable = (sh.flags & 0x4) != 0;  // SHF_EXECINSTR
+        out.push_back(std::move(sec));
+    }
+}
+
 Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8_t> b) {
     if (b.size() < 0x18) {
         return make_error("ELF: too small for identification header");
@@ -141,6 +224,18 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     img->kind_   = elf_kind(e_type);
     img->arch_   = elf_arch(e_machine);
     img->entry_  = e_entry;
+
+    // Sections (P2-1), best-effort: identity above is already valid.
+    const std::size_t ehsize = is64 ? 0x40 : 0x34;
+    if (b.size() >= ehsize) {
+        const std::uint64_t shoff     = is64 ? rd64(b, 0x28, big)
+                                             : static_cast<std::uint64_t>(rd32(b, 0x20, big));
+        const std::uint16_t shentsize = rd16(b, is64 ? 0x3A : 0x2E, big);
+        const std::uint16_t shnum     = rd16(b, is64 ? 0x3C : 0x30, big);
+        const std::uint16_t shstrndx  = rd16(b, is64 ? 0x3E : 0x32, big);
+        parse_elf_sections(b, is64, big, shoff, shentsize, shnum, shstrndx, img->sections_);
+    }
+
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
 
@@ -178,20 +273,15 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     // entry VA = ImageBase + AddressOfEntryPoint.
     // AddressOfEntryPoint: optional-header offset 16 (both PE32 and PE32+).
     // ImageBase: PE32 -> u32 @ offset 28; PE32+ -> u64 @ offset 24.
-    std::uint64_t entry_va = 0;
+    std::uint64_t image_base = 0;
+    if (is64) {
+        if (opt + 32 <= b.size()) image_base = rd64(b, opt + 24, false);
+    } else {
+        if (opt + 32 <= b.size()) image_base = rd32(b, opt + 28, false);
+    }
+    std::uint32_t entry_rva = 0;
     if (opt + 20 <= b.size()) {
-        const std::uint32_t entry_rva = rd32(b, opt + 16, false);
-        std::uint64_t image_base = 0;
-        if (is64) {
-            if (opt + 32 <= b.size()) {
-                image_base = rd64(b, opt + 24, false);
-            }
-        } else {
-            if (opt + 32 <= b.size()) {
-                image_base = rd32(b, opt + 28, false);
-            }
-        }
-        entry_va = image_base + entry_rva;
+        entry_rva = rd32(b, opt + 16, false);
     }
 
     auto img = std::unique_ptr<PeImage>(new PeImage());
@@ -201,7 +291,40 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     img->arch_   = pe_arch(machine);
     // IMAGE_FILE_DLL = 0x2000.
     img->kind_   = (characteristics & 0x2000) ? ImageKind::SharedLibrary : ImageKind::Executable;
-    img->entry_  = entry_va;
+    img->entry_  = image_base + entry_rva;
+
+    // Sections (P2-1): the section table follows the optional header.
+    const std::uint16_t num_sections = rd16(b, coff + 2, false);
+    const std::size_t   sect_table   = opt + size_of_opt;
+    constexpr std::size_t kSectHdr = 0x28;  // 40-byte section header
+    img->sections_.reserve(num_sections);
+    for (std::uint16_t i = 0; i < num_sections; ++i) {
+        const std::size_t hdr = sect_table + static_cast<std::size_t>(i) * kSectHdr;
+        if (hdr + kSectHdr > b.size()) {
+            break;  // truncated
+        }
+        std::string name;
+        for (std::size_t j = 0; j < 8 && b[hdr + j] != 0; ++j) {
+            name.push_back(static_cast<char>(b[hdr + j]));
+        }
+        const std::uint32_t vsize   = rd32(b, hdr + 8, false);
+        const std::uint32_t vaddr   = rd32(b, hdr + 12, false);
+        const std::uint32_t rawsize = rd32(b, hdr + 16, false);
+        const std::uint32_t rawptr  = rd32(b, hdr + 20, false);
+        const std::uint32_t chars   = rd32(b, hdr + 36, false);
+
+        Section sec;
+        sec.name            = std::move(name);
+        sec.virtual_address = image_base + vaddr;
+        sec.virtual_size    = vsize;
+        sec.file_offset     = rawptr;
+        sec.file_size       = rawsize;
+        sec.executable = (chars & 0x20000000u) != 0;  // IMAGE_SCN_MEM_EXECUTE
+        sec.readable   = (chars & 0x40000000u) != 0;  // IMAGE_SCN_MEM_READ
+        sec.writable   = (chars & 0x80000000u) != 0;  // IMAGE_SCN_MEM_WRITE
+        img->sections_.push_back(std::move(sec));
+    }
+
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
 

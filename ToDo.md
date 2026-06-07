@@ -8,7 +8,7 @@ and raising overall code quality.
 > Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 > Task IDs (`P1-3`, `TD-2`, …) are referenced across sections so work can be tracked and cross-linked.
 >
-> **Progress (Phase 1):** Phase 0 complete (P0-1 … P0-10). Phase 1 in progress — P1-1 / P1-2 done; P1-3 / P1-4 implemented in the **core** (`PeImage` / `ElfImage` identity behind `IBinaryImage`, via `parse_image`), with the app-side migration (BinaryModel/panels onto `IBinaryImage`, removing the legacy parsers) still pending. Unit suite: 16 tests. The app load path now calls `parse_image()` (ELF files load; PE panels still on the legacy `PeModel`); full panel migration + legacy-parser removal pending.
+> **Progress (Phase 1):** Phase 0 complete (P0-1 … P0-10). Phase 1 in progress — P1-1 / P1-2 done; P1-3 / P1-4 implemented in the **core** (`PeImage` / `ElfImage` identity behind `IBinaryImage`, via `parse_image`), with the app-side migration (BinaryModel/panels onto `IBinaryImage`, removing the legacy parsers) still pending. Unit suite: 17 tests. The app load path now calls `parse_image()` (ELF files load; PE panels still on the legacy `PeModel`); full panel migration + legacy-parser removal pending. Phase 2 started: section tables parsed for PE/ELF (P2-1), ELF sections now shown in the app.
 
 ---
 
@@ -111,7 +111,7 @@ concrete type (downcast) or a `format_details()` `std::variant`.
 
 ## 7. Phase 2 — Sections, segments & raw bytes
 
-- [ ] **P2-1** Section model populated for both formats (name, vaddr/RVA, file offset, sizes, flags decoded to human-readable). ELF additionally surfaces program-header **segments** and the section↔segment mapping.
+- [~] **P2-1** Section **table** populated for both formats in `binary_image.cpp`, exposed via `IBinaryImage::sections()`: name (PE inline 8-char; ELF resolved via `.shstrtab`), virtual address (PE = ImageBase+RVA; ELF `sh_addr`), virtual size, file offset/size (ELF `SHT_NOBITS`→0), and R/W/X (PE `IMAGE_SCN_MEM_*`; ELF `SHF_ALLOC`/`WRITE`/`EXECINSTR`), all bounds-checked. Tested against `hello.elf` (finds an executable `.text`) and a synthetic PE32+ with a section. App: `BinaryModel::load_elf` feeds these into the Sections panel, so ELF sections are now visible. **Remaining:** ELF program-header **segments** + section↔segment mapping; migrating the Sections panel onto `IBinaryImage` (R/W/X chips, click-through to hex — P2-2).
 - [ ] **P2-2** Sections panel: sortable table, flag chips (R/W/X, code/data), click-through to the raw-byte view at that section's offset.
 - [ ] **P2-3** Raw-bytes/hex view: virtualized hex+ASCII for large files (use the existing `FileMapping` so we don't load everything into RAM), offset/RVA toggle, go-to-offset, selection, and "follow" links from other panels.
 
