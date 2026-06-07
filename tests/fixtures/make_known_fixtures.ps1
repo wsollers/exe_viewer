@@ -46,11 +46,23 @@ function New-Elf64Fixture {
     Put-U16LE $Bytes 0x12 $Machine
     Put-U32LE $Bytes 0x14 1
     Put-U64LE $Bytes 0x18 0x400080
+    Put-U64LE $Bytes 0x20 0x40       # e_phoff
     Put-U64LE $Bytes 0x28 0x100      # e_shoff
     Put-U16LE $Bytes 0x34 0x40       # e_ehsize
+    Put-U16LE $Bytes 0x36 0x38       # e_phentsize
+    Put-U16LE $Bytes 0x38 1          # e_phnum
     Put-U16LE $Bytes 0x3a 0x40       # e_shentsize
     Put-U16LE $Bytes 0x3c 3          # e_shnum
     Put-U16LE $Bytes 0x3e 2          # e_shstrndx
+
+    Put-U32LE $Bytes 0x40 1          # PT_LOAD
+    Put-U32LE $Bytes 0x44 5          # PF_R | PF_X
+    Put-U64LE $Bytes 0x48 0x80       # p_offset
+    Put-U64LE $Bytes 0x50 0x400080   # p_vaddr
+    Put-U64LE $Bytes 0x58 0x400080   # p_paddr
+    Put-U64LE $Bytes 0x60 0x10       # p_filesz
+    Put-U64LE $Bytes 0x68 0x10       # p_memsz
+    Put-U64LE $Bytes 0x70 0x1000     # p_align
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))

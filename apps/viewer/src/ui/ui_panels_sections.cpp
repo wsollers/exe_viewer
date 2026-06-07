@@ -5,6 +5,18 @@
 #include <imgui.h>
 
 namespace viewer {
+namespace {
+
+void draw_permissions(bool readable, bool writable, bool executable) {
+    char perms[4];
+    perms[0] = readable ? 'R' : '-';
+    perms[1] = writable ? 'W' : '-';
+    perms[2] = executable ? 'X' : '-';
+    perms[3] = '\0';
+    ImGui::TextUnformatted(perms);
+}
+
+} // namespace
 
     SectionsPanel::SectionsPanel(BinaryModel& model)
         : UiPanel("Sections"), model_(model)
@@ -37,20 +49,34 @@ namespace viewer {
             if (has_filter && s.name.find(filter) == std::string::npos)
                 continue;
 
-            // R/W/X permissions (avoid braced-init to dodge /permissive- narrowing).
-            char perms[4];
-            perms[0] = s.readable   ? 'R' : '-';
-            perms[1] = s.writable   ? 'W' : '-';
-            perms[2] = s.executable ? 'X' : '-';
-            perms[3] = '\0';
-
             ImGui::TextUnformatted(s.name.c_str()); ImGui::NextColumn();
             ImGui::Text("0x%llX", (unsigned long long)s.virtual_address); ImGui::NextColumn();
             ImGui::Text("0x%llX", (unsigned long long)s.virtual_size); ImGui::NextColumn();
-            ImGui::TextUnformatted(perms); ImGui::NextColumn();
+            draw_permissions(s.readable, s.writable, s.executable); ImGui::NextColumn();
         }
 
         ImGui::Columns(1);
+
+        if (!img->segments().empty()) {
+            ImGui::SeparatorText("Segments");
+            ImGui::Columns(5, nullptr, true);
+            ImGui::Text("Type"); ImGui::NextColumn();
+            ImGui::Text("Address"); ImGui::NextColumn();
+            ImGui::Text("Mem Size"); ImGui::NextColumn();
+            ImGui::Text("File Off"); ImGui::NextColumn();
+            ImGui::Text("Perm"); ImGui::NextColumn();
+            ImGui::Separator();
+
+            for (const auto& segment : img->segments()) {
+                ImGui::Text("0x%X", segment.type); ImGui::NextColumn();
+                ImGui::Text("0x%llX", (unsigned long long)segment.virtual_address); ImGui::NextColumn();
+                ImGui::Text("0x%llX", (unsigned long long)segment.virtual_size); ImGui::NextColumn();
+                ImGui::Text("0x%llX", (unsigned long long)segment.file_offset); ImGui::NextColumn();
+                draw_permissions(segment.readable, segment.writable, segment.executable); ImGui::NextColumn();
+            }
+            ImGui::Columns(1);
+        }
+
         ImGui::EndChild();
     }
 

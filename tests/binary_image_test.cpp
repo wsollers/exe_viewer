@@ -216,6 +216,21 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
                   std::optional<std::uint64_t>(expected.text_virtual_address)) << expected.name;
         EXPECT_EQ(img.virtual_address_to_file_offset(expected.text_virtual_address),
                   std::optional<std::uint64_t>(expected.text_file_offset)) << expected.name;
+
+        if (expected.format == peelf::Format::ELF) {
+            ASSERT_EQ(img.segments().size(), 1u) << expected.name;
+            const peelf::Segment& segment = img.segments().front();
+            EXPECT_EQ(segment.type, 1u) << expected.name;  // PT_LOAD
+            EXPECT_EQ(segment.file_offset, expected.text_file_offset) << expected.name;
+            EXPECT_EQ(segment.file_size, 0x10u) << expected.name;
+            EXPECT_EQ(segment.virtual_address, expected.text_virtual_address) << expected.name;
+            EXPECT_EQ(segment.virtual_size, 0x10u) << expected.name;
+            EXPECT_TRUE(segment.readable) << expected.name;
+            EXPECT_TRUE(segment.executable) << expected.name;
+            EXPECT_FALSE(segment.writable) << expected.name;
+        } else {
+            EXPECT_TRUE(img.segments().empty()) << expected.name;
+        }
     }
 }
 

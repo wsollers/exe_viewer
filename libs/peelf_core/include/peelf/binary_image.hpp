@@ -45,6 +45,17 @@ struct Section {
     bool          executable      = false;
 };
 
+struct Segment {
+    std::uint32_t type            = 0;
+    std::uint64_t virtual_address = 0;
+    std::uint64_t virtual_size    = 0;
+    std::uint64_t file_offset     = 0;
+    std::uint64_t file_size       = 0;
+    bool          readable        = false;
+    bool          writable        = false;
+    bool          executable      = false;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -59,6 +70,7 @@ public:
     // Entry-point virtual address (ELF e_entry; PE ImageBase + AddressOfEntryPoint).
     [[nodiscard]] virtual std::uint64_t entry_point()  const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Section>& sections() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<Segment>& segments() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

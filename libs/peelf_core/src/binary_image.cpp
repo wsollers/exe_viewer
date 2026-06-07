@@ -66,6 +66,7 @@ public:
     [[nodiscard]] bool is_64bit() const noexcept override { return is_64_; }
     [[nodiscard]] std::uint64_t entry_point() const noexcept override { return entry_; }
     [[nodiscard]] const std::vector<Section>& sections() const noexcept override { return sections_; }
+    [[nodiscard]] const std::vector<Segment>& segments() const noexcept override { return segments_; }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -106,6 +107,7 @@ protected:
     bool         is_64_  = false;
     std::uint64_t entry_ = 0;
     std::vector<Section> sections_;
+    std::vector<Segment> segments_;
 };
 
 class ElfImage final : public ImageBase {
@@ -149,6 +151,52 @@ Architecture pe_arch(std::uint16_t machine) noexcept {
         case 0x01c4: return Architecture::ARM;     // IMAGE_FILE_MACHINE_ARMNT
         case 0xaa64: return Architecture::ARM64;   // IMAGE_FILE_MACHINE_ARM64
         default:     return Architecture::Unknown;
+    }
+}
+
+void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
+                        std::uint64_t phoff, std::uint16_t phentsize,
+                        std::uint16_t phnum, std::vector<Segment>& out) {
+    if (phoff == 0 || phnum == 0 || phentsize == 0) {
+        return;
+    }
+    const std::uint16_t min_ph = is64 ? 0x38 : 0x20;
+    if (phentsize < min_ph) {
+        return;
+    }
+    const std::uint64_t table_size = static_cast<std::uint64_t>(phnum) * phentsize;
+    if (!fits_range(phoff, table_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    out.reserve(phnum);
+    for (std::uint16_t i = 0; i < phnum; ++i) {
+        const std::uint64_t hdr64 = phoff + static_cast<std::uint64_t>(i) * phentsize;
+        const std::size_t hdr = static_cast<std::size_t>(hdr64);
+
+        Segment seg;
+        if (is64) {
+            seg.type            = rd32(b, hdr + 0x00, big);
+            const std::uint32_t flags = rd32(b, hdr + 0x04, big);
+            seg.file_offset     = rd64(b, hdr + 0x08, big);
+            seg.virtual_address = rd64(b, hdr + 0x10, big);
+            seg.file_size       = rd64(b, hdr + 0x20, big);
+            seg.virtual_size    = rd64(b, hdr + 0x28, big);
+            seg.executable = (flags & 0x1u) != 0;  // PF_X
+            seg.writable   = (flags & 0x2u) != 0;  // PF_W
+            seg.readable   = (flags & 0x4u) != 0;  // PF_R
+        } else {
+            seg.type            = rd32(b, hdr + 0x00, big);
+            seg.file_offset     = rd32(b, hdr + 0x04, big);
+            seg.virtual_address = rd32(b, hdr + 0x08, big);
+            seg.file_size       = rd32(b, hdr + 0x10, big);
+            seg.virtual_size    = rd32(b, hdr + 0x14, big);
+            const std::uint32_t flags = rd32(b, hdr + 0x18, big);
+            seg.executable = (flags & 0x1u) != 0;  // PF_X
+            seg.writable   = (flags & 0x2u) != 0;  // PF_W
+            seg.readable   = (flags & 0x4u) != 0;  // PF_R
+        }
+        out.push_back(seg);
     }
 }
 
@@ -277,11 +325,16 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     // Sections (P2-1), best-effort: identity above is already valid.
     const std::size_t ehsize = is64 ? 0x40 : 0x34;
     if (b.size() >= ehsize) {
+        const std::uint64_t phoff     = is64 ? rd64(b, 0x20, big)
+                                             : static_cast<std::uint64_t>(rd32(b, 0x1C, big));
+        const std::uint16_t phentsize = rd16(b, is64 ? 0x36 : 0x2A, big);
+        const std::uint16_t phnum     = rd16(b, is64 ? 0x38 : 0x2C, big);
         const std::uint64_t shoff     = is64 ? rd64(b, 0x28, big)
                                              : static_cast<std::uint64_t>(rd32(b, 0x20, big));
         const std::uint16_t shentsize = rd16(b, is64 ? 0x3A : 0x2E, big);
         const std::uint16_t shnum     = rd16(b, is64 ? 0x3C : 0x30, big);
         const std::uint16_t shstrndx  = rd16(b, is64 ? 0x3E : 0x32, big);
+        parse_elf_segments(b, is64, big, phoff, phentsize, phnum, img->segments_);
         parse_elf_sections(b, is64, big, shoff, shentsize, shnum, shstrndx, img->sections_);
     }
 
