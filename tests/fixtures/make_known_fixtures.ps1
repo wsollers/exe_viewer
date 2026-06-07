@@ -33,7 +33,7 @@ function Put-Ascii {
 function New-Elf64Fixture {
     param([string]$Name, [UInt16]$Machine)
 
-    $Bytes = [byte[]]::new(0x280)
+    $Bytes = [byte[]]::new(0x380)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -47,12 +47,12 @@ function New-Elf64Fixture {
     Put-U32LE $Bytes 0x14 1
     Put-U64LE $Bytes 0x18 0x400080
     Put-U64LE $Bytes 0x20 0x40       # e_phoff
-    Put-U64LE $Bytes 0x28 0x100      # e_shoff
+    Put-U64LE $Bytes 0x28 0x180      # e_shoff
     Put-U16LE $Bytes 0x34 0x40       # e_ehsize
     Put-U16LE $Bytes 0x36 0x38       # e_phentsize
     Put-U16LE $Bytes 0x38 1          # e_phnum
     Put-U16LE $Bytes 0x3a 0x40       # e_shentsize
-    Put-U16LE $Bytes 0x3c 5          # e_shnum
+    Put-U16LE $Bytes 0x3c 7          # e_shnum
     Put-U16LE $Bytes 0x3e 2          # e_shstrndx
 
     Put-U32LE $Bytes 0x40 1          # PT_LOAD
@@ -68,17 +68,17 @@ function New-Elf64Fixture {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
     }
 
-    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0)
+    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0, 46, 100, 121, 110, 115, 116, 114, 0, 46, 100, 121, 110, 97, 109, 105, 99, 0)
     for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
         $Bytes[0x90 + $Index] = $Names[$Index]
     }
 
     $SymNames = [byte[]](0, 95, 115, 116, 97, 114, 116, 0)
     for ($Index = [UInt32]0; $Index -lt $SymNames.Length; ++$Index) {
-        $Bytes[0xA8 + $Index] = $SymNames[$Index]
+        $Bytes[0xC8 + $Index] = $SymNames[$Index]
     }
 
-    $StartSym = [UInt32](0xC0 + 0x18)
+    $StartSym = [UInt32](0xD8 + 0x18)
     Put-U32LE $Bytes ($StartSym + 0x00) 1        # st_name = "_start"
     $Bytes[$StartSym + 0x04] = 0x12              # STB_GLOBAL | STT_FUNC
     $Bytes[$StartSym + 0x05] = 0                 # st_other
@@ -86,7 +86,17 @@ function New-Elf64Fixture {
     Put-U64LE $Bytes ($StartSym + 0x08) 0x400080
     Put-U64LE $Bytes ($StartSym + 0x10) 0x10
 
-    $Text = 0x100 + 0x40
+    $DynNames = [byte[]](0, 108, 105, 98, 99, 46, 115, 111, 46, 54, 0)
+    for ($Index = [UInt32]0; $Index -lt $DynNames.Length; ++$Index) {
+        $Bytes[0x108 + $Index] = $DynNames[$Index]
+    }
+
+    Put-U64LE $Bytes 0x118 1      # DT_NEEDED
+    Put-U64LE $Bytes 0x120 1      # "libc.so.6"
+    Put-U64LE $Bytes 0x128 0      # DT_NULL
+    Put-U64LE $Bytes 0x130 0
+
+    $Text = 0x180 + 0x40
     Put-U32LE $Bytes ($Text + 0x00) 1      # ".text"
     Put-U32LE $Bytes ($Text + 0x04) 1      # SHT_PROGBITS
     Put-U64LE $Bytes ($Text + 0x08) 6      # SHF_ALLOC | SHF_EXECINSTR
@@ -95,29 +105,46 @@ function New-Elf64Fixture {
     Put-U64LE $Bytes ($Text + 0x20) 0x10
     Put-U64LE $Bytes ($Text + 0x30) 0x10
 
-    $Strtab = 0x100 + 0x80
+    $Strtab = 0x180 + 0x80
     Put-U32LE $Bytes ($Strtab + 0x00) 7    # ".shstrtab"
     Put-U32LE $Bytes ($Strtab + 0x04) 3    # SHT_STRTAB
     Put-U64LE $Bytes ($Strtab + 0x18) 0x90
     Put-U64LE $Bytes ($Strtab + 0x20) ([UInt64]$Names.Length)
     Put-U64LE $Bytes ($Strtab + 0x30) 1
 
-    $StringTable = 0x100 + 0xC0
+    $StringTable = 0x180 + 0xC0
     Put-U32LE $Bytes ($StringTable + 0x00) 17   # ".strtab"
     Put-U32LE $Bytes ($StringTable + 0x04) 3    # SHT_STRTAB
-    Put-U64LE $Bytes ($StringTable + 0x18) 0xA8
+    Put-U64LE $Bytes ($StringTable + 0x18) 0xC8
     Put-U64LE $Bytes ($StringTable + 0x20) ([UInt64]$SymNames.Length)
     Put-U64LE $Bytes ($StringTable + 0x30) 1
 
-    $Symtab = 0x100 + 0x100
+    $Symtab = 0x180 + 0x100
     Put-U32LE $Bytes ($Symtab + 0x00) 25        # ".symtab"
     Put-U32LE $Bytes ($Symtab + 0x04) 2         # SHT_SYMTAB
-    Put-U64LE $Bytes ($Symtab + 0x18) 0xC0
+    Put-U64LE $Bytes ($Symtab + 0x18) 0xD8
     Put-U64LE $Bytes ($Symtab + 0x20) 0x30
     Put-U32LE $Bytes ($Symtab + 0x28) 3         # link -> .strtab
     Put-U32LE $Bytes ($Symtab + 0x2C) 1         # one local symbol (null)
     Put-U64LE $Bytes ($Symtab + 0x30) 8
     Put-U64LE $Bytes ($Symtab + 0x38) 0x18
+
+    $Dynstr = 0x180 + 0x140
+    Put-U32LE $Bytes ($Dynstr + 0x00) 33        # ".dynstr"
+    Put-U32LE $Bytes ($Dynstr + 0x04) 3         # SHT_STRTAB
+    Put-U64LE $Bytes ($Dynstr + 0x18) 0x108
+    Put-U64LE $Bytes ($Dynstr + 0x20) ([UInt64]$DynNames.Length)
+    Put-U64LE $Bytes ($Dynstr + 0x30) 1
+
+    $Dynamic = 0x180 + 0x180
+    Put-U32LE $Bytes ($Dynamic + 0x00) 41       # ".dynamic"
+    Put-U32LE $Bytes ($Dynamic + 0x04) 6        # SHT_DYNAMIC
+    Put-U64LE $Bytes ($Dynamic + 0x08) 2        # SHF_ALLOC
+    Put-U64LE $Bytes ($Dynamic + 0x18) 0x118
+    Put-U64LE $Bytes ($Dynamic + 0x20) 0x20
+    Put-U32LE $Bytes ($Dynamic + 0x28) 5        # link -> .dynstr
+    Put-U64LE $Bytes ($Dynamic + 0x30) 8
+    Put-U64LE $Bytes ($Dynamic + 0x38) 0x10
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

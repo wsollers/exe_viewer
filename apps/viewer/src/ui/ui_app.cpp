@@ -29,6 +29,7 @@ UiApp::UiApp(BinaryModel& model)
     , sections_panel_(model)
     , hex_panel_(model)
     , disasm_panel_(model,current_instructions_)
+    , imports_panel_(model)
     , symbols_panel_(model)
     , log_panel_()
     , pe_headers_panel_(model)
@@ -48,6 +49,7 @@ void UiApp::render() {
     sections_panel_.draw();
     hex_panel_.draw();
     disasm_panel_.draw();
+    imports_panel_.draw();
     symbols_panel_.draw();
     pe_headers_panel_.draw();
     pe_imports_panel_.draw();
@@ -77,6 +79,12 @@ void UiApp::render_main_menu() {
 
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
+
+        {
+            bool v = imports_panel_.visible();
+            if (ImGui::MenuItem(imports_panel_.name().c_str(), nullptr, &v))
+                imports_panel_.set_visible(v);
+        }
 
         {
             bool v = symbols_panel_.visible();

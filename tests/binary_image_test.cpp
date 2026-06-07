@@ -239,9 +239,14 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             EXPECT_EQ(start_symbol->type, 2u) << expected.name;     // STT_FUNC
             EXPECT_EQ(start_symbol->section_index, 1u) << expected.name;
             EXPECT_FALSE(start_symbol->dynamic) << expected.name;
+
+            ASSERT_EQ(img.imports().size(), 1u) << expected.name;
+            EXPECT_EQ(img.imports().front().library, "libc.so.6") << expected.name;
+            EXPECT_TRUE(img.imports().front().name.empty()) << expected.name;
         } else {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
             EXPECT_TRUE(img.symbols().empty()) << expected.name;
+            EXPECT_TRUE(img.imports().empty()) << expected.name;
         }
     }
 }

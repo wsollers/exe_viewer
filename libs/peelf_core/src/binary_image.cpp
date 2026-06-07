@@ -68,6 +68,7 @@ public:
     [[nodiscard]] const std::vector<Section>& sections() const noexcept override { return sections_; }
     [[nodiscard]] const std::vector<Segment>& segments() const noexcept override { return segments_; }
     [[nodiscard]] const std::vector<Symbol>& symbols() const noexcept override { return symbols_; }
+    [[nodiscard]] const std::vector<ImportEntry>& imports() const noexcept override { return imports_; }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -110,6 +111,7 @@ protected:
     std::vector<Section> sections_;
     std::vector<Segment> segments_;
     std::vector<Symbol> symbols_;
+    std::vector<ImportEntry> imports_;
 };
 
 class ElfImage final : public ImageBase {
@@ -208,7 +210,8 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t shoff, std::uint16_t shentsize,
                         std::uint16_t shnum, std::uint16_t shstrndx,
-                        std::vector<Section>& out, std::vector<Symbol>& symbols_out) {
+                        std::vector<Section>& out, std::vector<Symbol>& symbols_out,
+                        std::vector<ImportEntry>& imports_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
     }
@@ -360,6 +363,48 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             }
         }
     }
+
+    for (const auto& sh : headers) {
+        if (sh.type != 6) {  // SHT_DYNAMIC
+            continue;
+        }
+        const std::uint64_t min_dyn = is64 ? 0x10 : 0x08;
+        const std::uint64_t entry_size = sh.entsize != 0 ? sh.entsize : min_dyn;
+        if (entry_size < min_dyn || sh.link >= headers.size() ||
+            !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        const auto& strings = headers[sh.link];
+        if (!fits_range(strings.offset, strings.size, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        const std::uint64_t count = sh.size / entry_size;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const std::uint64_t dyn_off = sh.offset + i * entry_size;
+            if (!fits_range(dyn_off, min_dyn, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+
+            const std::size_t off = static_cast<std::size_t>(dyn_off);
+            const std::uint64_t tag = is64 ? rd64(b, off + 0x00, big)
+                                           : static_cast<std::uint64_t>(rd32(b, off + 0x00, big));
+            const std::uint64_t value = is64 ? rd64(b, off + 0x08, big)
+                                             : static_cast<std::uint64_t>(rd32(b, off + 0x04, big));
+            if (tag == 0) {  // DT_NULL
+                break;
+            }
+            if (tag == 1 && value <= std::numeric_limits<std::uint32_t>::max()) {  // DT_NEEDED
+                ImportEntry entry;
+                entry.library = read_string(strings.offset, strings.size,
+                                            static_cast<std::uint32_t>(value));
+                if (!entry.library.empty()) {
+                    imports_out.push_back(std::move(entry));
+                }
+            }
+        }
+    }
 }
 
 Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8_t> b) {
@@ -411,7 +456,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
         const std::uint16_t shstrndx  = rd16(b, is64 ? 0x3E : 0x32, big);
         parse_elf_segments(b, is64, big, phoff, phentsize, phnum, img->segments_);
         parse_elf_sections(b, is64, big, shoff, shentsize, shnum, shstrndx,
-                           img->sections_, img->symbols_);
+                           img->sections_, img->symbols_, img->imports_);
     }
 
     return std::unique_ptr<IBinaryImage>(std::move(img));

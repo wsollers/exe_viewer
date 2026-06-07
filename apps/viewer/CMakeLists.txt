@@ -35,6 +35,7 @@ add_executable(peelf_viewer
         src/ui/ui_panels_sections.cpp
         src/ui/ui_panels_hex.cpp
         src/ui/ui_panels_disasm.cpp
+        src/ui/ui_panels_imports.cpp
         src/ui/ui_panels_symbols.cpp
         src/ui/ui_panels_log.cpp
         src/ui/logger.hpp
