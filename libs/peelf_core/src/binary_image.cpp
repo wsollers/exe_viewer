@@ -80,6 +80,10 @@ public:
         static const std::vector<ElfSectionHeader> empty;
         return empty;
     }
+    [[nodiscard]] const std::vector<ElfSymbol>& elf_symbols() const noexcept override {
+        static const std::vector<ElfSymbol> empty;
+        return empty;
+    }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -135,12 +139,16 @@ public:
     [[nodiscard]] const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept override {
         return section_headers_;
     }
+    [[nodiscard]] const std::vector<ElfSymbol>& elf_symbols() const noexcept override {
+        return elf_symbols_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
     ElfHeader elf_header_;
     std::vector<ElfProgramHeader> program_headers_;
     std::vector<ElfSectionHeader> section_headers_;
+    std::vector<ElfSymbol> elf_symbols_;
 };
 
 class PeImage final : public ImageBase {
@@ -285,7 +293,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t shoff, std::uint16_t shentsize,
                         std::uint16_t shnum, std::uint16_t shstrndx,
                         std::vector<ElfSectionHeader>& headers, std::vector<Section>& out,
-                        std::vector<Symbol>& symbols_out,
+                        std::vector<ElfSymbol>& elf_symbols_out, std::vector<Symbol>& symbols_out,
                         std::vector<ImportEntry>& imports_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
@@ -406,30 +414,44 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             }
 
             const std::size_t off = static_cast<std::size_t>(sym_off);
-            Symbol symbol;
-            std::uint32_t name_off = 0;
+            ElfSymbol elf_symbol;
             std::uint8_t info = 0;
+            std::uint8_t other = 0;
             if (is64) {
-                name_off = rd32(b, off + 0x00, big);
+                elf_symbol.name_offset = rd32(b, off + 0x00, big);
                 info = b[off + 0x04];
-                symbol.section_index = rd16(b, off + 0x06, big);
-                symbol.virtual_address = rd64(b, off + 0x08, big);
-                symbol.size = rd64(b, off + 0x10, big);
+                other = b[off + 0x05];
+                elf_symbol.section_index = rd16(b, off + 0x06, big);
+                elf_symbol.value = rd64(b, off + 0x08, big);
+                elf_symbol.size = rd64(b, off + 0x10, big);
             } else {
-                name_off = rd32(b, off + 0x00, big);
-                symbol.virtual_address = rd32(b, off + 0x04, big);
-                symbol.size = rd32(b, off + 0x08, big);
+                elf_symbol.name_offset = rd32(b, off + 0x00, big);
+                elf_symbol.value = rd32(b, off + 0x04, big);
+                elf_symbol.size = rd32(b, off + 0x08, big);
                 info = b[off + 0x0C];
-                symbol.section_index = rd16(b, off + 0x0E, big);
+                other = b[off + 0x0D];
+                elf_symbol.section_index = rd16(b, off + 0x0E, big);
             }
-            symbol.binding = static_cast<std::uint8_t>(info >> 4);
-            symbol.type = static_cast<std::uint8_t>(info & 0x0F);
-            symbol.dynamic = is_dynsym;
-            symbol.name = read_string(strings.offset, strings.size, name_off);
+            elf_symbol.info = info;
+            elf_symbol.other = other;
+            elf_symbol.binding = static_cast<std::uint8_t>(info >> 4);
+            elf_symbol.type = static_cast<std::uint8_t>(info & 0x0F);
+            elf_symbol.visibility = static_cast<std::uint8_t>(other & 0x03);
+            elf_symbol.dynamic = is_dynsym;
+            elf_symbol.name = read_string(strings.offset, strings.size, elf_symbol.name_offset);
 
-            if (!symbol.name.empty()) {
+            if (!elf_symbol.name.empty()) {
+                Symbol symbol;
+                symbol.name = elf_symbol.name;
+                symbol.virtual_address = elf_symbol.value;
+                symbol.size = elf_symbol.size;
+                symbol.binding = elf_symbol.binding;
+                symbol.type = elf_symbol.type;
+                symbol.section_index = elf_symbol.section_index;
+                symbol.dynamic = elf_symbol.dynamic;
                 symbols_out.push_back(std::move(symbol));
             }
+            elf_symbols_out.push_back(std::move(elf_symbol));
         }
     }
 
@@ -546,7 +568,8 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
                        img->program_headers_, img->segments_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
-                       img->section_headers_, img->sections_, img->symbols_, img->imports_);
+                       img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
+                       img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
