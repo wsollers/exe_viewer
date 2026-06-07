@@ -184,6 +184,7 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_TRUE(img.elf_program_headers().empty());
     EXPECT_TRUE(img.elf_section_headers().empty());
     EXPECT_TRUE(img.elf_symbols().empty());
+    EXPECT_TRUE(img.elf_dynamic_entries().empty());
 
     ASSERT_EQ(img.sections().size(), 1u);
     const auto& sec = img.sections().front();
@@ -359,6 +360,10 @@ TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
             EXPECT_EQ(start_symbol->type, 2u) << expected.name;
             EXPECT_EQ(start_symbol->section_index, 1u) << expected.name;
             EXPECT_FALSE(start_symbol->dynamic) << expected.name;
+
+            ASSERT_EQ(img.imports().size(), 1u) << expected.name;
+            EXPECT_EQ(img.imports().front().library, "libc.so.6") << expected.name;
+            EXPECT_TRUE(img.imports().front().name.empty()) << expected.name;
         } else {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
         }
@@ -370,17 +375,17 @@ TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
         {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
         {"known-linux-arm64.elf", 2, peelf::Endianness::Little, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
         {"known-linux-riscv64.elf", 2, peelf::Endianness::Little, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x40, 0x180, 0x40, 0x38, 0x40, 5},
-        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 5},
-        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 5},
-        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x34, 0x100, 0x34, 0x20, 0x28, 5},
-        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x40, 0x180, 0x40, 0x38, 0x40, 5},
+        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
+        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
     }};
 
     for (const ExpectedElfHeader& expected : fixtures) {
@@ -635,6 +640,47 @@ TEST(BinaryImage, ParsesElfSymbolsAcrossFixtureMatrix) {
         EXPECT_EQ(projected.type, start.type) << name;
         EXPECT_EQ(projected.section_index, start.section_index) << name;
         EXPECT_EQ(projected.dynamic, start.dynamic) << name;
+    }
+}
+
+TEST(BinaryImage, ParsesElfDynamicEntriesAcrossFixtureMatrix) {
+    constexpr std::array<const char*, 14> fixtures{{
+        "known-linux-x64.elf",
+        "known-linux-arm64.elf",
+        "known-linux-riscv64.elf",
+        "known-linux-x86-elf32-le.elf",
+        "known-linux-mips-elf32-be.elf",
+        "known-linux-mips64-elf64-be.elf",
+        "known-linux-arm-elf32-le.elf",
+        "known-linux-arm-elf32-be.elf",
+        "known-linux-arm64-elf64-be.elf",
+        "known-linux-riscv32-elf32-le.elf",
+        "known-linux-riscv32-elf32-be.elf",
+        "known-linux-riscv64-elf64-be.elf",
+        "known-linux-ppc-elf32-be.elf",
+        "known-linux-ppc64-elf64-be.elf",
+    }};
+
+    for (const char* name : fixtures) {
+        const auto path = fixture_path(name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << name;
+
+        const auto& dynamic = (**result).elf_dynamic_entries();
+        ASSERT_EQ(dynamic.size(), 2u) << name;
+        EXPECT_EQ(dynamic[0].tag, 1u) << name;    // DT_NEEDED
+        EXPECT_EQ(dynamic[0].value, 1u) << name;  // string-table offset of "libc.so.6"
+        EXPECT_EQ(dynamic[0].needed_library, "libc.so.6") << name;
+        EXPECT_EQ(dynamic[1].tag, 0u) << name;    // DT_NULL
+        EXPECT_EQ(dynamic[1].value, 0u) << name;
+        EXPECT_TRUE(dynamic[1].needed_library.empty()) << name;
+
+        ASSERT_EQ((**result).imports().size(), 1u) << name;
+        EXPECT_EQ((**result).imports().front().library, dynamic[0].needed_library) << name;
+        EXPECT_TRUE((**result).imports().front().name.empty()) << name;
     }
 }
 

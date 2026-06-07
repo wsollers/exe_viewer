@@ -151,6 +151,12 @@ struct ElfSymbol {
     bool          dynamic = false;
 };
 
+struct ElfDynamicEntry {
+    std::uint64_t tag = 0;
+    std::uint64_t value = 0;
+    std::string   needed_library;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -173,6 +179,7 @@ public:
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSymbol>& elf_symbols() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

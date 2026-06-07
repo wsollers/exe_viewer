@@ -264,7 +264,7 @@ function New-Pe64Fixture {
 function New-Elf32CompatibilityFixture {
     param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
 
-    $Bytes = [byte[]]::new(0x300)
+    $Bytes = [byte[]]::new(0x380)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -278,12 +278,12 @@ function New-Elf32CompatibilityFixture {
     Put-U32 $Bytes 0x14 1 $BigEndian
     Put-U32 $Bytes 0x18 0x400080 $BigEndian
     Put-U32 $Bytes 0x1c 0x34 $BigEndian
-    Put-U32 $Bytes 0x20 0x100 $BigEndian
+    Put-U32 $Bytes 0x20 0x180 $BigEndian
     Put-U16 $Bytes 0x28 0x34 $BigEndian
     Put-U16 $Bytes 0x2a 0x20 $BigEndian
     Put-U16 $Bytes 0x2c 1 $BigEndian
     Put-U16 $Bytes 0x2e 0x28 $BigEndian
-    Put-U16 $Bytes 0x30 5 $BigEndian
+    Put-U16 $Bytes 0x30 7 $BigEndian
     Put-U16 $Bytes 0x32 2 $BigEndian
 
     Put-U32 $Bytes 0x34 1 $BigEndian
@@ -299,7 +299,7 @@ function New-Elf32CompatibilityFixture {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
     }
 
-    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0)
+    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0, 46, 100, 121, 110, 115, 116, 114, 0, 46, 100, 121, 110, 97, 109, 105, 99, 0)
     for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
         $Bytes[0x90 + $Index] = $Names[$Index]
     }
@@ -309,6 +309,16 @@ function New-Elf32CompatibilityFixture {
         $Bytes[0xC8 + $Index] = $SymNames[$Index]
     }
 
+    $DynNames = [byte[]](0, 108, 105, 98, 99, 46, 115, 111, 46, 54, 0)
+    for ($Index = [UInt32]0; $Index -lt $DynNames.Length; ++$Index) {
+        $Bytes[0x108 + $Index] = $DynNames[$Index]
+    }
+
+    Put-U32 $Bytes 0x118 1 $BigEndian
+    Put-U32 $Bytes 0x11C 1 $BigEndian
+    Put-U32 $Bytes 0x120 0 $BigEndian
+    Put-U32 $Bytes 0x124 0 $BigEndian
+
     $StartSym = [UInt32](0xD0 + 0x10)
     Put-U32 $Bytes ($StartSym + 0x00) 1 $BigEndian
     Put-U32 $Bytes ($StartSym + 0x04) 0x400080 $BigEndian
@@ -317,7 +327,7 @@ function New-Elf32CompatibilityFixture {
     $Bytes[$StartSym + 0x0D] = 0
     Put-U16 $Bytes ($StartSym + 0x0E) 1 $BigEndian
 
-    $Text = 0x100 + 0x28
+    $Text = 0x180 + 0x28
     Put-U32 $Bytes ($Text + 0x00) 1 $BigEndian
     Put-U32 $Bytes ($Text + 0x04) 1 $BigEndian
     Put-U32 $Bytes ($Text + 0x08) 6 $BigEndian
@@ -326,21 +336,21 @@ function New-Elf32CompatibilityFixture {
     Put-U32 $Bytes ($Text + 0x14) 0x10 $BigEndian
     Put-U32 $Bytes ($Text + 0x20) 0x10 $BigEndian
 
-    $Shstr = 0x100 + 0x50
+    $Shstr = 0x180 + 0x50
     Put-U32 $Bytes ($Shstr + 0x00) 7 $BigEndian
     Put-U32 $Bytes ($Shstr + 0x04) 3 $BigEndian
     Put-U32 $Bytes ($Shstr + 0x10) 0x90 $BigEndian
     Put-U32 $Bytes ($Shstr + 0x14) ([UInt32]$Names.Length) $BigEndian
     Put-U32 $Bytes ($Shstr + 0x20) 1 $BigEndian
 
-    $StringTable = 0x100 + 0x78
+    $StringTable = 0x180 + 0x78
     Put-U32 $Bytes ($StringTable + 0x00) 17 $BigEndian
     Put-U32 $Bytes ($StringTable + 0x04) 3 $BigEndian
     Put-U32 $Bytes ($StringTable + 0x10) 0xC8 $BigEndian
     Put-U32 $Bytes ($StringTable + 0x14) ([UInt32]$SymNames.Length) $BigEndian
     Put-U32 $Bytes ($StringTable + 0x20) 1 $BigEndian
 
-    $Symtab = 0x100 + 0xA0
+    $Symtab = 0x180 + 0xA0
     Put-U32 $Bytes ($Symtab + 0x00) 25 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x04) 2 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x10) 0xD0 $BigEndian
@@ -349,6 +359,23 @@ function New-Elf32CompatibilityFixture {
     Put-U32 $Bytes ($Symtab + 0x1C) 1 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x20) 4 $BigEndian
     Put-U32 $Bytes ($Symtab + 0x24) 0x10 $BigEndian
+
+    $Dynstr = 0x180 + 0xC8
+    Put-U32 $Bytes ($Dynstr + 0x00) 33 $BigEndian
+    Put-U32 $Bytes ($Dynstr + 0x04) 3 $BigEndian
+    Put-U32 $Bytes ($Dynstr + 0x10) 0x108 $BigEndian
+    Put-U32 $Bytes ($Dynstr + 0x14) ([UInt32]$DynNames.Length) $BigEndian
+    Put-U32 $Bytes ($Dynstr + 0x20) 1 $BigEndian
+
+    $Dynamic = 0x180 + 0xF0
+    Put-U32 $Bytes ($Dynamic + 0x00) 41 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x04) 6 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x08) 2 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x10) 0x118 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x14) 0x10 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x18) 5 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x20) 4 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x24) 0x08 $BigEndian
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }
@@ -375,7 +402,7 @@ function New-Elf64CompatibilityFixture {
     Put-U16 $Bytes 0x36 0x38 $BigEndian
     Put-U16 $Bytes 0x38 1 $BigEndian
     Put-U16 $Bytes 0x3a 0x40 $BigEndian
-    Put-U16 $Bytes 0x3c 5 $BigEndian
+    Put-U16 $Bytes 0x3c 7 $BigEndian
     Put-U16 $Bytes 0x3e 2 $BigEndian
 
     Put-U32 $Bytes 0x40 1 $BigEndian
@@ -391,7 +418,7 @@ function New-Elf64CompatibilityFixture {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
     }
 
-    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0)
+    $Names = [byte[]](0, 46, 116, 101, 120, 116, 0, 46, 115, 104, 115, 116, 114, 116, 97, 98, 0, 46, 115, 116, 114, 116, 97, 98, 0, 46, 115, 121, 109, 116, 97, 98, 0, 46, 100, 121, 110, 115, 116, 114, 0, 46, 100, 121, 110, 97, 109, 105, 99, 0)
     for ($Index = [UInt32]0; $Index -lt $Names.Length; ++$Index) {
         $Bytes[0x90 + $Index] = $Names[$Index]
     }
@@ -400,6 +427,16 @@ function New-Elf64CompatibilityFixture {
     for ($Index = [UInt32]0; $Index -lt $SymNames.Length; ++$Index) {
         $Bytes[0xC8 + $Index] = $SymNames[$Index]
     }
+
+    $DynNames = [byte[]](0, 108, 105, 98, 99, 46, 115, 111, 46, 54, 0)
+    for ($Index = [UInt32]0; $Index -lt $DynNames.Length; ++$Index) {
+        $Bytes[0x108 + $Index] = $DynNames[$Index]
+    }
+
+    Put-U64 $Bytes 0x118 1 $BigEndian
+    Put-U64 $Bytes 0x120 1 $BigEndian
+    Put-U64 $Bytes 0x128 0 $BigEndian
+    Put-U64 $Bytes 0x130 0 $BigEndian
 
     $StartSym = [UInt32](0xD8 + 0x18)
     Put-U32 $Bytes ($StartSym + 0x00) 1 $BigEndian
@@ -441,6 +478,23 @@ function New-Elf64CompatibilityFixture {
     Put-U32 $Bytes ($Symtab + 0x2C) 1 $BigEndian
     Put-U64 $Bytes ($Symtab + 0x30) 8 $BigEndian
     Put-U64 $Bytes ($Symtab + 0x38) 0x18 $BigEndian
+
+    $Dynstr = 0x180 + 0x140
+    Put-U32 $Bytes ($Dynstr + 0x00) 33 $BigEndian
+    Put-U32 $Bytes ($Dynstr + 0x04) 3 $BigEndian
+    Put-U64 $Bytes ($Dynstr + 0x18) 0x108 $BigEndian
+    Put-U64 $Bytes ($Dynstr + 0x20) ([UInt64]$DynNames.Length) $BigEndian
+    Put-U64 $Bytes ($Dynstr + 0x30) 1 $BigEndian
+
+    $Dynamic = 0x180 + 0x180
+    Put-U32 $Bytes ($Dynamic + 0x00) 41 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x04) 6 $BigEndian
+    Put-U64 $Bytes ($Dynamic + 0x08) 2 $BigEndian
+    Put-U64 $Bytes ($Dynamic + 0x18) 0x118 $BigEndian
+    Put-U64 $Bytes ($Dynamic + 0x20) 0x20 $BigEndian
+    Put-U32 $Bytes ($Dynamic + 0x28) 5 $BigEndian
+    Put-U64 $Bytes ($Dynamic + 0x30) 8 $BigEndian
+    Put-U64 $Bytes ($Dynamic + 0x38) 0x10 $BigEndian
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }
