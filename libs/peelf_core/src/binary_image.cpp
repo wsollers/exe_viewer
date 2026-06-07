@@ -556,6 +556,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t export_dir_size = (size_of_opt >= (is64 ? 0x78 : 0x68))
                                               ? rd32(b, opt + (is64 ? 0x74 : 0x64), false)
                                               : 0;
+    const std::uint32_t import_dir_rva = (size_of_opt >= (is64 ? 0x80 : 0x70))
+                                             ? rd32(b, opt + (is64 ? 0x78 : 0x68), false)
+                                             : 0;
+    const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
+                                              ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
+                                              : 0;
 
     auto img = std::unique_ptr<PeImage>(new PeImage());
     img->format_ = Format::PE;
@@ -651,6 +657,69 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                     }
                     if (!entry.name.empty()) {
                         img->exports_.push_back(std::move(entry));
+                    }
+                }
+            }
+        }
+    }
+
+    if (import_dir_rva != 0 && import_dir_size >= 20) {
+        const auto import_off = pe_rva_to_file_offset(img->sections_, image_base, import_dir_rva);
+        if (import_off) {
+            const std::uint64_t max_descriptors = import_dir_size / 20;
+            for (std::uint64_t desc_index = 0; desc_index < max_descriptors; ++desc_index) {
+                const std::uint64_t desc_off = *import_off + desc_index * 20;
+                if (!fits_range(desc_off, 20, static_cast<std::uint64_t>(b.size()))) {
+                    break;
+                }
+
+                const std::size_t desc = static_cast<std::size_t>(desc_off);
+                const std::uint32_t original_first_thunk = rd32(b, desc + 0, false);
+                const std::uint32_t name_rva = rd32(b, desc + 12, false);
+                const std::uint32_t first_thunk = rd32(b, desc + 16, false);
+                if (original_first_thunk == 0 && name_rva == 0 && first_thunk == 0) {
+                    break;
+                }
+
+                const auto dll_name_off = pe_rva_to_file_offset(img->sections_, image_base, name_rva);
+                const std::string library = dll_name_off ? read_c_string(b, *dll_name_off) : std::string{};
+                const std::uint32_t thunk_rva = original_first_thunk != 0 ? original_first_thunk : first_thunk;
+                const auto thunk_off = pe_rva_to_file_offset(img->sections_, image_base, thunk_rva);
+                if (library.empty() || !thunk_off || first_thunk == 0) {
+                    continue;
+                }
+
+                const std::uint64_t thunk_size = is64 ? 8 : 4;
+                for (std::uint64_t thunk_index = 0; thunk_index < 4096; ++thunk_index) {
+                    const std::uint64_t entry_off = *thunk_off + thunk_index * thunk_size;
+                    if (!fits_range(entry_off, thunk_size, static_cast<std::uint64_t>(b.size()))) {
+                        break;
+                    }
+
+                    const std::uint64_t thunk_value = is64
+                        ? rd64(b, static_cast<std::size_t>(entry_off), false)
+                        : static_cast<std::uint64_t>(rd32(b, static_cast<std::size_t>(entry_off), false));
+                    if (thunk_value == 0) {
+                        break;
+                    }
+
+                    const std::uint64_t ordinal_mask = is64 ? (1ull << 63) : (1ull << 31);
+                    if ((thunk_value & ordinal_mask) != 0) {
+                        continue;
+                    }
+
+                    const auto hint_name_off = pe_rva_to_file_offset(
+                        img->sections_, image_base, static_cast<std::uint32_t>(thunk_value));
+                    if (!hint_name_off || !fits_range(*hint_name_off, 2, static_cast<std::uint64_t>(b.size()))) {
+                        continue;
+                    }
+
+                    ImportEntry entry;
+                    entry.library = library;
+                    entry.name = read_c_string(b, *hint_name_off + 2);
+                    entry.address = image_base + first_thunk + thunk_index * thunk_size;
+                    if (!entry.name.empty()) {
+                        img->imports_.push_back(std::move(entry));
                     }
                 }
             }

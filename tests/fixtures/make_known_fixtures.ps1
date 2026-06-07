@@ -152,7 +152,7 @@ function New-Elf64Fixture {
 function New-Pe64Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x420)
+    $Bytes = [byte[]]::new(0x480)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -171,6 +171,8 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x6C) 16
     Put-U32LE $Bytes ($Opt + 0x70) 0x1100
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
+    Put-U32LE $Bytes ($Opt + 0x78) 0x1180
+    Put-U32LE $Bytes ($Opt + 0x7C) 0x40
 
     $Sect = [UInt32]($Opt + 0x00f0)
     Put-Ascii $Bytes $Sect ".text"
@@ -195,6 +197,17 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes 0x354 0x1160  # export name RVA
     Put-U16LE $Bytes 0x358 0       # ordinal index
     Put-Ascii $Bytes 0x360 "known_export"
+
+    Put-U32LE $Bytes 0x380 0x11C0  # OriginalFirstThunk
+    Put-U32LE $Bytes 0x38C 0x11A0  # Name
+    Put-U32LE $Bytes 0x390 0x11D0  # FirstThunk
+    Put-Ascii $Bytes 0x3A0 "KERNEL32.dll"
+    Put-U16LE $Bytes 0x3B0 0       # import hint
+    Put-Ascii $Bytes 0x3B2 "ExitProcess"
+    Put-U64LE $Bytes 0x3C0 0x11B0  # INT
+    Put-U64LE $Bytes 0x3C8 0
+    Put-U64LE $Bytes 0x3D0 0x11B0  # IAT
+    Put-U64LE $Bytes 0x3D8 0
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

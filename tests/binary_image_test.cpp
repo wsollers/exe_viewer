@@ -247,7 +247,12 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
         } else {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
             EXPECT_TRUE(img.symbols().empty()) << expected.name;
-            EXPECT_TRUE(img.imports().empty()) << expected.name;
+
+            ASSERT_EQ(img.imports().size(), 1u) << expected.name;
+            const peelf::ImportEntry& imported = img.imports().front();
+            EXPECT_EQ(imported.library, "KERNEL32.dll") << expected.name;
+            EXPECT_EQ(imported.name, "ExitProcess") << expected.name;
+            EXPECT_EQ(imported.address, 0x1400011D0ULL) << expected.name;
 
             ASSERT_EQ(img.exports().size(), 1u) << expected.name;
             const peelf::ExportEntry& exported = img.exports().front();
