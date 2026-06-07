@@ -92,6 +92,10 @@ public:
         static const std::vector<ElfRelocation> empty;
         return empty;
     }
+    [[nodiscard]] const std::vector<ElfNote>& elf_notes() const noexcept override {
+        static const std::vector<ElfNote> empty;
+        return empty;
+    }
     [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
         return {};
     }
@@ -159,6 +163,9 @@ public:
     [[nodiscard]] const std::vector<ElfRelocation>& elf_relocations() const noexcept override {
         return relocations_;
     }
+    [[nodiscard]] const std::vector<ElfNote>& elf_notes() const noexcept override {
+        return notes_;
+    }
     [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
         return interpreter_;
     }
@@ -171,6 +178,7 @@ private:
     std::vector<ElfSymbol> elf_symbols_;
     std::vector<ElfDynamicEntry> dynamic_entries_;
     std::vector<ElfRelocation> relocations_;
+    std::vector<ElfNote> notes_;
     std::string interpreter_;
 };
 
@@ -251,10 +259,64 @@ std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& s
     return std::nullopt;
 }
 
+[[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
+    return (value + 3u) & ~std::uint64_t{3u};
+}
+
+void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t offset,
+                     std::uint64_t size, bool from_program_header,
+                     std::vector<ElfNote>& notes_out) {
+    if (!fits_range(offset, size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::uint64_t end = offset + size;
+    std::uint64_t cursor = offset;
+    while (cursor + 12u <= end) {
+        const std::size_t off = static_cast<std::size_t>(cursor);
+        const std::uint32_t name_size = rd32(b, off + 0x00, big);
+        const std::uint32_t descriptor_size = rd32(b, off + 0x04, big);
+        const std::uint32_t type = rd32(b, off + 0x08, big);
+        cursor += 12u;
+
+        const std::uint64_t aligned_name_size = align4(name_size);
+        const std::uint64_t aligned_descriptor_size = align4(descriptor_size);
+        if (cursor > end || aligned_name_size > end - cursor) {
+            break;
+        }
+        const std::uint64_t name_offset = cursor;
+        cursor += aligned_name_size;
+        if (cursor > end || aligned_descriptor_size > end - cursor) {
+            break;
+        }
+        const std::uint64_t descriptor_offset = cursor;
+        cursor += aligned_descriptor_size;
+
+        ElfNote note;
+        note.type = type;
+        note.from_program_header = from_program_header;
+        for (std::uint32_t i = 0; i < name_size && name_offset + i < end; ++i) {
+            const std::uint8_t ch = b[static_cast<std::size_t>(name_offset + i)];
+            if (ch == 0) {
+                break;
+            }
+            note.name.push_back(static_cast<char>(ch));
+        }
+        if (descriptor_size != 0 && descriptor_offset + descriptor_size <= end) {
+            note.descriptor.reserve(descriptor_size);
+            for (std::uint32_t i = 0; i < descriptor_size; ++i) {
+                note.descriptor.push_back(b[static_cast<std::size_t>(descriptor_offset + i)]);
+            }
+        }
+        notes_out.push_back(std::move(note));
+    }
+}
+
 void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t phoff, std::uint16_t phentsize,
                         std::uint16_t phnum, std::vector<ElfProgramHeader>& headers_out,
-                        std::vector<Segment>& segments_out, std::string& interpreter_out) {
+                        std::vector<Segment>& segments_out, std::string& interpreter_out,
+                        std::vector<ElfNote>& notes_out) {
     if (phoff == 0 || phnum == 0 || phentsize == 0) {
         return;
     }
@@ -309,6 +371,9 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
         if (phdr.type == 3 && fits_range(phdr.offset, phdr.file_size, static_cast<std::uint64_t>(b.size()))) {
             interpreter_out = read_c_string(b, phdr.offset, phdr.file_size);
         }
+        if (phdr.type == 4) {
+            parse_elf_notes(b, big, phdr.offset, phdr.file_size, true, notes_out);
+        }
     }
 }
 
@@ -322,6 +387,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::vector<ElfSymbol>& elf_symbols_out, std::vector<Symbol>& symbols_out,
                         std::vector<ElfDynamicEntry>& dynamic_entries_out,
                         std::vector<ElfRelocation>& relocations_out,
+                        std::vector<ElfNote>& notes_out,
                         std::vector<ImportEntry>& imports_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
@@ -531,6 +597,12 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     }
 
     for (const auto& sh : headers) {
+        if (sh.type == 7) {  // SHT_NOTE
+            parse_elf_notes(b, big, sh.offset, sh.size, false, notes_out);
+        }
+    }
+
+    for (const auto& sh : headers) {
         const bool has_addend = sh.type == 4;     // SHT_RELA
         const bool no_addend = sh.type == 9;      // SHT_REL
         if (!has_addend && !no_addend) {
@@ -647,10 +719,10 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
 
     // Sections (P2-1), best-effort: identity above is already valid.
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
-                       img->program_headers_, img->segments_, img->interpreter_);
+                       img->program_headers_, img->segments_, img->interpreter_, img->notes_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
-                       img->dynamic_entries_, img->relocations_, img->imports_);
+                       img->dynamic_entries_, img->relocations_, img->notes_, img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }

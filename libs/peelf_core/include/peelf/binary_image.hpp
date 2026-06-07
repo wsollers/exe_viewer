@@ -167,6 +167,13 @@ struct ElfRelocation {
     bool          has_addend = false;
 };
 
+struct ElfNote {
+    std::string name;
+    std::uint32_t type = 0;
+    std::vector<std::uint8_t> descriptor;
+    bool from_program_header = false;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -191,6 +198,7 @@ public:
     [[nodiscard]] virtual const std::vector<ElfSymbol>& elf_symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfRelocation>& elf_relocations() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<ElfNote>& elf_notes() const noexcept = 0;
     [[nodiscard]] virtual std::string_view elf_interpreter() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
