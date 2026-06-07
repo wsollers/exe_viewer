@@ -24,7 +24,19 @@ namespace peelf {
 
 enum class Format { Unknown, PE, ELF };
 enum class ImageKind { Unknown, Executable, SharedLibrary, Object, Core };
-enum class Architecture { Unknown, X86, X86_64, ARM, ARM64, RISCV32, RISCV64, PowerPC64, MIPS };
+enum class Architecture {
+    Unknown,
+    X86,
+    X86_64,
+    ARM,
+    ARM64,
+    RISCV32,
+    RISCV64,
+    PowerPC,
+    PowerPC64,
+    MIPS32,
+    MIPS64
+};
 enum class Endianness { Little, Big };
 
 [[nodiscard]] std::string_view to_string(Format f) noexcept;

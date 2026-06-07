@@ -13,12 +13,22 @@ namespace {
 
 [[nodiscard]] std::optional<viewer::Architecture> disassembler_architecture(peelf::Architecture arch) {
     switch (arch) {
-        case peelf::Architecture::X86:    return viewer::Architecture::X86_32;
-        case peelf::Architecture::X86_64: return viewer::Architecture::X86_64;
-        case peelf::Architecture::ARM:    return viewer::Architecture::ARM32;
-        case peelf::Architecture::ARM64:  return viewer::Architecture::ARM64;
-        default:                          return std::nullopt;
+        case peelf::Architecture::X86:       return viewer::Architecture::X86_32;
+        case peelf::Architecture::X86_64:    return viewer::Architecture::X86_64;
+        case peelf::Architecture::ARM:       return viewer::Architecture::ARM32;
+        case peelf::Architecture::ARM64:     return viewer::Architecture::ARM64;
+        case peelf::Architecture::MIPS32:    return viewer::Architecture::MIPS32;
+        case peelf::Architecture::MIPS64:    return viewer::Architecture::MIPS64;
+        case peelf::Architecture::PowerPC:   return viewer::Architecture::PowerPC32;
+        case peelf::Architecture::PowerPC64: return viewer::Architecture::PowerPC64;
+        case peelf::Architecture::RISCV32:   return viewer::Architecture::RISCV32;
+        case peelf::Architecture::RISCV64:   return viewer::Architecture::RISCV64;
+        default:                             return std::nullopt;
     }
+}
+
+[[nodiscard]] viewer::Endianness disassembler_endianness(peelf::Endianness endianness) {
+    return endianness == peelf::Endianness::Big ? viewer::Endianness::Big : viewer::Endianness::Little;
 }
 
 } // namespace
@@ -224,7 +234,7 @@ void UiApp::render_dockspace() {
             return;
         }
 
-        if (!disasm_.init(*arch)) {
+        if (!disasm_.init(*arch, disassembler_endianness(img->endianness()))) {
             Log().error(std::string("Failed to initialize disassembler: ") + disasm_.get_error());
             file_loaded_ = false;
             return;

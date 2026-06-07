@@ -15,7 +15,7 @@ subdirectories to populate, and no vendoring step to run.
 | GLFW | `3.4` | Windowing/input. Docs, tests, examples, install disabled. |
 | Dear ImGui | `docking` @ `2af6dd96` (pinned) | Built here as a static `imgui` target with the GLFW + Vulkan backends; links `glfw` and `Vulkan::Vulkan`. |
 | nativefiledialog-extended (NFD) | `v1.2.1` | Native open/save file dialogs (`nfd` target). |
-| Capstone | `5.0.6` | Disassembler. Static only; X86, ARM, and ARM64 enabled. |
+| Capstone | `5.0.6` | Disassembler. Static only; X86, ARM, ARM64, MIPS, PowerPC, and RISC-V enabled. |
 
 > **Reproducibility note:** Dear ImGui is pinned to a specific `docking`-branch
 > commit (`2af6dd96`, 2026-06-04), verified to contain the Vulkan-backend

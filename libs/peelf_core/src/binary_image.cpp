@@ -134,8 +134,9 @@ Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
         case 40:  return Architecture::ARM;        // EM_ARM
         case 183: return Architecture::ARM64;      // EM_AARCH64
         case 243: return is64 ? Architecture::RISCV64 : Architecture::RISCV32;  // EM_RISCV
+        case 20:  return Architecture::PowerPC;    // EM_PPC
         case 21:  return Architecture::PowerPC64;  // EM_PPC64
-        case 8:   return Architecture::MIPS;       // EM_MIPS
+        case 8:   return is64 ? Architecture::MIPS64 : Architecture::MIPS32;    // EM_MIPS
         default:  return Architecture::Unknown;
     }
 }
@@ -757,8 +758,10 @@ std::string_view to_string(Architecture a) noexcept {
         case Architecture::ARM64:     return "ARM64";
         case Architecture::RISCV32:   return "RISC-V 32";
         case Architecture::RISCV64:   return "RISC-V 64";
+        case Architecture::PowerPC:   return "PowerPC";
         case Architecture::PowerPC64: return "PowerPC64";
-        case Architecture::MIPS:      return "MIPS";
+        case Architecture::MIPS32:    return "MIPS32";
+        case Architecture::MIPS64:    return "MIPS64";
         default:                      return "Unknown";
     }
 }

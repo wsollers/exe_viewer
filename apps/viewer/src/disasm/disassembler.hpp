@@ -13,7 +13,18 @@ enum class Architecture {
     X86_32,
     X86_64,
     ARM32,
-    ARM64
+    ARM64,
+    MIPS32,
+    MIPS64,
+    PowerPC32,
+    PowerPC64,
+    RISCV32,
+    RISCV64
+};
+
+enum class Endianness {
+    Little,
+    Big
 };
 
 struct Instruction {
@@ -57,7 +68,7 @@ public:
         return *this;
     }
 
-    bool init(Architecture arch) {
+    bool init(Architecture arch, Endianness endian = Endianness::Little) {
         close();
         arch_ = arch;
 
@@ -80,6 +91,34 @@ public:
             case Architecture::ARM64:
                 cs_architecture = CS_ARCH_ARM64;
                 cs_mode_flags = CS_MODE_LITTLE_ENDIAN;
+                break;
+            case Architecture::MIPS32:
+                cs_architecture = CS_ARCH_MIPS;
+                cs_mode_flags = static_cast<cs_mode>(
+                    CS_MODE_MIPS32 | (endian == Endianness::Big ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN));
+                break;
+            case Architecture::MIPS64:
+                cs_architecture = CS_ARCH_MIPS;
+                cs_mode_flags = static_cast<cs_mode>(
+                    CS_MODE_MIPS64 | (endian == Endianness::Big ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN));
+                break;
+            case Architecture::PowerPC32:
+                cs_architecture = CS_ARCH_PPC;
+                cs_mode_flags = static_cast<cs_mode>(
+                    endian == Endianness::Little ? CS_MODE_LITTLE_ENDIAN : CS_MODE_BIG_ENDIAN);
+                break;
+            case Architecture::PowerPC64:
+                cs_architecture = CS_ARCH_PPC;
+                cs_mode_flags = static_cast<cs_mode>(
+                    CS_MODE_64 | (endian == Endianness::Little ? CS_MODE_LITTLE_ENDIAN : CS_MODE_BIG_ENDIAN));
+                break;
+            case Architecture::RISCV32:
+                cs_architecture = CS_ARCH_RISCV;
+                cs_mode_flags = CS_MODE_RISCV32;
+                break;
+            case Architecture::RISCV64:
+                cs_architecture = CS_ARCH_RISCV;
+                cs_mode_flags = CS_MODE_RISCV64;
                 break;
             default:
                 return false;
