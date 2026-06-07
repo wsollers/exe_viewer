@@ -91,6 +91,27 @@ struct ExportEntry {
     std::string   forwarder;
 };
 
+struct ElfHeader {
+    std::uint8_t  elf_class = 0;
+    std::uint8_t  data_encoding = 0;
+    std::uint8_t  ident_version = 0;
+    std::uint8_t  os_abi = 0;
+    std::uint8_t  abi_version = 0;
+    std::uint16_t type = 0;
+    std::uint16_t machine = 0;
+    std::uint32_t version = 0;
+    std::uint64_t entry = 0;
+    std::uint64_t program_header_offset = 0;
+    std::uint64_t section_header_offset = 0;
+    std::uint32_t flags = 0;
+    std::uint16_t header_size = 0;
+    std::uint16_t program_header_entry_size = 0;
+    std::uint16_t program_header_count = 0;
+    std::uint16_t section_header_entry_size = 0;
+    std::uint16_t section_header_count = 0;
+    std::uint16_t section_name_string_table_index = 0;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -109,6 +130,7 @@ public:
     [[nodiscard]] virtual const std::vector<Symbol>& symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
+    [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

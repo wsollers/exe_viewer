@@ -68,6 +68,19 @@ struct ExpectedImage {
     std::uint64_t text_virtual_address;
 };
 
+struct ExpectedElfHeader {
+    const char* name;
+    std::uint8_t elf_class;
+    peelf::Endianness endianness;
+    std::uint16_t machine;
+    std::uint64_t program_header_offset;
+    std::uint64_t section_header_offset;
+    std::uint16_t header_size;
+    std::uint16_t program_header_entry_size;
+    std::uint16_t section_header_entry_size;
+    std::uint16_t section_header_count;
+};
+
 }  // namespace
 
 TEST(BinaryImage, DetectFormat) {
@@ -335,6 +348,69 @@ TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
         }
     }
+}
+
+TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
+    constexpr std::array<ExpectedElfHeader, 14> fixtures{{
+        {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-arm64.elf", 2, peelf::Endianness::Little, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-riscv64.elf", 2, peelf::Endianness::Little, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x40, 0x100, 0x40, 0x38, 0x40, 3},
+        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x40, 0x100, 0x40, 0x38, 0x40, 3},
+        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x40, 0x100, 0x40, 0x38, 0x40, 3},
+        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x34, 0x100, 0x34, 0x20, 0x28, 3},
+        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x40, 0x100, 0x40, 0x38, 0x40, 3},
+    }};
+
+    for (const ExpectedElfHeader& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::ElfHeader* header = (**result).elf_header();
+        ASSERT_NE(header, nullptr) << expected.name;
+        EXPECT_EQ(header->elf_class, expected.elf_class) << expected.name;
+        EXPECT_EQ(header->data_encoding, expected.endianness == peelf::Endianness::Big ? 2u : 1u) << expected.name;
+        EXPECT_EQ(header->ident_version, 1u) << expected.name;
+        EXPECT_EQ(header->os_abi, 0u) << expected.name;
+        EXPECT_EQ(header->abi_version, 0u) << expected.name;
+        EXPECT_EQ(header->type, 2u) << expected.name;
+        EXPECT_EQ(header->machine, expected.machine) << expected.name;
+        EXPECT_EQ(header->version, 1u) << expected.name;
+        EXPECT_EQ(header->entry, 0x400080u) << expected.name;
+        EXPECT_EQ(header->program_header_offset, expected.program_header_offset) << expected.name;
+        EXPECT_EQ(header->section_header_offset, expected.section_header_offset) << expected.name;
+        EXPECT_EQ(header->flags, 0u) << expected.name;
+        EXPECT_EQ(header->header_size, expected.header_size) << expected.name;
+        EXPECT_EQ(header->program_header_entry_size, expected.program_header_entry_size) << expected.name;
+        EXPECT_EQ(header->program_header_count, 1u) << expected.name;
+        EXPECT_EQ(header->section_header_entry_size, expected.section_header_entry_size) << expected.name;
+        EXPECT_EQ(header->section_header_count, expected.section_header_count) << expected.name;
+        EXPECT_EQ(header->section_name_string_table_index, 2u) << expected.name;
+    }
+}
+
+TEST(BinaryImage, RejectsTruncatedElfFileHeader) {
+    std::vector<std::uint8_t> b(0x20, 0);
+    b[0] = 0x7F;
+    b[1] = 'E';
+    b[2] = 'L';
+    b[3] = 'F';
+    b[4] = 2;  // ELFCLASS64 requires a 64-byte file header.
+    b[5] = 1;
+    b[6] = 1;
+
+    const auto result = peelf::parse_image(b);
+    EXPECT_FALSE(result.has_value());
 }
 
 TEST(BinaryImage, RejectsUnknownFormat) {

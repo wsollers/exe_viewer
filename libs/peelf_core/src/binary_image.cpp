@@ -71,6 +71,7 @@ public:
     [[nodiscard]] const std::vector<Symbol>& symbols() const noexcept override { return symbols_; }
     [[nodiscard]] const std::vector<ImportEntry>& imports() const noexcept override { return imports_; }
     [[nodiscard]] const std::vector<ExportEntry>& exports() const noexcept override { return exports_; }
+    [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -119,7 +120,11 @@ protected:
 
 class ElfImage final : public ImageBase {
 public:
+    [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return &elf_header_; }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
+
+private:
+    ElfHeader elf_header_;
 };
 
 class PeImage final : public ImageBase {
@@ -464,16 +469,27 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     const bool is64 = (ei_class == 2);
     const bool big  = (ei_data == 2);
 
-    // e_entry sits at 0x18: 8 bytes for ELF64, 4 bytes for ELF32.
-    const std::size_t need = is64 ? 0x20 : 0x1C;
-    if (b.size() < need) {
-        return make_error("ELF: truncated before e_entry");
+    const std::size_t ehsize = is64 ? 0x40 : 0x34;
+    if (b.size() < ehsize) {
+        return make_error("ELF: truncated file header");
     }
 
     const std::uint16_t e_type    = rd16(b, 0x10, big);
     const std::uint16_t e_machine = rd16(b, 0x12, big);
+    const std::uint32_t e_version = rd32(b, 0x14, big);
     const std::uint64_t e_entry   = is64 ? rd64(b, 0x18, big)
                                          : static_cast<std::uint64_t>(rd32(b, 0x18, big));
+    const std::uint64_t e_phoff = is64 ? rd64(b, 0x20, big)
+                                       : static_cast<std::uint64_t>(rd32(b, 0x1C, big));
+    const std::uint64_t e_shoff = is64 ? rd64(b, 0x28, big)
+                                       : static_cast<std::uint64_t>(rd32(b, 0x20, big));
+    const std::uint32_t e_flags = rd32(b, is64 ? 0x30 : 0x24, big);
+    const std::uint16_t e_ehsize = rd16(b, is64 ? 0x34 : 0x28, big);
+    const std::uint16_t e_phentsize = rd16(b, is64 ? 0x36 : 0x2A, big);
+    const std::uint16_t e_phnum = rd16(b, is64 ? 0x38 : 0x2C, big);
+    const std::uint16_t e_shentsize = rd16(b, is64 ? 0x3A : 0x2E, big);
+    const std::uint16_t e_shnum = rd16(b, is64 ? 0x3C : 0x30, big);
+    const std::uint16_t e_shstrndx = rd16(b, is64 ? 0x3E : 0x32, big);
 
     auto img = std::unique_ptr<ElfImage>(new ElfImage());
     img->format_ = Format::ELF;
@@ -482,23 +498,31 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     img->kind_   = elf_kind(e_type);
     img->arch_   = elf_arch(e_machine, is64);
     img->entry_  = e_entry;
+    img->elf_header_ = ElfHeader{
+        .elf_class = ei_class,
+        .data_encoding = ei_data,
+        .ident_version = b[6],
+        .os_abi = b[7],
+        .abi_version = b[8],
+        .type = e_type,
+        .machine = e_machine,
+        .version = e_version,
+        .entry = e_entry,
+        .program_header_offset = e_phoff,
+        .section_header_offset = e_shoff,
+        .flags = e_flags,
+        .header_size = e_ehsize,
+        .program_header_entry_size = e_phentsize,
+        .program_header_count = e_phnum,
+        .section_header_entry_size = e_shentsize,
+        .section_header_count = e_shnum,
+        .section_name_string_table_index = e_shstrndx,
+    };
 
     // Sections (P2-1), best-effort: identity above is already valid.
-    const std::size_t ehsize = is64 ? 0x40 : 0x34;
-    if (b.size() >= ehsize) {
-        const std::uint64_t phoff     = is64 ? rd64(b, 0x20, big)
-                                             : static_cast<std::uint64_t>(rd32(b, 0x1C, big));
-        const std::uint16_t phentsize = rd16(b, is64 ? 0x36 : 0x2A, big);
-        const std::uint16_t phnum     = rd16(b, is64 ? 0x38 : 0x2C, big);
-        const std::uint64_t shoff     = is64 ? rd64(b, 0x28, big)
-                                             : static_cast<std::uint64_t>(rd32(b, 0x20, big));
-        const std::uint16_t shentsize = rd16(b, is64 ? 0x3A : 0x2E, big);
-        const std::uint16_t shnum     = rd16(b, is64 ? 0x3C : 0x30, big);
-        const std::uint16_t shstrndx  = rd16(b, is64 ? 0x3E : 0x32, big);
-        parse_elf_segments(b, is64, big, phoff, phentsize, phnum, img->segments_);
-        parse_elf_sections(b, is64, big, shoff, shentsize, shnum, shstrndx,
-                           img->sections_, img->symbols_, img->imports_);
-    }
+    parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum, img->segments_);
+    parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
+                       img->sections_, img->symbols_, img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
