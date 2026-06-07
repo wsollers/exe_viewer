@@ -82,7 +82,7 @@ function Put-Ascii {
 function New-Elf64Fixture {
     param([string]$Name, [UInt16]$Machine)
 
-    $Bytes = [byte[]]::new(0x380)
+    $Bytes = [byte[]]::new(0x480)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -95,23 +95,32 @@ function New-Elf64Fixture {
     Put-U16LE $Bytes 0x12 $Machine
     Put-U32LE $Bytes 0x14 1
     Put-U64LE $Bytes 0x18 0x400080
-    Put-U64LE $Bytes 0x20 0x40       # e_phoff
+    Put-U64LE $Bytes 0x20 0x380      # e_phoff
     Put-U64LE $Bytes 0x28 0x180      # e_shoff
     Put-U16LE $Bytes 0x34 0x40       # e_ehsize
     Put-U16LE $Bytes 0x36 0x38       # e_phentsize
-    Put-U16LE $Bytes 0x38 1          # e_phnum
+    Put-U16LE $Bytes 0x38 2          # e_phnum
     Put-U16LE $Bytes 0x3a 0x40       # e_shentsize
     Put-U16LE $Bytes 0x3c 8          # e_shnum
     Put-U16LE $Bytes 0x3e 2          # e_shstrndx
 
-    Put-U32LE $Bytes 0x40 1          # PT_LOAD
-    Put-U32LE $Bytes 0x44 5          # PF_R | PF_X
-    Put-U64LE $Bytes 0x48 0x80       # p_offset
-    Put-U64LE $Bytes 0x50 0x400080   # p_vaddr
-    Put-U64LE $Bytes 0x58 0x400080   # p_paddr
-    Put-U64LE $Bytes 0x60 0x10       # p_filesz
-    Put-U64LE $Bytes 0x68 0x10       # p_memsz
-    Put-U64LE $Bytes 0x70 0x1000     # p_align
+    Put-U32LE $Bytes 0x380 1          # PT_LOAD
+    Put-U32LE $Bytes 0x384 5          # PF_R | PF_X
+    Put-U64LE $Bytes 0x388 0x80       # p_offset
+    Put-U64LE $Bytes 0x390 0x400080   # p_vaddr
+    Put-U64LE $Bytes 0x398 0x400080   # p_paddr
+    Put-U64LE $Bytes 0x3A0 0x10       # p_filesz
+    Put-U64LE $Bytes 0x3A8 0x10       # p_memsz
+    Put-U64LE $Bytes 0x3B0 0x1000     # p_align
+
+    Put-U32LE $Bytes 0x3B8 3          # PT_INTERP
+    Put-U32LE $Bytes 0x3BC 4          # PF_R
+    Put-U64LE $Bytes 0x3C0 0x160      # p_offset
+    Put-U64LE $Bytes 0x3C8 0x400160   # p_vaddr
+    Put-U64LE $Bytes 0x3D0 0x400160   # p_paddr
+    Put-U64LE $Bytes 0x3D8 0x11       # p_filesz
+    Put-U64LE $Bytes 0x3E0 0x11       # p_memsz
+    Put-U64LE $Bytes 0x3E8 1          # p_align
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
@@ -148,6 +157,7 @@ function New-Elf64Fixture {
     Put-U64LE $Bytes 0x140 0x400088
     Put-U64LE $Bytes 0x148 0x100000008
     Put-U64LE $Bytes 0x150 4
+    Put-Ascii $Bytes 0x160 "/lib/ld-peelf.so"
 
     $Text = 0x180 + 0x40
     Put-U32LE $Bytes ($Text + 0x00) 1      # ".text"
@@ -278,7 +288,7 @@ function New-Pe64Fixture {
 function New-Elf32CompatibilityFixture {
     param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
 
-    $Bytes = [byte[]]::new(0x380)
+    $Bytes = [byte[]]::new(0x480)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -291,23 +301,32 @@ function New-Elf32CompatibilityFixture {
     Put-U16 $Bytes 0x12 $Machine $BigEndian
     Put-U32 $Bytes 0x14 1 $BigEndian
     Put-U32 $Bytes 0x18 0x400080 $BigEndian
-    Put-U32 $Bytes 0x1c 0x34 $BigEndian
+    Put-U32 $Bytes 0x1c 0x380 $BigEndian
     Put-U32 $Bytes 0x20 0x180 $BigEndian
     Put-U16 $Bytes 0x28 0x34 $BigEndian
     Put-U16 $Bytes 0x2a 0x20 $BigEndian
-    Put-U16 $Bytes 0x2c 1 $BigEndian
+    Put-U16 $Bytes 0x2c 2 $BigEndian
     Put-U16 $Bytes 0x2e 0x28 $BigEndian
     Put-U16 $Bytes 0x30 8 $BigEndian
     Put-U16 $Bytes 0x32 2 $BigEndian
 
-    Put-U32 $Bytes 0x34 1 $BigEndian
-    Put-U32 $Bytes 0x38 0x80 $BigEndian
-    Put-U32 $Bytes 0x3c 0x400080 $BigEndian
-    Put-U32 $Bytes 0x40 0x400080 $BigEndian
-    Put-U32 $Bytes 0x44 0x10 $BigEndian
-    Put-U32 $Bytes 0x48 0x10 $BigEndian
-    Put-U32 $Bytes 0x4c 5 $BigEndian
-    Put-U32 $Bytes 0x50 0x1000 $BigEndian
+    Put-U32 $Bytes 0x380 1 $BigEndian
+    Put-U32 $Bytes 0x384 0x80 $BigEndian
+    Put-U32 $Bytes 0x388 0x400080 $BigEndian
+    Put-U32 $Bytes 0x38C 0x400080 $BigEndian
+    Put-U32 $Bytes 0x390 0x10 $BigEndian
+    Put-U32 $Bytes 0x394 0x10 $BigEndian
+    Put-U32 $Bytes 0x398 5 $BigEndian
+    Put-U32 $Bytes 0x39C 0x1000 $BigEndian
+
+    Put-U32 $Bytes 0x3A0 3 $BigEndian
+    Put-U32 $Bytes 0x3A4 0x160 $BigEndian
+    Put-U32 $Bytes 0x3A8 0x400160 $BigEndian
+    Put-U32 $Bytes 0x3AC 0x400160 $BigEndian
+    Put-U32 $Bytes 0x3B0 0x11 $BigEndian
+    Put-U32 $Bytes 0x3B4 0x11 $BigEndian
+    Put-U32 $Bytes 0x3B8 4 $BigEndian
+    Put-U32 $Bytes 0x3BC 1 $BigEndian
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
@@ -334,6 +353,7 @@ function New-Elf32CompatibilityFixture {
     Put-U32 $Bytes 0x12C 0 $BigEndian
     Put-U32 $Bytes 0x130 0x400084 $BigEndian
     Put-U32 $Bytes 0x134 0x101 $BigEndian
+    Put-Ascii $Bytes 0x160 "/lib/ld-peelf.so"
 
     $StartSym = [UInt32](0xE0 + 0x10)
     Put-U32 $Bytes ($StartSym + 0x00) 1 $BigEndian
@@ -409,7 +429,7 @@ function New-Elf32CompatibilityFixture {
 function New-Elf64CompatibilityFixture {
     param([string]$Name, [UInt16]$Machine, [bool]$BigEndian)
 
-    $Bytes = [byte[]]::new(0x380)
+    $Bytes = [byte[]]::new(0x480)
     $Bytes[0] = 0x7f
     $Bytes[1] = [byte][char]'E'
     $Bytes[2] = [byte][char]'L'
@@ -422,23 +442,32 @@ function New-Elf64CompatibilityFixture {
     Put-U16 $Bytes 0x12 $Machine $BigEndian
     Put-U32 $Bytes 0x14 1 $BigEndian
     Put-U64 $Bytes 0x18 0x400080 $BigEndian
-    Put-U64 $Bytes 0x20 0x40 $BigEndian
+    Put-U64 $Bytes 0x20 0x380 $BigEndian
     Put-U64 $Bytes 0x28 0x180 $BigEndian
     Put-U16 $Bytes 0x34 0x40 $BigEndian
     Put-U16 $Bytes 0x36 0x38 $BigEndian
-    Put-U16 $Bytes 0x38 1 $BigEndian
+    Put-U16 $Bytes 0x38 2 $BigEndian
     Put-U16 $Bytes 0x3a 0x40 $BigEndian
     Put-U16 $Bytes 0x3c 8 $BigEndian
     Put-U16 $Bytes 0x3e 2 $BigEndian
 
-    Put-U32 $Bytes 0x40 1 $BigEndian
-    Put-U32 $Bytes 0x44 5 $BigEndian
-    Put-U64 $Bytes 0x48 0x80 $BigEndian
-    Put-U64 $Bytes 0x50 0x400080 $BigEndian
-    Put-U64 $Bytes 0x58 0x400080 $BigEndian
-    Put-U64 $Bytes 0x60 0x10 $BigEndian
-    Put-U64 $Bytes 0x68 0x10 $BigEndian
-    Put-U64 $Bytes 0x70 0x1000 $BigEndian
+    Put-U32 $Bytes 0x380 1 $BigEndian
+    Put-U32 $Bytes 0x384 5 $BigEndian
+    Put-U64 $Bytes 0x388 0x80 $BigEndian
+    Put-U64 $Bytes 0x390 0x400080 $BigEndian
+    Put-U64 $Bytes 0x398 0x400080 $BigEndian
+    Put-U64 $Bytes 0x3A0 0x10 $BigEndian
+    Put-U64 $Bytes 0x3A8 0x10 $BigEndian
+    Put-U64 $Bytes 0x3B0 0x1000 $BigEndian
+
+    Put-U32 $Bytes 0x3B8 3 $BigEndian
+    Put-U32 $Bytes 0x3BC 4 $BigEndian
+    Put-U64 $Bytes 0x3C0 0x160 $BigEndian
+    Put-U64 $Bytes 0x3C8 0x400160 $BigEndian
+    Put-U64 $Bytes 0x3D0 0x400160 $BigEndian
+    Put-U64 $Bytes 0x3D8 0x11 $BigEndian
+    Put-U64 $Bytes 0x3E0 0x11 $BigEndian
+    Put-U64 $Bytes 0x3E8 1 $BigEndian
 
     for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
         $Bytes[0x80 + $Index] = [byte](0x90 + ($Index % 16))
@@ -466,6 +495,7 @@ function New-Elf64CompatibilityFixture {
     Put-U64 $Bytes 0x140 0x400088 $BigEndian
     Put-U64 $Bytes 0x148 0x100000008 $BigEndian
     Put-U64 $Bytes 0x150 4 $BigEndian
+    Put-Ascii $Bytes 0x160 "/lib/ld-peelf.so"
 
     $StartSym = [UInt32](0xE0 + 0x18)
     Put-U32 $Bytes ($StartSym + 0x00) 1 $BigEndian

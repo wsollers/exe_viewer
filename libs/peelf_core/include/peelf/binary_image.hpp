@@ -191,6 +191,7 @@ public:
     [[nodiscard]] virtual const std::vector<ElfSymbol>& elf_symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfRelocation>& elf_relocations() const noexcept = 0;
+    [[nodiscard]] virtual std::string_view elf_interpreter() const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

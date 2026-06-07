@@ -92,6 +92,9 @@ public:
         static const std::vector<ElfRelocation> empty;
         return empty;
     }
+    [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
+        return {};
+    }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -156,6 +159,9 @@ public:
     [[nodiscard]] const std::vector<ElfRelocation>& elf_relocations() const noexcept override {
         return relocations_;
     }
+    [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
+        return interpreter_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
@@ -165,6 +171,7 @@ private:
     std::vector<ElfSymbol> elf_symbols_;
     std::vector<ElfDynamicEntry> dynamic_entries_;
     std::vector<ElfRelocation> relocations_;
+    std::string interpreter_;
 };
 
 class PeImage final : public ImageBase {
@@ -247,7 +254,7 @@ std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& s
 void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t phoff, std::uint16_t phentsize,
                         std::uint16_t phnum, std::vector<ElfProgramHeader>& headers_out,
-                        std::vector<Segment>& segments_out) {
+                        std::vector<Segment>& segments_out, std::string& interpreter_out) {
     if (phoff == 0 || phnum == 0 || phentsize == 0) {
         return;
     }
@@ -299,6 +306,9 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 
         headers_out.push_back(phdr);
         segments_out.push_back(seg);
+        if (phdr.type == 3 && fits_range(phdr.offset, phdr.file_size, static_cast<std::uint64_t>(b.size()))) {
+            interpreter_out = read_c_string(b, phdr.offset, phdr.file_size);
+        }
     }
 }
 
@@ -637,7 +647,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
 
     // Sections (P2-1), best-effort: identity above is already valid.
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
-                       img->program_headers_, img->segments_);
+                       img->program_headers_, img->segments_, img->interpreter_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->imports_);
