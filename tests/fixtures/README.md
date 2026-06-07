@@ -10,47 +10,50 @@ Small binary samples used by the unit tests.
   to commit. Good for exercising ELF header parsing, program headers/sections,
   dynamic symbols/imports, and x86-64 disassembly.
 - `known-linux-x64.elf` — deterministic minimal ELF64 executable fixture with a
-  `.text` section, one `_start` function symbol, one `DT_NEEDED` library, and
-  `EM_X86_64`.
+  `.text` section, one `_start` function symbol, one `DT_NEEDED` library, one
+  `.rela.dyn` relocation, and `EM_X86_64`.
 - `known-linux-arm64.elf` — deterministic minimal ELF64 executable fixture with a
-  `.text` section, one `_start` function symbol, one `DT_NEEDED` library, and
-  `EM_AARCH64`.
+  `.text` section, one `_start` function symbol, one `DT_NEEDED` library, one
+  `.rela.dyn` relocation, and `EM_AARCH64`.
 - `known-linux-riscv64.elf` — deterministic minimal ELF64 executable fixture with a
-  `.text` section, one `_start` function symbol, one `DT_NEEDED` library, and
-  `EM_RISCV`.
+  `.text` section, one `_start` function symbol, one `DT_NEEDED` library, one
+  `.rela.dyn` relocation, and `EM_RISCV`.
 - `known-linux-x86-elf32-le.elf` — deterministic minimal ELF32 little-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_386`.
+  one `DT_NEEDED` library, one `.rel.dyn` relocation, and `EM_386`.
 - `known-linux-mips-elf32-be.elf` — deterministic minimal ELF32 big-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_MIPS`.
+  one `DT_NEEDED` library, one `.rel.dyn` relocation, and `EM_MIPS`.
 - `known-linux-mips64-elf64-be.elf` — deterministic minimal ELF64 big-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_MIPS`.
+  one `DT_NEEDED` library, one `.rela.dyn` relocation, and `EM_MIPS`.
 - `known-linux-arm-elf32-le.elf` — deterministic minimal ELF32 little-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_ARM`.
+  one `DT_NEEDED` library, one `.rel.dyn` relocation, and `EM_ARM`.
 - `known-linux-arm-elf32-be.elf` — deterministic minimal ELF32 big-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_ARM`.
+  one `DT_NEEDED` library, one `.rel.dyn` relocation, and `EM_ARM`.
 - `known-linux-arm64-elf64-be.elf` — deterministic minimal ELF64 big-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_AARCH64`.
+  one `DT_NEEDED` library, one `.rela.dyn` relocation, and `EM_AARCH64`.
 - `known-linux-riscv32-elf32-le.elf` — deterministic minimal ELF32 little-endian
   executable fixture with a `.text` section, one load segment, one `_start`
-  function symbol, one `DT_NEEDED` library, and `EM_RISCV`.
+  function symbol, one `DT_NEEDED` library, one `.rel.dyn` relocation, and
+  `EM_RISCV`.
 - `known-linux-riscv32-elf32-be.elf` — deterministic minimal ELF32 big-endian
   executable fixture with a `.text` section, one load segment, one `_start`
-  function symbol, one `DT_NEEDED` library, and `EM_RISCV`.
+  function symbol, one `DT_NEEDED` library, one `.rel.dyn` relocation, and
+  `EM_RISCV`.
 - `known-linux-riscv64-elf64-be.elf` — deterministic minimal ELF64 big-endian
   executable fixture with a `.text` section, one load segment, one `_start`
-  function symbol, one `DT_NEEDED` library, and `EM_RISCV`.
+  function symbol, one `DT_NEEDED` library, one `.rela.dyn` relocation, and
+  `EM_RISCV`.
 - `known-linux-ppc-elf32-be.elf` — deterministic minimal ELF32 big-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_PPC`.
+  one `DT_NEEDED` library, one `.rel.dyn` relocation, and `EM_PPC`.
 - `known-linux-ppc64-elf64-be.elf` — deterministic minimal ELF64 big-endian executable
   fixture with a `.text` section, one load segment, one `_start` function symbol,
-  one `DT_NEEDED` library, and `EM_PPC64`.
+  one `DT_NEEDED` library, one `.rela.dyn` relocation, and `EM_PPC64`.
 - `known-win-x86.exe` — deterministic minimal PE32 executable fixture with a `.text`
   section and `IMAGE_FILE_MACHINE_I386`.
 - `known-win-x64.exe` — deterministic minimal PE32+ executable fixture with a

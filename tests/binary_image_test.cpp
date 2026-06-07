@@ -185,6 +185,7 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_TRUE(img.elf_section_headers().empty());
     EXPECT_TRUE(img.elf_symbols().empty());
     EXPECT_TRUE(img.elf_dynamic_entries().empty());
+    EXPECT_TRUE(img.elf_relocations().empty());
 
     ASSERT_EQ(img.sections().size(), 1u);
     const auto& sec = img.sections().front();
@@ -372,20 +373,20 @@ TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
 
 TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
     constexpr std::array<ExpectedElfHeader, 14> fixtures{{
-        {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-arm64.elf", 2, peelf::Endianness::Little, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-riscv64.elf", 2, peelf::Endianness::Little, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
-        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x34, 0x180, 0x34, 0x20, 0x28, 7},
-        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x40, 0x180, 0x40, 0x38, 0x40, 7},
+        {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
+        {"known-linux-arm64.elf", 2, peelf::Endianness::Little, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
+        {"known-linux-riscv64.elf", 2, peelf::Endianness::Little, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
+        {"known-linux-x86-elf32-le.elf", 1, peelf::Endianness::Little, 3, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-mips-elf32-be.elf", 1, peelf::Endianness::Big, 8, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-mips64-elf64-be.elf", 2, peelf::Endianness::Big, 8, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
+        {"known-linux-arm-elf32-le.elf", 1, peelf::Endianness::Little, 40, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-arm-elf32-be.elf", 1, peelf::Endianness::Big, 40, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-arm64-elf64-be.elf", 2, peelf::Endianness::Big, 183, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
+        {"known-linux-riscv32-elf32-le.elf", 1, peelf::Endianness::Little, 243, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-riscv32-elf32-be.elf", 1, peelf::Endianness::Big, 243, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-riscv64-elf64-be.elf", 2, peelf::Endianness::Big, 243, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
+        {"known-linux-ppc-elf32-be.elf", 1, peelf::Endianness::Big, 20, 0x34, 0x180, 0x34, 0x20, 0x28, 8},
+        {"known-linux-ppc64-elf64-be.elf", 2, peelf::Endianness::Big, 21, 0x40, 0x180, 0x40, 0x38, 0x40, 8},
     }};
 
     for (const ExpectedElfHeader& expected : fixtures) {
@@ -550,14 +551,14 @@ TEST(BinaryImage, ParsesRichElfSectionHeaders) {
         ASSERT_TRUE(result.has_value()) << "parse_image failed for " << name;
 
         const auto& headers = (**result).elf_section_headers();
-        ASSERT_EQ(headers.size(), 7u) << name;
+        ASSERT_EQ(headers.size(), 8u) << name;
 
         const auto symtab = std::ranges::find_if(headers, [](const peelf::ElfSectionHeader& section) {
             return section.name == ".symtab";
         });
         ASSERT_NE(symtab, headers.end()) << name;
         EXPECT_EQ(symtab->type, 2u) << name;  // SHT_SYMTAB
-        EXPECT_EQ(symtab->offset, 0xD8u) << name;
+        EXPECT_EQ(symtab->offset, 0xE0u) << name;
         EXPECT_EQ(symtab->size, 0x30u) << name;
         EXPECT_EQ(symtab->link, 3u) << name;
         EXPECT_EQ(symtab->info, 1u) << name;
@@ -570,7 +571,7 @@ TEST(BinaryImage, ParsesRichElfSectionHeaders) {
         ASSERT_NE(dynamic, headers.end()) << name;
         EXPECT_EQ(dynamic->type, 6u) << name;  // SHT_DYNAMIC
         EXPECT_EQ(dynamic->flags, 2u) << name;
-        EXPECT_EQ(dynamic->offset, 0x118u) << name;
+        EXPECT_EQ(dynamic->offset, 0x120u) << name;
         EXPECT_EQ(dynamic->size, 0x20u) << name;
         EXPECT_EQ(dynamic->link, 5u) << name;
         EXPECT_EQ(dynamic->address_alignment, 8u) << name;
@@ -681,6 +682,60 @@ TEST(BinaryImage, ParsesElfDynamicEntriesAcrossFixtureMatrix) {
         ASSERT_EQ((**result).imports().size(), 1u) << name;
         EXPECT_EQ((**result).imports().front().library, dynamic[0].needed_library) << name;
         EXPECT_TRUE((**result).imports().front().name.empty()) << name;
+    }
+}
+
+TEST(BinaryImage, ParsesElfRelocationsAcrossFixtureMatrix) {
+    struct ExpectedRelocation {
+        const char* name;
+        bool is_64bit;
+    };
+    constexpr std::array<ExpectedRelocation, 14> fixtures{{
+        {"known-linux-x64.elf", true},
+        {"known-linux-arm64.elf", true},
+        {"known-linux-riscv64.elf", true},
+        {"known-linux-x86-elf32-le.elf", false},
+        {"known-linux-mips-elf32-be.elf", false},
+        {"known-linux-mips64-elf64-be.elf", true},
+        {"known-linux-arm-elf32-le.elf", false},
+        {"known-linux-arm-elf32-be.elf", false},
+        {"known-linux-arm64-elf64-be.elf", true},
+        {"known-linux-riscv32-elf32-le.elf", false},
+        {"known-linux-riscv32-elf32-be.elf", false},
+        {"known-linux-riscv64-elf64-be.elf", true},
+        {"known-linux-ppc-elf32-be.elf", false},
+        {"known-linux-ppc64-elf64-be.elf", true},
+    }};
+
+    for (const ExpectedRelocation& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto& relocations = (**result).elf_relocations();
+        ASSERT_EQ(relocations.size(), 1u) << expected.name;
+
+        const peelf::ElfRelocation& relocation = relocations.front();
+        EXPECT_EQ(relocation.section_name, expected.is_64bit ? ".rela.dyn" : ".rel.dyn") << expected.name;
+        EXPECT_EQ(relocation.offset, expected.is_64bit ? 0x400088u : 0x400084u) << expected.name;
+        EXPECT_EQ(relocation.info, expected.is_64bit ? 0x100000008u : 0x101u) << expected.name;
+        EXPECT_EQ(relocation.symbol_index, 1u) << expected.name;
+        EXPECT_EQ(relocation.type, expected.is_64bit ? 8u : 1u) << expected.name;
+        EXPECT_EQ(relocation.has_addend, expected.is_64bit) << expected.name;
+        EXPECT_EQ(relocation.addend, expected.is_64bit ? 4 : 0) << expected.name;
+
+        const auto relocation_section = std::ranges::find_if(
+            (**result).elf_section_headers(), [&](const peelf::ElfSectionHeader& section) {
+                return section.name == relocation.section_name;
+            });
+        ASSERT_NE(relocation_section, (**result).elf_section_headers().end()) << expected.name;
+        EXPECT_EQ(relocation_section->type, expected.is_64bit ? 4u : 9u) << expected.name;
+        EXPECT_EQ(relocation_section->link, 4u) << expected.name;
+        EXPECT_EQ(relocation_section->info, 1u) << expected.name;
+        EXPECT_EQ(relocation_section->entry_size, expected.is_64bit ? 0x18u : 0x08u) << expected.name;
     }
 }
 

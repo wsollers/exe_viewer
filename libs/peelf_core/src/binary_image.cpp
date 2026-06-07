@@ -88,6 +88,10 @@ public:
         static const std::vector<ElfDynamicEntry> empty;
         return empty;
     }
+    [[nodiscard]] const std::vector<ElfRelocation>& elf_relocations() const noexcept override {
+        static const std::vector<ElfRelocation> empty;
+        return empty;
+    }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
         for (const Section& section : sections_) {
@@ -149,6 +153,9 @@ public:
     [[nodiscard]] const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept override {
         return dynamic_entries_;
     }
+    [[nodiscard]] const std::vector<ElfRelocation>& elf_relocations() const noexcept override {
+        return relocations_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
@@ -157,6 +164,7 @@ private:
     std::vector<ElfSectionHeader> section_headers_;
     std::vector<ElfSymbol> elf_symbols_;
     std::vector<ElfDynamicEntry> dynamic_entries_;
+    std::vector<ElfRelocation> relocations_;
 };
 
 class PeImage final : public ImageBase {
@@ -303,6 +311,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::vector<ElfSectionHeader>& headers, std::vector<Section>& out,
                         std::vector<ElfSymbol>& elf_symbols_out, std::vector<Symbol>& symbols_out,
                         std::vector<ElfDynamicEntry>& dynamic_entries_out,
+                        std::vector<ElfRelocation>& relocations_out,
                         std::vector<ImportEntry>& imports_out) {
     if (shoff == 0 || shnum == 0 || shentsize == 0) {
         return;
@@ -510,6 +519,54 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             }
         }
     }
+
+    for (const auto& sh : headers) {
+        const bool has_addend = sh.type == 4;     // SHT_RELA
+        const bool no_addend = sh.type == 9;      // SHT_REL
+        if (!has_addend && !no_addend) {
+            continue;
+        }
+
+        const std::uint64_t min_reloc = has_addend
+            ? (is64 ? 0x18 : 0x0C)
+            : (is64 ? 0x10 : 0x08);
+        const std::uint64_t entry_size = sh.entry_size != 0 ? sh.entry_size : min_reloc;
+        if (entry_size < min_reloc ||
+            !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        const std::uint64_t count = sh.size / entry_size;
+        for (std::uint64_t i = 0; i < count; ++i) {
+            const std::uint64_t reloc_off = sh.offset + i * entry_size;
+            if (!fits_range(reloc_off, min_reloc, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+
+            const std::size_t off = static_cast<std::size_t>(reloc_off);
+            ElfRelocation relocation;
+            relocation.section_name = sh.name;
+            relocation.has_addend = has_addend;
+            if (is64) {
+                relocation.offset = rd64(b, off + 0x00, big);
+                relocation.info = rd64(b, off + 0x08, big);
+                relocation.symbol_index = relocation.info >> 32;
+                relocation.type = relocation.info & 0xFFFF'FFFFull;
+                if (has_addend) {
+                    relocation.addend = static_cast<std::int64_t>(rd64(b, off + 0x10, big));
+                }
+            } else {
+                relocation.offset = rd32(b, off + 0x00, big);
+                relocation.info = rd32(b, off + 0x04, big);
+                relocation.symbol_index = relocation.info >> 8;
+                relocation.type = relocation.info & 0xFFu;
+                if (has_addend) {
+                    relocation.addend = static_cast<std::int32_t>(rd32(b, off + 0x08, big));
+                }
+            }
+            relocations_out.push_back(relocation);
+        }
+    }
 }
 
 Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8_t> b) {
@@ -583,7 +640,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
                        img->program_headers_, img->segments_);
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
-                       img->dynamic_entries_, img->imports_);
+                       img->dynamic_entries_, img->relocations_, img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
