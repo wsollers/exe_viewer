@@ -127,13 +127,13 @@ public:
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 };
 
-Architecture elf_arch(std::uint16_t machine) noexcept {
+Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
     switch (machine) {
         case 3:   return Architecture::X86;        // EM_386
         case 62:  return Architecture::X86_64;     // EM_X86_64
         case 40:  return Architecture::ARM;        // EM_ARM
         case 183: return Architecture::ARM64;      // EM_AARCH64
-        case 243: return Architecture::RISCV64;    // EM_RISCV
+        case 243: return is64 ? Architecture::RISCV64 : Architecture::RISCV32;  // EM_RISCV
         case 21:  return Architecture::PowerPC64;  // EM_PPC64
         case 8:   return Architecture::MIPS;       // EM_MIPS
         default:  return Architecture::Unknown;
@@ -479,7 +479,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     img->is_64_  = is64;
     img->endian_ = big ? Endianness::Big : Endianness::Little;
     img->kind_   = elf_kind(e_type);
-    img->arch_   = elf_arch(e_machine);
+    img->arch_   = elf_arch(e_machine, is64);
     img->entry_  = e_entry;
 
     // Sections (P2-1), best-effort: identity above is already valid.
@@ -755,6 +755,7 @@ std::string_view to_string(Architecture a) noexcept {
         case Architecture::X86_64:    return "x86-64";
         case Architecture::ARM:       return "ARM";
         case Architecture::ARM64:     return "ARM64";
+        case Architecture::RISCV32:   return "RISC-V 32";
         case Architecture::RISCV64:   return "RISC-V 64";
         case Architecture::PowerPC64: return "PowerPC64";
         case Architecture::MIPS:      return "MIPS";

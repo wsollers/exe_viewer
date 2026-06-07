@@ -425,6 +425,12 @@ New-Elf64Fixture "known-linux-arm64.elf" 183
 New-Elf64Fixture "known-linux-riscv64.elf" 243
 New-Elf32CompatibilityFixture "known-linux-x86-elf32-le.elf" 3 $false
 New-Elf32CompatibilityFixture "known-linux-mips-elf32-be.elf" 8 $true
+New-Elf32CompatibilityFixture "known-linux-arm-elf32-le.elf" 40 $false
+New-Elf32CompatibilityFixture "known-linux-arm-elf32-be.elf" 40 $true
+New-Elf64CompatibilityFixture "known-linux-arm64-elf64-be.elf" 183 $true
+New-Elf32CompatibilityFixture "known-linux-riscv32-elf32-le.elf" 243 $false
+New-Elf32CompatibilityFixture "known-linux-riscv32-elf32-be.elf" 243 $true
+New-Elf64CompatibilityFixture "known-linux-riscv64-elf64-be.elf" 243 $true
 New-Elf64CompatibilityFixture "known-linux-ppc64-elf64-be.elf" 21 $true
 New-Pe32Fixture "known-win-x86.exe"
 New-Pe64Fixture "known-win-x64.exe"

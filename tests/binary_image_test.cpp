@@ -267,11 +267,23 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
 }
 
 TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
-    constexpr std::array<ExpectedImage, 4> fixtures{{
+    constexpr std::array<ExpectedImage, 10> fixtures{{
         {"known-linux-x86-elf32-le.elf", peelf::Format::ELF, peelf::Architecture::X86,
          peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x400080, 0x80, 0x400080},
         {"known-linux-mips-elf32-be.elf", peelf::Format::ELF, peelf::Architecture::MIPS,
          peelf::ImageKind::Executable, peelf::Endianness::Big, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-arm-elf32-le.elf", peelf::Format::ELF, peelf::Architecture::ARM,
+         peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-arm-elf32-be.elf", peelf::Format::ELF, peelf::Architecture::ARM,
+         peelf::ImageKind::Executable, peelf::Endianness::Big, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-arm64-elf64-be.elf", peelf::Format::ELF, peelf::Architecture::ARM64,
+         peelf::ImageKind::Executable, peelf::Endianness::Big, true, 0x400080, 0x80, 0x400080},
+        {"known-linux-riscv32-elf32-le.elf", peelf::Format::ELF, peelf::Architecture::RISCV32,
+         peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-riscv32-elf32-be.elf", peelf::Format::ELF, peelf::Architecture::RISCV32,
+         peelf::ImageKind::Executable, peelf::Endianness::Big, false, 0x400080, 0x80, 0x400080},
+        {"known-linux-riscv64-elf64-be.elf", peelf::Format::ELF, peelf::Architecture::RISCV64,
+         peelf::ImageKind::Executable, peelf::Endianness::Big, true, 0x400080, 0x80, 0x400080},
         {"known-linux-ppc64-elf64-be.elf", peelf::Format::ELF, peelf::Architecture::PowerPC64,
          peelf::ImageKind::Executable, peelf::Endianness::Big, true, 0x400080, 0x80, 0x400080},
         {"known-win-x86.exe", peelf::Format::PE, peelf::Architecture::X86,
