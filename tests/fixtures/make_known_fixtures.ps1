@@ -117,6 +117,16 @@ function Put-GnuHash {
     }
 }
 
+function Put-CodeViewRsds {
+    param([byte[]]$Bytes, [UInt32]$Offset, [UInt32]$Age, [string]$PdbPath, [byte]$GuidBase)
+    Put-Ascii $Bytes $Offset "RSDS"
+    for ($Index = [UInt32]0; $Index -lt 16; ++$Index) {
+        $Bytes[$Offset + 0x04 + $Index] = [byte]($GuidBase + $Index)
+    }
+    Put-U32LE $Bytes ($Offset + 0x14) $Age
+    Put-Ascii $Bytes ($Offset + 0x18) $PdbPath
+}
+
 function New-Elf64Fixture {
     param([string]$Name, [UInt16]$Machine)
 
@@ -300,7 +310,7 @@ function New-Elf64Fixture {
 function New-Pe64Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x600)
+    $Bytes = [byte[]]::new(0x700)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -308,7 +318,7 @@ function New-Pe64Fixture {
     Put-Ascii $Bytes 0x80 "PE"
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x8664
-    Put-U16LE $Bytes ($Coff + 2) 2
+    Put-U16LE $Bytes ($Coff + 2) 3
     Put-U16LE $Bytes ($Coff + 16) 0x00f0
     Put-U16LE $Bytes ($Coff + 18) 0x0022
 
@@ -323,6 +333,8 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
     Put-U32LE $Bytes ($Opt + 0x98) 0x2000
     Put-U32LE $Bytes ($Opt + 0x9C) 0x0C
+    Put-U32LE $Bytes ($Opt + 0xA0) 0x3000
+    Put-U32LE $Bytes ($Opt + 0xA4) 0x1C
 
     $Sect = [UInt32]($Opt + 0x00f0)
     Put-Ascii $Bytes $Sect ".text"
@@ -340,6 +352,14 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($RelocSect + 20) 0x400
     Put-U32LE $Bytes ($RelocSect + 36) 0x42000040
 
+    $DebugSect = [UInt32]($RelocSect + 0x28)
+    Put-Ascii $Bytes $DebugSect ".debug"
+    Put-U32LE $Bytes ($DebugSect + 8) 0x80
+    Put-U32LE $Bytes ($DebugSect + 12) 0x3000
+    Put-U32LE $Bytes ($DebugSect + 16) 0x100
+    Put-U32LE $Bytes ($DebugSect + 20) 0x500
+    Put-U32LE $Bytes ($DebugSect + 36) 0x42000040
+
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
@@ -348,6 +368,16 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes 0x404 0x0C    # Block size
     Put-U16LE $Bytes 0x408 0xA088  # IMAGE_REL_BASED_DIR64 at RVA 0x1088
     Put-U16LE $Bytes 0x40A 0       # IMAGE_REL_BASED_ABSOLUTE padding
+
+    Put-U32LE $Bytes 0x500 0           # Characteristics
+    Put-U32LE $Bytes 0x504 0x5E2A5A64  # TimeDateStamp
+    Put-U16LE $Bytes 0x508 0           # MajorVersion
+    Put-U16LE $Bytes 0x50A 0           # MinorVersion
+    Put-U32LE $Bytes 0x50C 2           # IMAGE_DEBUG_TYPE_CODEVIEW
+    Put-U32LE $Bytes 0x510 0x2A        # SizeOfData
+    Put-U32LE $Bytes 0x514 0x301C      # AddressOfRawData
+    Put-U32LE $Bytes 0x518 0x51C       # PointerToRawData
+    Put-CodeViewRsds $Bytes 0x51C 2 "known-win-x64.pdb" 0x20
 
     Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
     Put-U32LE $Bytes 0x310 1       # Base
@@ -736,7 +766,7 @@ function New-Elf64CompatibilityFixture {
 function New-Pe32Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x500)
+    $Bytes = [byte[]]::new(0x600)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -744,7 +774,7 @@ function New-Pe32Fixture {
     Put-Ascii $Bytes 0x80 "PE"
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x014c
-    Put-U16LE $Bytes ($Coff + 2) 2
+    Put-U16LE $Bytes ($Coff + 2) 3
     Put-U16LE $Bytes ($Coff + 16) 0x00e0
     Put-U16LE $Bytes ($Coff + 18) 0x0102
 
@@ -755,6 +785,8 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 0x5C) 16
     Put-U32LE $Bytes ($Opt + 0x88) 0x2000
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
+    Put-U32LE $Bytes ($Opt + 0x90) 0x3000
+    Put-U32LE $Bytes ($Opt + 0x94) 0x1C
 
     $Sect = [UInt32]($Opt + 0x00e0)
     Put-Ascii $Bytes $Sect ".text"
@@ -772,6 +804,14 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($RelocSect + 20) 0x300
     Put-U32LE $Bytes ($RelocSect + 36) 0x42000040
 
+    $DebugSect = [UInt32]($RelocSect + 0x28)
+    Put-Ascii $Bytes $DebugSect ".debug"
+    Put-U32LE $Bytes ($DebugSect + 8) 0x80
+    Put-U32LE $Bytes ($DebugSect + 12) 0x3000
+    Put-U32LE $Bytes ($DebugSect + 16) 0x100
+    Put-U32LE $Bytes ($DebugSect + 20) 0x400
+    Put-U32LE $Bytes ($DebugSect + 36) 0x42000040
+
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
@@ -780,6 +820,16 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x304 0x0C    # Block size
     Put-U16LE $Bytes 0x308 0x3010  # IMAGE_REL_BASED_HIGHLOW at RVA 0x1010
     Put-U16LE $Bytes 0x30A 0       # IMAGE_REL_BASED_ABSOLUTE padding
+
+    Put-U32LE $Bytes 0x400 0           # Characteristics
+    Put-U32LE $Bytes 0x404 0x5E2A5A32  # TimeDateStamp
+    Put-U16LE $Bytes 0x408 0           # MajorVersion
+    Put-U16LE $Bytes 0x40A 0           # MinorVersion
+    Put-U32LE $Bytes 0x40C 2           # IMAGE_DEBUG_TYPE_CODEVIEW
+    Put-U32LE $Bytes 0x410 0x2A        # SizeOfData
+    Put-U32LE $Bytes 0x414 0x301C      # AddressOfRawData
+    Put-U32LE $Bytes 0x418 0x41C       # PointerToRawData
+    Put-CodeViewRsds $Bytes 0x41C 1 "known-win-x86.pdb" 0x10
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

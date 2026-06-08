@@ -181,6 +181,7 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_EQ(img.kind(), peelf::ImageKind::Executable);
     EXPECT_EQ(img.entry_point(), 0x140000000ULL + 0x1000);
     EXPECT_TRUE(img.pe_base_relocations().empty());
+    EXPECT_TRUE(img.pe_debug_directories().empty());
     EXPECT_EQ(img.elf_header(), nullptr);
     EXPECT_TRUE(img.elf_program_headers().empty());
     EXPECT_TRUE(img.elf_section_headers().empty());
@@ -438,6 +439,60 @@ TEST(BinaryImage, ParsesPeBaseRelocationsAcrossFixtureMatrix) {
         EXPECT_EQ(padding.type, 0u) << expected.name;  // IMAGE_REL_BASED_ABSOLUTE
         EXPECT_EQ(padding.offset, 0u) << expected.name;
         EXPECT_EQ(padding.rva, block.page_rva) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesPeDebugDirectoriesAcrossFixtureMatrix) {
+    struct ExpectedDebug {
+        const char* name;
+        std::uint32_t time_date_stamp;
+        std::uint32_t pointer_to_raw_data;
+        std::uint64_t debug_section_virtual_address;
+        std::uint32_t codeview_age;
+        const char* pdb_path;
+        std::uint8_t guid_base;
+    };
+    constexpr std::array<ExpectedDebug, 2> fixtures{{
+        {"known-win-x86.exe", 0x5E2A5A32, 0x41C, 0x403000, 1, "known-win-x86.pdb", 0x10},
+        {"known-win-x64.exe", 0x5E2A5A64, 0x51C, 0x140003000, 2, "known-win-x64.pdb", 0x20},
+    }};
+
+    for (const ExpectedDebug& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto debug_section = std::ranges::find_if((**result).sections(), [](const peelf::Section& section) {
+            return section.name == ".debug";
+        });
+        ASSERT_NE(debug_section, (**result).sections().end()) << expected.name;
+        EXPECT_EQ(debug_section->virtual_address, expected.debug_section_virtual_address) << expected.name;
+        EXPECT_EQ(debug_section->virtual_size, 0x80u) << expected.name;
+        EXPECT_TRUE(debug_section->readable) << expected.name;
+        EXPECT_FALSE(debug_section->writable) << expected.name;
+        EXPECT_FALSE(debug_section->executable) << expected.name;
+
+        const auto& debug = (**result).pe_debug_directories();
+        ASSERT_EQ(debug.size(), 1u) << expected.name;
+        const peelf::PeDebugDirectory& entry = debug.front();
+        EXPECT_EQ(entry.characteristics, 0u) << expected.name;
+        EXPECT_EQ(entry.time_date_stamp, expected.time_date_stamp) << expected.name;
+        EXPECT_EQ(entry.major_version, 0u) << expected.name;
+        EXPECT_EQ(entry.minor_version, 0u) << expected.name;
+        EXPECT_EQ(entry.type, 2u) << expected.name;  // IMAGE_DEBUG_TYPE_CODEVIEW
+        EXPECT_EQ(entry.size_of_data, 0x2Au) << expected.name;
+        EXPECT_EQ(entry.address_of_raw_data, 0x301Cu) << expected.name;
+        EXPECT_EQ(entry.pointer_to_raw_data, expected.pointer_to_raw_data) << expected.name;
+        EXPECT_EQ(entry.codeview_signature, 0x5344'5352u) << expected.name;  // "RSDS"
+        EXPECT_EQ(entry.codeview_age, expected.codeview_age) << expected.name;
+        EXPECT_EQ(entry.codeview_pdb_path, expected.pdb_path) << expected.name;
+        ASSERT_EQ(entry.codeview_guid.size(), 16u) << expected.name;
+        for (std::uint8_t i = 0; i < 16; ++i) {
+            EXPECT_EQ(entry.codeview_guid[i], static_cast<std::uint8_t>(expected.guid_base + i)) << expected.name;
+        }
     }
 }
 

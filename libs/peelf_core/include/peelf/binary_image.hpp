@@ -104,6 +104,21 @@ struct PeBaseRelocationBlock {
     std::vector<PeBaseRelocationEntry> entries;
 };
 
+struct PeDebugDirectory {
+    std::uint32_t characteristics = 0;
+    std::uint32_t time_date_stamp = 0;
+    std::uint16_t major_version = 0;
+    std::uint16_t minor_version = 0;
+    std::uint32_t type = 0;
+    std::uint32_t size_of_data = 0;
+    std::uint32_t address_of_raw_data = 0;
+    std::uint32_t pointer_to_raw_data = 0;
+    std::uint32_t codeview_signature = 0;
+    std::vector<std::uint8_t> codeview_guid;
+    std::uint32_t codeview_age = 0;
+    std::string codeview_pdb_path;
+};
+
 struct ElfHeader {
     std::uint8_t  elf_class = 0;
     std::uint8_t  data_encoding = 0;
@@ -225,6 +240,7 @@ public:
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
