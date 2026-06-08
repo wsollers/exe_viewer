@@ -318,8 +318,8 @@ function New-Pe64Fixture {
     Put-Ascii $Bytes 0x80 "PE"
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x8664
-    Put-U16LE $Bytes ($Coff + 2) 3
-    Put-U16LE $Bytes ($Coff + 16) 0x00f0
+    Put-U16LE $Bytes ($Coff + 2) 4
+    Put-U16LE $Bytes ($Coff + 16) 0x00c0
     Put-U16LE $Bytes ($Coff + 18) 0x0022
 
     $Opt = [UInt32]($Coff + 20)
@@ -335,8 +335,10 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x9C) 0x0C
     Put-U32LE $Bytes ($Opt + 0xA0) 0x3000
     Put-U32LE $Bytes ($Opt + 0xA4) 0x1C
+    Put-U32LE $Bytes ($Opt + 0xB8) 0x4000
+    Put-U32LE $Bytes ($Opt + 0xBC) 0x28
 
-    $Sect = [UInt32]($Opt + 0x00f0)
+    $Sect = [UInt32]($Opt + 0x00c0)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x200
     Put-U32LE $Bytes ($Sect + 12) 0x1000
@@ -360,6 +362,14 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($DebugSect + 20) 0x500
     Put-U32LE $Bytes ($DebugSect + 36) 0x42000040
 
+    $TlsSect = [UInt32]($DebugSect + 0x28)
+    Put-Ascii $Bytes $TlsSect ".tls"
+    Put-U32LE $Bytes ($TlsSect + 8) 0x80
+    Put-U32LE $Bytes ($TlsSect + 12) 0x4000
+    Put-U32LE $Bytes ($TlsSect + 16) 0x100
+    Put-U32LE $Bytes ($TlsSect + 20) 0x600
+    Put-U32LE $Bytes ($TlsSect + 36) 3254779968
+
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
@@ -378,6 +388,15 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes 0x514 0x301C      # AddressOfRawData
     Put-U32LE $Bytes 0x518 0x51C       # PointerToRawData
     Put-CodeViewRsds $Bytes 0x51C 2 "known-win-x64.pdb" 0x20
+
+    Put-U64LE $Bytes 0x600 0x140004010 # StartAddressOfRawData
+    Put-U64LE $Bytes 0x608 0x140004020 # EndAddressOfRawData
+    Put-U64LE $Bytes 0x610 0x140004030 # AddressOfIndex
+    Put-U64LE $Bytes 0x618 0x140004040 # AddressOfCallBacks
+    Put-U32LE $Bytes 0x620 8           # SizeOfZeroFill
+    Put-U32LE $Bytes 0x624 0x00400000  # Characteristics
+    Put-U64LE $Bytes 0x640 0x140001088 # TLS callback VA
+    Put-U64LE $Bytes 0x648 0
 
     Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
     Put-U32LE $Bytes 0x310 1       # Base
@@ -774,8 +793,8 @@ function New-Pe32Fixture {
     Put-Ascii $Bytes 0x80 "PE"
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x014c
-    Put-U16LE $Bytes ($Coff + 2) 3
-    Put-U16LE $Bytes ($Coff + 16) 0x00e0
+    Put-U16LE $Bytes ($Coff + 2) 4
+    Put-U16LE $Bytes ($Coff + 16) 0x00b0
     Put-U16LE $Bytes ($Coff + 18) 0x0102
 
     $Opt = [UInt32]($Coff + 20)
@@ -787,8 +806,10 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
     Put-U32LE $Bytes ($Opt + 0x90) 0x3000
     Put-U32LE $Bytes ($Opt + 0x94) 0x1C
+    Put-U32LE $Bytes ($Opt + 0xA8) 0x4000
+    Put-U32LE $Bytes ($Opt + 0xAC) 0x18
 
-    $Sect = [UInt32]($Opt + 0x00e0)
+    $Sect = [UInt32]($Opt + 0x00b0)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x100
     Put-U32LE $Bytes ($Sect + 12) 0x1000
@@ -812,6 +833,14 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($DebugSect + 20) 0x400
     Put-U32LE $Bytes ($DebugSect + 36) 0x42000040
 
+    $TlsSect = [UInt32]($DebugSect + 0x28)
+    Put-Ascii $Bytes $TlsSect ".tls"
+    Put-U32LE $Bytes ($TlsSect + 8) 0x80
+    Put-U32LE $Bytes ($TlsSect + 12) 0x4000
+    Put-U32LE $Bytes ($TlsSect + 16) 0x100
+    Put-U32LE $Bytes ($TlsSect + 20) 0x500
+    Put-U32LE $Bytes ($TlsSect + 36) 3254779968
+
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
@@ -830,6 +859,15 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x414 0x301C      # AddressOfRawData
     Put-U32LE $Bytes 0x418 0x41C       # PointerToRawData
     Put-CodeViewRsds $Bytes 0x41C 1 "known-win-x86.pdb" 0x10
+
+    Put-U32LE $Bytes 0x500 0x404010 # StartAddressOfRawData
+    Put-U32LE $Bytes 0x504 0x404018 # EndAddressOfRawData
+    Put-U32LE $Bytes 0x508 0x404020 # AddressOfIndex
+    Put-U32LE $Bytes 0x50C 0x404030 # AddressOfCallBacks
+    Put-U32LE $Bytes 0x510 4        # SizeOfZeroFill
+    Put-U32LE $Bytes 0x514 0x00300000
+    Put-U32LE $Bytes 0x530 0x401010 # TLS callback VA
+    Put-U32LE $Bytes 0x534 0
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

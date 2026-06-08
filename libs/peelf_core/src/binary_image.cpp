@@ -79,6 +79,9 @@ public:
         static const std::vector<PeDebugDirectory> empty;
         return empty;
     }
+    [[nodiscard]] const PeTlsDirectory* pe_tls_directory() const noexcept override {
+        return nullptr;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -214,11 +217,15 @@ public:
     [[nodiscard]] const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept override {
         return debug_directories_;
     }
+    [[nodiscard]] const PeTlsDirectory* pe_tls_directory() const noexcept override {
+        return tls_directory_ ? &*tls_directory_ : nullptr;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
     std::vector<PeBaseRelocationBlock> base_relocations_;
     std::vector<PeDebugDirectory> debug_directories_;
+    std::optional<PeTlsDirectory> tls_directory_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -390,6 +397,68 @@ void parse_pe_debug_directories(std::span<const std::uint8_t> b,
         }
         debug_out.push_back(std::move(entry));
     }
+}
+
+void parse_pe_tls_directory(std::span<const std::uint8_t> b,
+                            const std::vector<Section>& sections,
+                            std::uint64_t image_base,
+                            bool is64,
+                            std::uint32_t directory_rva,
+                            std::uint32_t directory_size,
+                            std::optional<PeTlsDirectory>& tls_out) {
+    const std::uint64_t min_size = is64 ? 0x28u : 0x18u;
+    if (directory_rva == 0 || directory_size < min_size) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, min_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::size_t off = static_cast<std::size_t>(*directory_off);
+    PeTlsDirectory tls;
+    if (is64) {
+        tls.raw_data_start_va = rd64(b, off + 0x00, false);
+        tls.raw_data_end_va = rd64(b, off + 0x08, false);
+        tls.address_of_index = rd64(b, off + 0x10, false);
+        tls.address_of_callbacks = rd64(b, off + 0x18, false);
+        tls.size_of_zero_fill = rd32(b, off + 0x20, false);
+        tls.characteristics = rd32(b, off + 0x24, false);
+    } else {
+        tls.raw_data_start_va = rd32(b, off + 0x00, false);
+        tls.raw_data_end_va = rd32(b, off + 0x04, false);
+        tls.address_of_index = rd32(b, off + 0x08, false);
+        tls.address_of_callbacks = rd32(b, off + 0x0C, false);
+        tls.size_of_zero_fill = rd32(b, off + 0x10, false);
+        tls.characteristics = rd32(b, off + 0x14, false);
+    }
+
+    if (tls.address_of_callbacks != 0 && tls.address_of_callbacks >= image_base) {
+        const std::uint64_t callbacks_rva64 = tls.address_of_callbacks - image_base;
+        if (callbacks_rva64 <= std::numeric_limits<std::uint32_t>::max()) {
+            const auto callbacks_off = pe_rva_to_file_offset(
+                sections, image_base, static_cast<std::uint32_t>(callbacks_rva64));
+            if (callbacks_off) {
+                const std::uint64_t pointer_size = is64 ? 8u : 4u;
+                for (std::uint64_t callback_index = 0; callback_index < 4096; ++callback_index) {
+                    const std::uint64_t callback_off = *callbacks_off + callback_index * pointer_size;
+                    if (!fits_range(callback_off, pointer_size, static_cast<std::uint64_t>(b.size()))) {
+                        break;
+                    }
+                    const std::uint64_t callback_va = is64
+                        ? rd64(b, static_cast<std::size_t>(callback_off), false)
+                        : static_cast<std::uint64_t>(rd32(b, static_cast<std::size_t>(callback_off), false));
+                    if (callback_va == 0) {
+                        break;
+                    }
+                    tls.callbacks.push_back(callback_va);
+                }
+            }
+        }
+    }
+
+    tls_out = std::move(tls);
 }
 
 [[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
@@ -1013,6 +1082,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
                                               ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
                                               : 0;
+    const std::uint32_t tls_dir_rva = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
+                                          ? rd32(b, opt + (is64 ? 0xB8 : 0xA8), false)
+                                          : 0;
+    const std::uint32_t tls_dir_size = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
+                                           ? rd32(b, opt + (is64 ? 0xBC : 0xAC), false)
+                                           : 0;
     const std::uint32_t base_reloc_dir_rva = (size_of_opt >= (is64 ? 0xA0 : 0x90))
                                                  ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
                                                  : 0;
@@ -1073,6 +1148,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                               base_reloc_dir_size, img->base_relocations_);
     parse_pe_debug_directories(b, img->sections_, image_base, debug_dir_rva,
                                debug_dir_size, img->debug_directories_);
+    parse_pe_tls_directory(b, img->sections_, image_base, is64, tls_dir_rva,
+                           tls_dir_size, img->tls_directory_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);

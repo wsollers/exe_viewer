@@ -496,6 +496,43 @@ TEST(BinaryImage, ParsesPeDebugDirectoriesAcrossFixtureMatrix) {
     }
 }
 
+TEST(BinaryImage, ParsesPeTlsDirectoriesAcrossFixtureMatrix) {
+    struct ExpectedTls {
+        const char* name;
+        std::uint64_t raw_data_start_va;
+        std::uint64_t raw_data_end_va;
+        std::uint64_t address_of_index;
+        std::uint64_t address_of_callbacks;
+        std::uint32_t size_of_zero_fill;
+        std::uint32_t characteristics;
+        std::uint64_t callback;
+    };
+    constexpr std::array<ExpectedTls, 2> fixtures{{
+        {"known-win-x86.exe", 0x404010, 0x404018, 0x404020, 0x404030, 4, 0x00300000, 0x401010},
+        {"known-win-x64.exe", 0x140004010, 0x140004020, 0x140004030, 0x140004040, 8, 0x00400000, 0x140001088},
+    }};
+
+    for (const ExpectedTls& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::PeTlsDirectory* tls = (**result).pe_tls_directory();
+        ASSERT_NE(tls, nullptr) << expected.name;
+        EXPECT_EQ(tls->raw_data_start_va, expected.raw_data_start_va) << expected.name;
+        EXPECT_EQ(tls->raw_data_end_va, expected.raw_data_end_va) << expected.name;
+        EXPECT_EQ(tls->address_of_index, expected.address_of_index) << expected.name;
+        EXPECT_EQ(tls->address_of_callbacks, expected.address_of_callbacks) << expected.name;
+        EXPECT_EQ(tls->size_of_zero_fill, expected.size_of_zero_fill) << expected.name;
+        EXPECT_EQ(tls->characteristics, expected.characteristics) << expected.name;
+        ASSERT_EQ(tls->callbacks.size(), 1u) << expected.name;
+        EXPECT_EQ(tls->callbacks.front(), expected.callback) << expected.name;
+    }
+}
+
 TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
     constexpr std::array<ExpectedElfHeader, 14> fixtures{{
         {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x480, 0x180, 0x40, 0x38, 0x40, 11},
