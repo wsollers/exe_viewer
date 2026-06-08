@@ -47,6 +47,8 @@ add_executable(peelf_viewer
         src/model/pe_subsystem.hpp
         src/model/section_header_characteristics.hpp
         src/model/image_delay_load_descriptor.hpp
+        src/navigation/viewer_navigation.hpp
+        src/navigation/viewer_navigation.cpp
         src/disasm/disassembler.hpp
 )
 

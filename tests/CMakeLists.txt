@@ -31,6 +31,8 @@ add_executable(peelf_tests
   parsers_test.cpp
   binary_image_test.cpp
   disassembler_test.cpp
+  viewer_navigation_test.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
 )
 
 target_compile_features(peelf_tests PRIVATE cxx_std_23)
