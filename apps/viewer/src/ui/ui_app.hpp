@@ -47,7 +47,6 @@ namespace viewer {
         FilePanel       file_panel_;
         SectionsPanel   sections_panel_;
         HexViewPanel    hex_panel_;
-        DisassemblyPanel disasm_panel_;
         ImportsPanel    imports_panel_;
         ExportsPanel    exports_panel_;
         SymbolsPanel    symbols_panel_;
@@ -60,12 +59,15 @@ namespace viewer {
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;
+        bool reset_dock_layout_ = false;
+        bool show_disassembly_panel_ = true;
         PeModel pe_model_;
         std::vector<Instruction> current_instructions_;
 
 
         void render_main_menu();
         void render_dockspace();
+        void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
 
 
     };

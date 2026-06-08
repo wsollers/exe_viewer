@@ -1,5 +1,6 @@
 #include "ui_app.hpp"
 #include <imgui.h>
+#include <imgui_internal.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -38,7 +39,6 @@ UiApp::UiApp(BinaryModel& model)
     , file_panel_(model)
     , sections_panel_(model)
     , hex_panel_(model)
-    , disasm_panel_(model,current_instructions_)
     , imports_panel_(model)
     , exports_panel_(model)
     , symbols_panel_(model)
@@ -59,7 +59,6 @@ void UiApp::render() {
     file_panel_.draw();
     sections_panel_.draw();
     hex_panel_.draw();
-    disasm_panel_.draw();
     imports_panel_.draw();
     exports_panel_.draw();
     symbols_panel_.draw();
@@ -68,8 +67,9 @@ void UiApp::render() {
     pe_exports_panel_.draw();
     log_panel_.draw();
 
-    disasm_panel_.current_instructions_= current_instructions_;
-    render_disassembly_panel();
+    if (show_disassembly_panel_) {
+        render_disassembly_panel();
+    }
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
 }
@@ -90,7 +90,29 @@ void UiApp::render_main_menu() {
     }
 
     if (ImGui::BeginMenu("View")) {
+        if (ImGui::MenuItem("Reset Layout")) {
+            reset_dock_layout_ = true;
+        }
+        ImGui::Separator();
         ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
+
+        {
+            bool v = file_panel_.visible();
+            if (ImGui::MenuItem(file_panel_.name().c_str(), nullptr, &v))
+                file_panel_.set_visible(v);
+        }
+
+        {
+            bool v = sections_panel_.visible();
+            if (ImGui::MenuItem(sections_panel_.name().c_str(), nullptr, &v))
+                sections_panel_.set_visible(v);
+        }
+
+        {
+            bool v = hex_panel_.visible();
+            if (ImGui::MenuItem(hex_panel_.name().c_str(), nullptr, &v))
+                hex_panel_.set_visible(v);
+        }
 
         {
             bool v = imports_panel_.visible();
@@ -128,6 +150,16 @@ void UiApp::render_main_menu() {
                 pe_exports_panel_.set_visible(v);
         }
 
+        {
+            ImGui::MenuItem("Disassembly", nullptr, &show_disassembly_panel_);
+        }
+
+        {
+            bool v = log_panel_.visible();
+            if (ImGui::MenuItem(log_panel_.name().c_str(), nullptr, &v))
+                log_panel_.set_visible(v);
+        }
+
         ImGui::EndMenu();
     }
 
@@ -156,14 +188,45 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
-    ImGuiDockNodeFlags dock_flags =
-        ImGuiDockNodeFlags_PassthruCentralNode |
-        ImGuiDockNodeFlags_NoDockingInCentralNode;
+    const ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
+    const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
+    if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr) {
+        build_default_dock_layout(dockspace_id, viewport->WorkSize);
+        reset_dock_layout_ = false;
+    }
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dock_flags);
 
     ImGui::End();
 }
+
+void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size) {
+    ImGui::DockBuilderRemoveNode(dockspace_id);
+    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, dockspace_size);
+
+    ImGuiID main_id = dockspace_id;
+    const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, 0.22f, nullptr, &main_id);
+    const ImGuiID right_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.24f, nullptr, &main_id);
+    const ImGuiID bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.22f, nullptr, &main_id);
+    const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.42f, nullptr, &main_id);
+
+    ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
+
+    ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(pe_headers_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(pe_imports_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(pe_exports_panel_.name().c_str(), right_id);
+
+    ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), main_id);
+    ImGui::DockBuilderDockWindow("Disassembly", center_bottom_id);
+    ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
+
+    ImGui::DockBuilderFinish(dockspace_id);
+}
+
     void UiApp::render_disassembly_panel() {
     ImGui::Begin("Disassembly");
 
