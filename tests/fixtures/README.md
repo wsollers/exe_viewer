@@ -68,11 +68,11 @@ Small binary samples used by the unit tests.
   fixture with a `.text` section, one load segment, one `PT_INTERP` interpreter
   path, one `_start` function symbol, one `DT_NEEDED` library, one `.rela.dyn`
   relocation, one `.note.peelf` note also covered by `PT_NOTE`, and `EM_PPC64`.
-- `known-win-x86.exe` — deterministic minimal PE32 executable fixture with a `.text`
-  section and `IMAGE_FILE_MACHINE_I386`.
+- `known-win-x86.exe` — deterministic minimal PE32 executable fixture with `.text` and
+  `.reloc` sections, one HIGHLOW base relocation, and `IMAGE_FILE_MACHINE_I386`.
 - `known-win-x64.exe` — deterministic minimal PE32+ executable fixture with a
-  `.text` section, one import `KERNEL32.dll!ExitProcess`, one export named `known_export`, and
-  `IMAGE_FILE_MACHINE_AMD64`.
+  `.text` section, one import `KERNEL32.dll!ExitProcess`, one export named `known_export`,
+  one `.reloc` section with a DIR64 base relocation, and `IMAGE_FILE_MACHINE_AMD64`.
 - `make_known_fixtures.ps1` — regenerates the `known-*` binary fixtures from
   explicit fixed-width field writes.
 

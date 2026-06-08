@@ -180,6 +180,7 @@ TEST(BinaryImage, ParsesSyntheticPe64Identity) {
     EXPECT_EQ(img.endianness(), peelf::Endianness::Little);
     EXPECT_EQ(img.kind(), peelf::ImageKind::Executable);
     EXPECT_EQ(img.entry_point(), 0x140000000ULL + 0x1000);
+    EXPECT_TRUE(img.pe_base_relocations().empty());
     EXPECT_EQ(img.elf_header(), nullptr);
     EXPECT_TRUE(img.elf_program_headers().empty());
     EXPECT_TRUE(img.elf_section_headers().empty());
@@ -380,6 +381,63 @@ TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
         } else {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
         }
+    }
+}
+
+TEST(BinaryImage, ParsesPeBaseRelocationsAcrossFixtureMatrix) {
+    struct ExpectedRelocation {
+        const char* name;
+        std::uint16_t type;
+        std::uint16_t offset;
+        std::uint32_t rva;
+        std::uint64_t relocation_section_virtual_address;
+        std::uint64_t virtual_address;
+        std::uint64_t file_offset;
+    };
+    constexpr std::array<ExpectedRelocation, 2> fixtures{{
+        {"known-win-x86.exe", 3, 0x010, 0x1010, 0x402000, 0x401010, 0x210},
+        {"known-win-x64.exe", 10, 0x088, 0x1088, 0x140002000, 0x140001088, 0x288},
+    }};
+
+    for (const ExpectedRelocation& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto reloc_section = std::ranges::find_if((**result).sections(), [](const peelf::Section& section) {
+            return section.name == ".reloc";
+        });
+        ASSERT_NE(reloc_section, (**result).sections().end()) << expected.name;
+        EXPECT_EQ(reloc_section->virtual_address, expected.relocation_section_virtual_address) << expected.name;
+        EXPECT_EQ(reloc_section->virtual_size, 0x0Cu) << expected.name;
+        EXPECT_FALSE(reloc_section->executable) << expected.name;
+        EXPECT_TRUE(reloc_section->readable) << expected.name;
+        EXPECT_FALSE(reloc_section->writable) << expected.name;
+
+        const auto& blocks = (**result).pe_base_relocations();
+        ASSERT_EQ(blocks.size(), 1u) << expected.name;
+        const peelf::PeBaseRelocationBlock& block = blocks.front();
+        EXPECT_EQ(block.page_rva, 0x1000u) << expected.name;
+        EXPECT_EQ(block.block_size, 0x0Cu) << expected.name;
+        ASSERT_EQ(block.entries.size(), 2u) << expected.name;
+
+        const peelf::PeBaseRelocationEntry& relocation = block.entries.front();
+        EXPECT_EQ(relocation.page_rva, block.page_rva) << expected.name;
+        EXPECT_EQ(relocation.type, expected.type) << expected.name;
+        EXPECT_EQ(relocation.offset, expected.offset) << expected.name;
+        EXPECT_EQ(relocation.rva, expected.rva) << expected.name;
+        EXPECT_EQ((**result).file_offset_to_virtual_address(expected.file_offset),
+                  std::optional<std::uint64_t>(expected.virtual_address)) << expected.name;
+        EXPECT_EQ((**result).virtual_address_to_file_offset(expected.virtual_address),
+                  std::optional<std::uint64_t>(expected.file_offset)) << expected.name;
+
+        const peelf::PeBaseRelocationEntry& padding = block.entries.back();
+        EXPECT_EQ(padding.type, 0u) << expected.name;  // IMAGE_REL_BASED_ABSOLUTE
+        EXPECT_EQ(padding.offset, 0u) << expected.name;
+        EXPECT_EQ(padding.rva, block.page_rva) << expected.name;
     }
 }
 

@@ -71,6 +71,10 @@ public:
     [[nodiscard]] const std::vector<Symbol>& symbols() const noexcept override { return symbols_; }
     [[nodiscard]] const std::vector<ImportEntry>& imports() const noexcept override { return imports_; }
     [[nodiscard]] const std::vector<ExportEntry>& exports() const noexcept override { return exports_; }
+    [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
+        static const std::vector<PeBaseRelocationBlock> empty;
+        return empty;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -200,7 +204,13 @@ private:
 
 class PeImage final : public ImageBase {
 public:
+    [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
+        return base_relocations_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
+
+private:
+    std::vector<PeBaseRelocationBlock> base_relocations_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -273,6 +283,51 @@ std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& s
         }
     }
     return std::nullopt;
+}
+
+void parse_pe_base_relocations(std::span<const std::uint8_t> b,
+                               const std::vector<Section>& sections,
+                               std::uint64_t image_base,
+                               std::uint32_t directory_rva,
+                               std::uint32_t directory_size,
+                               std::vector<PeBaseRelocationBlock>& relocations_out) {
+    if (directory_rva == 0 || directory_size < 8) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, directory_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::uint64_t end = *directory_off + directory_size;
+    std::uint64_t cursor = *directory_off;
+    while (cursor + 8u <= end) {
+        const std::size_t off = static_cast<std::size_t>(cursor);
+        const std::uint32_t page_rva = rd32(b, off + 0x00, false);
+        const std::uint32_t block_size = rd32(b, off + 0x04, false);
+        if (block_size < 8 || block_size > end - cursor) {
+            break;
+        }
+
+        PeBaseRelocationBlock block;
+        block.page_rva = page_rva;
+        block.block_size = block_size;
+        const std::uint64_t entry_count = (block_size - 8u) / 2u;
+        block.entries.reserve(static_cast<std::size_t>(entry_count));
+        std::uint64_t entry_cursor = cursor + 8u;
+        for (std::uint64_t i = 0; i < entry_count; ++i, entry_cursor += 2u) {
+            const std::uint16_t raw = rd16(b, static_cast<std::size_t>(entry_cursor), false);
+            PeBaseRelocationEntry entry;
+            entry.page_rva = page_rva;
+            entry.type = static_cast<std::uint16_t>(raw >> 12);
+            entry.offset = static_cast<std::uint16_t>(raw & 0x0FFFu);
+            entry.rva = page_rva + entry.offset;
+            block.entries.push_back(entry);
+        }
+        relocations_out.push_back(std::move(block));
+        cursor += block_size;
+    }
 }
 
 [[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
@@ -896,6 +951,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
                                               ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
                                               : 0;
+    const std::uint32_t base_reloc_dir_rva = (size_of_opt >= (is64 ? 0xA0 : 0x90))
+                                                 ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
+                                                 : 0;
+    const std::uint32_t base_reloc_dir_size = (size_of_opt >= (is64 ? 0xA0 : 0x90))
+                                                  ? rd32(b, opt + (is64 ? 0x9C : 0x8C), false)
+                                                  : 0;
 
     auto img = std::unique_ptr<PeImage>(new PeImage());
     img->format_ = Format::PE;
@@ -939,6 +1000,9 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         sec.writable   = (chars & 0x80000000u) != 0;  // IMAGE_SCN_MEM_WRITE
         img->sections_.push_back(std::move(sec));
     }
+
+    parse_pe_base_relocations(b, img->sections_, image_base, base_reloc_dir_rva,
+                              base_reloc_dir_size, img->base_relocations_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);

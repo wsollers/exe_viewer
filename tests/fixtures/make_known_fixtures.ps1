@@ -300,7 +300,7 @@ function New-Elf64Fixture {
 function New-Pe64Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x480)
+    $Bytes = [byte[]]::new(0x600)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -308,7 +308,7 @@ function New-Pe64Fixture {
     Put-Ascii $Bytes 0x80 "PE"
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x8664
-    Put-U16LE $Bytes ($Coff + 2) 1
+    Put-U16LE $Bytes ($Coff + 2) 2
     Put-U16LE $Bytes ($Coff + 16) 0x00f0
     Put-U16LE $Bytes ($Coff + 18) 0x0022
 
@@ -321,6 +321,8 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
     Put-U32LE $Bytes ($Opt + 0x78) 0x1180
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
+    Put-U32LE $Bytes ($Opt + 0x98) 0x2000
+    Put-U32LE $Bytes ($Opt + 0x9C) 0x0C
 
     $Sect = [UInt32]($Opt + 0x00f0)
     Put-Ascii $Bytes $Sect ".text"
@@ -329,9 +331,23 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Sect + 16) 0x200
     Put-U32LE $Bytes ($Sect + 20) 0x200
     Put-U32LE $Bytes ($Sect + 36) 0x60000020
+
+    $RelocSect = [UInt32]($Sect + 0x28)
+    Put-Ascii $Bytes $RelocSect ".reloc"
+    Put-U32LE $Bytes ($RelocSect + 8) 0x0C
+    Put-U32LE $Bytes ($RelocSect + 12) 0x2000
+    Put-U32LE $Bytes ($RelocSect + 16) 0x200
+    Put-U32LE $Bytes ($RelocSect + 20) 0x400
+    Put-U32LE $Bytes ($RelocSect + 36) 0x42000040
+
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
+
+    Put-U32LE $Bytes 0x400 0x1000  # Page RVA
+    Put-U32LE $Bytes 0x404 0x0C    # Block size
+    Put-U16LE $Bytes 0x408 0xA088  # IMAGE_REL_BASED_DIR64 at RVA 0x1088
+    Put-U16LE $Bytes 0x40A 0       # IMAGE_REL_BASED_ABSOLUTE padding
 
     Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
     Put-U32LE $Bytes 0x310 1       # Base
@@ -720,7 +736,7 @@ function New-Elf64CompatibilityFixture {
 function New-Pe32Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x300)
+    $Bytes = [byte[]]::new(0x500)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -728,7 +744,7 @@ function New-Pe32Fixture {
     Put-Ascii $Bytes 0x80 "PE"
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x014c
-    Put-U16LE $Bytes ($Coff + 2) 1
+    Put-U16LE $Bytes ($Coff + 2) 2
     Put-U16LE $Bytes ($Coff + 16) 0x00e0
     Put-U16LE $Bytes ($Coff + 18) 0x0102
 
@@ -737,6 +753,8 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U32LE $Bytes ($Opt + 28) 0x00400000
     Put-U32LE $Bytes ($Opt + 0x5C) 16
+    Put-U32LE $Bytes ($Opt + 0x88) 0x2000
+    Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
 
     $Sect = [UInt32]($Opt + 0x00e0)
     Put-Ascii $Bytes $Sect ".text"
@@ -745,9 +763,23 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Sect + 16) 0x100
     Put-U32LE $Bytes ($Sect + 20) 0x200
     Put-U32LE $Bytes ($Sect + 36) 0x60000020
+
+    $RelocSect = [UInt32]($Sect + 0x28)
+    Put-Ascii $Bytes $RelocSect ".reloc"
+    Put-U32LE $Bytes ($RelocSect + 8) 0x0C
+    Put-U32LE $Bytes ($RelocSect + 12) 0x2000
+    Put-U32LE $Bytes ($RelocSect + 16) 0x100
+    Put-U32LE $Bytes ($RelocSect + 20) 0x300
+    Put-U32LE $Bytes ($RelocSect + 36) 0x42000040
+
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
+
+    Put-U32LE $Bytes 0x300 0x1000  # Page RVA
+    Put-U32LE $Bytes 0x304 0x0C    # Block size
+    Put-U16LE $Bytes 0x308 0x3010  # IMAGE_REL_BASED_HIGHLOW at RVA 0x1010
+    Put-U16LE $Bytes 0x30A 0       # IMAGE_REL_BASED_ABSOLUTE padding
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

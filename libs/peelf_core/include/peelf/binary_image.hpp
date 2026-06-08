@@ -91,6 +91,19 @@ struct ExportEntry {
     std::string   forwarder;
 };
 
+struct PeBaseRelocationEntry {
+    std::uint32_t page_rva = 0;
+    std::uint16_t type = 0;
+    std::uint16_t offset = 0;
+    std::uint32_t rva = 0;
+};
+
+struct PeBaseRelocationBlock {
+    std::uint32_t page_rva = 0;
+    std::uint32_t block_size = 0;
+    std::vector<PeBaseRelocationEntry> entries;
+};
+
 struct ElfHeader {
     std::uint8_t  elf_class = 0;
     std::uint8_t  data_encoding = 0;
@@ -211,6 +224,7 @@ public:
     [[nodiscard]] virtual const std::vector<Symbol>& symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
