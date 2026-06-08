@@ -37,6 +37,7 @@ Resolve these before the phases they gate; defaults are the recommended path.
 - **D1 — Decompiler backend (gates Phase 5b).** Options:
   - *RetDec* (LLVM-based, open source) invoked as a subprocess, output parsed and displayed. **Recommended default** — good quality, no Java, swappable.
   - *Ghidra headless* (`analyzeHeadless` + export script) — best quality, but heavyweight Java dependency.
+  - *Binary Ninja* (Free / personal / non-commercial) optional backend — good x86/x64 workflow and exposed API, especially useful for personal tooling. First integration should use a Python subprocess bridge so the viewer still builds/runs without BN installed; direct C++ SDK integration is deferred until the workflow proves valuable.
   - *In-tree pseudocode-lite only* — function/basic-block reconstruction over Capstone; lowest fidelity, no extra deps.
   - **Decision:** wrap whatever we pick behind `IDecompiler` (Phase 5a) so the choice is reversible. _Owner to confirm D1 default._
 - **D2 — GUI scope.** Stay with Dear ImGui + Vulkan (current stack) vs. simplify the renderer. **Default: keep ImGui**, but harden the Vulkan layer (TD-7, TD-13) and pin ImGui (TD-10).
@@ -151,6 +152,9 @@ The Capstone wrapper (`disassembler.hpp`) is solid; wire it into the model and U
 - [ ] **P5a-2** In-tree **pseudocode-lite** first pass: function boundary detection, basic-block/CFG reconstruction over Capstone output, annotated/structured listing. Ships without external deps and validates the UI.
 - [ ] **P5b-1** Integrate the chosen real backend (D1; default RetDec via subprocess): detect availability, run on the selected function/range, parse output into `DecompiledUnit`.
 - [ ] **P5b-2** Decompile panel: C-like output with line→address mapping, synchronized highlight with the disassembly panel, graceful "backend not installed" state.
+- [ ] **P5b-3** **Binary Ninja backend:** optional backend for users with Binary Ninja Free/personal/non-commercial/commercial installed. Start with a Python subprocess bridge (`bn_decompile.py`) that receives file path + target VA/range, opens the Binary Ninja `BinaryView`, waits for analysis, finds/creates the containing function where possible, exports HLIL/decompiled C-like text plus line/address metadata as JSON, and returns structured errors for missing install, license/API failure, unsupported architecture, analysis timeout, or no function found. Do not link against BN SDK in the first slice.
+- [ ] **P5b-4** **Binary Ninja discovery/configuration:** detect BN from PATH, common install locations, user-configured path, and BN settings/last-run hints where available. Expose backend availability and version/capability status in the UI. Support architecture capability checks so Binary Ninja Free limitations (notably x86/x64-focused decompilation) are reported clearly instead of silently failing on ARM64/RISC-V/MIPS/PowerPC fixtures.
+- [ ] **P5b-5** **Binary Ninja direct SDK spike:** after the Python bridge works, evaluate direct C++ SDK integration. Criteria: stable headers/libs on Windows and Linux, acceptable build isolation, no required redistributable BN binaries, clean optional CMake switch, and no CI dependency on BN. Keep Python bridge as fallback unless direct SDK is clearly better.
 
 **Exit criteria:** select a function and see pseudo-C; with the backend installed, see real decompiled C synced to the disassembly.
 
@@ -197,6 +201,8 @@ The Capstone wrapper (`disassembler.hpp`) is solid; wire it into the model and U
 - [ ] **P7-14 Process inventory tests** — fake Windows and Linux process providers covering process lists, access-denied entries, exited processes, parent/child relationships, command-line parsing, `/proc` missing-field behavior, and sorting/filtering view models.
 - [ ] **P7-15 Memory map tests** — fake VMMap-style region providers covering adjacent-region coalescing, protection labels, file-backed vs anonymous regions, heap/stack/module classification, partial reads, unreadable regions, process-exit invalidation, and live VA→region lookup.
 - [ ] **P7-16 Security hardening tests** — fixture-backed rule tests for BinSkim-style reports. PE coverage: ASLR/NX/CFG/high-entropy VA/relocations/load-config/certificate/debug/W+X sections. ELF coverage: PIE/NX/GNU_STACK/RELRO/BIND_NOW/RPATH/RUNPATH/build-id/stripped/W+X segments/text relocations. Each test asserts rule id, severity, evidence string, and affected address/table where applicable.
+- [ ] **P7-17 Decompiler backend contract tests** — fake backends for unavailable, timeout, unsupported architecture, no function, malformed JSON, and successful decompile with line→address mapping. These tests gate `IDecompiler`/UI behavior without RetDec/Ghidra/Binary Ninja installed.
+- [ ] **P7-18 Binary Ninja optional integration tests** — opt-in tests enabled only when `PEELF_ENABLE_BINARY_NINJA_TESTS=ON` and BN is detected. Cover x64 PE and x64 ELF fixtures, backend discovery, analysis timeout handling, unsupported architecture reporting, and JSON schema stability from `bn_decompile.py`. Never require BN in default CI.
 
 **Exit criteria:** green CI on both toolchains with tests, lint, and warnings-as-errors.
 
