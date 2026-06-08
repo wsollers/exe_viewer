@@ -4,6 +4,8 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
 
+#include <limits>
+
 namespace viewer {
 namespace {
 
@@ -49,7 +51,24 @@ void draw_permissions(bool readable, bool writable, bool executable) {
             if (has_filter && s.name.find(filter) == std::string::npos)
                 continue;
 
-            ImGui::TextUnformatted(s.name.c_str()); ImGui::NextColumn();
+            const std::uint64_t range_size = s.file_size != 0 ? s.file_size : s.virtual_size;
+            const bool can_navigate =
+                s.file_size != 0 &&
+                s.file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) &&
+                range_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
+
+            ImGui::PushID(s.name.c_str());
+            if (can_navigate && ImGui::Selectable(s.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                if (on_section_activated_) {
+                    on_section_activated_(static_cast<std::size_t>(s.file_offset),
+                                          static_cast<std::size_t>(range_size),
+                                          s.virtual_address);
+                }
+            } else if (!can_navigate) {
+                ImGui::TextDisabled("%s", s.name.c_str());
+            }
+            ImGui::PopID();
+            ImGui::NextColumn();
             ImGui::Text("0x%llX", (unsigned long long)s.virtual_address); ImGui::NextColumn();
             ImGui::Text("0x%llX", (unsigned long long)s.virtual_size); ImGui::NextColumn();
             draw_permissions(s.readable, s.writable, s.executable); ImGui::NextColumn();

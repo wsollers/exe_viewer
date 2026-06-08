@@ -52,11 +52,17 @@ namespace viewer {
     class SectionsPanel : public UiPanel {
     public:
         explicit SectionsPanel(BinaryModel& model);
+        void set_section_activated_callback(
+            std::function<void(std::size_t file_offset, std::size_t size, std::uint64_t virtual_address)> cb) {
+            on_section_activated_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
+        std::function<void(std::size_t file_offset, std::size_t size, std::uint64_t virtual_address)>
+            on_section_activated_;
     };
 
     class HexViewPanel : public UiPanel {
@@ -64,11 +70,15 @@ namespace viewer {
         explicit HexViewPanel(BinaryModel& model);
         // Invoked with the file offset of the byte the user clicks.
         void set_byte_activated_callback(std::function<void(std::size_t)> cb) { on_byte_activated_ = std::move(cb); }
+        void navigate_to_range(std::size_t file_offset, std::size_t size);
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         std::size_t selected_offset_ = 0;
+        std::size_t highlighted_offset_ = 0;
+        std::size_t highlighted_size_ = 0;
+        std::optional<std::size_t> pending_scroll_offset_;
         std::size_t bytes_per_row_ = 16;
         std::function<void(std::size_t)> on_byte_activated_;
     };

@@ -3,6 +3,8 @@
 //
 #include "ui_panels.hpp"
 #include <imgui.h>
+
+#include <algorithm>
 #include <cstdio>
 
 namespace viewer {
@@ -10,6 +12,22 @@ namespace viewer {
 HexViewPanel::HexViewPanel(BinaryModel& model)
     : UiPanel("Hex View"), model_(model)
 {}
+
+void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) {
+    const auto& bytes = model_.bytes();
+    if (bytes.empty() || file_offset >= bytes.size()) {
+        selected_offset_ = 0;
+        highlighted_offset_ = 0;
+        highlighted_size_ = 0;
+        pending_scroll_offset_.reset();
+        return;
+    }
+
+    selected_offset_ = file_offset;
+    highlighted_offset_ = file_offset;
+    highlighted_size_ = std::min(size, bytes.size() - file_offset);
+    pending_scroll_offset_ = file_offset;
+}
 
 void HexViewPanel::draw_contents() {
     const auto& bytes = model_.bytes();
@@ -23,6 +41,12 @@ void HexViewPanel::draw_contents() {
     const size_t total = bytes.size();
     const size_t row_bytes = bytes_per_row_;
     const size_t rows = (total + row_bytes - 1) / row_bytes;
+
+    if (pending_scroll_offset_) {
+        const std::size_t row = *pending_scroll_offset_ / row_bytes;
+        ImGui::SetScrollY(static_cast<float>(row) * ImGui::GetTextLineHeightWithSpacing());
+        pending_scroll_offset_.reset();
+    }
 
     ImGuiListClipper clipper;
     clipper.Begin((int)rows);
@@ -45,9 +69,15 @@ void HexViewPanel::draw_contents() {
                 char buf[32];
                 std::snprintf(buf, sizeof(buf), "%02X##%zu", bytes[i], i);
 
-                bool selected = (i == selected_offset_);
+                const bool in_highlight =
+                    highlighted_size_ != 0 &&
+                    i >= highlighted_offset_ &&
+                    i - highlighted_offset_ < highlighted_size_;
+                bool selected = (i == selected_offset_) || in_highlight;
                 if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick)) {
                     selected_offset_ = i;
+                    highlighted_offset_ = i;
+                    highlighted_size_ = 1;
                     if (on_byte_activated_) {
                         on_byte_activated_(i);
                     }

@@ -52,6 +52,11 @@ UiApp::UiApp(BinaryModel& model)
     hex_panel_.set_byte_activated_callback([this](std::size_t off) {
         disassemble_at_offset(off);
     });
+    sections_panel_.set_section_activated_callback(
+        [this](std::size_t file_offset, std::size_t size, std::uint64_t virtual_address) {
+            hex_panel_.navigate_to_range(file_offset, size);
+            disassemble_at_offset(file_offset, virtual_address);
+        });
 }
 
 void UiApp::render() {
@@ -327,6 +332,10 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
         file_loaded_ = true;
         current_instructions_.clear();
+
+        if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
+            hex_panel_.navigate_to_range(static_cast<std::size_t>(*entry_offset), 1);
+        }
 
         // PE keeps its entry-point disassembly via the legacy PeModel. ELF
         // entry-point disassembly via the unified image is future work (P4);
