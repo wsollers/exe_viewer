@@ -11,10 +11,16 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <crtdbg.h>
+#include <cstdlib>
 #include <windows.h>
 #endif
 
 namespace {
+
+#ifdef _WIN32
+void print_stack_trace_addresses() noexcept;
+#endif
 
 void write_stderr(std::string_view text) noexcept {
     std::fwrite(text.data(), 1, text.size(), stderr);
@@ -72,9 +78,26 @@ void print_current_exception() noexcept {
     std::_Exit(3);
 }
 
+const char* signal_name(int signal) noexcept {
+    switch (signal) {
+        case SIGABRT: return "SIGABRT";
+        case SIGSEGV: return "SIGSEGV";
+#ifdef SIGILL
+        case SIGILL: return "SIGILL";
+#endif
+#ifdef SIGFPE
+        case SIGFPE: return "SIGFPE";
+#endif
+        default: return "unknown";
+    }
+}
+
 void signal_handler(int signal) noexcept {
     print_fatal_prefix("Fatal C signal received");
-    diagnostic_printf("Signal: %d\n", signal);
+    diagnostic_printf("Signal: %d (%s)\n", signal, signal_name(signal));
+#ifdef _WIN32
+    print_stack_trace_addresses();
+#endif
     std::_Exit(128 + signal);
 }
 
@@ -153,6 +176,32 @@ LONG WINAPI unhandled_exception_filter(EXCEPTION_POINTERS* pointers) noexcept {
     print_stack_trace_addresses();
     return EXCEPTION_EXECUTE_HANDLER;
 }
+
+void invalid_parameter_handler(const wchar_t* expression,
+                               const wchar_t* function,
+                               const wchar_t* file,
+                               unsigned int line,
+                               uintptr_t /*reserved*/) noexcept {
+    print_fatal_prefix("MSVC invalid parameter handler was called");
+    if (expression != nullptr) {
+        std::fwprintf(stderr, L"Expression: %ls\n", expression);
+    }
+    if (function != nullptr) {
+        std::fwprintf(stderr, L"Function: %ls\n", function);
+    }
+    if (file != nullptr) {
+        std::fwprintf(stderr, L"File: %ls\n", file);
+    }
+    diagnostic_printf("Line: %u\n", line);
+    print_stack_trace_addresses();
+    std::_Exit(4);
+}
+
+void purecall_handler() noexcept {
+    print_fatal_prefix("Pure virtual function call");
+    print_stack_trace_addresses();
+    std::_Exit(5);
+}
 #endif
 
 void install_fatal_diagnostics() noexcept {
@@ -169,6 +218,9 @@ void install_fatal_diagnostics() noexcept {
 #endif
 #ifdef _WIN32
     SetUnhandledExceptionFilter(unhandled_exception_filter);
+    _set_invalid_parameter_handler(invalid_parameter_handler);
+    _set_purecall_handler(purecall_handler);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
 }
 

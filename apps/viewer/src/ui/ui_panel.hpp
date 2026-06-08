@@ -13,10 +13,11 @@ namespace viewer {
 
         void draw() {
             if (!visible_) return;
-            if (begin()) {
+            const bool contents_visible = begin();
+            if (contents_visible) {
                 draw_contents();
-                end();
             }
+            end();
         }
 
         void set_visible(bool v) { visible_ = v; }

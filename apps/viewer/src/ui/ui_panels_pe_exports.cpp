@@ -23,7 +23,7 @@ namespace viewer {
         bool has_filter = !filter.empty();
 
         ImGui::Separator();
-        ImGui::BeginChild("ExportsList", ImVec2(0, 0), false);
+        ImGui::BeginChild("PEExportsList", ImVec2(0, 0), false);
 
         ImGui::Columns(3, nullptr, true);
         ImGui::Text("Ordinal"); ImGui::NextColumn();
