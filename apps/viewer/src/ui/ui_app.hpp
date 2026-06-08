@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 
 #include "model/binary_model.hpp"
 #include "ui_panels.hpp"
@@ -43,8 +44,12 @@ namespace viewer {
 
     private:
         BinaryModel& model_;
+        std::optional<StructureNode> structure_tree_;
+        ViewerSelection current_selection_;
 
         FilePanel       file_panel_;
+        StructureNavigatorPanel structure_panel_;
+        SelectionDetailsPanel details_panel_;
         SectionsPanel   sections_panel_;
         HexViewPanel    hex_panel_;
         ImportsPanel    imports_panel_;

@@ -37,6 +37,8 @@ namespace {
 UiApp::UiApp(BinaryModel& model)
     : model_(model)
     , file_panel_(model)
+    , structure_panel_(structure_tree_, current_selection_)
+    , details_panel_(current_selection_)
     , sections_panel_(model)
     , hex_panel_(model)
     , imports_panel_(model)
@@ -57,6 +59,8 @@ void UiApp::render() {
     render_dockspace();
 
     file_panel_.draw();
+    structure_panel_.draw();
+    details_panel_.draw();
     sections_panel_.draw();
     hex_panel_.draw();
     imports_panel_.draw();
@@ -100,6 +104,18 @@ void UiApp::render_main_menu() {
             bool v = file_panel_.visible();
             if (ImGui::MenuItem(file_panel_.name().c_str(), nullptr, &v))
                 file_panel_.set_visible(v);
+        }
+
+        {
+            bool v = structure_panel_.visible();
+            if (ImGui::MenuItem(structure_panel_.name().c_str(), nullptr, &v))
+                structure_panel_.set_visible(v);
+        }
+
+        {
+            bool v = details_panel_.visible();
+            if (ImGui::MenuItem(details_panel_.name().c_str(), nullptr, &v))
+                details_panel_.set_visible(v);
         }
 
         {
@@ -210,10 +226,12 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     const ImGuiID bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.22f, nullptr, &main_id);
     const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.42f, nullptr, &main_id);
 
+    ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
 
+    ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(pe_headers_panel_.name().c_str(), right_id);
@@ -284,8 +302,13 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         const peelf::IBinaryImage* img = model_.image();
         if (!img) {
             file_loaded_ = false;
+            structure_tree_.reset();
+            current_selection_ = {};
             return;
         }
+
+        structure_tree_ = build_structure_tree(*img);
+        current_selection_ = structure_tree_->selection;
 
         // Map the unified architecture onto the disassembler's enum.
         const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());

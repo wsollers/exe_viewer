@@ -33,6 +33,7 @@ add_executable(peelf_viewer
         src/ui/ui_panels_pe_imports.cpp
         src/ui/ui_panels_pe_exports.cpp
         src/ui/ui_panels_sections.cpp
+        src/ui/ui_panels_structure.cpp
         src/ui/ui_panels_hex.cpp
         src/ui/ui_panels_disasm.cpp
         src/ui/ui_panels_exports.cpp

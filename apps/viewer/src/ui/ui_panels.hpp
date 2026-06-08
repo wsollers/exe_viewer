@@ -2,11 +2,13 @@
 
 #include <cstddef>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "disasm/disassembler.hpp"
 #include "model/binary_model.hpp"
+#include "navigation/viewer_navigation.hpp"
 #include "ui_panel.hpp"
 
 namespace viewer {
@@ -24,6 +26,27 @@ namespace viewer {
         void draw_contents() override;
     private:
         BinaryModel& model_;
+    };
+
+    class StructureNavigatorPanel : public UiPanel {
+    public:
+        StructureNavigatorPanel(const std::optional<StructureNode>& tree, ViewerSelection& selection);
+    protected:
+        void draw_contents() override;
+    private:
+        const std::optional<StructureNode>& tree_;
+        ViewerSelection& selection_;
+
+        void draw_node(const StructureNode& node);
+    };
+
+    class SelectionDetailsPanel : public UiPanel {
+    public:
+        explicit SelectionDetailsPanel(const ViewerSelection& selection);
+    protected:
+        void draw_contents() override;
+    private:
+        const ViewerSelection& selection_;
     };
 
     class SectionsPanel : public UiPanel {
