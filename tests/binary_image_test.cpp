@@ -543,8 +543,8 @@ TEST(BinaryImage, ParsesPeCertificateTableAcrossFixtureMatrix) {
         std::uint8_t payload_base;
     };
     constexpr std::array<ExpectedCertificate, 2> fixtures{{
-        {"known-win-x86.exe", 0x580, 0x20, 0x0200, 0x0002, 0x30},
-        {"known-win-x64.exe", 0x680, 0x20, 0x0200, 0x0002, 0x40},
+        {"known-win-x86.exe", 0x700, 0x20, 0x0200, 0x0002, 0x30},
+        {"known-win-x64.exe", 0x700, 0x20, 0x0200, 0x0002, 0x40},
     }};
 
     for (const ExpectedCertificate& expected : fixtures) {
@@ -568,6 +568,75 @@ TEST(BinaryImage, ParsesPeCertificateTableAcrossFixtureMatrix) {
         }
 
         EXPECT_EQ((**result).file_offset_to_virtual_address(expected.file_offset), std::nullopt) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesPeLoadConfigDirectoriesAcrossFixtureMatrix) {
+    struct ExpectedLoadConfig {
+        const char* name;
+        std::uint32_t rva;
+        std::uint32_t size;
+        std::uint32_t time_date_stamp;
+        std::uint16_t major_version;
+        std::uint16_t minor_version;
+        std::uint32_t global_flags_clear;
+        std::uint32_t global_flags_set;
+        std::uint64_t critical_section_default_timeout;
+        std::uint64_t decommit_free_block_threshold;
+        std::uint64_t decommit_total_free_threshold;
+        std::uint64_t security_cookie;
+        std::uint64_t se_handler_table;
+        std::uint64_t se_handler_count;
+        std::uint64_t guard_cf_check_function_pointer;
+        std::uint64_t guard_cf_dispatch_function_pointer;
+        std::uint64_t guard_cf_function_table;
+        std::uint64_t guard_cf_function_count;
+        std::uint32_t guard_flags;
+        std::uint64_t file_offset;
+    };
+    constexpr std::array<ExpectedLoadConfig, 2> fixtures{{
+        {"known-win-x86.exe", 0x4050, 0x5C, 0x6A2A5A32, 1, 2, 0x10, 0x20, 0x30,
+         0x1000, 0x2000, 0x405020, 0x405030, 3, 0x405040, 0x405044, 0x405050, 4,
+         0x0000'4100, 0x550},
+        {"known-win-x64.exe", 0x4050, 0x94, 0x6A2A5A64, 3, 4, 0x30, 0x40, 0x50,
+         0x1000'0000, 0x2000'0000, 0x140005020, 0x140005030, 5, 0x140005040,
+         0x140005048, 0x140005060, 6, 0x0000'4500, 0x650},
+    }};
+
+    for (const ExpectedLoadConfig& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::PeLoadConfigDirectory* load_config = (**result).pe_load_config_directory();
+        ASSERT_NE(load_config, nullptr) << expected.name;
+        EXPECT_EQ(load_config->rva, expected.rva) << expected.name;
+        EXPECT_EQ(load_config->file_offset, expected.file_offset) << expected.name;
+        EXPECT_EQ(load_config->size, expected.size) << expected.name;
+        EXPECT_EQ(load_config->time_date_stamp, expected.time_date_stamp) << expected.name;
+        EXPECT_EQ(load_config->major_version, expected.major_version) << expected.name;
+        EXPECT_EQ(load_config->minor_version, expected.minor_version) << expected.name;
+        EXPECT_EQ(load_config->global_flags_clear, expected.global_flags_clear) << expected.name;
+        EXPECT_EQ(load_config->global_flags_set, expected.global_flags_set) << expected.name;
+        EXPECT_EQ(load_config->critical_section_default_timeout,
+                  expected.critical_section_default_timeout) << expected.name;
+        EXPECT_EQ(load_config->decommit_free_block_threshold,
+                  expected.decommit_free_block_threshold) << expected.name;
+        EXPECT_EQ(load_config->decommit_total_free_threshold,
+                  expected.decommit_total_free_threshold) << expected.name;
+        EXPECT_EQ(load_config->security_cookie, expected.security_cookie) << expected.name;
+        EXPECT_EQ(load_config->se_handler_table, expected.se_handler_table) << expected.name;
+        EXPECT_EQ(load_config->se_handler_count, expected.se_handler_count) << expected.name;
+        EXPECT_EQ(load_config->guard_cf_check_function_pointer,
+                  expected.guard_cf_check_function_pointer) << expected.name;
+        EXPECT_EQ(load_config->guard_cf_dispatch_function_pointer,
+                  expected.guard_cf_dispatch_function_pointer) << expected.name;
+        EXPECT_EQ(load_config->guard_cf_function_table, expected.guard_cf_function_table) << expected.name;
+        EXPECT_EQ(load_config->guard_cf_function_count, expected.guard_cf_function_count) << expected.name;
+        EXPECT_EQ(load_config->guard_flags, expected.guard_flags) << expected.name;
     }
 }
 

@@ -310,7 +310,7 @@ function New-Elf64Fixture {
 function New-Pe64Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x700)
+    $Bytes = [byte[]]::new(0x800)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -319,7 +319,7 @@ function New-Pe64Fixture {
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x8664
     Put-U16LE $Bytes ($Coff + 2) 4
-    Put-U16LE $Bytes ($Coff + 16) 0x00c0
+    Put-U16LE $Bytes ($Coff + 16) 0x00c8
     Put-U16LE $Bytes ($Coff + 18) 0x0022
 
     $Opt = [UInt32]($Coff + 20)
@@ -331,7 +331,7 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
     Put-U32LE $Bytes ($Opt + 0x78) 0x1180
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
-    Put-U32LE $Bytes ($Opt + 0x90) 0x680
+    Put-U32LE $Bytes ($Opt + 0x90) 0x700
     Put-U32LE $Bytes ($Opt + 0x94) 0x20
     Put-U32LE $Bytes ($Opt + 0x98) 0x2000
     Put-U32LE $Bytes ($Opt + 0x9C) 0x0C
@@ -339,8 +339,10 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0xA4) 0x1C
     Put-U32LE $Bytes ($Opt + 0xB8) 0x4000
     Put-U32LE $Bytes ($Opt + 0xBC) 0x28
+    Put-U32LE $Bytes ($Opt + 0xC0) 0x4050
+    Put-U32LE $Bytes ($Opt + 0xC4) 0x94
 
-    $Sect = [UInt32]($Opt + 0x00c0)
+    $Sect = [UInt32]($Opt + 0x00c8)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x200
     Put-U32LE $Bytes ($Sect + 12) 0x1000
@@ -366,9 +368,9 @@ function New-Pe64Fixture {
 
     $TlsSect = [UInt32]($DebugSect + 0x28)
     Put-Ascii $Bytes $TlsSect ".tls"
-    Put-U32LE $Bytes ($TlsSect + 8) 0x80
+    Put-U32LE $Bytes ($TlsSect + 8) 0x100
     Put-U32LE $Bytes ($TlsSect + 12) 0x4000
-    Put-U32LE $Bytes ($TlsSect + 16) 0x60
+    Put-U32LE $Bytes ($TlsSect + 16) 0x100
     Put-U32LE $Bytes ($TlsSect + 20) 0x600
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
@@ -400,11 +402,37 @@ function New-Pe64Fixture {
     Put-U64LE $Bytes 0x640 0x140001088 # TLS callback VA
     Put-U64LE $Bytes 0x648 0
 
-    Put-U32LE $Bytes 0x680 0x20   # WIN_CERTIFICATE.dwLength
-    Put-U16LE $Bytes 0x684 0x0200 # WIN_CERTIFICATE.wRevision
-    Put-U16LE $Bytes 0x686 0x0002 # WIN_CERTIFICATE.wCertificateType
+    Put-U32LE $Bytes 0x650 0x94        # IMAGE_LOAD_CONFIG_DIRECTORY64.Size
+    Put-U32LE $Bytes 0x654 0x6A2A5A64  # TimeDateStamp
+    Put-U16LE $Bytes 0x658 3           # MajorVersion
+    Put-U16LE $Bytes 0x65A 4           # MinorVersion
+    Put-U32LE $Bytes 0x65C 0x30        # GlobalFlagsClear
+    Put-U32LE $Bytes 0x660 0x40        # GlobalFlagsSet
+    Put-U32LE $Bytes 0x664 0x50        # CriticalSectionDefaultTimeout
+    Put-U64LE $Bytes 0x668 0x10000000  # DeCommitFreeBlockThreshold
+    Put-U64LE $Bytes 0x670 0x20000000  # DeCommitTotalFreeThreshold
+    Put-U64LE $Bytes 0x678 0x140005010 # LockPrefixTable
+    Put-U64LE $Bytes 0x680 0x30000000  # MaximumAllocationSize
+    Put-U64LE $Bytes 0x688 0x40000000  # VirtualMemoryThreshold
+    Put-U64LE $Bytes 0x690 0x50000000  # ProcessAffinityMask
+    Put-U32LE $Bytes 0x698 0x60        # ProcessHeapFlags
+    Put-U16LE $Bytes 0x69C 0x70        # CSDVersion
+    Put-U16LE $Bytes 0x69E 0x80        # DependentLoadFlags
+    Put-U64LE $Bytes 0x6A0 0x140005018 # EditList
+    Put-U64LE $Bytes 0x6A8 0x140005020 # SecurityCookie
+    Put-U64LE $Bytes 0x6B0 0x140005030 # SEHandlerTable
+    Put-U64LE $Bytes 0x6B8 5           # SEHandlerCount
+    Put-U64LE $Bytes 0x6C0 0x140005040 # GuardCFCheckFunctionPointer
+    Put-U64LE $Bytes 0x6C8 0x140005048 # GuardCFDispatchFunctionPointer
+    Put-U64LE $Bytes 0x6D0 0x140005060 # GuardCFFunctionTable
+    Put-U64LE $Bytes 0x6D8 6           # GuardCFFunctionCount
+    Put-U32LE $Bytes 0x6E0 0x00004500  # GuardFlags
+
+    Put-U32LE $Bytes 0x700 0x20   # WIN_CERTIFICATE.dwLength
+    Put-U16LE $Bytes 0x704 0x0200 # WIN_CERTIFICATE.wRevision
+    Put-U16LE $Bytes 0x706 0x0002 # WIN_CERTIFICATE.wCertificateType
     for ($Index = [UInt32]0; $Index -lt 0x18; ++$Index) {
-        $Bytes[0x688 + $Index] = [byte](0x40 + $Index)
+        $Bytes[0x708 + $Index] = [byte](0x40 + $Index)
     }
 
     Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
@@ -794,7 +822,7 @@ function New-Elf64CompatibilityFixture {
 function New-Pe32Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x600)
+    $Bytes = [byte[]]::new(0x800)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -803,7 +831,7 @@ function New-Pe32Fixture {
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x014c
     Put-U16LE $Bytes ($Coff + 2) 4
-    Put-U16LE $Bytes ($Coff + 16) 0x00b0
+    Put-U16LE $Bytes ($Coff + 16) 0x00b8
     Put-U16LE $Bytes ($Coff + 18) 0x0102
 
     $Opt = [UInt32]($Coff + 20)
@@ -811,7 +839,7 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U32LE $Bytes ($Opt + 28) 0x00400000
     Put-U32LE $Bytes ($Opt + 0x5C) 16
-    Put-U32LE $Bytes ($Opt + 0x80) 0x580
+    Put-U32LE $Bytes ($Opt + 0x80) 0x700
     Put-U32LE $Bytes ($Opt + 0x84) 0x20
     Put-U32LE $Bytes ($Opt + 0x88) 0x2000
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
@@ -819,8 +847,10 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 0x94) 0x1C
     Put-U32LE $Bytes ($Opt + 0xA8) 0x4000
     Put-U32LE $Bytes ($Opt + 0xAC) 0x18
+    Put-U32LE $Bytes ($Opt + 0xB0) 0x4050
+    Put-U32LE $Bytes ($Opt + 0xB4) 0x5C
 
-    $Sect = [UInt32]($Opt + 0x00b0)
+    $Sect = [UInt32]($Opt + 0x00b8)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x100
     Put-U32LE $Bytes ($Sect + 12) 0x1000
@@ -846,9 +876,9 @@ function New-Pe32Fixture {
 
     $TlsSect = [UInt32]($DebugSect + 0x28)
     Put-Ascii $Bytes $TlsSect ".tls"
-    Put-U32LE $Bytes ($TlsSect + 8) 0x80
+    Put-U32LE $Bytes ($TlsSect + 8) 0x100
     Put-U32LE $Bytes ($TlsSect + 12) 0x4000
-    Put-U32LE $Bytes ($TlsSect + 16) 0x60
+    Put-U32LE $Bytes ($TlsSect + 16) 0x100
     Put-U32LE $Bytes ($TlsSect + 20) 0x500
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
@@ -880,11 +910,37 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x530 0x401010 # TLS callback VA
     Put-U32LE $Bytes 0x534 0
 
-    Put-U32LE $Bytes 0x580 0x20   # WIN_CERTIFICATE.dwLength
-    Put-U16LE $Bytes 0x584 0x0200 # WIN_CERTIFICATE.wRevision
-    Put-U16LE $Bytes 0x586 0x0002 # WIN_CERTIFICATE.wCertificateType
+    Put-U32LE $Bytes 0x550 0x5C       # IMAGE_LOAD_CONFIG_DIRECTORY32.Size
+    Put-U32LE $Bytes 0x554 0x6A2A5A32 # TimeDateStamp
+    Put-U16LE $Bytes 0x558 1          # MajorVersion
+    Put-U16LE $Bytes 0x55A 2          # MinorVersion
+    Put-U32LE $Bytes 0x55C 0x10       # GlobalFlagsClear
+    Put-U32LE $Bytes 0x560 0x20       # GlobalFlagsSet
+    Put-U32LE $Bytes 0x564 0x30       # CriticalSectionDefaultTimeout
+    Put-U32LE $Bytes 0x568 0x1000     # DeCommitFreeBlockThreshold
+    Put-U32LE $Bytes 0x56C 0x2000     # DeCommitTotalFreeThreshold
+    Put-U32LE $Bytes 0x570 0x405010   # LockPrefixTable
+    Put-U32LE $Bytes 0x574 0x3000     # MaximumAllocationSize
+    Put-U32LE $Bytes 0x578 0x4000     # VirtualMemoryThreshold
+    Put-U32LE $Bytes 0x57C 0x5000     # ProcessAffinityMask
+    Put-U32LE $Bytes 0x580 0x60       # ProcessHeapFlags
+    Put-U16LE $Bytes 0x584 0x70       # CSDVersion
+    Put-U16LE $Bytes 0x586 0x80       # DependentLoadFlags
+    Put-U32LE $Bytes 0x588 0x405018   # EditList
+    Put-U32LE $Bytes 0x58C 0x405020   # SecurityCookie
+    Put-U32LE $Bytes 0x590 0x405030   # SEHandlerTable
+    Put-U32LE $Bytes 0x594 3          # SEHandlerCount
+    Put-U32LE $Bytes 0x598 0x405040   # GuardCFCheckFunctionPointer
+    Put-U32LE $Bytes 0x59C 0x405044   # GuardCFDispatchFunctionPointer
+    Put-U32LE $Bytes 0x5A0 0x405050   # GuardCFFunctionTable
+    Put-U32LE $Bytes 0x5A4 4          # GuardCFFunctionCount
+    Put-U32LE $Bytes 0x5A8 0x00004100 # GuardFlags
+
+    Put-U32LE $Bytes 0x700 0x20   # WIN_CERTIFICATE.dwLength
+    Put-U16LE $Bytes 0x704 0x0200 # WIN_CERTIFICATE.wRevision
+    Put-U16LE $Bytes 0x706 0x0002 # WIN_CERTIFICATE.wCertificateType
     for ($Index = [UInt32]0; $Index -lt 0x18; ++$Index) {
-        $Bytes[0x588 + $Index] = [byte](0x30 + $Index)
+        $Bytes[0x708 + $Index] = [byte](0x30 + $Index)
     }
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)

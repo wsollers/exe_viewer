@@ -86,6 +86,9 @@ public:
         static const std::vector<PeCertificate> empty;
         return empty;
     }
+    [[nodiscard]] const PeLoadConfigDirectory* pe_load_config_directory() const noexcept override {
+        return nullptr;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -227,6 +230,9 @@ public:
     [[nodiscard]] const std::vector<PeCertificate>& pe_certificates() const noexcept override {
         return certificates_;
     }
+    [[nodiscard]] const PeLoadConfigDirectory* pe_load_config_directory() const noexcept override {
+        return load_config_directory_ ? &*load_config_directory_ : nullptr;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
@@ -234,6 +240,7 @@ private:
     std::vector<PeDebugDirectory> debug_directories_;
     std::optional<PeTlsDirectory> tls_directory_;
     std::vector<PeCertificate> certificates_;
+    std::optional<PeLoadConfigDirectory> load_config_directory_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -511,6 +518,83 @@ void parse_pe_certificates(std::span<const std::uint8_t> b,
         }
         cursor = next;
     }
+}
+
+void parse_pe_load_config_directory(std::span<const std::uint8_t> b,
+                                    const std::vector<Section>& sections,
+                                    std::uint64_t image_base,
+                                    bool is64,
+                                    std::uint32_t directory_rva,
+                                    std::uint32_t directory_size,
+                                    std::optional<PeLoadConfigDirectory>& load_config_out) {
+    const std::uint64_t min_size = is64 ? 0x94u : 0x5Cu;
+    if (directory_rva == 0 || directory_size < min_size) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, min_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::size_t off = static_cast<std::size_t>(*directory_off);
+    PeLoadConfigDirectory load_config;
+    load_config.rva = directory_rva;
+    load_config.file_offset = *directory_off;
+    load_config.size = rd32(b, off + 0x00, false);
+    if (load_config.size < min_size ||
+        !fits_range(*directory_off, load_config.size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    load_config.time_date_stamp = rd32(b, off + 0x04, false);
+    load_config.major_version = rd16(b, off + 0x08, false);
+    load_config.minor_version = rd16(b, off + 0x0A, false);
+    load_config.global_flags_clear = rd32(b, off + 0x0C, false);
+    load_config.global_flags_set = rd32(b, off + 0x10, false);
+    load_config.critical_section_default_timeout = rd32(b, off + 0x14, false);
+
+    if (is64) {
+        load_config.decommit_free_block_threshold = rd64(b, off + 0x18, false);
+        load_config.decommit_total_free_threshold = rd64(b, off + 0x20, false);
+        load_config.lock_prefix_table = rd64(b, off + 0x28, false);
+        load_config.maximum_allocation_size = rd64(b, off + 0x30, false);
+        load_config.virtual_memory_threshold = rd64(b, off + 0x38, false);
+        load_config.process_affinity_mask = rd64(b, off + 0x40, false);
+        load_config.process_heap_flags = rd32(b, off + 0x48, false);
+        load_config.csd_version = rd16(b, off + 0x4C, false);
+        load_config.dependent_load_flags = rd16(b, off + 0x4E, false);
+        load_config.edit_list = rd64(b, off + 0x50, false);
+        load_config.security_cookie = rd64(b, off + 0x58, false);
+        load_config.se_handler_table = rd64(b, off + 0x60, false);
+        load_config.se_handler_count = rd64(b, off + 0x68, false);
+        load_config.guard_cf_check_function_pointer = rd64(b, off + 0x70, false);
+        load_config.guard_cf_dispatch_function_pointer = rd64(b, off + 0x78, false);
+        load_config.guard_cf_function_table = rd64(b, off + 0x80, false);
+        load_config.guard_cf_function_count = rd64(b, off + 0x88, false);
+        load_config.guard_flags = rd32(b, off + 0x90, false);
+    } else {
+        load_config.decommit_free_block_threshold = rd32(b, off + 0x18, false);
+        load_config.decommit_total_free_threshold = rd32(b, off + 0x1C, false);
+        load_config.lock_prefix_table = rd32(b, off + 0x20, false);
+        load_config.maximum_allocation_size = rd32(b, off + 0x24, false);
+        load_config.virtual_memory_threshold = rd32(b, off + 0x28, false);
+        load_config.process_affinity_mask = rd32(b, off + 0x2C, false);
+        load_config.process_heap_flags = rd32(b, off + 0x30, false);
+        load_config.csd_version = rd16(b, off + 0x34, false);
+        load_config.dependent_load_flags = rd16(b, off + 0x36, false);
+        load_config.edit_list = rd32(b, off + 0x38, false);
+        load_config.security_cookie = rd32(b, off + 0x3C, false);
+        load_config.se_handler_table = rd32(b, off + 0x40, false);
+        load_config.se_handler_count = rd32(b, off + 0x44, false);
+        load_config.guard_cf_check_function_pointer = rd32(b, off + 0x48, false);
+        load_config.guard_cf_dispatch_function_pointer = rd32(b, off + 0x4C, false);
+        load_config.guard_cf_function_table = rd32(b, off + 0x50, false);
+        load_config.guard_cf_function_count = rd32(b, off + 0x54, false);
+        load_config.guard_flags = rd32(b, off + 0x58, false);
+    }
+
+    load_config_out = load_config;
 }
 
 [[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
@@ -1141,14 +1225,20 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                                                      ? rd32(b, opt + (is64 ? 0x94 : 0x84), false)
                                                      : 0;
     const std::uint32_t tls_dir_rva = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
-                                          ? rd32(b, opt + (is64 ? 0xB8 : 0xA8), false)
-                                          : 0;
+        ? rd32(b, opt + (is64 ? 0xB8 : 0xA8), false)
+        : 0;
     const std::uint32_t tls_dir_size = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
-                                           ? rd32(b, opt + (is64 ? 0xBC : 0xAC), false)
-                                           : 0;
+        ? rd32(b, opt + (is64 ? 0xBC : 0xAC), false)
+        : 0;
+    const std::uint32_t load_config_dir_rva = (size_of_opt >= (is64 ? 0xC8 : 0xB8))
+        ? rd32(b, opt + (is64 ? 0xC0 : 0xB0), false)
+        : 0;
+    const std::uint32_t load_config_dir_size = (size_of_opt >= (is64 ? 0xC8 : 0xB8))
+        ? rd32(b, opt + (is64 ? 0xC4 : 0xB4), false)
+        : 0;
     const std::uint32_t base_reloc_dir_rva = (size_of_opt >= (is64 ? 0xA0 : 0x90))
-                                                 ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
-                                                 : 0;
+        ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
+        : 0;
     const std::uint32_t base_reloc_dir_size = (size_of_opt >= (is64 ? 0xA0 : 0x90))
                                                   ? rd32(b, opt + (is64 ? 0x9C : 0x8C), false)
                                                   : 0;
@@ -1210,6 +1300,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                            tls_dir_size, img->tls_directory_);
     parse_pe_certificates(b, certificate_table_file_offset, certificate_table_size,
                           img->certificates_);
+    parse_pe_load_config_directory(b, img->sections_, image_base, is64, load_config_dir_rva,
+                                   load_config_dir_size, img->load_config_directory_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);

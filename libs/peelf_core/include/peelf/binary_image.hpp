@@ -137,6 +137,36 @@ struct PeCertificate {
     std::vector<std::uint8_t> certificate;
 };
 
+struct PeLoadConfigDirectory {
+    std::uint32_t rva = 0;
+    std::uint64_t file_offset = 0;
+    std::uint32_t size = 0;
+    std::uint32_t time_date_stamp = 0;
+    std::uint16_t major_version = 0;
+    std::uint16_t minor_version = 0;
+    std::uint32_t global_flags_clear = 0;
+    std::uint32_t global_flags_set = 0;
+    std::uint64_t critical_section_default_timeout = 0;
+    std::uint64_t decommit_free_block_threshold = 0;
+    std::uint64_t decommit_total_free_threshold = 0;
+    std::uint64_t lock_prefix_table = 0;
+    std::uint64_t maximum_allocation_size = 0;
+    std::uint64_t virtual_memory_threshold = 0;
+    std::uint64_t process_affinity_mask = 0;
+    std::uint32_t process_heap_flags = 0;
+    std::uint16_t csd_version = 0;
+    std::uint16_t dependent_load_flags = 0;
+    std::uint64_t edit_list = 0;
+    std::uint64_t security_cookie = 0;
+    std::uint64_t se_handler_table = 0;
+    std::uint64_t se_handler_count = 0;
+    std::uint64_t guard_cf_check_function_pointer = 0;
+    std::uint64_t guard_cf_dispatch_function_pointer = 0;
+    std::uint64_t guard_cf_function_table = 0;
+    std::uint64_t guard_cf_function_count = 0;
+    std::uint32_t guard_flags = 0;
+};
+
 struct ElfHeader {
     std::uint8_t  elf_class = 0;
     std::uint8_t  data_encoding = 0;
@@ -261,6 +291,7 @@ public:
     [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;
     [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeCertificate>& pe_certificates() const noexcept = 0;
+    [[nodiscard]] virtual const PeLoadConfigDirectory* pe_load_config_directory() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
