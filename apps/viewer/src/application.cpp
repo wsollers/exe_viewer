@@ -1,7 +1,10 @@
 #include "application.h"
 
+#include <array>
 #include <cstdio>
+#include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 #include <imgui.h>
 #include <imgui_impl_glfw.h>
@@ -16,6 +19,30 @@
 #include "disasm/disassembler.hpp"
 
 namespace viewer {
+    namespace {
+        constexpr float kUiFontSize = 18.0f;
+
+        std::filesystem::path find_monospace_font() {
+#ifdef _WIN32
+            constexpr std::array<std::wstring_view, 5> candidates{
+                L"CascadiaMono.ttf",
+                L"CascadiaCode.ttf",
+                L"consola.ttf",
+                L"lucon.ttf",
+                L"cour.ttf",
+            };
+            const std::filesystem::path fonts_dir = LR"(C:\Windows\Fonts)";
+            for (const std::wstring_view candidate : candidates) {
+                std::filesystem::path path = fonts_dir / candidate;
+                if (std::filesystem::exists(path)) {
+                    return path;
+                }
+            }
+#endif
+            return {};
+        }
+    }
+
     Application::~Application() {
         if (running_) {
             shutdown();
@@ -100,6 +127,25 @@ namespace viewer {
         ImGuiIO &io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+        const std::filesystem::path font_path = find_monospace_font();
+        if (!font_path.empty()) {
+            const std::string font_path_string = font_path.string();
+            if (io.Fonts->AddFontFromFileTTF(font_path_string.c_str(), kUiFontSize) != nullptr) {
+                Log().info("Loaded UI monospace font: {}", font_path.string());
+            } else {
+                ImFontConfig config{};
+                config.SizePixels = kUiFontSize;
+                io.Fonts->AddFontDefault(&config);
+                Log().warn("Failed to load monospace font {}; using enlarged ImGui default",
+                           font_path.string());
+            }
+        } else {
+            ImFontConfig config{};
+            config.SizePixels = kUiFontSize;
+            io.Fonts->AddFontDefault(&config);
+            Log().warn("No system monospace font found; using enlarged ImGui default");
+        }
 
         ImGui::StyleColorsDark();
         ImGui_ImplGlfw_InitForVulkan(window_, true);
@@ -246,5 +292,3 @@ namespace viewer {
 
 
 }
-
-
