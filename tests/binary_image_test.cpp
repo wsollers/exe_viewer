@@ -533,6 +533,44 @@ TEST(BinaryImage, ParsesPeTlsDirectoriesAcrossFixtureMatrix) {
     }
 }
 
+TEST(BinaryImage, ParsesPeCertificateTableAcrossFixtureMatrix) {
+    struct ExpectedCertificate {
+        const char* name;
+        std::uint32_t file_offset;
+        std::uint32_t length;
+        std::uint16_t revision;
+        std::uint16_t certificate_type;
+        std::uint8_t payload_base;
+    };
+    constexpr std::array<ExpectedCertificate, 2> fixtures{{
+        {"known-win-x86.exe", 0x580, 0x20, 0x0200, 0x0002, 0x30},
+        {"known-win-x64.exe", 0x680, 0x20, 0x0200, 0x0002, 0x40},
+    }};
+
+    for (const ExpectedCertificate& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto& certs = (**result).pe_certificates();
+        ASSERT_EQ(certs.size(), 1u) << expected.name;
+        const peelf::PeCertificate& cert = certs.front();
+        EXPECT_EQ(cert.file_offset, expected.file_offset) << expected.name;
+        EXPECT_EQ(cert.length, expected.length) << expected.name;
+        EXPECT_EQ(cert.revision, expected.revision) << expected.name;
+        EXPECT_EQ(cert.certificate_type, expected.certificate_type) << expected.name;
+        ASSERT_EQ(cert.certificate.size(), expected.length - 8u) << expected.name;
+        for (std::uint8_t i = 0; i < cert.certificate.size(); ++i) {
+            EXPECT_EQ(cert.certificate[i], static_cast<std::uint8_t>(expected.payload_base + i)) << expected.name;
+        }
+
+        EXPECT_EQ((**result).file_offset_to_virtual_address(expected.file_offset), std::nullopt) << expected.name;
+    }
+}
+
 TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
     constexpr std::array<ExpectedElfHeader, 14> fixtures{{
         {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x480, 0x180, 0x40, 0x38, 0x40, 11},

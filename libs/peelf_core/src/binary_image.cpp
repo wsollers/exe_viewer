@@ -82,6 +82,10 @@ public:
     [[nodiscard]] const PeTlsDirectory* pe_tls_directory() const noexcept override {
         return nullptr;
     }
+    [[nodiscard]] const std::vector<PeCertificate>& pe_certificates() const noexcept override {
+        static const std::vector<PeCertificate> empty;
+        return empty;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -220,12 +224,16 @@ public:
     [[nodiscard]] const PeTlsDirectory* pe_tls_directory() const noexcept override {
         return tls_directory_ ? &*tls_directory_ : nullptr;
     }
+    [[nodiscard]] const std::vector<PeCertificate>& pe_certificates() const noexcept override {
+        return certificates_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
     std::vector<PeBaseRelocationBlock> base_relocations_;
     std::vector<PeDebugDirectory> debug_directories_;
     std::optional<PeTlsDirectory> tls_directory_;
+    std::vector<PeCertificate> certificates_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -459,6 +467,50 @@ void parse_pe_tls_directory(std::span<const std::uint8_t> b,
     }
 
     tls_out = std::move(tls);
+}
+
+[[nodiscard]] std::uint64_t align8(std::uint64_t value) noexcept {
+    return (value + 7u) & ~std::uint64_t{7u};
+}
+
+void parse_pe_certificates(std::span<const std::uint8_t> b,
+                           std::uint32_t directory_file_offset,
+                           std::uint32_t directory_size,
+                           std::vector<PeCertificate>& certificates_out) {
+    if (directory_file_offset == 0 || directory_size < 8) {
+        return;
+    }
+    if (!fits_range(directory_file_offset, directory_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::uint64_t end = static_cast<std::uint64_t>(directory_file_offset) + directory_size;
+    std::uint64_t cursor = directory_file_offset;
+    while (cursor + 8u <= end) {
+        const std::size_t off = static_cast<std::size_t>(cursor);
+        const std::uint32_t length = rd32(b, off + 0x00, false);
+        if (length < 8 || length > end - cursor ||
+            !fits_range(cursor, length, static_cast<std::uint64_t>(b.size()))) {
+            break;
+        }
+
+        PeCertificate cert;
+        cert.file_offset = static_cast<std::uint32_t>(cursor);
+        cert.length = length;
+        cert.revision = rd16(b, off + 0x04, false);
+        cert.certificate_type = rd16(b, off + 0x06, false);
+        cert.certificate.reserve(length - 8u);
+        for (std::uint64_t i = 0; i < static_cast<std::uint64_t>(length - 8u); ++i) {
+            cert.certificate.push_back(b[static_cast<std::size_t>(cursor + 8u + i)]);
+        }
+        certificates_out.push_back(std::move(cert));
+
+        const std::uint64_t next = align8(cursor + length);
+        if (next <= cursor) {
+            break;
+        }
+        cursor = next;
+    }
 }
 
 [[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
@@ -1082,6 +1134,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
                                               ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
                                               : 0;
+    const std::uint32_t certificate_table_file_offset = (size_of_opt >= (is64 ? 0x98 : 0x88))
+                                                            ? rd32(b, opt + (is64 ? 0x90 : 0x80), false)
+                                                            : 0;
+    const std::uint32_t certificate_table_size = (size_of_opt >= (is64 ? 0x98 : 0x88))
+                                                     ? rd32(b, opt + (is64 ? 0x94 : 0x84), false)
+                                                     : 0;
     const std::uint32_t tls_dir_rva = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
                                           ? rd32(b, opt + (is64 ? 0xB8 : 0xA8), false)
                                           : 0;
@@ -1150,6 +1208,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                                debug_dir_size, img->debug_directories_);
     parse_pe_tls_directory(b, img->sections_, image_base, is64, tls_dir_rva,
                            tls_dir_size, img->tls_directory_);
+    parse_pe_certificates(b, certificate_table_file_offset, certificate_table_size,
+                          img->certificates_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);

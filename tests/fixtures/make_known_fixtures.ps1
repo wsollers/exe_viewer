@@ -331,6 +331,8 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
     Put-U32LE $Bytes ($Opt + 0x78) 0x1180
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
+    Put-U32LE $Bytes ($Opt + 0x90) 0x680
+    Put-U32LE $Bytes ($Opt + 0x94) 0x20
     Put-U32LE $Bytes ($Opt + 0x98) 0x2000
     Put-U32LE $Bytes ($Opt + 0x9C) 0x0C
     Put-U32LE $Bytes ($Opt + 0xA0) 0x3000
@@ -366,7 +368,7 @@ function New-Pe64Fixture {
     Put-Ascii $Bytes $TlsSect ".tls"
     Put-U32LE $Bytes ($TlsSect + 8) 0x80
     Put-U32LE $Bytes ($TlsSect + 12) 0x4000
-    Put-U32LE $Bytes ($TlsSect + 16) 0x100
+    Put-U32LE $Bytes ($TlsSect + 16) 0x60
     Put-U32LE $Bytes ($TlsSect + 20) 0x600
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
@@ -397,6 +399,13 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes 0x624 0x00400000  # Characteristics
     Put-U64LE $Bytes 0x640 0x140001088 # TLS callback VA
     Put-U64LE $Bytes 0x648 0
+
+    Put-U32LE $Bytes 0x680 0x20   # WIN_CERTIFICATE.dwLength
+    Put-U16LE $Bytes 0x684 0x0200 # WIN_CERTIFICATE.wRevision
+    Put-U16LE $Bytes 0x686 0x0002 # WIN_CERTIFICATE.wCertificateType
+    for ($Index = [UInt32]0; $Index -lt 0x18; ++$Index) {
+        $Bytes[0x688 + $Index] = [byte](0x40 + $Index)
+    }
 
     Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
     Put-U32LE $Bytes 0x310 1       # Base
@@ -802,6 +811,8 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U32LE $Bytes ($Opt + 28) 0x00400000
     Put-U32LE $Bytes ($Opt + 0x5C) 16
+    Put-U32LE $Bytes ($Opt + 0x80) 0x580
+    Put-U32LE $Bytes ($Opt + 0x84) 0x20
     Put-U32LE $Bytes ($Opt + 0x88) 0x2000
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
     Put-U32LE $Bytes ($Opt + 0x90) 0x3000
@@ -837,7 +848,7 @@ function New-Pe32Fixture {
     Put-Ascii $Bytes $TlsSect ".tls"
     Put-U32LE $Bytes ($TlsSect + 8) 0x80
     Put-U32LE $Bytes ($TlsSect + 12) 0x4000
-    Put-U32LE $Bytes ($TlsSect + 16) 0x100
+    Put-U32LE $Bytes ($TlsSect + 16) 0x60
     Put-U32LE $Bytes ($TlsSect + 20) 0x500
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
@@ -868,6 +879,13 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x514 0x00300000
     Put-U32LE $Bytes 0x530 0x401010 # TLS callback VA
     Put-U32LE $Bytes 0x534 0
+
+    Put-U32LE $Bytes 0x580 0x20   # WIN_CERTIFICATE.dwLength
+    Put-U16LE $Bytes 0x584 0x0200 # WIN_CERTIFICATE.wRevision
+    Put-U16LE $Bytes 0x586 0x0002 # WIN_CERTIFICATE.wCertificateType
+    for ($Index = [UInt32]0; $Index -lt 0x18; ++$Index) {
+        $Bytes[0x588 + $Index] = [byte](0x30 + $Index)
+    }
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }

@@ -129,6 +129,14 @@ struct PeTlsDirectory {
     std::vector<std::uint64_t> callbacks;
 };
 
+struct PeCertificate {
+    std::uint32_t file_offset = 0;
+    std::uint32_t length = 0;
+    std::uint16_t revision = 0;
+    std::uint16_t certificate_type = 0;
+    std::vector<std::uint8_t> certificate;
+};
+
 struct ElfHeader {
     std::uint8_t  elf_class = 0;
     std::uint8_t  data_encoding = 0;
@@ -252,6 +260,7 @@ public:
     [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;
     [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeCertificate>& pe_certificates() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
