@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -114,4 +115,52 @@ TEST(DebugSymbols, DiscoversMissingCodeViewPdbAndReportsMissingExplicitPath) {
     const viewer::DebugSymbolLoadResult result =
         viewer::load_pdb_debug_symbols(exe_path.parent_path() / "known-win-x64.pdb", *image);
     EXPECT_EQ(result.status, viewer::DebugSymbolLoadStatus::FileNotFound);
+}
+
+TEST(DebugSymbols, RejectsInvalidPdbBeforeDia) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    const std::filesystem::path pdb_path = std::filesystem::temp_directory_path() / "peelf_invalid_debug_symbols.pdb";
+    {
+        std::ofstream out(pdb_path, std::ios::binary);
+        ASSERT_TRUE(out) << pdb_path.string();
+        out << "not a real pdb";
+    }
+
+    const viewer::DebugSymbolLoadResult result = viewer::load_pdb_debug_symbols(pdb_path, *image);
+    std::filesystem::remove(pdb_path);
+
+    EXPECT_EQ(result.status, viewer::DebugSymbolLoadStatus::UnsupportedFormat);
+}
+
+TEST(DebugSymbols, ConfiguredDiaBackendLoadsBuildPdb) {
+#if defined(_WIN32) && defined(PEELF_HAS_DIA) && defined(PEELF_DIA_DLL_PATH)
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    const std::array<std::filesystem::path, 4> candidates{
+        std::filesystem::current_path() / "Debug" / "peelf_tests.pdb",
+        std::filesystem::current_path() / "tests" / "Debug" / "peelf_tests.pdb",
+        std::filesystem::current_path().parent_path() / "Debug" / "peelf_tests.pdb",
+        std::filesystem::current_path().parent_path() / "tests" / "Debug" / "peelf_tests.pdb",
+    };
+
+    std::filesystem::path pdb_path;
+    for (const std::filesystem::path& candidate : candidates) {
+        if (std::filesystem::exists(candidate)) {
+            pdb_path = candidate;
+            break;
+        }
+    }
+    if (pdb_path.empty()) {
+        GTEST_SKIP() << "No build-produced peelf_tests.pdb found";
+    }
+
+    const viewer::DebugSymbolLoadResult result = viewer::load_pdb_debug_symbols(pdb_path, *image);
+    EXPECT_EQ(result.status, viewer::DebugSymbolLoadStatus::Loaded) << result.diagnostic;
+    EXPECT_FALSE(result.symbols.empty());
+#else
+    GTEST_SKIP() << "DIA backend was not configured for this build";
+#endif
 }

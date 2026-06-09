@@ -89,9 +89,22 @@ if(MSVC)
       "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib"
       "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib"
   )
+  find_file(PEELF_DIA_DLL msdia140.dll
+    PATHS
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/bin/amd64"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/bin/amd64"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/bin"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/bin"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/Common7/IDE"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/Common7/IDE"
+  )
   if(PEELF_DIA_INCLUDE_DIR AND PEELF_DIA_GUIDS_LIBRARY)
     target_include_directories(peelf_viewer PRIVATE ${PEELF_DIA_INCLUDE_DIR})
     target_link_libraries(peelf_viewer PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)
     target_compile_definitions(peelf_viewer PRIVATE PEELF_HAS_DIA=1)
+    if(PEELF_DIA_DLL)
+      file(TO_CMAKE_PATH "${PEELF_DIA_DLL}" PEELF_DIA_DLL_NORMALIZED)
+      target_compile_definitions(peelf_viewer PRIVATE PEELF_DIA_DLL_PATH="${PEELF_DIA_DLL_NORMALIZED}")
+    endif()
   endif()
 endif()
