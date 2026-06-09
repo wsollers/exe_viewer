@@ -37,6 +37,11 @@ namespace viewer {
             ElfStartup
         };
 
+        struct PendingCallGraphRequest {
+            CallGraphSample sample = CallGraphSample::LoadedImage;
+            std::uint8_t delay_frames = 0;
+        };
+
         void disassemble_at(std::uint64_t rva, std::size_t size);
 
         void disassemble_entry_point(std::size_t max_size);
@@ -91,6 +96,7 @@ namespace viewer {
         std::optional<GraphLayout> current_call_graph_layout_;
         std::optional<SymbolRecord> pending_call_graph_root_;
         std::uint8_t pending_call_graph_delay_frames_ = 0;
+        std::optional<PendingCallGraphRequest> pending_call_graph_request_;
         std::string call_graph_status_;
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
@@ -101,6 +107,8 @@ namespace viewer {
         void render_dockspace();
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);
+        void queue_call_graph_sample(CallGraphSample sample);
+        void process_pending_call_graph_work();
         void load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name);
         void activate_call_graph_node(const CallGraphNode& node);
         const CallGraphNode* hit_test_call_graph_node(const ImVec2& image_pos,

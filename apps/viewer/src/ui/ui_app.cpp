@@ -453,7 +453,7 @@ void UiApp::render_main_menu() {
         {
             if (ImGui::MenuItem("Call Graph", nullptr, &show_call_graph_panel_)) {
                 if (show_call_graph_panel_ && !call_graph_texture_) {
-                    load_call_graph_sample(call_graph_sample_);
+                    queue_call_graph_sample(call_graph_sample_);
                 }
             }
         }
@@ -504,6 +504,7 @@ void UiApp::render_dockspace() {
 }
 
 void UiApp::load_call_graph_sample(CallGraphSample sample) {
+    pending_call_graph_request_.reset();
     if (sample == CallGraphSample::LoadedImage) {
         const peelf::IBinaryImage* image = model_.image();
         if (image == nullptr) {
@@ -556,6 +557,46 @@ void UiApp::load_call_graph_sample(CallGraphSample sample) {
     current_call_graph_.reset();
     current_call_graph_layout_.reset();
     call_graph_status_ = "Loaded " + bmp_path.filename().string();
+}
+
+void UiApp::queue_call_graph_sample(CallGraphSample sample) {
+    pending_call_graph_request_ = PendingCallGraphRequest{
+        .sample = sample,
+        .delay_frames = 1,
+    };
+    call_graph_sample_ = sample;
+    call_graph_status_ = "Queued call graph render";
+}
+
+void UiApp::process_pending_call_graph_work() {
+    if (pending_call_graph_request_) {
+        if (pending_call_graph_request_->delay_frames > 0) {
+            --pending_call_graph_request_->delay_frames;
+        } else {
+            const CallGraphSample sample = pending_call_graph_request_->sample;
+            pending_call_graph_request_.reset();
+            load_call_graph_sample(sample);
+            return;
+        }
+    }
+
+    if (pending_call_graph_root_ && pending_call_graph_delay_frames_ > 0) {
+        --pending_call_graph_delay_frames_;
+    } else if (pending_call_graph_root_) {
+        const peelf::IBinaryImage* img = model_.image();
+        const SymbolRecord root = *pending_call_graph_root_;
+        pending_call_graph_root_.reset();
+        pending_call_graph_delay_frames_ = 0;
+        if (img != nullptr) {
+            load_call_graph_from_graph(
+                build_symbol_fanout_call_graph(*img,
+                                               std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
+                                               symbol_index_,
+                                               root),
+                "loaded_symbol_fanout_call_graph.bmp");
+            call_graph_status_ = "Loaded fan-out from " + root.name;
+        }
+    }
 }
 
 void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name) {
@@ -690,46 +731,30 @@ void UiApp::render_call_graph_panel() {
         return;
     }
 
-    if (pending_call_graph_root_ && pending_call_graph_delay_frames_ > 0) {
-        --pending_call_graph_delay_frames_;
-    } else if (pending_call_graph_root_) {
-        const peelf::IBinaryImage* img = model_.image();
-        const SymbolRecord root = *pending_call_graph_root_;
-        pending_call_graph_root_.reset();
-        pending_call_graph_delay_frames_ = 0;
-        if (img != nullptr) {
-            load_call_graph_from_graph(
-                build_symbol_fanout_call_graph(*img,
-                                               std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
-                                               symbol_index_,
-                                               root),
-                "loaded_symbol_fanout_call_graph.bmp");
-            call_graph_status_ = "Loaded fan-out from " + root.name;
-        }
-    }
+    process_pending_call_graph_work();
 
     if (ImGui::Button("Loaded Image")) {
-        load_call_graph_sample(CallGraphSample::LoadedImage);
+        queue_call_graph_sample(CallGraphSample::LoadedImage);
     }
     ImGui::SameLine();
     if (ImGui::Button("PE x64 sample")) {
-        load_call_graph_sample(CallGraphSample::PeStartup);
+        queue_call_graph_sample(CallGraphSample::PeStartup);
     }
     ImGui::SameLine();
     if (ImGui::Button("Linux ELF sample")) {
-        load_call_graph_sample(CallGraphSample::ElfStartup);
+        queue_call_graph_sample(CallGraphSample::ElfStartup);
     }
     ImGui::SameLine();
     if (ImGui::Button("Reload")) {
-        load_call_graph_sample(call_graph_sample_);
+        queue_call_graph_sample(call_graph_sample_);
     }
 
     if (!call_graph_status_.empty()) {
         ImGui::TextUnformatted(call_graph_status_.c_str());
     }
 
-    if (!call_graph_texture_) {
-        load_call_graph_sample(call_graph_sample_);
+    if (!call_graph_texture_ && !pending_call_graph_request_) {
+        queue_call_graph_sample(call_graph_sample_);
     }
 
     const ImVec2 available = ImGui::GetContentRegionAvail();
@@ -868,6 +893,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             last_navigation_selection_.reset();
             pending_call_graph_root_.reset();
             pending_call_graph_delay_frames_ = 0;
+            pending_call_graph_request_.reset();
             return;
         }
 
@@ -875,6 +901,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         symbol_index_ = SymbolIndex::build(*img);
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
+        pending_call_graph_request_.reset();
         if (const std::optional<std::filesystem::path> pdb = find_local_codeview_pdb(*img, model_.file_info().path)) {
             load_debug_symbols(*pdb);
         } else if (!img->pe_debug_directories().empty()) {
