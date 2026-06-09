@@ -84,6 +84,52 @@ UiApp::UiApp(BinaryModel& model)
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
         disassemble_at_offset(static_cast<std::size_t>(*file_offset), symbol.virtual_address);
     });
+    imports_panel_.set_import_activated_callback([this](const peelf::ImportEntry& entry) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr || entry.address == 0) {
+            return;
+        }
+
+        const auto file_offset = img->virtual_address_to_file_offset(entry.address);
+        if (!file_offset) {
+            Log().warn("Import '{}!{}' at 0x{:X} does not map to file bytes",
+                       entry.library,
+                       entry.name.empty() ? "<ordinal-or-library>" : entry.name,
+                       entry.address);
+            return;
+        }
+        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            Log().warn("Import '{}!{}' address is too large for this platform",
+                       entry.library,
+                       entry.name.empty() ? "<ordinal-or-library>" : entry.name);
+            return;
+        }
+
+        const std::size_t pointer_size = img->is_64bit() ? 8u : 4u;
+        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), pointer_size);
+    });
+    exports_panel_.set_export_activated_callback([this](const peelf::ExportEntry& entry) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr || entry.virtual_address == 0) {
+            return;
+        }
+
+        const auto file_offset = img->virtual_address_to_file_offset(entry.virtual_address);
+        if (!file_offset) {
+            Log().warn("Export '{}' at 0x{:X} does not map to file bytes",
+                       entry.name.empty() ? "<unnamed>" : entry.name,
+                       entry.virtual_address);
+            return;
+        }
+        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            Log().warn("Export '{}' address is too large for this platform",
+                       entry.name.empty() ? "<unnamed>" : entry.name);
+            return;
+        }
+
+        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), 1);
+        disassemble_at_offset(static_cast<std::size_t>(*file_offset), entry.virtual_address);
+    });
 }
 
 void UiApp::render() {

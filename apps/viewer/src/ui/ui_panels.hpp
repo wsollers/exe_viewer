@@ -115,21 +115,29 @@ namespace viewer {
     class ImportsPanel : public UiPanel {
     public:
         explicit ImportsPanel(BinaryModel& model);
+        void set_import_activated_callback(std::function<void(const peelf::ImportEntry& entry)> cb) {
+            on_import_activated_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
+        std::function<void(const peelf::ImportEntry& entry)> on_import_activated_;
     };
 
     class ExportsPanel : public UiPanel {
     public:
         explicit ExportsPanel(BinaryModel& model);
+        void set_export_activated_callback(std::function<void(const peelf::ExportEntry& entry)> cb) {
+            on_export_activated_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
+        std::function<void(const peelf::ExportEntry& entry)> on_export_activated_;
     };
 
     class LogPanel : public UiPanel {

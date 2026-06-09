@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 
+#include <cstdint>
 #include <string>
 
 namespace viewer {
@@ -33,16 +34,24 @@ void ImportsPanel::draw_contents() {
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
         ImGui::TableHeadersRow();
 
+        std::uint64_t row_id = 0;
         for (const peelf::ImportEntry& entry : img->imports()) {
             if (has_filter &&
                 entry.library.find(filter) == std::string::npos &&
                 entry.name.find(filter) == std::string::npos) {
+                ++row_id;
                 continue;
             }
 
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(entry.library.c_str());
+            ImGui::PushID(static_cast<int>(row_id));
+            if (ImGui::Selectable(entry.library.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                if (on_import_activated_) {
+                    on_import_activated_(entry);
+                }
+            }
+            ImGui::PopID();
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(entry.name.empty() ? "-" : entry.name.c_str());
             ImGui::TableNextColumn();
@@ -51,6 +60,7 @@ void ImportsPanel::draw_contents() {
             } else {
                 ImGui::Text("0x%llX", static_cast<unsigned long long>(entry.address));
             }
+            ++row_id;
         }
 
         ImGui::EndTable();

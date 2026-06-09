@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 
+#include <cstdint>
 #include <string>
 
 namespace viewer {
@@ -34,22 +35,32 @@ void ExportsPanel::draw_contents() {
         ImGui::TableSetupColumn("Forwarder", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
+        std::uint64_t row_id = 0;
         for (const peelf::ExportEntry& entry : img->exports()) {
             if (has_filter &&
                 entry.name.find(filter) == std::string::npos &&
                 entry.forwarder.find(filter) == std::string::npos) {
+                ++row_id;
                 continue;
             }
 
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(entry.name.c_str());
+            ImGui::PushID(static_cast<int>(row_id));
+            const char* display_name = entry.name.empty() ? "<unnamed>" : entry.name.c_str();
+            if (ImGui::Selectable(display_name, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                if (on_export_activated_) {
+                    on_export_activated_(entry);
+                }
+            }
+            ImGui::PopID();
             ImGui::TableNextColumn();
             ImGui::Text("%u", entry.ordinal);
             ImGui::TableNextColumn();
             ImGui::Text("0x%llX", static_cast<unsigned long long>(entry.virtual_address));
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(entry.forwarder.empty() ? "-" : entry.forwarder.c_str());
+            ++row_id;
         }
 
         ImGui::EndTable();
