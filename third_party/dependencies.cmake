@@ -114,9 +114,10 @@ add_library(peelf_graphviz INTERFACE)
 add_library(peelf::graphviz ALIAS peelf_graphviz)
 
 if(PEELF_GRAPHVIZ_DOT_EXECUTABLE)
+        file(TO_CMAKE_PATH "${PEELF_GRAPHVIZ_DOT_EXECUTABLE}" PEELF_GRAPHVIZ_DOT_EXECUTABLE_CMAKE_PATH)
         target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_DOT_AVAILABLE=1)
         target_compile_definitions(peelf_graphviz INTERFACE
-                PEELF_GRAPHVIZ_DOT_EXECUTABLE="$<SHELL_PATH:${PEELF_GRAPHVIZ_DOT_EXECUTABLE}>")
+                PEELF_GRAPHVIZ_DOT_EXECUTABLE="${PEELF_GRAPHVIZ_DOT_EXECUTABLE_CMAKE_PATH}")
 else()
         target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_DOT_AVAILABLE=0)
 endif()

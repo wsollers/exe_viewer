@@ -32,7 +32,9 @@ add_executable(peelf_tests
   binary_image_test.cpp
   disassembler_test.cpp
   viewer_navigation_test.cpp
+  call_graph_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
 )
 
 target_compile_features(peelf_tests PRIVATE cxx_std_23)
@@ -40,6 +42,7 @@ target_compile_features(peelf_tests PRIVATE cxx_std_23)
 target_link_libraries(peelf_tests PRIVATE
   peelf::core
   capstone
+  peelf::graphviz
   GTest::gtest_main
 )
 

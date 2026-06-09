@@ -50,6 +50,8 @@ add_executable(peelf_viewer
         src/model/image_delay_load_descriptor.hpp
         src/navigation/viewer_navigation.hpp
         src/navigation/viewer_navigation.cpp
+        src/graph/call_graph.hpp
+        src/graph/call_graph.cpp
         src/disasm/disassembler.hpp
 )
 
