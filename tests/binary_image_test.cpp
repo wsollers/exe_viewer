@@ -749,10 +749,12 @@ TEST(BinaryImage, ParsesPeResourceDirectoriesAcrossFixtureMatrix) {
         std::uint32_t rva;
         std::uint64_t file_offset;
         std::uint32_t time_date_stamp;
+        std::uint64_t data_file_offset;
+        std::uint8_t data_byte_base;
     };
     constexpr std::array<ExpectedResourceDirectory, 2> fixtures{{
-        {"known-win-x86.exe", 0x3070, 0x470, 0x4A2A5A32},
-        {"known-win-x64.exe", 0x3070, 0x570, 0x4A2A5A64},
+        {"known-win-x86.exe", 0x4170, 0x670, 0x4A2A5A32, 0x6D0, 0x70},
+        {"known-win-x64.exe", 0x4170, 0x770, 0x4A2A5A64, 0x7D0, 0x80},
     }};
 
     for (const ExpectedResourceDirectory& expected : fixtures) {
@@ -778,6 +780,20 @@ TEST(BinaryImage, ParsesPeResourceDirectoriesAcrossFixtureMatrix) {
         EXPECT_FALSE(resource->entries.front().name_is_string) << expected.name;
         EXPECT_TRUE(resource->entries.front().data_is_directory) << expected.name;
         EXPECT_EQ(resource->entries.front().offset_to_data_or_directory, 0x80000018u) << expected.name;
+
+        const auto& data_entries = (**result).pe_resource_data_entries();
+        ASSERT_EQ(data_entries.size(), 1u) << expected.name;
+        const peelf::PeResourceDataEntry& data = data_entries.front();
+        EXPECT_EQ(data.type_id, 16u) << expected.name;
+        EXPECT_EQ(data.name_id, 1u) << expected.name;
+        EXPECT_EQ(data.language_id, 0x0409u) << expected.name;
+        EXPECT_EQ(data.data_rva, 0x41D0u) << expected.name;
+        EXPECT_EQ(data.size, 0x10u) << expected.name;
+        EXPECT_EQ(data.code_page, 1252u) << expected.name;
+        EXPECT_EQ(data.reserved, 0u) << expected.name;
+        EXPECT_EQ(data.data_file_offset, expected.data_file_offset) << expected.name;
+        ASSERT_LT(data.data_file_offset, bytes.size()) << expected.name;
+        EXPECT_EQ(bytes[static_cast<std::size_t>(data.data_file_offset)], expected.data_byte_base) << expected.name;
     }
 }
 

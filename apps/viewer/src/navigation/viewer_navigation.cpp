@@ -252,6 +252,20 @@ void add_pe_metadata(const peelf::IBinaryImage& image, StructureNode& root) {
         node.selection.file_offset = resource->file_offset;
         node.selection.virtual_address = image.file_offset_to_virtual_address(resource->file_offset);
         node.selection.size = 16u + static_cast<std::uint64_t>(resource->entries.size()) * 8u;
+        std::uint64_t resource_data_index = 0;
+        for (const peelf::PeResourceDataEntry& entry : image.pe_resource_data_entries()) {
+            StructureNode data = selectable_node(SelectionKind::ResourceData,
+                                                 "Resource " + std::to_string(entry.type_id) + "/" +
+                                                     std::to_string(entry.name_id) + "/" +
+                                                     std::to_string(entry.language_id),
+                                                 resource_data_index,
+                                                 PreferredView::Hex);
+            data.selection.file_offset = entry.data_file_offset;
+            data.selection.virtual_address = image.file_offset_to_virtual_address(entry.data_file_offset);
+            data.selection.size = entry.size;
+            node.children.push_back(std::move(data));
+            ++resource_data_index;
+        }
         root.children.push_back(std::move(node));
     }
 

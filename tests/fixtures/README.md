@@ -72,17 +72,17 @@ Small binary samples used by the unit tests.
   `.reloc`, `.debug`, and `.tls` sections, one HIGHLOW base relocation, one
   CodeView RSDS debug record, one runtime-function entry in the exception
   directory, one delay-load import (`USER32.dll!MessageBoxA`), one bound import
-  record (`BOUND32.dll`), one top-level resource directory, one CLR header, one
-  TLS directory with one callback, one overlay certificate table entry, one Load
-  Config directory with Guard CF fields, and `IMAGE_FILE_MACHINE_I386`.
+  record (`BOUND32.dll`), one resource directory/data-entry path, one CLR header,
+  one TLS directory with one callback, one overlay certificate table entry, one
+  Load Config directory with Guard CF fields, and `IMAGE_FILE_MACHINE_I386`.
 - `known-win-x64.exe` — deterministic minimal PE32+ executable fixture with a
   `.text` section, one import `KERNEL32.dll!ExitProcess`, one export named `known_export`,
   one `.reloc` section with a DIR64 base relocation, one `.debug` section with a
   CodeView RSDS debug record, one runtime-function entry in the exception
   directory, one delay-load import (`USER32.dll!MessageBoxA`), one bound import
-  record (`BOUND64.dll`), one top-level resource directory, one CLR header, one
-  `.tls` section with one TLS directory/callback, one overlay certificate table
-  entry, one Load Config directory with Guard CF fields, and `IMAGE_FILE_MACHINE_AMD64`.
+  record (`BOUND64.dll`), one resource directory/data-entry path, one CLR header,
+  one `.tls` section with one TLS directory/callback, one overlay certificate
+  table entry, one Load Config directory with Guard CF fields, and `IMAGE_FILE_MACHINE_AMD64`.
 - `make_known_fixtures.ps1` — regenerates the `known-*` binary fixtures from
   explicit fixed-width field writes.
 

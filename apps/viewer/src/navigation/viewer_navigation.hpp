@@ -32,6 +32,7 @@ enum class SelectionKind : std::uint8_t {
     LoadConfig,
     BoundImport,
     ResourceDirectory,
+    ResourceData,
     ClrHeader,
     DynamicEntry,
     Note,

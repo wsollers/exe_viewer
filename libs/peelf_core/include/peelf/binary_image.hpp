@@ -112,6 +112,18 @@ struct PeResourceDirectory {
     std::vector<PeResourceDirectoryEntry> entries;
 };
 
+struct PeResourceDataEntry {
+    std::uint32_t type_id = 0;
+    std::uint32_t name_id = 0;
+    std::uint32_t language_id = 0;
+    std::uint32_t data_rva = 0;
+    std::uint32_t size = 0;
+    std::uint32_t code_page = 0;
+    std::uint32_t reserved = 0;
+    std::uint64_t entry_file_offset = 0;
+    std::uint64_t data_file_offset = 0;
+};
+
 struct ExportEntry {
     std::string   name;
     std::uint32_t ordinal = 0;
@@ -354,6 +366,7 @@ public:
     [[nodiscard]] virtual const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeBoundImport>& pe_bound_imports() const noexcept = 0;
     [[nodiscard]] virtual const PeResourceDirectory* pe_resource_directory() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeResourceDataEntry>& pe_resource_data_entries() const noexcept = 0;
     [[nodiscard]] virtual const PeClrHeader* pe_clr_header() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;

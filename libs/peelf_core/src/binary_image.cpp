@@ -100,6 +100,10 @@ public:
     [[nodiscard]] const PeResourceDirectory* pe_resource_directory() const noexcept override {
         return nullptr;
     }
+    [[nodiscard]] const std::vector<PeResourceDataEntry>& pe_resource_data_entries() const noexcept override {
+        static const std::vector<PeResourceDataEntry> empty;
+        return empty;
+    }
     [[nodiscard]] const PeClrHeader* pe_clr_header() const noexcept override {
         return nullptr;
     }
@@ -256,6 +260,9 @@ public:
     [[nodiscard]] const PeResourceDirectory* pe_resource_directory() const noexcept override {
         return resource_directory_ ? &*resource_directory_ : nullptr;
     }
+    [[nodiscard]] const std::vector<PeResourceDataEntry>& pe_resource_data_entries() const noexcept override {
+        return resource_data_entries_;
+    }
     [[nodiscard]] const PeClrHeader* pe_clr_header() const noexcept override {
         return clr_header_ ? &*clr_header_ : nullptr;
     }
@@ -270,6 +277,7 @@ private:
     std::vector<PeRuntimeFunction> runtime_functions_;
     std::vector<PeBoundImport> bound_imports_;
     std::optional<PeResourceDirectory> resource_directory_;
+    std::vector<PeResourceDataEntry> resource_data_entries_;
     std::optional<PeClrHeader> clr_header_;
 };
 
@@ -519,7 +527,8 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
                                  std::uint64_t image_base,
                                  std::uint32_t directory_rva,
                                  std::uint32_t directory_size,
-                                 std::optional<PeResourceDirectory>& resource_out) {
+                                 std::optional<PeResourceDirectory>& resource_out,
+                                 std::vector<PeResourceDataEntry>& data_entries_out) {
     if (directory_rva == 0 || directory_size < 16) {
         return;
     }
@@ -558,6 +567,74 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
         entry.data_is_directory = (entry.offset_to_data_or_directory & 0x8000'0000u) != 0;
         resource.entries.push_back(entry);
     }
+
+    auto parse_resource_level = [&](auto&& self,
+                                    std::uint64_t relative_directory_offset,
+                                    std::uint32_t depth,
+                                    std::uint32_t type_id,
+                                    std::uint32_t name_id,
+                                    std::uint32_t language_id) -> void {
+        if (depth > 2 || relative_directory_offset > directory_size ||
+            directory_size - relative_directory_offset < 16) {
+            return;
+        }
+
+        const std::uint64_t directory_file_offset = *directory_off + relative_directory_offset;
+        if (!fits_range(directory_file_offset, 16, static_cast<std::uint64_t>(b.size()))) {
+            return;
+        }
+
+        const std::size_t dir = static_cast<std::size_t>(directory_file_offset);
+        const std::uint16_t named_count = rd16(b, dir + 0x0C, false);
+        const std::uint16_t id_count = rd16(b, dir + 0x0E, false);
+        const std::uint64_t entry_count = static_cast<std::uint64_t>(named_count) +
+                                          static_cast<std::uint64_t>(id_count);
+        for (std::uint64_t i = 0; i < entry_count; ++i) {
+            const std::uint64_t entry_off = directory_file_offset + 16u + i * 8u;
+            if (!fits_range(entry_off, 8, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+
+            const std::size_t entry_pos = static_cast<std::size_t>(entry_off);
+            const std::uint32_t raw_name = rd32(b, entry_pos + 0x00, false);
+            const std::uint32_t raw_target = rd32(b, entry_pos + 0x04, false);
+            const std::uint32_t id = raw_name & 0x7FFF'FFFFu;
+            const std::uint32_t next_type = depth == 0 ? id : type_id;
+            const std::uint32_t next_name = depth == 1 ? id : name_id;
+            const std::uint32_t next_language = depth == 2 ? id : language_id;
+
+            const std::uint32_t target_offset = raw_target & 0x7FFF'FFFFu;
+            if ((raw_target & 0x8000'0000u) != 0) {
+                self(self, target_offset, depth + 1u, next_type, next_name, next_language);
+                continue;
+            }
+
+            if (target_offset > directory_size || directory_size - target_offset < 16) {
+                continue;
+            }
+            const std::uint64_t data_entry_off = *directory_off + target_offset;
+            if (!fits_range(data_entry_off, 16, static_cast<std::uint64_t>(b.size()))) {
+                continue;
+            }
+
+            const std::size_t data = static_cast<std::size_t>(data_entry_off);
+            PeResourceDataEntry data_entry;
+            data_entry.type_id = next_type;
+            data_entry.name_id = next_name;
+            data_entry.language_id = next_language;
+            data_entry.data_rva = rd32(b, data + 0x00, false);
+            data_entry.size = rd32(b, data + 0x04, false);
+            data_entry.code_page = rd32(b, data + 0x08, false);
+            data_entry.reserved = rd32(b, data + 0x0C, false);
+            data_entry.entry_file_offset = data_entry_off;
+            if (const auto data_off = pe_rva_to_file_offset(sections, image_base, data_entry.data_rva)) {
+                data_entry.data_file_offset = *data_off;
+            }
+            data_entries_out.push_back(data_entry);
+        }
+    };
+
+    parse_resource_level(parse_resource_level, 0, 0, 0, 0, 0);
 
     resource_out = std::move(resource);
 }
@@ -1620,7 +1697,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     parse_pe_bound_imports(b, img->sections_, image_base, bound_import_dir_rva,
                            bound_import_dir_size, img->bound_imports_);
     parse_pe_resource_directory(b, img->sections_, image_base, resource_dir_rva,
-                                resource_dir_size, img->resource_directory_);
+                                resource_dir_size, img->resource_directory_,
+                                img->resource_data_entries_);
     parse_pe_clr_header(b, img->sections_, image_base, clr_dir_rva, clr_dir_size,
                         img->clr_header_);
 

@@ -161,6 +161,10 @@ TEST(ViewerNavigation, BuildsPeStructureTreeWithRelocationAndDebugSelections) {
     EXPECT_EQ(resource->selection.kind, viewer::SelectionKind::ResourceDirectory);
     EXPECT_TRUE(resource->selection.file_offset.has_value());
     EXPECT_GT(resource->selection.size, 0u);
+    ASSERT_FALSE(resource->children.empty());
+    EXPECT_EQ(resource->children.front().selection.kind, viewer::SelectionKind::ResourceData);
+    EXPECT_TRUE(resource->children.front().selection.file_offset.has_value());
+    EXPECT_EQ(resource->children.front().selection.size, 0x10u);
 
     const viewer::StructureNode* clr = find_child(tree, "CLR Header");
     ASSERT_NE(clr, nullptr);

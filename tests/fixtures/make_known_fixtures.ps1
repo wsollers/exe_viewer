@@ -331,8 +331,8 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
     Put-U32LE $Bytes ($Opt + 0x78) 0x1180
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
-    Put-U32LE $Bytes ($Opt + 0x80) 0x3070
-    Put-U32LE $Bytes ($Opt + 0x84) 0x18
+    Put-U32LE $Bytes ($Opt + 0x80) 0x4170
+    Put-U32LE $Bytes ($Opt + 0x84) 0x60
     Put-U32LE $Bytes ($Opt + 0x88) 0x1080
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
     Put-U32LE $Bytes ($Opt + 0x90) 0x900
@@ -423,15 +423,6 @@ function New-Pe64Fixture {
     Put-U16LE $Bytes 0x5E6 0          # bound NumberOfModuleForwarderRefs
     Put-Ascii $Bytes 0x5F0 "BOUND64.dll"
 
-    Put-U32LE $Bytes 0x570 0           # resource Characteristics
-    Put-U32LE $Bytes 0x574 0x4A2A5A64  # resource TimeDateStamp
-    Put-U16LE $Bytes 0x578 1           # resource MajorVersion
-    Put-U16LE $Bytes 0x57A 0           # resource MinorVersion
-    Put-U16LE $Bytes 0x57C 0           # resource NumberOfNamedEntries
-    Put-U16LE $Bytes 0x57E 1           # resource NumberOfIdEntries
-    Put-U32LE $Bytes 0x580 16          # resource ID: RT_VERSION
-    Put-U32LE $Bytes 0x584 2147483672 # resource entry points to child directory
-
     Put-U64LE $Bytes 0x600 0x140004010 # StartAddressOfRawData
     Put-U64LE $Bytes 0x608 0x140004020 # EndAddressOfRawData
     Put-U64LE $Bytes 0x610 0x140004030 # AddressOfIndex
@@ -480,6 +471,34 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes 0x724 0x10       # StrongNameSignature Size
     Put-U32LE $Bytes 0x730 0x41A0     # VTableFixups RVA
     Put-U32LE $Bytes 0x734 0x08       # VTableFixups Size
+
+    Put-U32LE $Bytes 0x770 0           # resource Characteristics
+    Put-U32LE $Bytes 0x774 0x4A2A5A64  # resource TimeDateStamp
+    Put-U16LE $Bytes 0x778 1           # resource MajorVersion
+    Put-U16LE $Bytes 0x77A 0           # resource MinorVersion
+    Put-U16LE $Bytes 0x77C 0           # resource NumberOfNamedEntries
+    Put-U16LE $Bytes 0x77E 1           # resource NumberOfIdEntries
+    Put-U32LE $Bytes 0x780 16          # resource ID: RT_VERSION
+    Put-U32LE $Bytes 0x784 2147483672  # resource entry points to child directory
+    Put-U16LE $Bytes 0x790 0           # child NumberOfNamedEntries
+    Put-U16LE $Bytes 0x792 0
+    Put-U16LE $Bytes 0x794 0
+    Put-U16LE $Bytes 0x796 1           # child NumberOfIdEntries
+    Put-U32LE $Bytes 0x798 1           # resource name/id
+    Put-U32LE $Bytes 0x79C 2147483696  # resource entry points to language directory
+    Put-U16LE $Bytes 0x7A8 0
+    Put-U16LE $Bytes 0x7AA 0
+    Put-U16LE $Bytes 0x7AC 0
+    Put-U16LE $Bytes 0x7AE 1
+    Put-U32LE $Bytes 0x7B0 0x0409      # language
+    Put-U32LE $Bytes 0x7B4 0x50        # data entry offset
+    Put-U32LE $Bytes 0x7C0 0x41D0      # resource data RVA
+    Put-U32LE $Bytes 0x7C4 0x10        # resource data size
+    Put-U32LE $Bytes 0x7C8 1252        # code page
+    Put-U32LE $Bytes 0x7CC 0
+    for ($Index = [UInt32]0; $Index -lt 0x10; ++$Index) {
+        $Bytes[0x7D0 + $Index] = [byte](0x80 + $Index)
+    }
 
     Put-U32LE $Bytes 0x900 0x20   # WIN_CERTIFICATE.dwLength
     Put-U16LE $Bytes 0x904 0x0200 # WIN_CERTIFICATE.wRevision
@@ -892,8 +911,8 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U32LE $Bytes ($Opt + 28) 0x00400000
     Put-U32LE $Bytes ($Opt + 0x5C) 16
-    Put-U32LE $Bytes ($Opt + 0x70) 0x3070
-    Put-U32LE $Bytes ($Opt + 0x74) 0x18
+    Put-U32LE $Bytes ($Opt + 0x70) 0x4170
+    Put-U32LE $Bytes ($Opt + 0x74) 0x60
     Put-U32LE $Bytes ($Opt + 0x78) 0x1080
     Put-U32LE $Bytes ($Opt + 0x7C) 0x0C
     Put-U32LE $Bytes ($Opt + 0x80) 0x900
@@ -984,15 +1003,6 @@ function New-Pe32Fixture {
     Put-U16LE $Bytes 0x4E6 0          # bound NumberOfModuleForwarderRefs
     Put-Ascii $Bytes 0x4F0 "BOUND32.dll"
 
-    Put-U32LE $Bytes 0x470 0           # resource Characteristics
-    Put-U32LE $Bytes 0x474 0x4A2A5A32  # resource TimeDateStamp
-    Put-U16LE $Bytes 0x478 1           # resource MajorVersion
-    Put-U16LE $Bytes 0x47A 0           # resource MinorVersion
-    Put-U16LE $Bytes 0x47C 0           # resource NumberOfNamedEntries
-    Put-U16LE $Bytes 0x47E 1           # resource NumberOfIdEntries
-    Put-U32LE $Bytes 0x480 16          # resource ID: RT_VERSION
-    Put-U32LE $Bytes 0x484 2147483672 # resource entry points to child directory
-
     Put-U32LE $Bytes 0x500 0x404010 # StartAddressOfRawData
     Put-U32LE $Bytes 0x504 0x404018 # EndAddressOfRawData
     Put-U32LE $Bytes 0x508 0x404020 # AddressOfIndex
@@ -1041,6 +1051,34 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x624 0x10       # StrongNameSignature Size
     Put-U32LE $Bytes 0x630 0x41A0     # VTableFixups RVA
     Put-U32LE $Bytes 0x634 0x08       # VTableFixups Size
+
+    Put-U32LE $Bytes 0x670 0           # resource Characteristics
+    Put-U32LE $Bytes 0x674 0x4A2A5A32  # resource TimeDateStamp
+    Put-U16LE $Bytes 0x678 1           # resource MajorVersion
+    Put-U16LE $Bytes 0x67A 0           # resource MinorVersion
+    Put-U16LE $Bytes 0x67C 0           # resource NumberOfNamedEntries
+    Put-U16LE $Bytes 0x67E 1           # resource NumberOfIdEntries
+    Put-U32LE $Bytes 0x680 16          # resource ID: RT_VERSION
+    Put-U32LE $Bytes 0x684 2147483672  # resource entry points to child directory
+    Put-U16LE $Bytes 0x690 0
+    Put-U16LE $Bytes 0x692 0
+    Put-U16LE $Bytes 0x694 0
+    Put-U16LE $Bytes 0x696 1
+    Put-U32LE $Bytes 0x698 1
+    Put-U32LE $Bytes 0x69C 2147483696
+    Put-U16LE $Bytes 0x6A8 0
+    Put-U16LE $Bytes 0x6AA 0
+    Put-U16LE $Bytes 0x6AC 0
+    Put-U16LE $Bytes 0x6AE 1
+    Put-U32LE $Bytes 0x6B0 0x0409
+    Put-U32LE $Bytes 0x6B4 0x50
+    Put-U32LE $Bytes 0x6C0 0x41D0
+    Put-U32LE $Bytes 0x6C4 0x10
+    Put-U32LE $Bytes 0x6C8 1252
+    Put-U32LE $Bytes 0x6CC 0
+    for ($Index = [UInt32]0; $Index -lt 0x10; ++$Index) {
+        $Bytes[0x6D0 + $Index] = [byte](0x70 + $Index)
+    }
 
     Put-U32LE $Bytes 0x900 0x20   # WIN_CERTIFICATE.dwLength
     Put-U16LE $Bytes 0x904 0x0200 # WIN_CERTIFICATE.wRevision
