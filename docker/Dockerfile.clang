@@ -1,0 +1,31 @@
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        clang-18 \
+        clang-format-18 \
+        clang-tidy-18 \
+        cmake \
+        git \
+        graphviz \
+        libvulkan-dev \
+        libwayland-dev \
+        libx11-dev \
+        libxkbcommon-dev \
+        libxcursor-dev \
+        libxi-dev \
+        libxinerama-dev \
+        libxrandr-dev \
+        ninja-build \
+        pkg-config \
+        xorg-dev \
+    && ln -sf /usr/bin/clang-format-18 /usr/local/bin/clang-format \
+    && ln -sf /usr/bin/clang-tidy-18 /usr/local/bin/clang-tidy \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/exe_viewer
+
+CMD ["bash"]

@@ -19,8 +19,32 @@ You need all of the following before configuring:
 - **Git** and a working network connection — third-party libraries are downloaded at configure time (see below)
 - A **C++23** compiler (see Toolchains)
 - The **Vulkan SDK** (from LunarG). The build calls `find_package(Vulkan REQUIRED)`, so the SDK must be installed and discoverable. The SDK installer sets the `VULKAN_SDK` environment variable for you.
+- **Graphviz** is optional today, but recommended for call-flow / CFG rendering. The project emits DOT without it; installing Graphviz puts `dot` on `PATH` so CMake can define `PEELF_GRAPHVIZ_DOT_AVAILABLE=1` and the viewer can later render DOT through an external process.
 - **Linux only:** GLFW's system dependencies, e.g. on Debian/Ubuntu:
-  `sudo apt install xorg-dev libwayland-dev libxkbcommon-dev pkg-config`
+  `sudo apt install xorg-dev libwayland-dev libxkbcommon-dev pkg-config graphviz`
+
+### Graphviz on Windows
+
+Install one of these, then open a new terminal so `PATH` is refreshed:
+
+```powershell
+# winget
+winget install --id Graphviz.Graphviz -e
+
+# or Chocolatey
+choco install graphviz
+```
+
+Verify:
+
+```powershell
+dot -V
+Get-Command dot
+cmake --preset msvc-debug
+```
+
+If `dot` is not found, add Graphviz's `bin` directory to `PATH` manually. The
+default installer path is usually `C:\Program Files\Graphviz\bin`.
 
 ## Dependencies (fetched automatically)
 
@@ -66,6 +90,19 @@ cmake --build --preset clang18-release
 ```
 
 Output binary: `out/build/<preset>/apps/viewer/peelf_viewer`
+
+### Clang Docker image
+
+The repository includes a Clang 18 build image with Graphviz installed:
+
+```bash
+docker build -f docker/Dockerfile.clang -t peelf-viewer-clang .
+docker run --rm -it -v "$PWD":/workspace/exe_viewer peelf-viewer-clang
+
+cmake --preset clang18-debug
+cmake --build --preset clang18-debug
+ctest --test-dir out/build/clang18-debug --output-on-failure
+```
 
 The first configure will take a while because it clones and builds GLFW, ImGui,
 nativefiledialog-extended, and Capstone. Enabling `PEELF_ENABLE_GRAPHVIZ` also
