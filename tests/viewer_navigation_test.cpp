@@ -106,6 +106,10 @@ TEST(ViewerNavigation, BuildsPeStructureTreeWithRelocationAndDebugSelections) {
     ASSERT_NE(sections, nullptr);
     EXPECT_NE(find_child(*sections, ".text"), nullptr);
 
+    const viewer::StructureNode* imports = find_child(tree, "Imports");
+    ASSERT_NE(imports, nullptr);
+    EXPECT_NE(find_child(*imports, "USER32.dll!MessageBoxA (delay)"), nullptr);
+
     const viewer::StructureNode* relocations = find_child(tree, "Base Relocations");
     ASSERT_NE(relocations, nullptr);
     ASSERT_FALSE(relocations->children.empty());
@@ -144,4 +148,11 @@ TEST(ViewerNavigation, BuildsPeStructureTreeWithRelocationAndDebugSelections) {
     EXPECT_EQ(load_config->selection.kind, viewer::SelectionKind::LoadConfig);
     EXPECT_TRUE(load_config->selection.file_offset.has_value());
     EXPECT_GT(load_config->selection.size, 0u);
+
+    const viewer::StructureNode* bound_imports = find_child(tree, "Bound Imports");
+    ASSERT_NE(bound_imports, nullptr);
+    ASSERT_FALSE(bound_imports->children.empty());
+    EXPECT_EQ(bound_imports->children.front().selection.kind, viewer::SelectionKind::BoundImport);
+    EXPECT_TRUE(bound_imports->children.front().selection.file_offset.has_value());
+    EXPECT_GT(bound_imports->children.front().selection.size, 0u);
 }

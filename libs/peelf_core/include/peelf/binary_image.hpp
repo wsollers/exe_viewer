@@ -82,6 +82,15 @@ struct ImportEntry {
     std::string   library;
     std::string   name;
     std::uint64_t address = 0;
+    bool          delay_load = false;
+};
+
+struct PeBoundImport {
+    std::uint32_t time_date_stamp = 0;
+    std::uint16_t offset_module_name = 0;
+    std::uint16_t forwarder_ref_count = 0;
+    std::string module_name;
+    std::uint64_t file_offset = 0;
 };
 
 struct ExportEntry {
@@ -300,6 +309,7 @@ public:
     [[nodiscard]] virtual const std::vector<PeCertificate>& pe_certificates() const noexcept = 0;
     [[nodiscard]] virtual const PeLoadConfigDirectory* pe_load_config_directory() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeBoundImport>& pe_bound_imports() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;

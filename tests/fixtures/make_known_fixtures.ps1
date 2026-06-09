@@ -319,7 +319,7 @@ function New-Pe64Fixture {
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x8664
     Put-U16LE $Bytes ($Coff + 2) 4
-    Put-U16LE $Bytes ($Coff + 16) 0x00c8
+    Put-U16LE $Bytes ($Coff + 16) 0x00e0
     Put-U16LE $Bytes ($Coff + 18) 0x0022
 
     $Opt = [UInt32]($Coff + 20)
@@ -343,13 +343,17 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0xBC) 0x28
     Put-U32LE $Bytes ($Opt + 0xC0) 0x4050
     Put-U32LE $Bytes ($Opt + 0xC4) 0x94
+    Put-U32LE $Bytes ($Opt + 0xC8) 0x30E0
+    Put-U32LE $Bytes ($Opt + 0xCC) 0x20
+    Put-U32LE $Bytes ($Opt + 0xD8) 0x3050
+    Put-U32LE $Bytes ($Opt + 0xDC) 0x40
 
-    $Sect = [UInt32]($Opt + 0x00c8)
+    $Sect = [UInt32]($Opt + 0x00e0)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x200
     Put-U32LE $Bytes ($Sect + 12) 0x1000
     Put-U32LE $Bytes ($Sect + 16) 0x200
-    Put-U32LE $Bytes ($Sect + 20) 0x200
+    Put-U32LE $Bytes ($Sect + 20) 0x220
     Put-U32LE $Bytes ($Sect + 36) 0x60000020
 
     $RelocSect = [UInt32]($Sect + 0x28)
@@ -362,7 +366,7 @@ function New-Pe64Fixture {
 
     $DebugSect = [UInt32]($RelocSect + 0x28)
     Put-Ascii $Bytes $DebugSect ".debug"
-    Put-U32LE $Bytes ($DebugSect + 8) 0x80
+    Put-U32LE $Bytes ($DebugSect + 8) 0x100
     Put-U32LE $Bytes ($DebugSect + 12) 0x3000
     Put-U32LE $Bytes ($DebugSect + 16) 0x100
     Put-U32LE $Bytes ($DebugSect + 20) 0x500
@@ -377,11 +381,11 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
-        $Bytes[0x200 + $Index] = [byte](0xcc)
+        $Bytes[0x220 + $Index] = [byte](0xcc)
     }
-    Put-U32LE $Bytes 0x280 0x1000 # RUNTIME_FUNCTION.BeginAddress
-    Put-U32LE $Bytes 0x284 0x1010 # RUNTIME_FUNCTION.EndAddress
-    Put-U32LE $Bytes 0x288 0x1090 # RUNTIME_FUNCTION.UnwindInfoAddress
+    Put-U32LE $Bytes 0x2A0 0x1000 # RUNTIME_FUNCTION.BeginAddress
+    Put-U32LE $Bytes 0x2A4 0x1010 # RUNTIME_FUNCTION.EndAddress
+    Put-U32LE $Bytes 0x2A8 0x1090 # RUNTIME_FUNCTION.UnwindInfoAddress
 
     Put-U32LE $Bytes 0x400 0x1000  # Page RVA
     Put-U32LE $Bytes 0x404 0x0C    # Block size
@@ -397,6 +401,23 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes 0x514 0x301C      # AddressOfRawData
     Put-U32LE $Bytes 0x518 0x51C       # PointerToRawData
     Put-CodeViewRsds $Bytes 0x51C 2 "known-win-x64.pdb" 0x20
+
+    Put-U32LE $Bytes 0x550 1      # delay Attributes: RVAs
+    Put-U32LE $Bytes 0x554 0x3090 # delay DllNameRVA
+    Put-U32LE $Bytes 0x55C 0x30C0 # delay ImportAddressTableRVA
+    Put-U32LE $Bytes 0x560 0x30B0 # delay ImportNameTableRVA
+    Put-Ascii $Bytes 0x590 "USER32.dll"
+    Put-U16LE $Bytes 0x5A0 0
+    Put-Ascii $Bytes 0x5A2 "MessageBoxA"
+    Put-U64LE $Bytes 0x5B0 0x30A0
+    Put-U64LE $Bytes 0x5B8 0
+    Put-U64LE $Bytes 0x5C0 0x30A0
+    Put-U64LE $Bytes 0x5C8 0
+
+    Put-U32LE $Bytes 0x5E0 0x7A2A5A64 # bound TimeDateStamp
+    Put-U16LE $Bytes 0x5E4 0x10       # bound OffsetModuleName
+    Put-U16LE $Bytes 0x5E6 0          # bound NumberOfModuleForwarderRefs
+    Put-Ascii $Bytes 0x5F0 "BOUND64.dll"
 
     Put-U64LE $Bytes 0x600 0x140004010 # StartAddressOfRawData
     Put-U64LE $Bytes 0x608 0x140004020 # EndAddressOfRawData
@@ -440,29 +461,29 @@ function New-Pe64Fixture {
         $Bytes[0x708 + $Index] = [byte](0x40 + $Index)
     }
 
-    Put-U32LE $Bytes 0x30C 0x1140  # Name RVA
-    Put-U32LE $Bytes 0x310 1       # Base
-    Put-U32LE $Bytes 0x314 1       # NumberOfFunctions
-    Put-U32LE $Bytes 0x318 1       # NumberOfNames
-    Put-U32LE $Bytes 0x31C 0x1150  # AddressOfFunctions
-    Put-U32LE $Bytes 0x320 0x1154  # AddressOfNames
-    Put-U32LE $Bytes 0x324 0x1158  # AddressOfNameOrdinals
-    Put-Ascii $Bytes 0x340 "known-win-x64.exe"
-    Put-U32LE $Bytes 0x350 0x1000  # exported function RVA
-    Put-U32LE $Bytes 0x354 0x1160  # export name RVA
-    Put-U16LE $Bytes 0x358 0       # ordinal index
-    Put-Ascii $Bytes 0x360 "known_export"
+    Put-U32LE $Bytes 0x32C 0x1140  # Name RVA
+    Put-U32LE $Bytes 0x330 1       # Base
+    Put-U32LE $Bytes 0x334 1       # NumberOfFunctions
+    Put-U32LE $Bytes 0x338 1       # NumberOfNames
+    Put-U32LE $Bytes 0x33C 0x1150  # AddressOfFunctions
+    Put-U32LE $Bytes 0x340 0x1154  # AddressOfNames
+    Put-U32LE $Bytes 0x344 0x1158  # AddressOfNameOrdinals
+    Put-Ascii $Bytes 0x360 "known-win-x64.exe"
+    Put-U32LE $Bytes 0x370 0x1000  # exported function RVA
+    Put-U32LE $Bytes 0x374 0x1160  # export name RVA
+    Put-U16LE $Bytes 0x378 0       # ordinal index
+    Put-Ascii $Bytes 0x380 "known_export"
 
-    Put-U32LE $Bytes 0x380 0x11C0  # OriginalFirstThunk
-    Put-U32LE $Bytes 0x38C 0x11A0  # Name
-    Put-U32LE $Bytes 0x390 0x11D0  # FirstThunk
-    Put-Ascii $Bytes 0x3A0 "KERNEL32.dll"
-    Put-U16LE $Bytes 0x3B0 0       # import hint
-    Put-Ascii $Bytes 0x3B2 "ExitProcess"
-    Put-U64LE $Bytes 0x3C0 0x11B0  # INT
-    Put-U64LE $Bytes 0x3C8 0
-    Put-U64LE $Bytes 0x3D0 0x11B0  # IAT
-    Put-U64LE $Bytes 0x3D8 0
+    Put-U32LE $Bytes 0x3A0 0x11C0  # OriginalFirstThunk
+    Put-U32LE $Bytes 0x3AC 0x11A0  # Name
+    Put-U32LE $Bytes 0x3B0 0x11D0  # FirstThunk
+    Put-Ascii $Bytes 0x3C0 "KERNEL32.dll"
+    Put-U16LE $Bytes 0x3D0 0       # import hint
+    Put-Ascii $Bytes 0x3D2 "ExitProcess"
+    Put-U64LE $Bytes 0x3E0 0x11B0  # INT
+    Put-U64LE $Bytes 0x3E8 0
+    Put-U64LE $Bytes 0x3F0 0x11B0  # IAT
+    Put-U64LE $Bytes 0x3F8 0
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)
 }
@@ -836,7 +857,7 @@ function New-Pe32Fixture {
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x014c
     Put-U16LE $Bytes ($Coff + 2) 4
-    Put-U16LE $Bytes ($Coff + 16) 0x00b8
+    Put-U16LE $Bytes ($Coff + 16) 0x00d0
     Put-U16LE $Bytes ($Coff + 18) 0x0102
 
     $Opt = [UInt32]($Coff + 20)
@@ -856,13 +877,17 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 0xAC) 0x18
     Put-U32LE $Bytes ($Opt + 0xB0) 0x4050
     Put-U32LE $Bytes ($Opt + 0xB4) 0x5C
+    Put-U32LE $Bytes ($Opt + 0xB8) 0x30E0
+    Put-U32LE $Bytes ($Opt + 0xBC) 0x20
+    Put-U32LE $Bytes ($Opt + 0xC8) 0x3050
+    Put-U32LE $Bytes ($Opt + 0xCC) 0x40
 
-    $Sect = [UInt32]($Opt + 0x00b8)
+    $Sect = [UInt32]($Opt + 0x00d0)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x100
     Put-U32LE $Bytes ($Sect + 12) 0x1000
     Put-U32LE $Bytes ($Sect + 16) 0x100
-    Put-U32LE $Bytes ($Sect + 20) 0x200
+    Put-U32LE $Bytes ($Sect + 20) 0x220
     Put-U32LE $Bytes ($Sect + 36) 0x60000020
 
     $RelocSect = [UInt32]($Sect + 0x28)
@@ -875,7 +900,7 @@ function New-Pe32Fixture {
 
     $DebugSect = [UInt32]($RelocSect + 0x28)
     Put-Ascii $Bytes $DebugSect ".debug"
-    Put-U32LE $Bytes ($DebugSect + 8) 0x80
+    Put-U32LE $Bytes ($DebugSect + 8) 0x100
     Put-U32LE $Bytes ($DebugSect + 12) 0x3000
     Put-U32LE $Bytes ($DebugSect + 16) 0x100
     Put-U32LE $Bytes ($DebugSect + 20) 0x400
@@ -890,11 +915,11 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
-        $Bytes[0x200 + $Index] = [byte](0xcc)
+        $Bytes[0x220 + $Index] = [byte](0xcc)
     }
-    Put-U32LE $Bytes 0x280 0x1000 # RUNTIME_FUNCTION.BeginAddress
-    Put-U32LE $Bytes 0x284 0x1010 # RUNTIME_FUNCTION.EndAddress
-    Put-U32LE $Bytes 0x288 0x1090 # RUNTIME_FUNCTION.UnwindInfoAddress
+    Put-U32LE $Bytes 0x2A0 0x1000 # RUNTIME_FUNCTION.BeginAddress
+    Put-U32LE $Bytes 0x2A4 0x1010 # RUNTIME_FUNCTION.EndAddress
+    Put-U32LE $Bytes 0x2A8 0x1090 # RUNTIME_FUNCTION.UnwindInfoAddress
 
     Put-U32LE $Bytes 0x300 0x1000  # Page RVA
     Put-U32LE $Bytes 0x304 0x0C    # Block size
@@ -910,6 +935,23 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x414 0x301C      # AddressOfRawData
     Put-U32LE $Bytes 0x418 0x41C       # PointerToRawData
     Put-CodeViewRsds $Bytes 0x41C 1 "known-win-x86.pdb" 0x10
+
+    Put-U32LE $Bytes 0x450 1      # delay Attributes: RVAs
+    Put-U32LE $Bytes 0x454 0x3090 # delay DllNameRVA
+    Put-U32LE $Bytes 0x45C 0x30C0 # delay ImportAddressTableRVA
+    Put-U32LE $Bytes 0x460 0x30B0 # delay ImportNameTableRVA
+    Put-Ascii $Bytes 0x490 "USER32.dll"
+    Put-U16LE $Bytes 0x4A0 0
+    Put-Ascii $Bytes 0x4A2 "MessageBoxA"
+    Put-U32LE $Bytes 0x4B0 0x30A0
+    Put-U32LE $Bytes 0x4B4 0
+    Put-U32LE $Bytes 0x4C0 0x30A0
+    Put-U32LE $Bytes 0x4C4 0
+
+    Put-U32LE $Bytes 0x4E0 0x7A2A5A32 # bound TimeDateStamp
+    Put-U16LE $Bytes 0x4E4 0x10       # bound OffsetModuleName
+    Put-U16LE $Bytes 0x4E6 0          # bound NumberOfModuleForwarderRefs
+    Put-Ascii $Bytes 0x4F0 "BOUND32.dll"
 
     Put-U32LE $Bytes 0x500 0x404010 # StartAddressOfRawData
     Put-U32LE $Bytes 0x504 0x404018 # EndAddressOfRawData

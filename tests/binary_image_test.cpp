@@ -211,7 +211,7 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
         {"known-linux-riscv64.elf", peelf::Format::ELF, peelf::Architecture::RISCV64,
          peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x400080, 0x80, 0x400080},
         {"known-win-x64.exe", peelf::Format::PE, peelf::Architecture::X86_64,
-         peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x140001000, 0x200, 0x140001000},
+         peelf::ImageKind::Executable, peelf::Endianness::Little, true, 0x140001000, 0x220, 0x140001000},
     }};
 
     for (const ExpectedImage& expected : fixtures) {
@@ -279,11 +279,16 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             EXPECT_TRUE(img.segments().empty()) << expected.name;
             EXPECT_TRUE(img.symbols().empty()) << expected.name;
 
-            ASSERT_EQ(img.imports().size(), 1u) << expected.name;
-            const peelf::ImportEntry& imported = img.imports().front();
+            ASSERT_EQ(img.imports().size(), 2u) << expected.name;
+            const auto normal_import = std::ranges::find_if(img.imports(), [](const peelf::ImportEntry& entry) {
+                return !entry.delay_load;
+            });
+            ASSERT_NE(normal_import, img.imports().end()) << expected.name;
+            const peelf::ImportEntry& imported = *normal_import;
             EXPECT_EQ(imported.library, "KERNEL32.dll") << expected.name;
             EXPECT_EQ(imported.name, "ExitProcess") << expected.name;
             EXPECT_EQ(imported.address, 0x1400011D0ULL) << expected.name;
+            EXPECT_FALSE(imported.delay_load) << expected.name;
 
             ASSERT_EQ(img.exports().size(), 1u) << expected.name;
             const peelf::ExportEntry& exported = img.exports().front();
@@ -320,7 +325,7 @@ TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
         {"known-linux-ppc64-elf64-be.elf", peelf::Format::ELF, peelf::Architecture::PowerPC64,
          peelf::ImageKind::Executable, peelf::Endianness::Big, true, 0x400080, 0x80, 0x400080},
         {"known-win-x86.exe", peelf::Format::PE, peelf::Architecture::X86,
-         peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x401000, 0x200, 0x401000},
+         peelf::ImageKind::Executable, peelf::Endianness::Little, false, 0x401000, 0x220, 0x401000},
     }};
 
     for (const ExpectedImage& expected : fixtures) {
@@ -396,8 +401,8 @@ TEST(BinaryImage, ParsesPeBaseRelocationsAcrossFixtureMatrix) {
         std::uint64_t file_offset;
     };
     constexpr std::array<ExpectedRelocation, 2> fixtures{{
-        {"known-win-x86.exe", 3, 0x010, 0x1010, 0x402000, 0x401010, 0x210},
-        {"known-win-x64.exe", 10, 0x088, 0x1088, 0x140002000, 0x140001088, 0x288},
+        {"known-win-x86.exe", 3, 0x010, 0x1010, 0x402000, 0x401010, 0x230},
+        {"known-win-x64.exe", 10, 0x088, 0x1088, 0x140002000, 0x140001088, 0x2A8},
     }};
 
     for (const ExpectedRelocation& expected : fixtures) {
@@ -470,7 +475,7 @@ TEST(BinaryImage, ParsesPeDebugDirectoriesAcrossFixtureMatrix) {
         });
         ASSERT_NE(debug_section, (**result).sections().end()) << expected.name;
         EXPECT_EQ(debug_section->virtual_address, expected.debug_section_virtual_address) << expected.name;
-        EXPECT_EQ(debug_section->virtual_size, 0x80u) << expected.name;
+        EXPECT_EQ(debug_section->virtual_size, 0x100u) << expected.name;
         EXPECT_TRUE(debug_section->readable) << expected.name;
         EXPECT_FALSE(debug_section->writable) << expected.name;
         EXPECT_FALSE(debug_section->executable) << expected.name;
@@ -651,8 +656,8 @@ TEST(BinaryImage, ParsesPeRuntimeFunctionsAcrossFixtureMatrix) {
         std::uint64_t unwind_info_va;
     };
     constexpr std::array<ExpectedRuntimeFunction, 2> fixtures{{
-        {"known-win-x86.exe", 0x1000, 0x1010, 0x1090, 0x280, 0x401000, 0x401090},
-        {"known-win-x64.exe", 0x1000, 0x1010, 0x1090, 0x280, 0x140001000, 0x140001090},
+        {"known-win-x86.exe", 0x1000, 0x1010, 0x1090, 0x2A0, 0x401000, 0x401090},
+        {"known-win-x64.exe", 0x1000, 0x1010, 0x1090, 0x2A0, 0x140001000, 0x140001090},
     }};
 
     for (const ExpectedRuntimeFunction& expected : fixtures) {
@@ -673,9 +678,68 @@ TEST(BinaryImage, ParsesPeRuntimeFunctionsAcrossFixtureMatrix) {
         EXPECT_EQ((**result).file_offset_to_virtual_address(function.file_offset),
                   std::optional<std::uint64_t>(expected.begin_va + 0x80u)) << expected.name;
         EXPECT_EQ((**result).virtual_address_to_file_offset(expected.begin_va),
-                  std::optional<std::uint64_t>(0x200)) << expected.name;
+                  std::optional<std::uint64_t>(0x220)) << expected.name;
         EXPECT_EQ((**result).virtual_address_to_file_offset(expected.unwind_info_va),
-                  std::optional<std::uint64_t>(0x290)) << expected.name;
+                  std::optional<std::uint64_t>(0x2B0)) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesPeDelayLoadImportsAcrossFixtureMatrix) {
+    struct ExpectedDelayImport {
+        const char* name;
+        std::uint64_t address;
+    };
+    constexpr std::array<ExpectedDelayImport, 2> fixtures{{
+        {"known-win-x86.exe", 0x4030C0},
+        {"known-win-x64.exe", 0x1400030C0},
+    }};
+
+    for (const ExpectedDelayImport& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto delay_import = std::ranges::find_if((**result).imports(), [](const peelf::ImportEntry& entry) {
+            return entry.delay_load;
+        });
+        ASSERT_NE(delay_import, (**result).imports().end()) << expected.name;
+        EXPECT_EQ(delay_import->library, "USER32.dll") << expected.name;
+        EXPECT_EQ(delay_import->name, "MessageBoxA") << expected.name;
+        EXPECT_EQ(delay_import->address, expected.address) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesPeBoundImportsAcrossFixtureMatrix) {
+    struct ExpectedBoundImport {
+        const char* name;
+        std::uint32_t time_date_stamp;
+        const char* module_name;
+        std::uint64_t file_offset;
+    };
+    constexpr std::array<ExpectedBoundImport, 2> fixtures{{
+        {"known-win-x86.exe", 0x7A2A5A32, "BOUND32.dll", 0x4E0},
+        {"known-win-x64.exe", 0x7A2A5A64, "BOUND64.dll", 0x5E0},
+    }};
+
+    for (const ExpectedBoundImport& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto& bound_imports = (**result).pe_bound_imports();
+        ASSERT_EQ(bound_imports.size(), 1u) << expected.name;
+        const peelf::PeBoundImport& entry = bound_imports.front();
+        EXPECT_EQ(entry.time_date_stamp, expected.time_date_stamp) << expected.name;
+        EXPECT_EQ(entry.offset_module_name, 0x10u) << expected.name;
+        EXPECT_EQ(entry.forwarder_ref_count, 0u) << expected.name;
+        EXPECT_EQ(entry.module_name, expected.module_name) << expected.name;
+        EXPECT_EQ(entry.file_offset, expected.file_offset) << expected.name;
     }
 }
 

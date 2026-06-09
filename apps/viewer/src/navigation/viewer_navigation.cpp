@@ -99,6 +99,9 @@ void add_imports(const peelf::IBinaryImage& image, StructureNode& root) {
             label += "!";
             label += entry.name;
         }
+        if (entry.delay_load) {
+            label += " (delay)";
+        }
         StructureNode node = selectable_node(SelectionKind::Import, std::move(label), index, PreferredView::Details);
         if (entry.address != 0) {
             node.selection.virtual_address = entry.address;
@@ -226,6 +229,20 @@ void add_pe_metadata(const peelf::IBinaryImage& image, StructureNode& root) {
         node.selection.size = load_config->size;
         root.children.push_back(std::move(node));
     }
+
+    StructureNode bound_imports = group_node("Bound Imports");
+    std::uint64_t bound_index = 0;
+    for (const peelf::PeBoundImport& entry : image.pe_bound_imports()) {
+        StructureNode node = selectable_node(SelectionKind::BoundImport,
+                                             entry.module_name.empty() ? "Bound Import" : entry.module_name,
+                                             bound_index,
+                                             PreferredView::Details);
+        node.selection.file_offset = entry.file_offset;
+        node.selection.size = 8;
+        bound_imports.children.push_back(std::move(node));
+        ++bound_index;
+    }
+    root.children.push_back(std::move(bound_imports));
 }
 
 void add_elf_metadata(const peelf::IBinaryImage& image, StructureNode& root) {

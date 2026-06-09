@@ -30,6 +30,7 @@ enum class SelectionKind : std::uint8_t {
     TlsDirectory,
     Certificate,
     LoadConfig,
+    BoundImport,
     DynamicEntry,
     Note,
     HashTable,

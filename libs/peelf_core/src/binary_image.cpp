@@ -93,6 +93,10 @@ public:
         static const std::vector<PeRuntimeFunction> empty;
         return empty;
     }
+    [[nodiscard]] const std::vector<PeBoundImport>& pe_bound_imports() const noexcept override {
+        static const std::vector<PeBoundImport> empty;
+        return empty;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -240,6 +244,9 @@ public:
     [[nodiscard]] const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept override {
         return runtime_functions_;
     }
+    [[nodiscard]] const std::vector<PeBoundImport>& pe_bound_imports() const noexcept override {
+        return bound_imports_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
@@ -249,6 +256,7 @@ private:
     std::vector<PeCertificate> certificates_;
     std::optional<PeLoadConfigDirectory> load_config_directory_;
     std::vector<PeRuntimeFunction> runtime_functions_;
+    std::vector<PeBoundImport> bound_imports_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -456,6 +464,42 @@ void parse_pe_runtime_functions(std::span<const std::uint8_t> b,
     }
 }
 
+void parse_pe_bound_imports(std::span<const std::uint8_t> b,
+                            const std::vector<Section>& sections,
+                            std::uint64_t image_base,
+                            std::uint32_t directory_rva,
+                            std::uint32_t directory_size,
+                            std::vector<PeBoundImport>& bound_imports_out) {
+    if (directory_rva == 0 || directory_size < 8) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, directory_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::uint64_t end = *directory_off + directory_size;
+    for (std::uint64_t cursor = *directory_off; cursor + 8u <= end; cursor += 8u) {
+        const std::size_t off = static_cast<std::size_t>(cursor);
+        PeBoundImport entry;
+        entry.time_date_stamp = rd32(b, off + 0x00, false);
+        entry.offset_module_name = rd16(b, off + 0x04, false);
+        entry.forwarder_ref_count = rd16(b, off + 0x06, false);
+        entry.file_offset = cursor;
+        if (entry.time_date_stamp == 0 && entry.offset_module_name == 0 &&
+            entry.forwarder_ref_count == 0) {
+            break;
+        }
+
+        const std::uint64_t name_off = *directory_off + entry.offset_module_name;
+        if (name_off < end) {
+            entry.module_name = read_c_string(b, name_off, end - name_off);
+        }
+        bound_imports_out.push_back(std::move(entry));
+    }
+}
+
 void parse_pe_tls_directory(std::span<const std::uint8_t> b,
                             const std::vector<Section>& sections,
                             std::uint64_t image_base,
@@ -637,6 +681,96 @@ void parse_pe_load_config_directory(std::span<const std::uint8_t> b,
     }
 
     load_config_out = load_config;
+}
+
+void parse_pe_import_thunks(std::span<const std::uint8_t> b,
+                            const std::vector<Section>& sections,
+                            std::uint64_t image_base,
+                            bool is64,
+                            std::string library,
+                            std::uint32_t name_table_rva,
+                            std::uint32_t address_table_rva,
+                            bool delay_load,
+                            std::vector<ImportEntry>& imports_out) {
+    const auto thunk_off = pe_rva_to_file_offset(sections, image_base, name_table_rva);
+    if (library.empty() || !thunk_off || address_table_rva == 0) {
+        return;
+    }
+
+    const std::uint64_t thunk_size = is64 ? 8u : 4u;
+    for (std::uint64_t thunk_index = 0; thunk_index < 4096; ++thunk_index) {
+        const std::uint64_t entry_off = *thunk_off + thunk_index * thunk_size;
+        if (!fits_range(entry_off, thunk_size, static_cast<std::uint64_t>(b.size()))) {
+            break;
+        }
+
+        const std::uint64_t thunk_value = is64
+            ? rd64(b, static_cast<std::size_t>(entry_off), false)
+            : static_cast<std::uint64_t>(rd32(b, static_cast<std::size_t>(entry_off), false));
+        if (thunk_value == 0) {
+            break;
+        }
+
+        const std::uint64_t ordinal_mask = is64 ? (1ull << 63) : (1ull << 31);
+        if ((thunk_value & ordinal_mask) != 0) {
+            continue;
+        }
+
+        const auto hint_name_off = pe_rva_to_file_offset(
+            sections, image_base, static_cast<std::uint32_t>(thunk_value));
+        if (!hint_name_off || !fits_range(*hint_name_off, 2, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        ImportEntry entry;
+        entry.library = library;
+        entry.name = read_c_string(b, *hint_name_off + 2);
+        entry.address = image_base + address_table_rva + thunk_index * thunk_size;
+        entry.delay_load = delay_load;
+        if (!entry.name.empty()) {
+            imports_out.push_back(std::move(entry));
+        }
+    }
+}
+
+void parse_pe_delay_load_imports(std::span<const std::uint8_t> b,
+                                 const std::vector<Section>& sections,
+                                 std::uint64_t image_base,
+                                 bool is64,
+                                 std::uint32_t directory_rva,
+                                 std::uint32_t directory_size,
+                                 std::vector<ImportEntry>& imports_out) {
+    if (directory_rva == 0 || directory_size < 32) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, directory_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::uint64_t max_descriptors = directory_size / 32u;
+    for (std::uint64_t desc_index = 0; desc_index < max_descriptors; ++desc_index) {
+        const std::uint64_t desc_off = *directory_off + desc_index * 32u;
+        if (!fits_range(desc_off, 32, static_cast<std::uint64_t>(b.size()))) {
+            break;
+        }
+
+        const std::size_t desc = static_cast<std::size_t>(desc_off);
+        const std::uint32_t attributes = rd32(b, desc + 0x00, false);
+        const std::uint32_t name_rva = rd32(b, desc + 0x04, false);
+        const std::uint32_t import_address_table_rva = rd32(b, desc + 0x0C, false);
+        const std::uint32_t import_name_table_rva = rd32(b, desc + 0x10, false);
+        if (attributes == 0 && name_rva == 0 && import_address_table_rva == 0 &&
+            import_name_table_rva == 0) {
+            break;
+        }
+
+        const auto dll_name_off = pe_rva_to_file_offset(sections, image_base, name_rva);
+        const std::string library = dll_name_off ? read_c_string(b, *dll_name_off) : std::string{};
+        parse_pe_import_thunks(b, sections, image_base, is64, library, import_name_table_rva,
+                               import_address_table_rva, true, imports_out);
+    }
 }
 
 [[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
@@ -1284,6 +1418,18 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t load_config_dir_size = (size_of_opt >= (is64 ? 0xC8 : 0xB8))
         ? rd32(b, opt + (is64 ? 0xC4 : 0xB4), false)
         : 0;
+    const std::uint32_t bound_import_dir_rva = (size_of_opt >= (is64 ? 0xD0 : 0xC0))
+        ? rd32(b, opt + (is64 ? 0xC8 : 0xB8), false)
+        : 0;
+    const std::uint32_t bound_import_dir_size = (size_of_opt >= (is64 ? 0xD0 : 0xC0))
+        ? rd32(b, opt + (is64 ? 0xCC : 0xBC), false)
+        : 0;
+    const std::uint32_t delay_import_dir_rva = (size_of_opt >= (is64 ? 0xE0 : 0xD0))
+        ? rd32(b, opt + (is64 ? 0xD8 : 0xC8), false)
+        : 0;
+    const std::uint32_t delay_import_dir_size = (size_of_opt >= (is64 ? 0xE0 : 0xD0))
+        ? rd32(b, opt + (is64 ? 0xDC : 0xCC), false)
+        : 0;
     const std::uint32_t base_reloc_dir_rva = (size_of_opt >= (is64 ? 0xA0 : 0x90))
         ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
         : 0;
@@ -1352,6 +1498,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                                    load_config_dir_size, img->load_config_directory_);
     parse_pe_runtime_functions(b, img->sections_, image_base, exception_dir_rva,
                                exception_dir_size, img->runtime_functions_);
+    parse_pe_bound_imports(b, img->sections_, image_base, bound_import_dir_rva,
+                           bound_import_dir_size, img->bound_imports_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);
@@ -1431,47 +1579,14 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                 const auto dll_name_off = pe_rva_to_file_offset(img->sections_, image_base, name_rva);
                 const std::string library = dll_name_off ? read_c_string(b, *dll_name_off) : std::string{};
                 const std::uint32_t thunk_rva = original_first_thunk != 0 ? original_first_thunk : first_thunk;
-                const auto thunk_off = pe_rva_to_file_offset(img->sections_, image_base, thunk_rva);
-                if (library.empty() || !thunk_off || first_thunk == 0) {
-                    continue;
-                }
-
-                const std::uint64_t thunk_size = is64 ? 8 : 4;
-                for (std::uint64_t thunk_index = 0; thunk_index < 4096; ++thunk_index) {
-                    const std::uint64_t entry_off = *thunk_off + thunk_index * thunk_size;
-                    if (!fits_range(entry_off, thunk_size, static_cast<std::uint64_t>(b.size()))) {
-                        break;
-                    }
-
-                    const std::uint64_t thunk_value = is64
-                        ? rd64(b, static_cast<std::size_t>(entry_off), false)
-                        : static_cast<std::uint64_t>(rd32(b, static_cast<std::size_t>(entry_off), false));
-                    if (thunk_value == 0) {
-                        break;
-                    }
-
-                    const std::uint64_t ordinal_mask = is64 ? (1ull << 63) : (1ull << 31);
-                    if ((thunk_value & ordinal_mask) != 0) {
-                        continue;
-                    }
-
-                    const auto hint_name_off = pe_rva_to_file_offset(
-                        img->sections_, image_base, static_cast<std::uint32_t>(thunk_value));
-                    if (!hint_name_off || !fits_range(*hint_name_off, 2, static_cast<std::uint64_t>(b.size()))) {
-                        continue;
-                    }
-
-                    ImportEntry entry;
-                    entry.library = library;
-                    entry.name = read_c_string(b, *hint_name_off + 2);
-                    entry.address = image_base + first_thunk + thunk_index * thunk_size;
-                    if (!entry.name.empty()) {
-                        img->imports_.push_back(std::move(entry));
-                    }
-                }
+                parse_pe_import_thunks(b, img->sections_, image_base, is64, library, thunk_rva,
+                                       first_thunk, false, img->imports_);
             }
         }
     }
+
+    parse_pe_delay_load_imports(b, img->sections_, image_base, is64, delay_import_dir_rva,
+                                delay_import_dir_size, img->imports_);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }

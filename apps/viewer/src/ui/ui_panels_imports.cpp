@@ -26,11 +26,12 @@ void ImportsPanel::draw_contents() {
     const bool has_filter = !filter.empty();
 
     ImGui::Separator();
-    if (ImGui::BeginTable("UnifiedImportsTable", 3,
+    if (ImGui::BeginTable("UnifiedImportsTable", 4,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
         ImGui::TableSetupColumn("Library", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 72.0f);
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
         ImGui::TableHeadersRow();
 
@@ -54,6 +55,8 @@ void ImportsPanel::draw_contents() {
             ImGui::PopID();
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(entry.name.empty() ? "-" : entry.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(entry.delay_load ? "Delay" : "Import");
             ImGui::TableNextColumn();
             if (entry.address == 0) {
                 ImGui::TextUnformatted("-");
