@@ -76,7 +76,8 @@ struct CallGraph {
 
 enum class GraphRenderFormat : std::uint8_t {
     Svg,
-    Png
+    Png,
+    Bmp
 };
 
 struct GraphRenderCommand {

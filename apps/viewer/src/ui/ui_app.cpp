@@ -3,13 +3,20 @@
 #include <imgui_internal.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "graph/call_graph.hpp"
 #include "logger.hpp"
 
 namespace viewer {
@@ -41,10 +48,129 @@ namespace {
            lhs.label == rhs.label;
 }
 
+struct BmpImage {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::vector<std::uint8_t> rgba;
+};
+
+[[nodiscard]] std::uint16_t read_u16_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8u));
+}
+
+[[nodiscard]] std::uint32_t read_u32_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    return static_cast<std::uint32_t>(bytes[offset] |
+                                      (bytes[offset + 1] << 8u) |
+                                      (bytes[offset + 2] << 16u) |
+                                      (bytes[offset + 3] << 24u));
+}
+
+[[nodiscard]] std::int32_t read_i32_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
+    return static_cast<std::int32_t>(read_u32_le(bytes, offset));
+}
+
+[[nodiscard]] std::optional<BmpImage> load_bmp_rgba(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return std::nullopt;
+    }
+    std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    if (bytes.size() < 54 || bytes[0] != 'B' || bytes[1] != 'M') {
+        return std::nullopt;
+    }
+
+    const std::uint32_t pixel_offset = read_u32_le(bytes, 10);
+    const std::uint32_t dib_size = read_u32_le(bytes, 14);
+    if (dib_size < 40 || pixel_offset >= bytes.size()) {
+        return std::nullopt;
+    }
+
+    const std::int32_t raw_width = read_i32_le(bytes, 18);
+    const std::int32_t raw_height = read_i32_le(bytes, 22);
+    const std::uint16_t planes = read_u16_le(bytes, 26);
+    const std::uint16_t bits_per_pixel = read_u16_le(bytes, 28);
+    const std::uint32_t compression = read_u32_le(bytes, 30);
+    if (raw_width <= 0 || raw_height == 0 || planes != 1 || compression != 0 ||
+        (bits_per_pixel != 24 && bits_per_pixel != 32)) {
+        return std::nullopt;
+    }
+
+    const bool top_down = raw_height < 0;
+    const std::uint32_t width = static_cast<std::uint32_t>(raw_width);
+    const std::uint32_t height = static_cast<std::uint32_t>(top_down ? -raw_height : raw_height);
+    const std::uint32_t bytes_per_pixel = bits_per_pixel / 8u;
+    const std::uint32_t source_stride = ((width * bytes_per_pixel + 3u) / 4u) * 4u;
+    if (pixel_offset + static_cast<std::size_t>(source_stride) * height > bytes.size()) {
+        return std::nullopt;
+    }
+
+    BmpImage image{
+        .width = width,
+        .height = height,
+        .rgba = std::vector<std::uint8_t>(static_cast<std::size_t>(width) * height * 4u),
+    };
+
+    for (std::uint32_t y = 0; y < height; ++y) {
+        const std::uint32_t source_y = top_down ? y : (height - 1u - y);
+        const std::size_t source_row = pixel_offset + static_cast<std::size_t>(source_y) * source_stride;
+        const std::size_t dest_row = static_cast<std::size_t>(y) * width * 4u;
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const std::size_t source = source_row + static_cast<std::size_t>(x) * bytes_per_pixel;
+            const std::size_t dest = dest_row + static_cast<std::size_t>(x) * 4u;
+            image.rgba[dest + 0] = bytes[source + 2];
+            image.rgba[dest + 1] = bytes[source + 1];
+            image.rgba[dest + 2] = bytes[source + 0];
+            image.rgba[dest + 3] = bits_per_pixel == 32 ? bytes[source + 3] : 255u;
+        }
+    }
+    return image;
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> find_graphs_dir() {
+    std::filesystem::path current = std::filesystem::current_path();
+    for (std::uint32_t depth = 0; depth < 10; ++depth) {
+        const std::array<std::filesystem::path, 2> candidates{
+            current / "out" / "graphs",
+            current / "apps" / "viewer" / "assets" / "graphs",
+        };
+        for (const std::filesystem::path& candidate : candidates) {
+            if (std::filesystem::exists(candidate)) {
+                return candidate;
+            }
+        }
+        if (!current.has_parent_path() || current == current.parent_path()) {
+            break;
+        }
+        current = current.parent_path();
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] const char* graph_dot_name(UiApp::CallGraphSample sample) {
+    switch (sample) {
+        case UiApp::CallGraphSample::PeStartup:
+            return "pe_x64_startup_to_winmain.dot";
+        case UiApp::CallGraphSample::ElfStartup:
+            return "linux_elf_startup_to_main.dot";
+    }
+    return "pe_x64_startup_to_winmain.dot";
+}
+
+[[nodiscard]] const char* graph_bmp_name(UiApp::CallGraphSample sample) {
+    switch (sample) {
+        case UiApp::CallGraphSample::PeStartup:
+            return "pe_x64_startup_to_winmain.bmp";
+        case UiApp::CallGraphSample::ElfStartup:
+            return "linux_elf_startup_to_main.bmp";
+    }
+    return "pe_x64_startup_to_winmain.bmp";
+}
+
 } // namespace
 
-UiApp::UiApp(BinaryModel& model)
+UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     : model_(model)
+    , vulkan_(vulkan)
     , file_panel_(model)
     , structure_panel_(structure_tree_, current_selection_)
     , details_panel_(current_selection_)
@@ -189,6 +315,13 @@ UiApp::UiApp(BinaryModel& model)
     });
 }
 
+UiApp::~UiApp() {
+    if (call_graph_texture_) {
+        vulkan_.destroy_texture(*call_graph_texture_);
+        call_graph_texture_.reset();
+    }
+}
+
 void UiApp::render() {
     render_main_menu();
     render_dockspace();
@@ -209,6 +342,9 @@ void UiApp::render() {
 
     if (show_disassembly_panel_) {
         render_disassembly_panel();
+    }
+    if (show_call_graph_panel_) {
+        render_call_graph_panel();
     }
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
@@ -307,6 +443,14 @@ void UiApp::render_main_menu() {
         }
 
         {
+            if (ImGui::MenuItem("Call Graph", nullptr, &show_call_graph_panel_)) {
+                if (show_call_graph_panel_ && !call_graph_texture_) {
+                    load_call_graph_sample(call_graph_sample_);
+                }
+            }
+        }
+
+        {
             bool v = log_panel_.visible();
             if (ImGui::MenuItem(log_panel_.name().c_str(), nullptr, &v))
                 log_panel_.set_visible(v);
@@ -348,6 +492,107 @@ void UiApp::render_dockspace() {
     }
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dock_flags);
 
+    ImGui::End();
+}
+
+void UiApp::load_call_graph_sample(CallGraphSample sample) {
+    const std::optional<std::filesystem::path> graphs_dir = find_graphs_dir();
+    if (!graphs_dir) {
+        call_graph_status_ = "Could not find out/graphs. Generate the sample DOT files first.";
+        return;
+    }
+
+    const std::filesystem::path dot_path = *graphs_dir / graph_dot_name(sample);
+    const std::filesystem::path bmp_path = std::filesystem::temp_directory_path() / graph_bmp_name(sample);
+    if (!std::filesystem::exists(dot_path)) {
+        call_graph_status_ = "Missing DOT file: " + dot_path.string();
+        return;
+    }
+
+    const DefaultProcessRunner runner;
+    const GraphRenderCommand command =
+        make_graphviz_render_command(dot_path, bmp_path, GraphRenderFormat::Bmp);
+    const GraphRenderResult render_result = runner.run(command.executable, command.arguments);
+    if (!render_result.success) {
+        call_graph_status_ = "Graphviz failed to render BMP: " + render_result.diagnostic;
+        return;
+    }
+
+    const std::optional<BmpImage> bmp = load_bmp_rgba(bmp_path);
+    if (!bmp) {
+        call_graph_status_ = "Failed to load BMP: " + bmp_path.string();
+        return;
+    }
+
+    if (call_graph_texture_) {
+        vulkan_.destroy_texture(*call_graph_texture_);
+        call_graph_texture_.reset();
+    }
+
+    call_graph_texture_ = vulkan_.create_rgba_texture(std::span<const std::uint8_t>(bmp->rgba.data(), bmp->rgba.size()),
+                                                      bmp->width,
+                                                      bmp->height);
+    loaded_call_graph_bmp_ = bmp_path;
+    call_graph_sample_ = sample;
+    call_graph_status_ = "Loaded " + bmp_path.filename().string();
+}
+
+void UiApp::render_call_graph_panel() {
+    ImGui::SetNextWindowSize(ImVec2(900.0f, 420.0f), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Call Graph", &show_call_graph_panel_)) {
+        ImGui::End();
+        return;
+    }
+
+    if (ImGui::Button("PE x64 startup -> WinMain")) {
+        load_call_graph_sample(CallGraphSample::PeStartup);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Linux ELF _start -> main")) {
+        load_call_graph_sample(CallGraphSample::ElfStartup);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload")) {
+        load_call_graph_sample(call_graph_sample_);
+    }
+
+    if (!call_graph_status_.empty()) {
+        ImGui::TextUnformatted(call_graph_status_.c_str());
+    }
+
+    if (!call_graph_texture_) {
+        load_call_graph_sample(call_graph_sample_);
+    }
+
+    const ImVec2 available = ImGui::GetContentRegionAvail();
+    const ImVec2 canvas_size(std::max(available.x, 64.0f), std::max(available.y, 64.0f));
+    const ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->AddRectFilled(canvas_pos,
+                             ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+                             IM_COL32(255, 255, 255, 255));
+
+    if (call_graph_texture_) {
+        const float image_width = static_cast<float>(call_graph_texture_->width);
+        const float image_height = static_cast<float>(call_graph_texture_->height);
+        const float scale = std::min(canvas_size.x / image_width, canvas_size.y / image_height);
+        const ImVec2 draw_size(std::max(1.0f, image_width * scale), std::max(1.0f, image_height * scale));
+        const ImVec2 image_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f,
+                               canvas_pos.y + (canvas_size.y - draw_size.y) * 0.5f);
+        ImTextureID texture_id = reinterpret_cast<ImTextureID>(call_graph_texture_->descriptor_set);
+        draw_list->AddImage(texture_id,
+                            image_pos,
+                            ImVec2(image_pos.x + draw_size.x, image_pos.y + draw_size.y));
+    } else {
+        const char* message = "Call graph image unavailable";
+        const ImVec2 text_size = ImGui::CalcTextSize(message);
+        draw_list->AddText(ImVec2(canvas_pos.x + (canvas_size.x - text_size.x) * 0.5f,
+                                  canvas_pos.y + (canvas_size.y - text_size.y) * 0.5f),
+                           IM_COL32(80, 80, 80, 255),
+                           message);
+    }
+
+    ImGui::Dummy(canvas_size);
     ImGui::End();
 }
 

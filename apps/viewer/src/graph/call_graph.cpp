@@ -174,6 +174,8 @@ std::string_view graphviz_format_name(GraphRenderFormat format) noexcept {
             return "svg";
         case GraphRenderFormat::Png:
             return "png";
+        case GraphRenderFormat::Bmp:
+            return "bmp";
     }
     return "svg";
 }

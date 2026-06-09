@@ -1,7 +1,10 @@
 #include "vulkan_manager.h"
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 #include <cstdio>
+
+#include <imgui_impl_vulkan.h>
 
 namespace viewer {
 
@@ -293,6 +296,222 @@ void VulkanManager::create_sync_objects() {
           "Failed to create semaphore");
     check(vkCreateFence(device_, &fi, nullptr, &in_flight_fence_),
           "Failed to create fence");
+}
+
+uint32_t VulkanManager::find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const {
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties);
+
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+        if ((type_filter & (1u << i)) != 0 &&
+            (memory_properties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return i;
+        }
+    }
+
+    throw std::runtime_error("No suitable Vulkan memory type found");
+}
+
+VkCommandBuffer VulkanManager::begin_one_time_commands() const {
+    VkCommandBufferAllocateInfo alloc_info{};
+    alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandPool = command_pool_;
+    alloc_info.commandBufferCount = 1;
+
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    check(vkAllocateCommandBuffers(device_, &alloc_info, &command_buffer),
+          "vkAllocateCommandBuffers failed for one-time command");
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(command_buffer, &begin_info),
+          "vkBeginCommandBuffer failed for one-time command");
+
+    return command_buffer;
+}
+
+void VulkanManager::end_one_time_commands(VkCommandBuffer command_buffer) const {
+    vkEndCommandBuffer(command_buffer);
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+
+    check(vkQueueSubmit(graphics_queue_, 1, &submit_info, VK_NULL_HANDLE),
+          "vkQueueSubmit failed for one-time command");
+    vkQueueWaitIdle(graphics_queue_);
+    vkFreeCommandBuffers(device_, command_pool_, 1, &command_buffer);
+}
+
+VulkanManager::Texture VulkanManager::create_rgba_texture(std::span<const std::uint8_t> pixels,
+                                                          uint32_t width,
+                                                          uint32_t height) {
+    if (width == 0 || height == 0 || pixels.size() != static_cast<std::size_t>(width) * height * 4u) {
+        throw std::runtime_error("Invalid RGBA texture data");
+    }
+
+    const VkDeviceSize image_size = static_cast<VkDeviceSize>(pixels.size());
+
+    VkBuffer staging_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = image_size;
+    buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    check(vkCreateBuffer(device_, &buffer_info, nullptr, &staging_buffer), "vkCreateBuffer failed");
+
+    VkMemoryRequirements buffer_requirements{};
+    vkGetBufferMemoryRequirements(device_, staging_buffer, &buffer_requirements);
+    VkMemoryAllocateInfo buffer_alloc{};
+    buffer_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    buffer_alloc.allocationSize = buffer_requirements.size;
+    buffer_alloc.memoryTypeIndex = find_memory_type(buffer_requirements.memoryTypeBits,
+                                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    check(vkAllocateMemory(device_, &buffer_alloc, nullptr, &staging_memory),
+          "vkAllocateMemory failed for staging texture");
+    vkBindBufferMemory(device_, staging_buffer, staging_memory, 0);
+
+    void* mapped = nullptr;
+    vkMapMemory(device_, staging_memory, 0, image_size, 0, &mapped);
+    std::memcpy(mapped, pixels.data(), pixels.size());
+    vkUnmapMemory(device_, staging_memory);
+
+    Texture texture{};
+    texture.width = width;
+    texture.height = height;
+
+    VkImageCreateInfo image_info{};
+    image_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    image_info.imageType = VK_IMAGE_TYPE_2D;
+    image_info.extent.width = width;
+    image_info.extent.height = height;
+    image_info.extent.depth = 1;
+    image_info.mipLevels = 1;
+    image_info.arrayLayers = 1;
+    image_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    image_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    image_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    image_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    image_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    image_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    check(vkCreateImage(device_, &image_info, nullptr, &texture.image), "vkCreateImage failed for texture");
+
+    VkMemoryRequirements image_requirements{};
+    vkGetImageMemoryRequirements(device_, texture.image, &image_requirements);
+    VkMemoryAllocateInfo image_alloc{};
+    image_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    image_alloc.allocationSize = image_requirements.size;
+    image_alloc.memoryTypeIndex = find_memory_type(image_requirements.memoryTypeBits,
+                                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    check(vkAllocateMemory(device_, &image_alloc, nullptr, &texture.memory),
+          "vkAllocateMemory failed for texture");
+    vkBindImageMemory(device_, texture.image, texture.memory, 0);
+
+    VkCommandBuffer command_buffer = begin_one_time_commands();
+
+    VkImageMemoryBarrier to_transfer{};
+    to_transfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_transfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_transfer.image = texture.image;
+    to_transfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_transfer.subresourceRange.levelCount = 1;
+    to_transfer.subresourceRange.layerCount = 1;
+    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(command_buffer,
+                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0,
+                         0,
+                         nullptr,
+                         0,
+                         nullptr,
+                         1,
+                         &to_transfer);
+
+    VkBufferImageCopy region{};
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(command_buffer,
+                           staging_buffer,
+                           texture.image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1,
+                           &region);
+
+    VkImageMemoryBarrier to_shader{};
+    to_shader.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_shader.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_shader.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_shader.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_shader.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_shader.image = texture.image;
+    to_shader.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_shader.subresourceRange.levelCount = 1;
+    to_shader.subresourceRange.layerCount = 1;
+    to_shader.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_shader.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command_buffer,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0,
+                         0,
+                         nullptr,
+                         0,
+                         nullptr,
+                         1,
+                         &to_shader);
+
+    end_one_time_commands(command_buffer);
+
+    vkDestroyBuffer(device_, staging_buffer, nullptr);
+    vkFreeMemory(device_, staging_memory, nullptr);
+
+    VkImageViewCreateInfo view_info{};
+    view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    view_info.image = texture.image;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = VK_FORMAT_R8G8B8A8_UNORM;
+    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    view_info.subresourceRange.levelCount = 1;
+    view_info.subresourceRange.layerCount = 1;
+    check(vkCreateImageView(device_, &view_info, nullptr, &texture.view),
+          "vkCreateImageView failed for texture");
+
+    texture.descriptor_set = ImGui_ImplVulkan_AddTexture(texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    return texture;
+}
+
+void VulkanManager::destroy_texture(Texture& texture) {
+    if (device_ == VK_NULL_HANDLE) {
+        return;
+    }
+    if (texture.descriptor_set != VK_NULL_HANDLE) {
+        ImGui_ImplVulkan_RemoveTexture(texture.descriptor_set);
+        texture.descriptor_set = VK_NULL_HANDLE;
+    }
+    if (texture.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(device_, texture.view, nullptr);
+        texture.view = VK_NULL_HANDLE;
+    }
+    if (texture.image != VK_NULL_HANDLE) {
+        vkDestroyImage(device_, texture.image, nullptr);
+        texture.image = VK_NULL_HANDLE;
+    }
+    if (texture.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, texture.memory, nullptr);
+        texture.memory = VK_NULL_HANDLE;
+    }
+    texture.width = 0;
+    texture.height = 0;
 }
 
 void VulkanManager::begin_frame() {

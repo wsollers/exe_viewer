@@ -6,6 +6,8 @@
 #include <vector>
 #include <stdexcept>
 #include <string>
+#include <span>
+#include <cstdint>
 
 namespace viewer {
 
@@ -18,6 +20,15 @@ struct VulkanConfig {
 
 class VulkanManager {
 public:
+    struct Texture {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
     VulkanManager() = default;
     ~VulkanManager();
 
@@ -34,6 +45,10 @@ public:
 
     void wait_idle();
     void recreate_swapchain(GLFWwindow* window);
+    [[nodiscard]] Texture create_rgba_texture(std::span<const std::uint8_t> pixels,
+                                              uint32_t width,
+                                              uint32_t height);
+    void destroy_texture(Texture& texture);
 
     // Accessors for ImGui initialization
     [[nodiscard]] VkInstance instance() const { return instance_; }
@@ -61,6 +76,9 @@ private:
     void create_sync_objects();
 
     void cleanup_swapchain();
+    [[nodiscard]] uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const;
+    [[nodiscard]] VkCommandBuffer begin_one_time_commands() const;
+    void end_one_time_commands(VkCommandBuffer command_buffer) const;
 
     static void check_vk(VkResult result, const char* msg);
 

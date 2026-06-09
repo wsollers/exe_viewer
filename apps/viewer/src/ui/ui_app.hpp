@@ -2,18 +2,23 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "model/binary_model.hpp"
 #include "ui_panels.hpp"
 #include "disasm/disassembler.hpp"
+#include "vulkan/vulkan_manager.h"
 
 namespace viewer {
 
     class UiApp {
     public:
-        explicit UiApp(BinaryModel& model);
+        UiApp(BinaryModel& model, VulkanManager& vulkan);
+        ~UiApp();
 
         void render(); // call each frame from Application::render_ui()
 
@@ -23,6 +28,10 @@ namespace viewer {
 
         bool show_demo_window_ = false;
 
+        enum class CallGraphSample : std::uint8_t {
+            PeStartup,
+            ElfStartup
+        };
 
         void disassemble_at(std::uint64_t rva, std::size_t size);
 
@@ -44,6 +53,7 @@ namespace viewer {
 
     private:
         BinaryModel& model_;
+        VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
         ViewerSelection current_selection_;
         std::optional<ViewerSelection> last_navigation_selection_;
@@ -67,12 +77,19 @@ namespace viewer {
         bool file_loaded_ = false;
         bool reset_dock_layout_ = false;
         bool show_disassembly_panel_ = true;
+        bool show_call_graph_panel_ = false;
+        CallGraphSample call_graph_sample_ = CallGraphSample::PeStartup;
+        std::optional<VulkanManager::Texture> call_graph_texture_;
+        std::string call_graph_status_;
+        std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
         std::vector<Instruction> current_instructions_;
 
 
         void render_main_menu();
         void render_dockspace();
+        void render_call_graph_panel();
+        void load_call_graph_sample(CallGraphSample sample);
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
         void apply_structure_selection_navigation();
 

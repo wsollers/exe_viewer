@@ -71,7 +71,7 @@ namespace viewer {
         vulkan_.init(window_, vk_config);
 
         // Initialize model/UI
-        ui_ = new UiApp(model_);
+        ui_ = new UiApp(model_, vulkan_);
         ui_->set_open_file_callback([this]() {
             open_file_dialog();
         });
@@ -202,6 +202,8 @@ namespace viewer {
         if (!running_) return;
 
         vulkan_.wait_idle();
+        delete ui_;
+        ui_ = nullptr;
         shutdown_imgui();
         vulkan_.shutdown();
 

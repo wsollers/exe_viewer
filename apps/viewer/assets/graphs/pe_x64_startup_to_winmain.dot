@@ -1,0 +1,18 @@
+digraph "pe_x64_startup_to_winmain" {
+  graph [rankdir="LR", labelloc="t", label="PE x64 startup toward WinMain - known-win-x64.exe", bgcolor="white"];
+  node [fontname="Consolas", fontsize="10", shape="box", style="rounded,filled", fillcolor="#f7f7f7", color="#555555"];
+  edge [fontname="Consolas", fontsize="9", color="#555555"];
+
+  file [label="PE32+ x64 fixture\nknown-win-x64.exe\nImageBase 0x140000000"];
+  entry [label="AddressOfEntryPoint\nRVA 0x1000\nVA 0x140001000\nfile offset 0x220\nbytes: int3 padding", fillcolor="#fff7e6"];
+  export [label="Export Directory\nknown_export -> RVA 0x1000\n(entry/export alias)", fillcolor="#e8f3ff"];
+  import [label="Import Directory\nKERNEL32.dll!ExitProcess\nIAT around RVA 0x11D0", shape="component", fillcolor="#edf7ed"];
+  crt [label="CRT startup thunk\nmainCRTStartup / WinMainCRTStartup\nnot present in this synthetic fixture", style="rounded,dashed,filled", fillcolor="#ffffff", color="#999999"];
+  winmain [label="WinMain\nnot resolved from fixture symbols/PDB yet", style="rounded,dashed,filled", fillcolor="#ffffff", color="#999999"];
+
+  file -> entry [label="entry point"];
+  export -> entry [label="export target"];
+  entry -> import [label="would terminate via import", color="#1f77b4"];
+  entry -> crt [label="future recovered startup path", style="dashed", color="#999999"];
+  crt -> winmain [label="future symbol/PDB/disasm resolution", style="dashed", color="#999999"];
+}

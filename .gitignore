@@ -42,4 +42,5 @@
 /.idea/*
 
 build/
+out/
 cmake-build-*/

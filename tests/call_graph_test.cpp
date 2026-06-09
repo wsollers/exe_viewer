@@ -113,6 +113,12 @@ TEST(CallGraph, BuildsGraphvizSvgAndPngCommandsWithoutAssumingArchitecture) {
                                                                                  "dot-test");
     ASSERT_FALSE(png.arguments.empty());
     EXPECT_EQ(png.arguments[0], "-Tpng");
+
+    const viewer::GraphRenderCommand bmp = viewer::make_graphviz_render_command("entry.dot", "entry.bmp",
+                                                                                 viewer::GraphRenderFormat::Bmp,
+                                                                                 "dot-test");
+    ASSERT_FALSE(bmp.arguments.empty());
+    EXPECT_EQ(bmp.arguments[0], "-Tbmp");
 }
 
 TEST(CallGraph, RenderWritesDotAndInvokesInjectedRunner) {

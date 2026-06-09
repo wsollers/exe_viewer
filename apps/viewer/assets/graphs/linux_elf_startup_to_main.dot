@@ -1,0 +1,18 @@
+digraph "linux_elf_startup_to_main" {
+  graph [rankdir="LR", labelloc="t", label="Linux ELF x64 startup to main - hello.elf", bgcolor="white"];
+  node [fontname="Consolas", fontsize="10", shape="box", style="rounded,filled", fillcolor="#f7f7f7", color="#555555"];
+  edge [fontname="Consolas", fontsize="9", color="#555555"];
+
+  entry [label="_start\nVA 0x1060\nsize 38\nloads main into RDI", fillcolor="#fff7e6"];
+  libc [label="__libc_start_main@GLIBC_2.34\nexternal runtime entry", shape="component", fillcolor="#edf7ed"];
+  main [label="main\nVA 0x1161\nsize 52", fillcolor="#e8f3ff"];
+  add [label="add\nVA 0x1149\nsize 24"];
+  printf [label="printf@plt\nVA 0x1050\nexternal printf@GLIBC_2.2.5", shape="component", fillcolor="#edf7ed"];
+  fini [label="process return / libc exit path", style="rounded,dashed,filled", fillcolor="#ffffff", color="#999999"];
+
+  entry -> libc [label="call *GOT"];
+  libc -> main [label="startup callback\nmain pointer loaded at _start+0x18", style="dashed"];
+  main -> add [label="call 0x1149", color="#1f77b4"];
+  main -> printf [label="call printf@plt", color="#1f77b4"];
+  main -> fini [label="return", style="dashed", color="#999999"];
+}
