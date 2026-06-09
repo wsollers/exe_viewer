@@ -169,6 +169,8 @@ TEST(CallGraph, BuildsLoadedPeEntryGraphFromParsedImage) {
     EXPECT_NE(dot.find("Entry Point"), std::string::npos);
     EXPECT_NE(dot.find("known_export"), std::string::npos);
     EXPECT_NE(dot.find("KERNEL32.dll!ExitProcess"), std::string::npos);
+    EXPECT_NE(dot.find("import table"), std::string::npos);
+    EXPECT_EQ(dot.find("import ref"), std::string::npos);
     EXPECT_NE(dot.find("WinMain"), std::string::npos);
     EXPECT_NE(dot.find("symbol lookup pending"), std::string::npos);
 }
