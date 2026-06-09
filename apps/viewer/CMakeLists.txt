@@ -67,4 +67,5 @@ target_link_libraries(peelf_viewer PRIVATE
         Vulkan::Vulkan
         nfd
         capstone
+        peelf::graphviz
 )

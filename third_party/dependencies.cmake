@@ -91,3 +91,44 @@ set(CAPSTONE_PPC_SUPPORT ON CACHE BOOL "" FORCE)      # PowerPC/PowerPC64
 set(CAPSTONE_RISCV_SUPPORT ON CACHE BOOL "" FORCE)    # RISC-V RV32/RV64
 
 FetchContent_MakeAvailable(capstone)
+
+# Graphviz
+#
+# We primarily need Graphviz as a DOT renderer/export target for call-flow and
+# control-flow graphs. DOT text emission does not require a dependency, so this
+# is deliberately optional: enabling it fetches the upstream source tree and
+# exposes a stable project target (`peelf::graphviz`) with source/tool paths for
+# future renderer integration. We do not force Graphviz's full build into every
+# configure because it is a large project with platform/system-library edges.
+set(PEELF_GRAPHVIZ_TAG "13.0.0" CACHE STRING "Graphviz git tag to fetch when PEELF_ENABLE_GRAPHVIZ is ON")
+find_program(PEELF_GRAPHVIZ_DOT_EXECUTABLE NAMES dot)
+
+add_library(peelf_graphviz INTERFACE)
+add_library(peelf::graphviz ALIAS peelf_graphviz)
+
+if(PEELF_GRAPHVIZ_DOT_EXECUTABLE)
+        target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_DOT_AVAILABLE=1)
+        target_compile_definitions(peelf_graphviz INTERFACE
+                PEELF_GRAPHVIZ_DOT_EXECUTABLE="$<SHELL_PATH:${PEELF_GRAPHVIZ_DOT_EXECUTABLE}>")
+else()
+        target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_DOT_AVAILABLE=0)
+endif()
+
+if(PEELF_ENABLE_GRAPHVIZ)
+        FetchContent_Declare(
+                graphviz_src
+                GIT_REPOSITORY https://gitlab.com/graphviz/graphviz.git
+                GIT_TAG        ${PEELF_GRAPHVIZ_TAG}
+                GIT_SHALLOW    TRUE
+                DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_GetProperties(graphviz_src)
+        if(NOT graphviz_src_POPULATED)
+                FetchContent_Populate(graphviz_src)
+        endif()
+        target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_SOURCE_AVAILABLE=1)
+        target_compile_definitions(peelf_graphviz INTERFACE
+                PEELF_GRAPHVIZ_SOURCE_DIR="$<SHELL_PATH:${graphviz_src_SOURCE_DIR}>")
+else()
+        target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_SOURCE_AVAILABLE=0)
+endif()

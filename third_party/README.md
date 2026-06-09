@@ -16,6 +16,7 @@ subdirectories to populate, and no vendoring step to run.
 | Dear ImGui | `docking` @ `2af6dd96` (pinned) | Built here as a static `imgui` target with the GLFW + Vulkan backends; links `glfw` and `Vulkan::Vulkan`. |
 | nativefiledialog-extended (NFD) | `v1.2.1` | Native open/save file dialogs (`nfd` target). |
 | Capstone | `5.0.6` | Disassembler. Static only; X86, ARM, ARM64, MIPS, PowerPC, and RISC-V enabled. |
+| Graphviz | `13.0.0` | Optional. Enable with `PEELF_ENABLE_GRAPHVIZ=ON` to fetch upstream Graphviz source for future DOT rendering hooks; default builds still emit DOT without requiring Graphviz. |
 
 > **Reproducibility note:** Dear ImGui is pinned to a specific `docking`-branch
 > commit (`2af6dd96`, 2026-06-04), verified to contain the Vulkan-backend
@@ -38,9 +39,11 @@ The top-level `CMakeLists.txt` does:
 include(third_party/dependencies.cmake)
 ```
 
-after which targets can link `glfw`, `imgui`, `nfd`, `capstone`, and
-`Vulkan::Vulkan`. The **first** configure clones and builds these, so it takes
-noticeably longer than subsequent configures.
+after which targets can link `glfw`, `imgui`, `nfd`, `capstone`,
+`peelf::graphviz`, and `Vulkan::Vulkan`. The **first** configure clones and
+builds the mandatory dependencies, so it takes noticeably longer than subsequent
+configures. `peelf::graphviz` is always available as an interface target; with
+`PEELF_ENABLE_GRAPHVIZ=ON`, CMake also fetches the pinned Graphviz source tree.
 
 ## Legacy scripts
 

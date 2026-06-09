@@ -34,7 +34,9 @@ the following the first time you configure:
 | Dear ImGui | `docking` branch |
 | nativefiledialog-extended | 1.2.1 |
 | Capstone | 5.0.6 |
+| Graphviz | 13.0.0, optional source fetch |
 
+Graphviz is optional and is not fetched unless `PEELF_ENABLE_GRAPHVIZ=ON`.
 The Vulkan loader/headers are **not** fetched; they come from the installed Vulkan SDK.
 
 > The scripts under `scripts/` (`bootstrap_deps.*`, `getdeps.ps1`) are legacy helpers from
@@ -66,7 +68,8 @@ cmake --build --preset clang18-release
 Output binary: `out/build/<preset>/apps/viewer/peelf_viewer`
 
 The first configure will take a while because it clones and builds GLFW, ImGui,
-nativefiledialog-extended, and Capstone.
+nativefiledialog-extended, and Capstone. Enabling `PEELF_ENABLE_GRAPHVIZ` also
+fetches the pinned Graphviz source tree for future DOT rendering hooks.
 
 ## Build options
 
@@ -76,6 +79,9 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 | --- | --- | --- |
 | `PEELF_BUILD_VIEWER` | `ON` | Build the GUI viewer app (`peelf_viewer`) |
 | `PEELF_BUILD_SHARED` | `ON` | Build `peelf_core` as a shared library |
+| `PEELF_BUILD_TESTS` | `ON` | Build the GoogleTest unit suite |
+| `PEELF_ENABLE_GRAPHVIZ` | `OFF` | Fetch optional Graphviz source and expose Graphviz feature macros through `peelf::graphviz` |
+| `PEELF_ENABLE_CLANG_TIDY` | `OFF` | Run clang-tidy on project targets for supported generators |
 
 ## Running
 
