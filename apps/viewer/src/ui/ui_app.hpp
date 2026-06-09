@@ -12,6 +12,7 @@
 #include "ui_panels.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
+#include "symbols/symbol_index.hpp"
 #include "vulkan/vulkan_manager.h"
 
 namespace viewer {
@@ -57,6 +58,7 @@ namespace viewer {
         BinaryModel& model_;
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
+        SymbolIndex symbol_index_;
         ViewerSelection current_selection_;
         std::optional<ViewerSelection> last_navigation_selection_;
 

@@ -7,6 +7,8 @@
 #include <sstream>
 #include <utility>
 
+#include "symbols/symbol_index.hpp"
+
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -116,28 +118,16 @@ namespace {
     return static_cast<std::size_t>(std::distance(symbols.begin(), it));
 }
 
-[[nodiscard]] std::optional<std::size_t> find_symbol_index_containing(const peelf::IBinaryImage& image,
-                                                                      std::string_view name) {
-    const std::vector<peelf::Symbol>& symbols = image.symbols();
-    const auto it = std::ranges::find_if(symbols, [&](const peelf::Symbol& symbol) {
-        return contains_case_sensitive(symbol.name, name);
+[[nodiscard]] const SymbolRecord* find_symbol_record_containing_name(const SymbolIndex& index,
+                                                                     std::string_view name) {
+    const auto records = index.records();
+    const auto it = std::ranges::find_if(records, [&](const SymbolRecord& record) {
+        return contains_case_sensitive(record.name, name);
     });
-    if (it == symbols.end()) {
-        return std::nullopt;
+    if (it == records.end()) {
+        return nullptr;
     }
-    return static_cast<std::size_t>(std::distance(symbols.begin(), it));
-}
-
-[[nodiscard]] std::optional<std::size_t> find_import_index_containing(const peelf::IBinaryImage& image,
-                                                                      std::string_view name) {
-    const std::vector<peelf::ImportEntry>& imports = image.imports();
-    const auto it = std::ranges::find_if(imports, [&](const peelf::ImportEntry& entry) {
-        return contains_case_sensitive(entry.name, name) || contains_case_sensitive(entry.library, name);
-    });
-    if (it == imports.end()) {
-        return std::nullopt;
-    }
-    return static_cast<std::size_t>(std::distance(imports.begin(), it));
+    return &*it;
 }
 
 [[nodiscard]] GraphByteRange symbol_range(const peelf::IBinaryImage& image, const peelf::Symbol& symbol) {
@@ -168,13 +158,7 @@ namespace {
 }
 
 [[nodiscard]] std::string import_label(const peelf::ImportEntry& entry) {
-    if (entry.library.empty()) {
-        return entry.name.empty() ? "<import>" : entry.name;
-    }
-    if (entry.name.empty()) {
-        return entry.library;
-    }
-    return entry.library + "!" + entry.name;
+    return import_symbol_name(entry);
 }
 
 [[nodiscard]] std::string imports_summary_label(const peelf::IBinaryImage& image) {
@@ -281,6 +265,7 @@ std::string to_dot(const CallGraph& graph) {
 }
 
 CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
+    const SymbolIndex symbol_index = SymbolIndex::build(image);
     CallGraph graph{
         .id = "loaded_entry_call_graph",
         .label = image_label(image),
@@ -357,8 +342,7 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
 
     const std::optional<std::size_t> start_symbol = find_symbol_index_by_name(image, "_start");
     const std::optional<std::size_t> main_symbol = find_symbol_index_by_name(image, "main");
-    const std::optional<std::size_t> libc_start_import = find_import_index_containing(image, "__libc_start_main");
-    const std::optional<std::size_t> libc_start_symbol = find_symbol_index_containing(image, "__libc_start_main");
+    const SymbolRecord* libc_start_record = find_symbol_record_containing_name(symbol_index, "__libc_start_main");
     if (start_symbol && main_symbol) {
         const std::string start_id = "sym_" + std::to_string(*start_symbol);
         const std::string main_id = "sym_" + std::to_string(*main_symbol);
@@ -367,45 +351,24 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
         }
         graph.nodes.push_back(symbol_node(image, image.symbols()[*main_symbol], *main_symbol, main_id));
 
-        if (libc_start_import) {
-            const peelf::ImportEntry& import = image.imports()[*libc_start_import];
-            const std::string libc_id = "import_" + std::to_string(*libc_start_import);
+        if (libc_start_record) {
+            const std::string libc_id = "symbol_record_" + std::to_string(libc_start_record->source_index);
             graph.nodes.push_back(CallGraphNode{
                 .id = libc_id,
-                .label = import_label(import),
-                .kind = CallGraphNodeKind::Import,
+                .label = libc_start_record->name,
+                .kind = libc_start_record->source == SymbolSource::Import ? CallGraphNodeKind::Import
+                                                                           : CallGraphNodeKind::External,
                 .bytes = GraphByteRange{
                     .start = GraphAddress{
-                        .virtual_address = import.address == 0 ? std::optional<std::uint64_t>{}
-                                                               : std::optional(import.address),
-                        .file_offset = import.address == 0 ? std::optional<std::uint64_t>{}
-                                                           : image.virtual_address_to_file_offset(import.address),
+                        .virtual_address = libc_start_record->virtual_address,
+                        .file_offset = libc_start_record->file_offset,
                     },
-                    .size = image.is_64bit() ? 8u : 4u,
+                    .size = libc_start_record->size,
                 },
-            });
-            add_edge_if_missing(graph, CallGraphEdge{
-                .from_node_id = start_id,
-                .to_node_id = libc_id,
-                .kind = CallGraphEdgeKind::Call,
-                .label = "startup call",
-            });
-            add_edge_if_missing(graph, CallGraphEdge{
-                .from_node_id = libc_id,
-                .to_node_id = main_id,
-                .kind = CallGraphEdgeKind::Call,
-                .label = "main callback",
-            });
-        } else if (libc_start_symbol) {
-            const std::string libc_id = "sym_" + std::to_string(*libc_start_symbol);
-            graph.nodes.push_back(CallGraphNode{
-                .id = libc_id,
-                .label = image.symbols()[*libc_start_symbol].name,
-                .kind = CallGraphNodeKind::External,
                 .symbol = GraphSymbolRef{
-                    .name = image.symbols()[*libc_start_symbol].name,
-                    .symbol_index = static_cast<std::uint64_t>(*libc_start_symbol),
-                    .dynamic = image.symbols()[*libc_start_symbol].dynamic,
+                    .name = libc_start_record->name,
+                    .symbol_index = libc_start_record->source_index,
+                    .dynamic = libc_start_record->dynamic,
                 },
             });
             add_edge_if_missing(graph, CallGraphEdge{

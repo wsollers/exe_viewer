@@ -731,14 +731,17 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         if (!img) {
             file_loaded_ = false;
             structure_tree_.reset();
+            symbol_index_ = {};
             current_selection_ = {};
             last_navigation_selection_.reset();
             return;
         }
 
         structure_tree_ = build_structure_tree(*img);
+        symbol_index_ = SymbolIndex::build(*img);
         current_selection_ = structure_tree_->selection;
         last_navigation_selection_.reset();
+        Log().info("Loaded {} symbol records", symbol_index_.size());
 
         // Map the unified architecture onto the disassembler's enum.
         const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());

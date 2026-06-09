@@ -52,6 +52,8 @@ add_executable(peelf_viewer
         src/navigation/viewer_navigation.cpp
         src/graph/call_graph.hpp
         src/graph/call_graph.cpp
+        src/symbols/symbol_index.hpp
+        src/symbols/symbol_index.cpp
         src/disasm/disassembler.hpp
 )
 

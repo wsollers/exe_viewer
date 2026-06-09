@@ -33,8 +33,10 @@ add_executable(peelf_tests
   disassembler_test.cpp
   viewer_navigation_test.cpp
   call_graph_test.cpp
+  symbol_index_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
 )
 
 target_compile_features(peelf_tests PRIVATE cxx_std_23)
