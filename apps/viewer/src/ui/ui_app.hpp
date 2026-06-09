@@ -23,6 +23,7 @@ namespace viewer {
         ~UiApp();
 
         void render(); // call each frame from Application::render_ui()
+        void process_deferred_gpu_work();
 
         void set_open_file_callback(std::function<void()> cb) { on_open_file_ = std::move(cb); }
         void set_open_debug_symbols_callback(std::function<void()> cb) { on_open_debug_symbols_ = std::move(cb); }
@@ -108,7 +109,6 @@ namespace viewer {
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);
         void queue_call_graph_sample(CallGraphSample sample);
-        void process_pending_call_graph_work();
         void load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name);
         void activate_call_graph_node(const CallGraphNode& node);
         const CallGraphNode* hit_test_call_graph_node(const ImVec2& image_pos,

@@ -568,7 +568,7 @@ void UiApp::queue_call_graph_sample(CallGraphSample sample) {
     call_graph_status_ = "Queued call graph render";
 }
 
-void UiApp::process_pending_call_graph_work() {
+void UiApp::process_deferred_gpu_work() {
     if (pending_call_graph_request_) {
         if (pending_call_graph_request_->delay_frames > 0) {
             --pending_call_graph_request_->delay_frames;
@@ -730,8 +730,6 @@ void UiApp::render_call_graph_panel() {
         ImGui::End();
         return;
     }
-
-    process_pending_call_graph_work();
 
     if (ImGui::Button("Loaded Image")) {
         queue_call_graph_sample(CallGraphSample::LoadedImage);

@@ -234,6 +234,14 @@ namespace viewer {
                 framebuffer_resized_ = false;
             }
 
+            try {
+                ui_->process_deferred_gpu_work();
+            } catch (const std::exception& e) {
+                Log().error(std::string("Deferred GPU/UI work failed: ") + e.what());
+            } catch (...) {
+                Log().error("Deferred GPU/UI work failed with an unknown exception");
+            }
+
             // Start frame
             vulkan_.begin_frame();
 
