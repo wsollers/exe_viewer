@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 #include "logger.hpp"
@@ -57,6 +58,32 @@ UiApp::UiApp(BinaryModel& model)
             hex_panel_.navigate_to_range(file_offset, size);
             disassemble_at_offset(file_offset, virtual_address);
         });
+    symbols_panel_.set_symbol_activated_callback([this](const peelf::Symbol& symbol) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr) {
+            return;
+        }
+
+        const auto file_offset = img->virtual_address_to_file_offset(symbol.virtual_address);
+        if (!file_offset) {
+            Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
+                       symbol.name.empty() ? "<unnamed>" : symbol.name,
+                       symbol.virtual_address);
+            return;
+        }
+        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+            symbol.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            Log().warn("Symbol '{}' range is too large for this platform",
+                       symbol.name.empty() ? "<unnamed>" : symbol.name);
+            return;
+        }
+
+        const std::size_t highlight_size = symbol.size != 0
+            ? static_cast<std::size_t>(symbol.size)
+            : std::size_t{1};
+        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
+        disassemble_at_offset(static_cast<std::size_t>(*file_offset), symbol.virtual_address);
+    });
 }
 
 void UiApp::render() {

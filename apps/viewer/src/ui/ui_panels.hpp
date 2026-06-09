@@ -101,11 +101,15 @@ namespace viewer {
     class SymbolsPanel : public UiPanel {
     public:
         explicit SymbolsPanel(BinaryModel& model);
+        void set_symbol_activated_callback(std::function<void(const peelf::Symbol& symbol)> cb) {
+            on_symbol_activated_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
+        std::function<void(const peelf::Symbol& symbol)> on_symbol_activated_;
     };
 
     class ImportsPanel : public UiPanel {

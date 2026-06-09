@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 
+#include <cstdint>
 #include <string>
 
 namespace viewer {
@@ -36,14 +37,23 @@ void SymbolsPanel::draw_contents() {
         ImGui::TableSetupColumn("Table", ImGuiTableColumnFlags_WidthFixed, 64.0f);
         ImGui::TableHeadersRow();
 
+        std::uint64_t row_id = 0;
         for (const peelf::Symbol& symbol : img->symbols()) {
             if (has_filter && symbol.name.find(filter) == std::string::npos) {
+                ++row_id;
                 continue;
             }
 
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(symbol.name.c_str());
+            ImGui::PushID(static_cast<int>(row_id));
+            const char* display_name = symbol.name.empty() ? "<unnamed>" : symbol.name.c_str();
+            if (ImGui::Selectable(display_name, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                if (on_symbol_activated_) {
+                    on_symbol_activated_(symbol);
+                }
+            }
+            ImGui::PopID();
             ImGui::TableNextColumn();
             ImGui::Text("0x%llX", static_cast<unsigned long long>(symbol.virtual_address));
             ImGui::TableNextColumn();
@@ -54,6 +64,7 @@ void SymbolsPanel::draw_contents() {
             ImGui::Text("%u", static_cast<unsigned>(symbol.type));
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(symbol.dynamic ? "dynsym" : "symtab");
+            ++row_id;
         }
 
         ImGui::EndTable();
