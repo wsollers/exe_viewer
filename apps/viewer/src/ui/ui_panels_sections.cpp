@@ -47,9 +47,13 @@ void draw_permissions(bool readable, bool writable, bool executable) {
         ImGui::Text("Perm"); ImGui::NextColumn();
         ImGui::Separator();
 
+        std::uint64_t section_index = 0;
         for (const auto& s : img->sections()) {
             if (has_filter && s.name.find(filter) == std::string::npos)
+            {
+                ++section_index;
                 continue;
+            }
 
             const std::uint64_t range_size = s.file_size != 0 ? s.file_size : s.virtual_size;
             const bool can_navigate =
@@ -60,9 +64,7 @@ void draw_permissions(bool readable, bool writable, bool executable) {
             ImGui::PushID(s.name.c_str());
             if (can_navigate && ImGui::Selectable(s.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
                 if (on_section_activated_) {
-                    on_section_activated_(static_cast<std::size_t>(s.file_offset),
-                                          static_cast<std::size_t>(range_size),
-                                          s.virtual_address);
+                    on_section_activated_(s, section_index);
                 }
             } else if (!can_navigate) {
                 ImGui::TextDisabled("%s", s.name.c_str());
@@ -72,6 +74,7 @@ void draw_permissions(bool readable, bool writable, bool executable) {
             ImGui::Text("0x%llX", (unsigned long long)s.virtual_address); ImGui::NextColumn();
             ImGui::Text("0x%llX", (unsigned long long)s.virtual_size); ImGui::NextColumn();
             draw_permissions(s.readable, s.writable, s.executable); ImGui::NextColumn();
+            ++section_index;
         }
 
         ImGui::Columns(1);

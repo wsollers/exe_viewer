@@ -50,7 +50,7 @@ void ExportsPanel::draw_contents() {
             const char* display_name = entry.name.empty() ? "<unnamed>" : entry.name.c_str();
             if (ImGui::Selectable(display_name, false, ImGuiSelectableFlags_SpanAllColumns)) {
                 if (on_export_activated_) {
-                    on_export_activated_(entry);
+                    on_export_activated_(entry, row_id);
                 }
             }
             ImGui::PopID();

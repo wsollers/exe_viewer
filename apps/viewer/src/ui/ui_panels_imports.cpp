@@ -48,7 +48,7 @@ void ImportsPanel::draw_contents() {
             ImGui::PushID(static_cast<int>(row_id));
             if (ImGui::Selectable(entry.library.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
                 if (on_import_activated_) {
-                    on_import_activated_(entry);
+                    on_import_activated_(entry, row_id);
                 }
             }
             ImGui::PopID();

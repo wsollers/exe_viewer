@@ -53,7 +53,7 @@ namespace viewer {
     public:
         explicit SectionsPanel(BinaryModel& model);
         void set_section_activated_callback(
-            std::function<void(std::size_t file_offset, std::size_t size, std::uint64_t virtual_address)> cb) {
+            std::function<void(const peelf::Section& section, std::uint64_t object_index)> cb) {
             on_section_activated_ = std::move(cb);
         }
     protected:
@@ -61,8 +61,7 @@ namespace viewer {
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
-        std::function<void(std::size_t file_offset, std::size_t size, std::uint64_t virtual_address)>
-            on_section_activated_;
+        std::function<void(const peelf::Section& section, std::uint64_t object_index)> on_section_activated_;
     };
 
     class HexViewPanel : public UiPanel {
@@ -101,7 +100,8 @@ namespace viewer {
     class SymbolsPanel : public UiPanel {
     public:
         explicit SymbolsPanel(BinaryModel& model);
-        void set_symbol_activated_callback(std::function<void(const peelf::Symbol& symbol)> cb) {
+        void set_symbol_activated_callback(
+            std::function<void(const peelf::Symbol& symbol, std::uint64_t object_index)> cb) {
             on_symbol_activated_ = std::move(cb);
         }
     protected:
@@ -109,13 +109,14 @@ namespace viewer {
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
-        std::function<void(const peelf::Symbol& symbol)> on_symbol_activated_;
+        std::function<void(const peelf::Symbol& symbol, std::uint64_t object_index)> on_symbol_activated_;
     };
 
     class ImportsPanel : public UiPanel {
     public:
         explicit ImportsPanel(BinaryModel& model);
-        void set_import_activated_callback(std::function<void(const peelf::ImportEntry& entry)> cb) {
+        void set_import_activated_callback(
+            std::function<void(const peelf::ImportEntry& entry, std::uint64_t object_index)> cb) {
             on_import_activated_ = std::move(cb);
         }
     protected:
@@ -123,13 +124,14 @@ namespace viewer {
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
-        std::function<void(const peelf::ImportEntry& entry)> on_import_activated_;
+        std::function<void(const peelf::ImportEntry& entry, std::uint64_t object_index)> on_import_activated_;
     };
 
     class ExportsPanel : public UiPanel {
     public:
         explicit ExportsPanel(BinaryModel& model);
-        void set_export_activated_callback(std::function<void(const peelf::ExportEntry& entry)> cb) {
+        void set_export_activated_callback(
+            std::function<void(const peelf::ExportEntry& entry, std::uint64_t object_index)> cb) {
             on_export_activated_ = std::move(cb);
         }
     protected:
@@ -137,7 +139,7 @@ namespace viewer {
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
-        std::function<void(const peelf::ExportEntry& entry)> on_export_activated_;
+        std::function<void(const peelf::ExportEntry& entry, std::uint64_t object_index)> on_export_activated_;
     };
 
     class LogPanel : public UiPanel {

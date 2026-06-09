@@ -50,7 +50,7 @@ void SymbolsPanel::draw_contents() {
             const char* display_name = symbol.name.empty() ? "<unnamed>" : symbol.name.c_str();
             if (ImGui::Selectable(display_name, false, ImGuiSelectableFlags_SpanAllColumns)) {
                 if (on_symbol_activated_) {
-                    on_symbol_activated_(symbol);
+                    on_symbol_activated_(symbol, row_id);
                 }
             }
             ImGui::PopID();

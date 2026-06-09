@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <string>
+#include <utility>
 
 #include "logger.hpp"
 
@@ -60,11 +62,25 @@ UiApp::UiApp(BinaryModel& model)
         disassemble_at_offset(off);
     });
     sections_panel_.set_section_activated_callback(
-        [this](std::size_t file_offset, std::size_t size, std::uint64_t virtual_address) {
-            hex_panel_.navigate_to_range(file_offset, size);
-            disassemble_at_offset(file_offset, virtual_address);
+        [this](const peelf::Section& section, std::uint64_t object_index) {
+            const std::uint64_t range_size = section.file_size != 0 ? section.file_size : section.virtual_size;
+            current_selection_ = ViewerSelection{
+                .kind = SelectionKind::Section,
+                .label = section.name,
+                .file_offset = section.file_offset,
+                .virtual_address = section.virtual_address,
+                .size = std::max(section.file_size, section.virtual_size),
+                .object_index = object_index,
+                .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex
+            };
+            hex_panel_.navigate_to_range(static_cast<std::size_t>(section.file_offset),
+                                         static_cast<std::size_t>(range_size));
+            if (section.executable) {
+                disassemble_at_offset(static_cast<std::size_t>(section.file_offset), section.virtual_address);
+            }
+            last_navigation_selection_ = current_selection_;
         });
-    symbols_panel_.set_symbol_activated_callback([this](const peelf::Symbol& symbol) {
+    symbols_panel_.set_symbol_activated_callback([this](const peelf::Symbol& symbol, std::uint64_t object_index) {
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr) {
             return;
@@ -87,10 +103,20 @@ UiApp::UiApp(BinaryModel& model)
         const std::size_t highlight_size = symbol.size != 0
             ? static_cast<std::size_t>(symbol.size)
             : std::size_t{1};
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::Symbol,
+            .label = symbol.name.empty() ? "<unnamed>" : symbol.name,
+            .file_offset = *file_offset,
+            .virtual_address = symbol.virtual_address,
+            .size = symbol.size,
+            .object_index = object_index,
+            .preferred_view = PreferredView::Disassembly
+        };
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
         disassemble_at_offset(static_cast<std::size_t>(*file_offset), symbol.virtual_address);
+        last_navigation_selection_ = current_selection_;
     });
-    imports_panel_.set_import_activated_callback([this](const peelf::ImportEntry& entry) {
+    imports_panel_.set_import_activated_callback([this](const peelf::ImportEntry& entry, std::uint64_t object_index) {
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr || entry.address == 0) {
             return;
@@ -112,9 +138,24 @@ UiApp::UiApp(BinaryModel& model)
         }
 
         const std::size_t pointer_size = img->is_64bit() ? 8u : 4u;
+        std::string label = entry.library;
+        if (!entry.name.empty()) {
+            label += "!";
+            label += entry.name;
+        }
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::Import,
+            .label = std::move(label),
+            .file_offset = *file_offset,
+            .virtual_address = entry.address,
+            .size = pointer_size,
+            .object_index = object_index,
+            .preferred_view = PreferredView::Hex
+        };
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), pointer_size);
+        last_navigation_selection_ = current_selection_;
     });
-    exports_panel_.set_export_activated_callback([this](const peelf::ExportEntry& entry) {
+    exports_panel_.set_export_activated_callback([this](const peelf::ExportEntry& entry, std::uint64_t object_index) {
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr || entry.virtual_address == 0) {
             return;
@@ -133,8 +174,18 @@ UiApp::UiApp(BinaryModel& model)
             return;
         }
 
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::Export,
+            .label = entry.name.empty() ? "<unnamed>" : entry.name,
+            .file_offset = *file_offset,
+            .virtual_address = entry.virtual_address,
+            .size = 1,
+            .object_index = object_index,
+            .preferred_view = PreferredView::Disassembly
+        };
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), 1);
         disassemble_at_offset(static_cast<std::size_t>(*file_offset), entry.virtual_address);
+        last_navigation_selection_ = current_selection_;
     });
 }
 
