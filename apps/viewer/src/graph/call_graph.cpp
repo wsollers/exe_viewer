@@ -3,10 +3,14 @@
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <utility>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 
@@ -89,6 +93,101 @@ namespace {
     return out.str();
 }
 
+[[nodiscard]] bool contains_case_sensitive(std::string_view text, std::string_view needle) {
+    return text.find(needle) != std::string_view::npos;
+}
+
+[[nodiscard]] std::string image_label(const peelf::IBinaryImage& image) {
+    std::ostringstream out;
+    out << peelf::to_string(image.format()) << ' ' << peelf::to_string(image.architecture())
+        << " entry graph\\nEntry " << format_hex(image.entry_point());
+    return out.str();
+}
+
+[[nodiscard]] std::optional<std::size_t> find_symbol_index_by_name(const peelf::IBinaryImage& image,
+                                                                    std::string_view name) {
+    const std::vector<peelf::Symbol>& symbols = image.symbols();
+    const auto it = std::ranges::find_if(symbols, [&](const peelf::Symbol& symbol) {
+        return symbol.name == name;
+    });
+    if (it == symbols.end()) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(std::distance(symbols.begin(), it));
+}
+
+[[nodiscard]] std::optional<std::size_t> find_symbol_index_containing(const peelf::IBinaryImage& image,
+                                                                      std::string_view name) {
+    const std::vector<peelf::Symbol>& symbols = image.symbols();
+    const auto it = std::ranges::find_if(symbols, [&](const peelf::Symbol& symbol) {
+        return contains_case_sensitive(symbol.name, name);
+    });
+    if (it == symbols.end()) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(std::distance(symbols.begin(), it));
+}
+
+[[nodiscard]] std::optional<std::size_t> find_import_index_containing(const peelf::IBinaryImage& image,
+                                                                      std::string_view name) {
+    const std::vector<peelf::ImportEntry>& imports = image.imports();
+    const auto it = std::ranges::find_if(imports, [&](const peelf::ImportEntry& entry) {
+        return contains_case_sensitive(entry.name, name) || contains_case_sensitive(entry.library, name);
+    });
+    if (it == imports.end()) {
+        return std::nullopt;
+    }
+    return static_cast<std::size_t>(std::distance(imports.begin(), it));
+}
+
+[[nodiscard]] GraphByteRange symbol_range(const peelf::IBinaryImage& image, const peelf::Symbol& symbol) {
+    return GraphByteRange{
+        .start = GraphAddress{
+            .virtual_address = symbol.virtual_address,
+            .file_offset = image.virtual_address_to_file_offset(symbol.virtual_address),
+        },
+        .size = symbol.size,
+    };
+}
+
+[[nodiscard]] CallGraphNode symbol_node(const peelf::IBinaryImage& image,
+                                        const peelf::Symbol& symbol,
+                                        std::size_t index,
+                                        std::string id) {
+    return CallGraphNode{
+        .id = std::move(id),
+        .label = symbol.name.empty() ? "<unnamed symbol>" : symbol.name,
+        .kind = CallGraphNodeKind::Function,
+        .bytes = symbol_range(image, symbol),
+        .symbol = GraphSymbolRef{
+            .name = symbol.name,
+            .symbol_index = static_cast<std::uint64_t>(index),
+            .dynamic = symbol.dynamic,
+        },
+    };
+}
+
+[[nodiscard]] std::string import_label(const peelf::ImportEntry& entry) {
+    if (entry.library.empty()) {
+        return entry.name.empty() ? "<import>" : entry.name;
+    }
+    if (entry.name.empty()) {
+        return entry.library;
+    }
+    return entry.library + "!" + entry.name;
+}
+
+void add_edge_if_missing(CallGraph& graph, CallGraphEdge edge) {
+    const auto exists = std::ranges::any_of(graph.edges, [&](const CallGraphEdge& existing) {
+        return existing.from_node_id == edge.from_node_id &&
+               existing.to_node_id == edge.to_node_id &&
+               existing.label == edge.label;
+    });
+    if (!exists) {
+        graph.edges.push_back(std::move(edge));
+    }
+}
+
 [[nodiscard]] std::string node_label(const CallGraphNode& node) {
     const std::string base_label = node.label.empty() ? node.id : node.label;
     std::string label = base_label;
@@ -166,6 +265,180 @@ std::string to_dot(const CallGraph& graph) {
 
     out << "}\n";
     return out.str();
+}
+
+CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
+    CallGraph graph{
+        .id = "loaded_entry_call_graph",
+        .label = image_label(image),
+        .architecture = image.architecture(),
+        .endianness = image.endianness(),
+    };
+
+    const std::uint64_t entry_va = image.entry_point();
+    const std::optional<GraphSymbolRef> entry_ref = find_symbol_for_address(image, entry_va);
+    std::string entry_id = "entry";
+    GraphByteRange entry_range{
+        .start = GraphAddress{
+            .virtual_address = entry_va,
+            .file_offset = image.virtual_address_to_file_offset(entry_va),
+        },
+        .size = 1,
+    };
+
+    if (entry_ref && entry_ref->symbol_index <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        const std::size_t index = static_cast<std::size_t>(entry_ref->symbol_index);
+        if (index < image.symbols().size()) {
+            entry_range = symbol_range(image, image.symbols()[index]);
+            entry_id = "sym_" + std::to_string(index);
+        }
+    }
+
+    graph.nodes.push_back(CallGraphNode{
+        .id = entry_id,
+        .label = entry_ref && !entry_ref->name.empty() ? entry_ref->name : "Entry Point",
+        .kind = CallGraphNodeKind::Function,
+        .bytes = entry_range,
+        .symbol = entry_ref,
+    });
+
+    for (std::size_t i = 0; i < image.exports().size(); ++i) {
+        const peelf::ExportEntry& entry = image.exports()[i];
+        if (entry.virtual_address != entry_va) {
+            continue;
+        }
+        const std::string export_id = "export_" + std::to_string(i);
+        graph.nodes.push_back(CallGraphNode{
+            .id = export_id,
+            .label = entry.name.empty() ? "<export>" : entry.name,
+            .kind = CallGraphNodeKind::External,
+            .bytes = GraphByteRange{
+                .start = GraphAddress{
+                    .virtual_address = entry.virtual_address,
+                    .file_offset = image.virtual_address_to_file_offset(entry.virtual_address),
+                },
+                .size = 1,
+            },
+        });
+        add_edge_if_missing(graph, CallGraphEdge{
+            .from_node_id = export_id,
+            .to_node_id = entry_id,
+            .kind = CallGraphEdgeKind::DataReference,
+            .label = "export target",
+        });
+    }
+
+    constexpr std::size_t max_import_nodes = 16;
+    for (std::size_t i = 0; i < std::min(image.imports().size(), max_import_nodes); ++i) {
+        const peelf::ImportEntry& import = image.imports()[i];
+        const std::string import_id = "import_" + std::to_string(i);
+        graph.nodes.push_back(CallGraphNode{
+            .id = import_id,
+            .label = import_label(import),
+            .kind = CallGraphNodeKind::Import,
+            .bytes = GraphByteRange{
+                .start = GraphAddress{
+                    .virtual_address = import.address == 0 ? std::optional<std::uint64_t>{} : std::optional(import.address),
+                    .file_offset = import.address == 0 ? std::optional<std::uint64_t>{}
+                                                       : image.virtual_address_to_file_offset(import.address),
+                },
+                .size = image.is_64bit() ? 8u : 4u,
+            },
+        });
+        add_edge_if_missing(graph, CallGraphEdge{
+            .from_node_id = entry_id,
+            .to_node_id = import_id,
+            .kind = CallGraphEdgeKind::Call,
+            .label = "import ref",
+        });
+    }
+
+    const std::optional<std::size_t> start_symbol = find_symbol_index_by_name(image, "_start");
+    const std::optional<std::size_t> main_symbol = find_symbol_index_by_name(image, "main");
+    const std::optional<std::size_t> libc_start_import = find_import_index_containing(image, "__libc_start_main");
+    const std::optional<std::size_t> libc_start_symbol = find_symbol_index_containing(image, "__libc_start_main");
+    if (start_symbol && main_symbol) {
+        const std::string start_id = "sym_" + std::to_string(*start_symbol);
+        const std::string main_id = "sym_" + std::to_string(*main_symbol);
+        if (start_id != entry_id) {
+            graph.nodes.push_back(symbol_node(image, image.symbols()[*start_symbol], *start_symbol, start_id));
+        }
+        graph.nodes.push_back(symbol_node(image, image.symbols()[*main_symbol], *main_symbol, main_id));
+
+        if (libc_start_import) {
+            const std::string libc_id = "import_" + std::to_string(*libc_start_import);
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = start_id,
+                .to_node_id = libc_id,
+                .kind = CallGraphEdgeKind::Call,
+                .label = "startup call",
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = libc_id,
+                .to_node_id = main_id,
+                .kind = CallGraphEdgeKind::Call,
+                .label = "main callback",
+            });
+        } else if (libc_start_symbol) {
+            const std::string libc_id = "sym_" + std::to_string(*libc_start_symbol);
+            graph.nodes.push_back(CallGraphNode{
+                .id = libc_id,
+                .label = image.symbols()[*libc_start_symbol].name,
+                .kind = CallGraphNodeKind::External,
+                .symbol = GraphSymbolRef{
+                    .name = image.symbols()[*libc_start_symbol].name,
+                    .symbol_index = static_cast<std::uint64_t>(*libc_start_symbol),
+                    .dynamic = image.symbols()[*libc_start_symbol].dynamic,
+                },
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = start_id,
+                .to_node_id = libc_id,
+                .kind = CallGraphEdgeKind::Call,
+                .label = "startup call",
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = libc_id,
+                .to_node_id = main_id,
+                .kind = CallGraphEdgeKind::Call,
+                .label = "main callback",
+            });
+        } else {
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = start_id,
+                .to_node_id = main_id,
+                .kind = CallGraphEdgeKind::Call,
+                .label = "startup target",
+            });
+        }
+    }
+
+    if (image.format() == peelf::Format::PE && find_symbol_index_by_name(image, "WinMain") == std::nullopt) {
+        graph.nodes.push_back(CallGraphNode{
+            .id = "crt_startup_unresolved",
+            .label = "CRT startup\\nmainCRTStartup / WinMainCRTStartup\\nunresolved",
+            .kind = CallGraphNodeKind::Unknown,
+        });
+        graph.nodes.push_back(CallGraphNode{
+            .id = "winmain_unresolved",
+            .label = "WinMain\\nunresolved from current symbols",
+            .kind = CallGraphNodeKind::External,
+        });
+        add_edge_if_missing(graph, CallGraphEdge{
+            .from_node_id = entry_id,
+            .to_node_id = "crt_startup_unresolved",
+            .kind = CallGraphEdgeKind::Unknown,
+            .label = "startup recovery pending",
+        });
+        add_edge_if_missing(graph, CallGraphEdge{
+            .from_node_id = "crt_startup_unresolved",
+            .to_node_id = "winmain_unresolved",
+            .kind = CallGraphEdgeKind::Unknown,
+            .label = "symbol lookup pending",
+        });
+    }
+
+    return graph;
 }
 
 std::string_view graphviz_format_name(GraphRenderFormat format) noexcept {

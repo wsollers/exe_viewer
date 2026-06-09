@@ -148,6 +148,8 @@ struct BmpImage {
 
 [[nodiscard]] const char* graph_dot_name(UiApp::CallGraphSample sample) {
     switch (sample) {
+        case UiApp::CallGraphSample::LoadedImage:
+            return "loaded_image_call_graph.dot";
         case UiApp::CallGraphSample::PeStartup:
             return "pe_x64_startup_to_winmain.dot";
         case UiApp::CallGraphSample::ElfStartup:
@@ -158,6 +160,8 @@ struct BmpImage {
 
 [[nodiscard]] const char* graph_bmp_name(UiApp::CallGraphSample sample) {
     switch (sample) {
+        case UiApp::CallGraphSample::LoadedImage:
+            return "loaded_image_call_graph.bmp";
         case UiApp::CallGraphSample::PeStartup:
             return "pe_x64_startup_to_winmain.bmp";
         case UiApp::CallGraphSample::ElfStartup:
@@ -496,6 +500,17 @@ void UiApp::render_dockspace() {
 }
 
 void UiApp::load_call_graph_sample(CallGraphSample sample) {
+    if (sample == CallGraphSample::LoadedImage) {
+        const peelf::IBinaryImage* image = model_.image();
+        if (image == nullptr) {
+            call_graph_status_ = "No image loaded. Open a PE/ELF file or choose a sample graph.";
+            return;
+        }
+        load_call_graph_from_graph(build_entry_call_graph(*image), graph_bmp_name(sample));
+        call_graph_sample_ = sample;
+        return;
+    }
+
     const std::optional<std::filesystem::path> graphs_dir = find_graphs_dir();
     if (!graphs_dir) {
         call_graph_status_ = "Could not find out/graphs. Generate the sample DOT files first.";
@@ -537,6 +552,34 @@ void UiApp::load_call_graph_sample(CallGraphSample sample) {
     call_graph_status_ = "Loaded " + bmp_path.filename().string();
 }
 
+void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name) {
+    const std::filesystem::path bmp_path = std::filesystem::temp_directory_path() / output_name;
+    const DefaultProcessRunner runner;
+    const GraphRenderResult render_result =
+        render_graph_with_graphviz(graph, bmp_path, GraphRenderFormat::Bmp, runner);
+    if (!render_result.success) {
+        call_graph_status_ = "Graphviz failed to render loaded-image graph: " + render_result.diagnostic;
+        return;
+    }
+
+    const std::optional<BmpImage> bmp = load_bmp_rgba(bmp_path);
+    if (!bmp) {
+        call_graph_status_ = "Failed to load rendered graph BMP: " + bmp_path.string();
+        return;
+    }
+
+    if (call_graph_texture_) {
+        vulkan_.destroy_texture(*call_graph_texture_);
+        call_graph_texture_.reset();
+    }
+
+    call_graph_texture_ = vulkan_.create_rgba_texture(std::span<const std::uint8_t>(bmp->rgba.data(), bmp->rgba.size()),
+                                                      bmp->width,
+                                                      bmp->height);
+    loaded_call_graph_bmp_ = bmp_path;
+    call_graph_status_ = "Loaded graph from current image";
+}
+
 void UiApp::render_call_graph_panel() {
     ImGui::SetNextWindowSize(ImVec2(900.0f, 420.0f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Call Graph", &show_call_graph_panel_)) {
@@ -544,11 +587,15 @@ void UiApp::render_call_graph_panel() {
         return;
     }
 
-    if (ImGui::Button("PE x64 startup -> WinMain")) {
+    if (ImGui::Button("Loaded Image")) {
+        load_call_graph_sample(CallGraphSample::LoadedImage);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("PE x64 sample")) {
         load_call_graph_sample(CallGraphSample::PeStartup);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Linux ELF _start -> main")) {
+    if (ImGui::Button("Linux ELF sample")) {
         load_call_graph_sample(CallGraphSample::ElfStartup);
     }
     ImGui::SameLine();
@@ -724,6 +771,17 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             disassemble_entry_point(4096);
         } else if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
+        }
+
+        if (show_call_graph_panel_) {
+            load_call_graph_sample(CallGraphSample::LoadedImage);
+        } else {
+            call_graph_sample_ = CallGraphSample::LoadedImage;
+            call_graph_status_ = "Loaded-image graph will render when Call Graph is opened.";
+            if (call_graph_texture_) {
+                vulkan_.destroy_texture(*call_graph_texture_);
+                call_graph_texture_.reset();
+            }
         }
     }
 

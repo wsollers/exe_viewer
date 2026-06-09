@@ -144,6 +144,35 @@ TEST(CallGraph, RenderWritesDotAndInvokesInjectedRunner) {
     std::filesystem::remove(dot_path);
 }
 
+TEST(CallGraph, BuildsLoadedElfStartupGraphFromParsedImage) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("hello.elf");
+    ASSERT_NE(image, nullptr);
+
+    const viewer::CallGraph graph = viewer::build_entry_call_graph(*image);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_EQ(graph.architecture, peelf::Architecture::X86_64);
+    EXPECT_NE(dot.find("_start"), std::string::npos);
+    EXPECT_NE(dot.find("main"), std::string::npos);
+    EXPECT_NE(dot.find("__libc_start_main"), std::string::npos);
+    EXPECT_NE(dot.find("main callback"), std::string::npos);
+}
+
+TEST(CallGraph, BuildsLoadedPeEntryGraphFromParsedImage) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    const viewer::CallGraph graph = viewer::build_entry_call_graph(*image);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_EQ(graph.architecture, peelf::Architecture::X86_64);
+    EXPECT_NE(dot.find("Entry Point"), std::string::npos);
+    EXPECT_NE(dot.find("known_export"), std::string::npos);
+    EXPECT_NE(dot.find("KERNEL32.dll!ExitProcess"), std::string::npos);
+    EXPECT_NE(dot.find("WinMain"), std::string::npos);
+    EXPECT_NE(dot.find("symbol lookup pending"), std::string::npos);
+}
+
 TEST(CallGraph, DefaultRunnerRendersSvgWhenGraphvizIsAvailable) {
 #if defined(PEELF_GRAPHVIZ_DOT_AVAILABLE) && PEELF_GRAPHVIZ_DOT_AVAILABLE
     const std::filesystem::path output_path =

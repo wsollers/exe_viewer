@@ -11,6 +11,7 @@
 #include "model/binary_model.hpp"
 #include "ui_panels.hpp"
 #include "disasm/disassembler.hpp"
+#include "graph/call_graph.hpp"
 #include "vulkan/vulkan_manager.h"
 
 namespace viewer {
@@ -29,6 +30,7 @@ namespace viewer {
         bool show_demo_window_ = false;
 
         enum class CallGraphSample : std::uint8_t {
+            LoadedImage,
             PeStartup,
             ElfStartup
         };
@@ -78,7 +80,7 @@ namespace viewer {
         bool reset_dock_layout_ = false;
         bool show_disassembly_panel_ = true;
         bool show_call_graph_panel_ = false;
-        CallGraphSample call_graph_sample_ = CallGraphSample::PeStartup;
+        CallGraphSample call_graph_sample_ = CallGraphSample::LoadedImage;
         std::optional<VulkanManager::Texture> call_graph_texture_;
         std::string call_graph_status_;
         std::filesystem::path loaded_call_graph_bmp_;
@@ -90,6 +92,7 @@ namespace viewer {
         void render_dockspace();
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);
+        void load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name);
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
         void apply_structure_selection_navigation();
 
