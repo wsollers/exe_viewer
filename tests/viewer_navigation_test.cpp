@@ -119,4 +119,29 @@ TEST(ViewerNavigation, BuildsPeStructureTreeWithRelocationAndDebugSelections) {
     EXPECT_EQ(debug->children.front().selection.kind, viewer::SelectionKind::DebugDirectory);
     EXPECT_TRUE(debug->children.front().selection.file_offset.has_value());
     EXPECT_GT(debug->children.front().selection.size, 0u);
+
+    const viewer::StructureNode* runtime_functions = find_child(tree, "Runtime Functions");
+    ASSERT_NE(runtime_functions, nullptr);
+    ASSERT_FALSE(runtime_functions->children.empty());
+    EXPECT_EQ(runtime_functions->children.front().selection.kind, viewer::SelectionKind::RuntimeFunction);
+    EXPECT_TRUE(runtime_functions->children.front().selection.file_offset.has_value());
+    EXPECT_GT(runtime_functions->children.front().selection.size, 0u);
+
+    const viewer::StructureNode* tls = find_child(tree, "TLS Directory");
+    ASSERT_NE(tls, nullptr);
+    EXPECT_EQ(tls->selection.kind, viewer::SelectionKind::TlsDirectory);
+    EXPECT_TRUE(tls->selection.virtual_address.has_value());
+
+    const viewer::StructureNode* certificates = find_child(tree, "Certificates");
+    ASSERT_NE(certificates, nullptr);
+    ASSERT_FALSE(certificates->children.empty());
+    EXPECT_EQ(certificates->children.front().selection.kind, viewer::SelectionKind::Certificate);
+    EXPECT_TRUE(certificates->children.front().selection.file_offset.has_value());
+    EXPECT_GT(certificates->children.front().selection.size, 0u);
+
+    const viewer::StructureNode* load_config = find_child(tree, "Load Config");
+    ASSERT_NE(load_config, nullptr);
+    EXPECT_EQ(load_config->selection.kind, viewer::SelectionKind::LoadConfig);
+    EXPECT_TRUE(load_config->selection.file_offset.has_value());
+    EXPECT_GT(load_config->selection.size, 0u);
 }

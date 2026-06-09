@@ -640,6 +640,45 @@ TEST(BinaryImage, ParsesPeLoadConfigDirectoriesAcrossFixtureMatrix) {
     }
 }
 
+TEST(BinaryImage, ParsesPeRuntimeFunctionsAcrossFixtureMatrix) {
+    struct ExpectedRuntimeFunction {
+        const char* name;
+        std::uint32_t begin_address_rva;
+        std::uint32_t end_address_rva;
+        std::uint32_t unwind_info_rva;
+        std::uint64_t file_offset;
+        std::uint64_t begin_va;
+        std::uint64_t unwind_info_va;
+    };
+    constexpr std::array<ExpectedRuntimeFunction, 2> fixtures{{
+        {"known-win-x86.exe", 0x1000, 0x1010, 0x1090, 0x280, 0x401000, 0x401090},
+        {"known-win-x64.exe", 0x1000, 0x1010, 0x1090, 0x280, 0x140001000, 0x140001090},
+    }};
+
+    for (const ExpectedRuntimeFunction& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const auto& runtime_functions = (**result).pe_runtime_functions();
+        ASSERT_EQ(runtime_functions.size(), 1u) << expected.name;
+        const peelf::PeRuntimeFunction& function = runtime_functions.front();
+        EXPECT_EQ(function.begin_address_rva, expected.begin_address_rva) << expected.name;
+        EXPECT_EQ(function.end_address_rva, expected.end_address_rva) << expected.name;
+        EXPECT_EQ(function.unwind_info_rva, expected.unwind_info_rva) << expected.name;
+        EXPECT_EQ(function.file_offset, expected.file_offset) << expected.name;
+        EXPECT_EQ((**result).file_offset_to_virtual_address(function.file_offset),
+                  std::optional<std::uint64_t>(expected.begin_va + 0x80u)) << expected.name;
+        EXPECT_EQ((**result).virtual_address_to_file_offset(expected.begin_va),
+                  std::optional<std::uint64_t>(0x200)) << expected.name;
+        EXPECT_EQ((**result).virtual_address_to_file_offset(expected.unwind_info_va),
+                  std::optional<std::uint64_t>(0x290)) << expected.name;
+    }
+}
+
 TEST(BinaryImage, ParsesElfFileHeaderFieldsAcrossFixtureMatrix) {
     constexpr std::array<ExpectedElfHeader, 14> fixtures{{
         {"known-linux-x64.elf", 2, peelf::Endianness::Little, 62, 0x480, 0x180, 0x40, 0x38, 0x40, 11},

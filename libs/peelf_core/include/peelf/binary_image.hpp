@@ -167,6 +167,13 @@ struct PeLoadConfigDirectory {
     std::uint32_t guard_flags = 0;
 };
 
+struct PeRuntimeFunction {
+    std::uint32_t begin_address_rva = 0;
+    std::uint32_t end_address_rva = 0;
+    std::uint32_t unwind_info_rva = 0;
+    std::uint64_t file_offset = 0;
+};
+
 struct ElfHeader {
     std::uint8_t  elf_class = 0;
     std::uint8_t  data_encoding = 0;
@@ -292,6 +299,7 @@ public:
     [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeCertificate>& pe_certificates() const noexcept = 0;
     [[nodiscard]] virtual const PeLoadConfigDirectory* pe_load_config_directory() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;

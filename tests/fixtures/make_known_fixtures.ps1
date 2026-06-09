@@ -331,6 +331,8 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
     Put-U32LE $Bytes ($Opt + 0x78) 0x1180
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
+    Put-U32LE $Bytes ($Opt + 0x88) 0x1080
+    Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
     Put-U32LE $Bytes ($Opt + 0x90) 0x700
     Put-U32LE $Bytes ($Opt + 0x94) 0x20
     Put-U32LE $Bytes ($Opt + 0x98) 0x2000
@@ -377,6 +379,9 @@ function New-Pe64Fixture {
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
+    Put-U32LE $Bytes 0x280 0x1000 # RUNTIME_FUNCTION.BeginAddress
+    Put-U32LE $Bytes 0x284 0x1010 # RUNTIME_FUNCTION.EndAddress
+    Put-U32LE $Bytes 0x288 0x1090 # RUNTIME_FUNCTION.UnwindInfoAddress
 
     Put-U32LE $Bytes 0x400 0x1000  # Page RVA
     Put-U32LE $Bytes 0x404 0x0C    # Block size
@@ -839,6 +844,8 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U32LE $Bytes ($Opt + 28) 0x00400000
     Put-U32LE $Bytes ($Opt + 0x5C) 16
+    Put-U32LE $Bytes ($Opt + 0x78) 0x1080
+    Put-U32LE $Bytes ($Opt + 0x7C) 0x0C
     Put-U32LE $Bytes ($Opt + 0x80) 0x700
     Put-U32LE $Bytes ($Opt + 0x84) 0x20
     Put-U32LE $Bytes ($Opt + 0x88) 0x2000
@@ -885,6 +892,9 @@ function New-Pe32Fixture {
     for ($Index = [UInt32]0; $Index -lt 0x20; ++$Index) {
         $Bytes[0x200 + $Index] = [byte](0xcc)
     }
+    Put-U32LE $Bytes 0x280 0x1000 # RUNTIME_FUNCTION.BeginAddress
+    Put-U32LE $Bytes 0x284 0x1010 # RUNTIME_FUNCTION.EndAddress
+    Put-U32LE $Bytes 0x288 0x1090 # RUNTIME_FUNCTION.UnwindInfoAddress
 
     Put-U32LE $Bytes 0x300 0x1000  # Page RVA
     Put-U32LE $Bytes 0x304 0x0C    # Block size

@@ -171,6 +171,61 @@ void add_pe_metadata(const peelf::IBinaryImage& image, StructureNode& root) {
         ++debug_index;
     }
     root.children.push_back(std::move(debug));
+
+    StructureNode runtime_functions = group_node("Runtime Functions");
+    std::uint64_t runtime_index = 0;
+    for (const peelf::PeRuntimeFunction& entry : image.pe_runtime_functions()) {
+        StructureNode node = selectable_node(SelectionKind::RuntimeFunction,
+                                             "Function " + std::to_string(runtime_index),
+                                             runtime_index,
+                                             PreferredView::Details);
+        node.selection.file_offset = entry.file_offset;
+        node.selection.virtual_address = image.file_offset_to_virtual_address(entry.file_offset);
+        node.selection.size = 12;
+        runtime_functions.children.push_back(std::move(node));
+        ++runtime_index;
+    }
+    root.children.push_back(std::move(runtime_functions));
+
+    if (const peelf::PeTlsDirectory* tls = image.pe_tls_directory()) {
+        StructureNode tls_node = selectable_node(SelectionKind::TlsDirectory,
+                                                 "TLS Directory",
+                                                 0,
+                                                 PreferredView::Details);
+        if (tls->raw_data_start_va != 0) {
+            tls_node.selection.virtual_address = tls->raw_data_start_va;
+            tls_node.selection.file_offset = image.virtual_address_to_file_offset(tls->raw_data_start_va);
+        }
+        tls_node.selection.size = tls->raw_data_end_va > tls->raw_data_start_va
+            ? tls->raw_data_end_va - tls->raw_data_start_va
+            : 0;
+        root.children.push_back(std::move(tls_node));
+    }
+
+    StructureNode certificates = group_node("Certificates");
+    std::uint64_t certificate_index = 0;
+    for (const peelf::PeCertificate& certificate : image.pe_certificates()) {
+        StructureNode node = selectable_node(SelectionKind::Certificate,
+                                             "Certificate " + std::to_string(certificate_index),
+                                             certificate_index,
+                                             PreferredView::Hex);
+        node.selection.file_offset = certificate.file_offset;
+        node.selection.size = certificate.length;
+        certificates.children.push_back(std::move(node));
+        ++certificate_index;
+    }
+    root.children.push_back(std::move(certificates));
+
+    if (const peelf::PeLoadConfigDirectory* load_config = image.pe_load_config_directory()) {
+        StructureNode node = selectable_node(SelectionKind::LoadConfig,
+                                             "Load Config",
+                                             0,
+                                             PreferredView::Details);
+        node.selection.file_offset = load_config->file_offset;
+        node.selection.virtual_address = image.file_offset_to_virtual_address(load_config->file_offset);
+        node.selection.size = load_config->size;
+        root.children.push_back(std::move(node));
+    }
 }
 
 void add_elf_metadata(const peelf::IBinaryImage& image, StructureNode& root) {

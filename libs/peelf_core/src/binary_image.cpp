@@ -89,6 +89,10 @@ public:
     [[nodiscard]] const PeLoadConfigDirectory* pe_load_config_directory() const noexcept override {
         return nullptr;
     }
+    [[nodiscard]] const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept override {
+        static const std::vector<PeRuntimeFunction> empty;
+        return empty;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -233,6 +237,9 @@ public:
     [[nodiscard]] const PeLoadConfigDirectory* pe_load_config_directory() const noexcept override {
         return load_config_directory_ ? &*load_config_directory_ : nullptr;
     }
+    [[nodiscard]] const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept override {
+        return runtime_functions_;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
@@ -241,6 +248,7 @@ private:
     std::optional<PeTlsDirectory> tls_directory_;
     std::vector<PeCertificate> certificates_;
     std::optional<PeLoadConfigDirectory> load_config_directory_;
+    std::vector<PeRuntimeFunction> runtime_functions_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -411,6 +419,40 @@ void parse_pe_debug_directories(std::span<const std::uint8_t> b,
             }
         }
         debug_out.push_back(std::move(entry));
+    }
+}
+
+void parse_pe_runtime_functions(std::span<const std::uint8_t> b,
+                                const std::vector<Section>& sections,
+                                std::uint64_t image_base,
+                                std::uint32_t directory_rva,
+                                std::uint32_t directory_size,
+                                std::vector<PeRuntimeFunction>& runtime_functions_out) {
+    if (directory_rva == 0 || directory_size < 12) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, directory_size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    constexpr std::uint64_t kRuntimeFunctionSize = 12;
+    const std::uint64_t count = directory_size / kRuntimeFunctionSize;
+    runtime_functions_out.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t i = 0; i < count; ++i) {
+        const std::uint64_t entry_off = *directory_off + i * kRuntimeFunctionSize;
+        if (!fits_range(entry_off, kRuntimeFunctionSize, static_cast<std::uint64_t>(b.size()))) {
+            break;
+        }
+
+        const std::size_t off = static_cast<std::size_t>(entry_off);
+        PeRuntimeFunction entry;
+        entry.begin_address_rva = rd32(b, off + 0x00, false);
+        entry.end_address_rva = rd32(b, off + 0x04, false);
+        entry.unwind_info_rva = rd32(b, off + 0x08, false);
+        entry.file_offset = entry_off;
+        runtime_functions_out.push_back(entry);
     }
 }
 
@@ -1218,6 +1260,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
                                               ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
                                               : 0;
+    const std::uint32_t exception_dir_rva = (size_of_opt >= (is64 ? 0x90 : 0x80))
+                                                ? rd32(b, opt + (is64 ? 0x88 : 0x78), false)
+                                                : 0;
+    const std::uint32_t exception_dir_size = (size_of_opt >= (is64 ? 0x90 : 0x80))
+                                                 ? rd32(b, opt + (is64 ? 0x8C : 0x7C), false)
+                                                 : 0;
     const std::uint32_t certificate_table_file_offset = (size_of_opt >= (is64 ? 0x98 : 0x88))
                                                             ? rd32(b, opt + (is64 ? 0x90 : 0x80), false)
                                                             : 0;
@@ -1302,6 +1350,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                           img->certificates_);
     parse_pe_load_config_directory(b, img->sections_, image_base, is64, load_config_dir_rva,
                                    load_config_dir_size, img->load_config_directory_);
+    parse_pe_runtime_functions(b, img->sections_, image_base, exception_dir_rva,
+                               exception_dir_size, img->runtime_functions_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);

@@ -20,6 +20,10 @@ namespace {
         case SelectionKind::Symbol:         return "Symbol";
         case SelectionKind::Relocation:     return "Relocation";
         case SelectionKind::DebugDirectory: return "Debug Directory";
+        case SelectionKind::RuntimeFunction:return "Runtime Function";
+        case SelectionKind::TlsDirectory:   return "TLS Directory";
+        case SelectionKind::Certificate:    return "Certificate";
+        case SelectionKind::LoadConfig:     return "Load Config";
         case SelectionKind::DynamicEntry:   return "Dynamic Entry";
         case SelectionKind::Note:           return "Note";
         case SelectionKind::HashTable:      return "Hash Table";
