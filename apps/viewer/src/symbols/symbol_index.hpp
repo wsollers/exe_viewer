@@ -15,7 +15,16 @@ enum class SymbolSource : std::uint8_t {
     EntryPoint,
     ImageSymbol,
     Import,
-    Export
+    Export,
+    DebugSymbol
+};
+
+struct DebugSymbol {
+    std::string name;
+    std::uint64_t relative_virtual_address = 0;
+    std::uint64_t virtual_address = 0;
+    std::uint64_t size = 0;
+    bool function = false;
 };
 
 struct SymbolRecord {
@@ -32,6 +41,7 @@ struct SymbolRecord {
 class SymbolIndex {
 public:
     [[nodiscard]] static SymbolIndex build(const peelf::IBinaryImage& image);
+    void add_debug_symbols(const peelf::IBinaryImage& image, std::span<const DebugSymbol> symbols);
 
     [[nodiscard]] std::span<const SymbolRecord> records() const noexcept { return records_; }
     [[nodiscard]] bool empty() const noexcept { return records_.empty(); }

@@ -75,6 +75,9 @@ namespace viewer {
         ui_->set_open_file_callback([this]() {
             open_file_dialog();
         });
+        ui_->set_open_debug_symbols_callback([this]() {
+            open_debug_symbols_dialog();
+        });
         Logger::instance().init(&ui_->log_panel());
 
         init_imgui();
@@ -290,6 +293,33 @@ namespace viewer {
             Log().error(std::string("File dialog error: ") + NFD_GetError());
         }
         // NFD_CANCEL: user cancelled; nothing to do.
+    }
+
+    void Application::open_debug_symbols_dialog() {
+        if (!nfd_initialized_) {
+            Log().error("Cannot open debug symbol dialog: NFD not initialized");
+            return;
+        }
+
+        if (model_.image() == nullptr) {
+            Log().warn("Open an executable before loading debug symbols");
+            return;
+        }
+
+        nfdchar_t *out_path = nullptr;
+        nfdfilteritem_t filters[2] = {
+            {"Program Database", "pdb"},
+            {"All Files", "*"}
+        };
+
+        nfdresult_t result = NFD_OpenDialog(&out_path, filters, 2, nullptr);
+        if (result == NFD_OKAY) {
+            std::string path(out_path);
+            NFD_FreePath(out_path);
+            ui_->load_debug_symbols(path);
+        } else if (result == NFD_ERROR) {
+            Log().error(std::string("Debug symbol dialog error: ") + NFD_GetError());
+        }
     }
 
 

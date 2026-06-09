@@ -37,6 +37,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
 )
 
 target_compile_features(peelf_tests PRIVATE cxx_std_23)
@@ -51,6 +52,26 @@ target_link_libraries(peelf_tests PRIVATE
 target_include_directories(peelf_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/apps/viewer/src
 )
+
+if(MSVC)
+  find_path(PEELF_DIA_INCLUDE_DIR dia2.h
+    PATHS
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/include"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/include"
+  )
+  find_library(PEELF_DIA_GUIDS_LIBRARY diaguids
+    PATHS
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib/amd64"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib/amd64"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib"
+  )
+  if(PEELF_DIA_INCLUDE_DIR AND PEELF_DIA_GUIDS_LIBRARY)
+    target_include_directories(peelf_tests PRIVATE ${PEELF_DIA_INCLUDE_DIR})
+    target_link_libraries(peelf_tests PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)
+    target_compile_definitions(peelf_tests PRIVATE PEELF_HAS_DIA=1)
+  endif()
+endif()
 
 # Absolute path to the test fixtures directory, available to the test code.
 target_compile_definitions(peelf_tests PRIVATE

@@ -32,9 +32,7 @@ namespace viewer {
         void shutdown();
 
         void open_file_dialog();
-
-
-
+        void open_debug_symbols_dialog();
 
     private:
         void init_glfw(const AppConfig& config);

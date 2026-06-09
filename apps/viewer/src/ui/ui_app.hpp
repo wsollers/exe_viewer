@@ -25,6 +25,7 @@ namespace viewer {
         void render(); // call each frame from Application::render_ui()
 
         void set_open_file_callback(std::function<void()> cb) { on_open_file_ = std::move(cb); }
+        void set_open_debug_symbols_callback(std::function<void()> cb) { on_open_debug_symbols_ = std::move(cb); }
 
         LogPanel& log_panel() { return log_panel_; }
 
@@ -43,6 +44,7 @@ namespace viewer {
         void render_disassembly_panel();
 
         void on_file_loaded();
+        void load_debug_symbols(const std::filesystem::path& path);
 
         ImVec4 get_mnemonic_color(const std::string &mnemonic) const;
 
@@ -76,6 +78,7 @@ namespace viewer {
         PeExportsPanel  pe_exports_panel_;
 
         std::function<void()> on_open_file_;
+        std::function<void()> on_open_debug_symbols_;
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;

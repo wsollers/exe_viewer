@@ -1,13 +1,12 @@
 #include "graph/call_graph.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <sstream>
 #include <utility>
-
-#include "symbols/symbol_index.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -128,6 +127,48 @@ namespace {
         return nullptr;
     }
     return &*it;
+}
+
+[[nodiscard]] const SymbolRecord* find_first_symbol_record_containing_name(const SymbolIndex& index,
+                                                                           std::span<const std::string_view> names) {
+    for (const std::string_view name : names) {
+        if (const SymbolRecord* record = find_symbol_record_containing_name(index, name)) {
+            return record;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] std::optional<GraphSymbolRef> graph_ref_from_record(const SymbolRecord* record) {
+    if (record == nullptr) {
+        return std::nullopt;
+    }
+    return GraphSymbolRef{
+        .name = record->name,
+        .symbol_index = record->source_index,
+        .dynamic = record->dynamic,
+    };
+}
+
+[[nodiscard]] CallGraphNode node_from_record(const SymbolRecord& record, std::string id) {
+    const bool external = record.external || record.source == SymbolSource::Import;
+    return CallGraphNode{
+        .id = std::move(id),
+        .label = record.name,
+        .kind = external ? CallGraphNodeKind::External : CallGraphNodeKind::Function,
+        .bytes = GraphByteRange{
+            .start = GraphAddress{
+                .virtual_address = record.virtual_address,
+                .file_offset = record.file_offset,
+            },
+            .size = record.size,
+        },
+        .symbol = GraphSymbolRef{
+            .name = record.name,
+            .symbol_index = record.source_index,
+            .dynamic = record.dynamic,
+        },
+    };
 }
 
 [[nodiscard]] GraphByteRange symbol_range(const peelf::IBinaryImage& image, const peelf::Symbol& symbol) {
@@ -266,6 +307,10 @@ std::string to_dot(const CallGraph& graph) {
 
 CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
     const SymbolIndex symbol_index = SymbolIndex::build(image);
+    return build_entry_call_graph(image, symbol_index);
+}
+
+CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolIndex& symbol_index) {
     CallGraph graph{
         .id = "loaded_entry_call_graph",
         .label = image_label(image),
@@ -274,7 +319,9 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
     };
 
     const std::uint64_t entry_va = image.entry_point();
-    const std::optional<GraphSymbolRef> entry_ref = find_symbol_for_address(image, entry_va);
+    const SymbolRecord* entry_record = symbol_index.find_by_name("Entry Point");
+    const std::optional<GraphSymbolRef> entry_ref = entry_record ? graph_ref_from_record(entry_record)
+                                                                 : find_symbol_for_address(image, entry_va);
     std::string entry_id = "entry";
     GraphByteRange entry_range{
         .start = GraphAddress{
@@ -284,7 +331,16 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
         .size = 1,
     };
 
-    if (entry_ref && entry_ref->symbol_index <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+    if (entry_record != nullptr) {
+        entry_range = GraphByteRange{
+            .start = GraphAddress{
+                .virtual_address = entry_record->virtual_address,
+                .file_offset = entry_record->file_offset,
+            },
+            .size = entry_record->size,
+        };
+        entry_id = "entry_symbol";
+    } else if (entry_ref && entry_ref->symbol_index <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
         const std::size_t index = static_cast<std::size_t>(entry_ref->symbol_index);
         if (index < image.symbols().size()) {
             entry_range = symbol_range(image, image.symbols()[index]);
@@ -393,29 +449,66 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
         }
     }
 
-    if (image.format() == peelf::Format::PE && find_symbol_index_by_name(image, "WinMain") == std::nullopt) {
+    if (image.format() == peelf::Format::PE) {
+        constexpr std::array<std::string_view, 4> crt_names{
+            "WinMainCRTStartup",
+            "mainCRTStartup",
+            "wWinMainCRTStartup",
+            "wmainCRTStartup",
+        };
+        constexpr std::array<std::string_view, 4> user_entry_names{
+            "WinMain",
+            "wWinMain",
+            "main",
+            "wmain",
+        };
+        const SymbolRecord* crt_record = find_first_symbol_record_containing_name(symbol_index, crt_names);
+        const SymbolRecord* user_entry_record = find_first_symbol_record_containing_name(symbol_index, user_entry_names);
+
         graph.nodes.push_back(CallGraphNode{
-            .id = "crt_startup_unresolved",
-            .label = "CRT startup\nmainCRTStartup / WinMainCRTStartup\nunresolved",
-            .kind = CallGraphNodeKind::Unknown,
-        });
-        graph.nodes.push_back(CallGraphNode{
-            .id = "winmain_unresolved",
-            .label = "WinMain\nunresolved from current symbols",
-            .kind = CallGraphNodeKind::External,
+            .id = "crt_startup",
+            .label = crt_record != nullptr ? crt_record->name
+                                           : "CRT startup\nmainCRTStartup / WinMainCRTStartup\nunresolved",
+            .kind = crt_record != nullptr ? CallGraphNodeKind::Function : CallGraphNodeKind::Unknown,
+            .bytes = GraphByteRange{
+                .start = GraphAddress{
+                    .virtual_address = crt_record != nullptr ? crt_record->virtual_address
+                                                             : std::optional<std::uint64_t>{},
+                    .file_offset = crt_record != nullptr ? crt_record->file_offset
+                                                         : std::optional<std::uint64_t>{},
+                },
+                .size = crt_record != nullptr ? crt_record->size : 0,
+            },
+            .symbol = graph_ref_from_record(crt_record),
         });
         add_edge_if_missing(graph, CallGraphEdge{
             .from_node_id = entry_id,
-            .to_node_id = "crt_startup_unresolved",
+            .to_node_id = "crt_startup",
             .kind = CallGraphEdgeKind::Unknown,
-            .label = "startup recovery pending",
+            .label = crt_record != nullptr ? "startup symbol" : "startup recovery pending",
         });
-        add_edge_if_missing(graph, CallGraphEdge{
-            .from_node_id = "crt_startup_unresolved",
-            .to_node_id = "winmain_unresolved",
-            .kind = CallGraphEdgeKind::Unknown,
-            .label = "symbol lookup pending",
-        });
+
+        if (user_entry_record != nullptr) {
+            graph.nodes.push_back(node_from_record(*user_entry_record, "user_entry"));
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = "crt_startup",
+                .to_node_id = "user_entry",
+                .kind = CallGraphEdgeKind::Call,
+                .label = "user entry symbol",
+            });
+        } else {
+            graph.nodes.push_back(CallGraphNode{
+                .id = "winmain_unresolved",
+                .label = "WinMain\nunresolved from current symbols",
+                .kind = CallGraphNodeKind::External,
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = "crt_startup",
+                .to_node_id = "winmain_unresolved",
+                .kind = CallGraphEdgeKind::Unknown,
+                .label = "symbol lookup pending",
+            });
+        }
     }
 
     return graph;

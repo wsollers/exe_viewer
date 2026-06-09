@@ -10,6 +10,8 @@
 
 #include <peelf/binary_image.hpp>
 
+#include "symbols/symbol_index.hpp"
+
 namespace viewer {
 
 struct GraphAddress {
@@ -106,6 +108,7 @@ public:
 
 [[nodiscard]] std::string to_dot(const CallGraph& graph);
 [[nodiscard]] CallGraph build_entry_call_graph(const peelf::IBinaryImage& image);
+[[nodiscard]] CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolIndex& symbol_index);
 [[nodiscard]] std::string_view graphviz_format_name(GraphRenderFormat format) noexcept;
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,
                                                                     std::uint64_t virtual_address);

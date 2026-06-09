@@ -54,6 +54,8 @@ add_executable(peelf_viewer
         src/graph/call_graph.cpp
         src/symbols/symbol_index.hpp
         src/symbols/symbol_index.cpp
+        src/symbols/debug_symbols.hpp
+        src/symbols/debug_symbols.cpp
         src/disasm/disassembler.hpp
 )
 
@@ -73,3 +75,23 @@ target_link_libraries(peelf_viewer PRIVATE
         capstone
         peelf::graphviz
 )
+
+if(MSVC)
+  find_path(PEELF_DIA_INCLUDE_DIR dia2.h
+    PATHS
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/include"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/include"
+  )
+  find_library(PEELF_DIA_GUIDS_LIBRARY diaguids
+    PATHS
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib/amd64"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib/amd64"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib"
+      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib"
+  )
+  if(PEELF_DIA_INCLUDE_DIR AND PEELF_DIA_GUIDS_LIBRARY)
+    target_include_directories(peelf_viewer PRIVATE ${PEELF_DIA_INCLUDE_DIR})
+    target_link_libraries(peelf_viewer PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)
+    target_compile_definitions(peelf_viewer PRIVATE PEELF_HAS_DIA=1)
+  endif()
+endif()

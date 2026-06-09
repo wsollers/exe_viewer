@@ -18,6 +18,7 @@
 
 #include "graph/call_graph.hpp"
 #include "logger.hpp"
+#include "symbols/debug_symbols.hpp"
 
 namespace viewer {
 namespace {
@@ -362,6 +363,9 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) {
             if (on_open_file_) { on_open_file_(); }
         }
+        if (ImGui::MenuItem("Open Debug Symbols...")) {
+            if (on_open_debug_symbols_) { on_open_debug_symbols_(); }
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Alt+F4")) {
             // handled by Application
@@ -506,7 +510,7 @@ void UiApp::load_call_graph_sample(CallGraphSample sample) {
             call_graph_status_ = "No image loaded. Open a PE/ELF file or choose a sample graph.";
             return;
         }
-        load_call_graph_from_graph(build_entry_call_graph(*image), graph_bmp_name(sample));
+        load_call_graph_from_graph(build_entry_call_graph(*image, symbol_index_), graph_bmp_name(sample));
         call_graph_sample_ = sample;
         return;
     }
@@ -739,6 +743,17 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
         structure_tree_ = build_structure_tree(*img);
         symbol_index_ = SymbolIndex::build(*img);
+        if (const std::optional<std::filesystem::path> pdb = find_local_codeview_pdb(*img, model_.file_info().path)) {
+            load_debug_symbols(*pdb);
+        } else if (!img->pe_debug_directories().empty()) {
+            for (const peelf::PeDebugDirectory& debug : img->pe_debug_directories()) {
+                if (!debug.codeview_pdb_path.empty()) {
+                    Log().info("CodeView references PDB '{}'; use File > Open Debug Symbols... if it is elsewhere",
+                               debug.codeview_pdb_path);
+                    break;
+                }
+            }
+        }
         current_selection_ = structure_tree_->selection;
         last_navigation_selection_.reset();
         Log().info("Loaded {} symbol records", symbol_index_.size());
@@ -785,6 +800,32 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                 vulkan_.destroy_texture(*call_graph_texture_);
                 call_graph_texture_.reset();
             }
+        }
+    }
+
+    void UiApp::load_debug_symbols(const std::filesystem::path& path) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr) {
+            Log().warn("Cannot load debug symbols without a loaded image");
+            return;
+        }
+
+        DebugSymbolLoadResult result = load_pdb_debug_symbols(path, *img);
+        if (result.status != DebugSymbolLoadStatus::Loaded) {
+            Log().warn("Debug symbols not loaded ({}): {}",
+                       to_string(result.status),
+                       result.diagnostic);
+            return;
+        }
+
+        symbol_index_.add_debug_symbols(*img, std::span<const DebugSymbol>(result.symbols.data(), result.symbols.size()));
+        Log().info("Loaded {} debug symbols from {}; symbol index now has {} records",
+                   result.symbols.size(),
+                   path.string(),
+                   symbol_index_.size());
+
+        if (show_call_graph_panel_) {
+            load_call_graph_sample(CallGraphSample::LoadedImage);
         }
     }
 

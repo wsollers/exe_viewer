@@ -27,6 +27,8 @@ namespace {
     switch (source) {
         case SymbolSource::ImageSymbol:
             return 0;
+        case SymbolSource::DebugSymbol:
+            return 0;
         case SymbolSource::Export:
             return 1;
         case SymbolSource::EntryPoint:
@@ -124,6 +126,25 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
     }
 
     return index;
+}
+
+void SymbolIndex::add_debug_symbols(const peelf::IBinaryImage& image, std::span<const DebugSymbol> symbols) {
+    records_.reserve(records_.size() + symbols.size());
+    for (std::uint64_t i = 0; i < symbols.size(); ++i) {
+        const DebugSymbol& symbol = symbols[static_cast<std::size_t>(i)];
+        add_record(records_, SymbolRecord{
+            .name = symbol.name,
+            .source = SymbolSource::DebugSymbol,
+            .source_index = i,
+            .virtual_address = symbol.virtual_address == 0 ? std::optional<std::uint64_t>{}
+                                                           : std::optional(symbol.virtual_address),
+            .file_offset = symbol.virtual_address == 0 ? std::optional<std::uint64_t>{}
+                                                       : image.virtual_address_to_file_offset(symbol.virtual_address),
+            .size = symbol.size,
+            .dynamic = false,
+            .external = symbol.virtual_address == 0,
+        });
+    }
 }
 
 const SymbolRecord* SymbolIndex::find_by_name(std::string_view name) const noexcept {

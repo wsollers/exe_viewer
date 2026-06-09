@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
 #include <peelf/binary_image.hpp>
 
@@ -76,4 +77,41 @@ TEST(SymbolIndex, LoadsPeExportsImportsAndEntryPoint) {
     ASSERT_NE(imported, nullptr);
     EXPECT_EQ(imported->source, viewer::SymbolSource::Import);
     EXPECT_TRUE(imported->external);
+}
+
+TEST(SymbolIndex, MergesPdbDebugSymbolsAboveParserSymbols) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        viewer::DebugSymbol{
+            .name = "WinMain",
+            .relative_virtual_address = 0x1000,
+            .virtual_address = image->entry_point(),
+            .size = 0x30,
+            .function = true,
+        },
+    };
+
+    index.add_debug_symbols(*image, symbols);
+
+    const viewer::SymbolRecord* winmain = index.find_by_name("WinMain");
+    ASSERT_NE(winmain, nullptr);
+    EXPECT_EQ(winmain->source, viewer::SymbolSource::DebugSymbol);
+    ASSERT_TRUE(winmain->virtual_address.has_value());
+    EXPECT_EQ(*winmain->virtual_address, image->entry_point());
+    EXPECT_EQ(index.find_containing_address(image->entry_point()), winmain);
+}
+
+TEST(DebugSymbols, DiscoversMissingCodeViewPdbAndReportsMissingExplicitPath) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    const std::filesystem::path exe_path = std::filesystem::path(PEELF_TEST_FIXTURES_DIR) / "known-win-x64.exe";
+    EXPECT_FALSE(viewer::find_local_codeview_pdb(*image, exe_path).has_value());
+
+    const viewer::DebugSymbolLoadResult result =
+        viewer::load_pdb_debug_symbols(exe_path.parent_path() / "known-win-x64.pdb", *image);
+    EXPECT_EQ(result.status, viewer::DebugSymbolLoadStatus::FileNotFound);
 }
