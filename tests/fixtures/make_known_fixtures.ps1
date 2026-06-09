@@ -310,7 +310,7 @@ function New-Elf64Fixture {
 function New-Pe64Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x800)
+    $Bytes = [byte[]]::new(0xA00)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -319,7 +319,7 @@ function New-Pe64Fixture {
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x8664
     Put-U16LE $Bytes ($Coff + 2) 4
-    Put-U16LE $Bytes ($Coff + 16) 0x00e0
+    Put-U16LE $Bytes ($Coff + 16) 0x00e8
     Put-U16LE $Bytes ($Coff + 18) 0x0022
 
     $Opt = [UInt32]($Coff + 20)
@@ -331,9 +331,11 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0x74) 0x80
     Put-U32LE $Bytes ($Opt + 0x78) 0x1180
     Put-U32LE $Bytes ($Opt + 0x7C) 0x40
+    Put-U32LE $Bytes ($Opt + 0x80) 0x3070
+    Put-U32LE $Bytes ($Opt + 0x84) 0x18
     Put-U32LE $Bytes ($Opt + 0x88) 0x1080
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
-    Put-U32LE $Bytes ($Opt + 0x90) 0x700
+    Put-U32LE $Bytes ($Opt + 0x90) 0x900
     Put-U32LE $Bytes ($Opt + 0x94) 0x20
     Put-U32LE $Bytes ($Opt + 0x98) 0x2000
     Put-U32LE $Bytes ($Opt + 0x9C) 0x0C
@@ -347,8 +349,10 @@ function New-Pe64Fixture {
     Put-U32LE $Bytes ($Opt + 0xCC) 0x20
     Put-U32LE $Bytes ($Opt + 0xD8) 0x3050
     Put-U32LE $Bytes ($Opt + 0xDC) 0x40
+    Put-U32LE $Bytes ($Opt + 0xE0) 0x4100
+    Put-U32LE $Bytes ($Opt + 0xE4) 0x48
 
-    $Sect = [UInt32]($Opt + 0x00e0)
+    $Sect = [UInt32]($Opt + 0x00e8)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x200
     Put-U32LE $Bytes ($Sect + 12) 0x1000
@@ -374,9 +378,9 @@ function New-Pe64Fixture {
 
     $TlsSect = [UInt32]($DebugSect + 0x28)
     Put-Ascii $Bytes $TlsSect ".tls"
-    Put-U32LE $Bytes ($TlsSect + 8) 0x100
+    Put-U32LE $Bytes ($TlsSect + 8) 0x200
     Put-U32LE $Bytes ($TlsSect + 12) 0x4000
-    Put-U32LE $Bytes ($TlsSect + 16) 0x100
+    Put-U32LE $Bytes ($TlsSect + 16) 0x200
     Put-U32LE $Bytes ($TlsSect + 20) 0x600
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
@@ -419,6 +423,15 @@ function New-Pe64Fixture {
     Put-U16LE $Bytes 0x5E6 0          # bound NumberOfModuleForwarderRefs
     Put-Ascii $Bytes 0x5F0 "BOUND64.dll"
 
+    Put-U32LE $Bytes 0x570 0           # resource Characteristics
+    Put-U32LE $Bytes 0x574 0x4A2A5A64  # resource TimeDateStamp
+    Put-U16LE $Bytes 0x578 1           # resource MajorVersion
+    Put-U16LE $Bytes 0x57A 0           # resource MinorVersion
+    Put-U16LE $Bytes 0x57C 0           # resource NumberOfNamedEntries
+    Put-U16LE $Bytes 0x57E 1           # resource NumberOfIdEntries
+    Put-U32LE $Bytes 0x580 16          # resource ID: RT_VERSION
+    Put-U32LE $Bytes 0x584 2147483672 # resource entry points to child directory
+
     Put-U64LE $Bytes 0x600 0x140004010 # StartAddressOfRawData
     Put-U64LE $Bytes 0x608 0x140004020 # EndAddressOfRawData
     Put-U64LE $Bytes 0x610 0x140004030 # AddressOfIndex
@@ -454,11 +467,25 @@ function New-Pe64Fixture {
     Put-U64LE $Bytes 0x6D8 6           # GuardCFFunctionCount
     Put-U32LE $Bytes 0x6E0 0x00004500  # GuardFlags
 
-    Put-U32LE $Bytes 0x700 0x20   # WIN_CERTIFICATE.dwLength
-    Put-U16LE $Bytes 0x704 0x0200 # WIN_CERTIFICATE.wRevision
-    Put-U16LE $Bytes 0x706 0x0002 # WIN_CERTIFICATE.wCertificateType
+    Put-U32LE $Bytes 0x700 0x48       # IMAGE_COR20_HEADER.cb
+    Put-U16LE $Bytes 0x704 2          # MajorRuntimeVersion
+    Put-U16LE $Bytes 0x706 5          # MinorRuntimeVersion
+    Put-U32LE $Bytes 0x708 0x4150     # MetaData RVA
+    Put-U32LE $Bytes 0x70C 0x20       # MetaData Size
+    Put-U32LE $Bytes 0x710 0x00000003 # Flags: ILONLY | 32BITREQUIRED
+    Put-U32LE $Bytes 0x714 0x06000001 # EntryPointToken
+    Put-U32LE $Bytes 0x718 0x4180     # Resources RVA
+    Put-U32LE $Bytes 0x71C 0x10       # Resources Size
+    Put-U32LE $Bytes 0x720 0x4190     # StrongNameSignature RVA
+    Put-U32LE $Bytes 0x724 0x10       # StrongNameSignature Size
+    Put-U32LE $Bytes 0x730 0x41A0     # VTableFixups RVA
+    Put-U32LE $Bytes 0x734 0x08       # VTableFixups Size
+
+    Put-U32LE $Bytes 0x900 0x20   # WIN_CERTIFICATE.dwLength
+    Put-U16LE $Bytes 0x904 0x0200 # WIN_CERTIFICATE.wRevision
+    Put-U16LE $Bytes 0x906 0x0002 # WIN_CERTIFICATE.wCertificateType
     for ($Index = [UInt32]0; $Index -lt 0x18; ++$Index) {
-        $Bytes[0x708 + $Index] = [byte](0x40 + $Index)
+        $Bytes[0x908 + $Index] = [byte](0x40 + $Index)
     }
 
     Put-U32LE $Bytes 0x32C 0x1140  # Name RVA
@@ -848,7 +875,7 @@ function New-Elf64CompatibilityFixture {
 function New-Pe32Fixture {
     param([string]$Name)
 
-    $Bytes = [byte[]]::new(0x800)
+    $Bytes = [byte[]]::new(0xA00)
     $Bytes[0] = [byte][char]'M'
     $Bytes[1] = [byte][char]'Z'
     Put-U32LE $Bytes 0x3c 0x80
@@ -857,7 +884,7 @@ function New-Pe32Fixture {
     $Coff = [UInt32](0x80 + 4)
     Put-U16LE $Bytes ($Coff + 0) 0x014c
     Put-U16LE $Bytes ($Coff + 2) 4
-    Put-U16LE $Bytes ($Coff + 16) 0x00d0
+    Put-U16LE $Bytes ($Coff + 16) 0x00d8
     Put-U16LE $Bytes ($Coff + 18) 0x0102
 
     $Opt = [UInt32]($Coff + 20)
@@ -865,9 +892,11 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 16) 0x1000
     Put-U32LE $Bytes ($Opt + 28) 0x00400000
     Put-U32LE $Bytes ($Opt + 0x5C) 16
+    Put-U32LE $Bytes ($Opt + 0x70) 0x3070
+    Put-U32LE $Bytes ($Opt + 0x74) 0x18
     Put-U32LE $Bytes ($Opt + 0x78) 0x1080
     Put-U32LE $Bytes ($Opt + 0x7C) 0x0C
-    Put-U32LE $Bytes ($Opt + 0x80) 0x700
+    Put-U32LE $Bytes ($Opt + 0x80) 0x900
     Put-U32LE $Bytes ($Opt + 0x84) 0x20
     Put-U32LE $Bytes ($Opt + 0x88) 0x2000
     Put-U32LE $Bytes ($Opt + 0x8C) 0x0C
@@ -881,8 +910,10 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes ($Opt + 0xBC) 0x20
     Put-U32LE $Bytes ($Opt + 0xC8) 0x3050
     Put-U32LE $Bytes ($Opt + 0xCC) 0x40
+    Put-U32LE $Bytes ($Opt + 0xD0) 0x4100
+    Put-U32LE $Bytes ($Opt + 0xD4) 0x48
 
-    $Sect = [UInt32]($Opt + 0x00d0)
+    $Sect = [UInt32]($Opt + 0x00d8)
     Put-Ascii $Bytes $Sect ".text"
     Put-U32LE $Bytes ($Sect + 8) 0x100
     Put-U32LE $Bytes ($Sect + 12) 0x1000
@@ -908,9 +939,9 @@ function New-Pe32Fixture {
 
     $TlsSect = [UInt32]($DebugSect + 0x28)
     Put-Ascii $Bytes $TlsSect ".tls"
-    Put-U32LE $Bytes ($TlsSect + 8) 0x100
+    Put-U32LE $Bytes ($TlsSect + 8) 0x200
     Put-U32LE $Bytes ($TlsSect + 12) 0x4000
-    Put-U32LE $Bytes ($TlsSect + 16) 0x100
+    Put-U32LE $Bytes ($TlsSect + 16) 0x200
     Put-U32LE $Bytes ($TlsSect + 20) 0x500
     Put-U32LE $Bytes ($TlsSect + 36) 3254779968
 
@@ -953,6 +984,15 @@ function New-Pe32Fixture {
     Put-U16LE $Bytes 0x4E6 0          # bound NumberOfModuleForwarderRefs
     Put-Ascii $Bytes 0x4F0 "BOUND32.dll"
 
+    Put-U32LE $Bytes 0x470 0           # resource Characteristics
+    Put-U32LE $Bytes 0x474 0x4A2A5A32  # resource TimeDateStamp
+    Put-U16LE $Bytes 0x478 1           # resource MajorVersion
+    Put-U16LE $Bytes 0x47A 0           # resource MinorVersion
+    Put-U16LE $Bytes 0x47C 0           # resource NumberOfNamedEntries
+    Put-U16LE $Bytes 0x47E 1           # resource NumberOfIdEntries
+    Put-U32LE $Bytes 0x480 16          # resource ID: RT_VERSION
+    Put-U32LE $Bytes 0x484 2147483672 # resource entry points to child directory
+
     Put-U32LE $Bytes 0x500 0x404010 # StartAddressOfRawData
     Put-U32LE $Bytes 0x504 0x404018 # EndAddressOfRawData
     Put-U32LE $Bytes 0x508 0x404020 # AddressOfIndex
@@ -988,11 +1028,25 @@ function New-Pe32Fixture {
     Put-U32LE $Bytes 0x5A4 4          # GuardCFFunctionCount
     Put-U32LE $Bytes 0x5A8 0x00004100 # GuardFlags
 
-    Put-U32LE $Bytes 0x700 0x20   # WIN_CERTIFICATE.dwLength
-    Put-U16LE $Bytes 0x704 0x0200 # WIN_CERTIFICATE.wRevision
-    Put-U16LE $Bytes 0x706 0x0002 # WIN_CERTIFICATE.wCertificateType
+    Put-U32LE $Bytes 0x600 0x48       # IMAGE_COR20_HEADER.cb
+    Put-U16LE $Bytes 0x604 2          # MajorRuntimeVersion
+    Put-U16LE $Bytes 0x606 5          # MinorRuntimeVersion
+    Put-U32LE $Bytes 0x608 0x4150     # MetaData RVA
+    Put-U32LE $Bytes 0x60C 0x20       # MetaData Size
+    Put-U32LE $Bytes 0x610 0x00000003 # Flags: ILONLY | 32BITREQUIRED
+    Put-U32LE $Bytes 0x614 0x06000001 # EntryPointToken
+    Put-U32LE $Bytes 0x618 0x4180     # Resources RVA
+    Put-U32LE $Bytes 0x61C 0x10       # Resources Size
+    Put-U32LE $Bytes 0x620 0x4190     # StrongNameSignature RVA
+    Put-U32LE $Bytes 0x624 0x10       # StrongNameSignature Size
+    Put-U32LE $Bytes 0x630 0x41A0     # VTableFixups RVA
+    Put-U32LE $Bytes 0x634 0x08       # VTableFixups Size
+
+    Put-U32LE $Bytes 0x900 0x20   # WIN_CERTIFICATE.dwLength
+    Put-U16LE $Bytes 0x904 0x0200 # WIN_CERTIFICATE.wRevision
+    Put-U16LE $Bytes 0x906 0x0002 # WIN_CERTIFICATE.wCertificateType
     for ($Index = [UInt32]0; $Index -lt 0x18; ++$Index) {
-        $Bytes[0x708 + $Index] = [byte](0x30 + $Index)
+        $Bytes[0x908 + $Index] = [byte](0x30 + $Index)
     }
 
     [IO.File]::WriteAllBytes((Join-Path $Root $Name), $Bytes)

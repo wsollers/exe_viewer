@@ -243,6 +243,28 @@ void add_pe_metadata(const peelf::IBinaryImage& image, StructureNode& root) {
         ++bound_index;
     }
     root.children.push_back(std::move(bound_imports));
+
+    if (const peelf::PeResourceDirectory* resource = image.pe_resource_directory()) {
+        StructureNode node = selectable_node(SelectionKind::ResourceDirectory,
+                                             "Resource Directory",
+                                             0,
+                                             PreferredView::Details);
+        node.selection.file_offset = resource->file_offset;
+        node.selection.virtual_address = image.file_offset_to_virtual_address(resource->file_offset);
+        node.selection.size = 16u + static_cast<std::uint64_t>(resource->entries.size()) * 8u;
+        root.children.push_back(std::move(node));
+    }
+
+    if (const peelf::PeClrHeader* clr = image.pe_clr_header()) {
+        StructureNode node = selectable_node(SelectionKind::ClrHeader,
+                                             "CLR Header",
+                                             0,
+                                             PreferredView::Details);
+        node.selection.file_offset = clr->file_offset;
+        node.selection.virtual_address = image.file_offset_to_virtual_address(clr->file_offset);
+        node.selection.size = clr->size;
+        root.children.push_back(std::move(node));
+    }
 }
 
 void add_elf_metadata(const peelf::IBinaryImage& image, StructureNode& root) {

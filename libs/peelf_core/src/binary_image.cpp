@@ -97,6 +97,12 @@ public:
         static const std::vector<PeBoundImport> empty;
         return empty;
     }
+    [[nodiscard]] const PeResourceDirectory* pe_resource_directory() const noexcept override {
+        return nullptr;
+    }
+    [[nodiscard]] const PeClrHeader* pe_clr_header() const noexcept override {
+        return nullptr;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         static const std::vector<ElfProgramHeader> empty;
@@ -247,6 +253,12 @@ public:
     [[nodiscard]] const std::vector<PeBoundImport>& pe_bound_imports() const noexcept override {
         return bound_imports_;
     }
+    [[nodiscard]] const PeResourceDirectory* pe_resource_directory() const noexcept override {
+        return resource_directory_ ? &*resource_directory_ : nullptr;
+    }
+    [[nodiscard]] const PeClrHeader* pe_clr_header() const noexcept override {
+        return clr_header_ ? &*clr_header_ : nullptr;
+    }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
@@ -257,6 +269,8 @@ private:
     std::optional<PeLoadConfigDirectory> load_config_directory_;
     std::vector<PeRuntimeFunction> runtime_functions_;
     std::vector<PeBoundImport> bound_imports_;
+    std::optional<PeResourceDirectory> resource_directory_;
+    std::optional<PeClrHeader> clr_header_;
 };
 
 Architecture elf_arch(std::uint16_t machine, bool is64) noexcept {
@@ -498,6 +512,54 @@ void parse_pe_bound_imports(std::span<const std::uint8_t> b,
         }
         bound_imports_out.push_back(std::move(entry));
     }
+}
+
+void parse_pe_resource_directory(std::span<const std::uint8_t> b,
+                                 const std::vector<Section>& sections,
+                                 std::uint64_t image_base,
+                                 std::uint32_t directory_rva,
+                                 std::uint32_t directory_size,
+                                 std::optional<PeResourceDirectory>& resource_out) {
+    if (directory_rva == 0 || directory_size < 16) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, 16, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::size_t off = static_cast<std::size_t>(*directory_off);
+    PeResourceDirectory resource;
+    resource.rva = directory_rva;
+    resource.file_offset = *directory_off;
+    resource.characteristics = rd32(b, off + 0x00, false);
+    resource.time_date_stamp = rd32(b, off + 0x04, false);
+    resource.major_version = rd16(b, off + 0x08, false);
+    resource.minor_version = rd16(b, off + 0x0A, false);
+    resource.named_entry_count = rd16(b, off + 0x0C, false);
+    resource.id_entry_count = rd16(b, off + 0x0E, false);
+
+    const std::uint64_t total_entries = static_cast<std::uint64_t>(resource.named_entry_count) +
+                                        static_cast<std::uint64_t>(resource.id_entry_count);
+    const std::uint64_t max_entries = directory_size >= 16 ? (directory_size - 16u) / 8u : 0;
+    const std::uint64_t parsed_entries = std::min(total_entries, max_entries);
+    resource.entries.reserve(static_cast<std::size_t>(parsed_entries));
+    for (std::uint64_t i = 0; i < parsed_entries; ++i) {
+        const std::uint64_t entry_off = *directory_off + 16u + i * 8u;
+        if (!fits_range(entry_off, 8, static_cast<std::uint64_t>(b.size()))) {
+            break;
+        }
+        const std::size_t entry_pos = static_cast<std::size_t>(entry_off);
+        PeResourceDirectoryEntry entry;
+        entry.name_or_id = rd32(b, entry_pos + 0x00, false);
+        entry.offset_to_data_or_directory = rd32(b, entry_pos + 0x04, false);
+        entry.name_is_string = (entry.name_or_id & 0x8000'0000u) != 0;
+        entry.data_is_directory = (entry.offset_to_data_or_directory & 0x8000'0000u) != 0;
+        resource.entries.push_back(entry);
+    }
+
+    resource_out = std::move(resource);
 }
 
 void parse_pe_tls_directory(std::span<const std::uint8_t> b,
@@ -771,6 +833,51 @@ void parse_pe_delay_load_imports(std::span<const std::uint8_t> b,
         parse_pe_import_thunks(b, sections, image_base, is64, library, import_name_table_rva,
                                import_address_table_rva, true, imports_out);
     }
+}
+
+void parse_pe_clr_header(std::span<const std::uint8_t> b,
+                         const std::vector<Section>& sections,
+                         std::uint64_t image_base,
+                         std::uint32_t directory_rva,
+                         std::uint32_t directory_size,
+                         std::optional<PeClrHeader>& clr_out) {
+    if (directory_rva == 0 || directory_size < 0x48) {
+        return;
+    }
+
+    const auto directory_off = pe_rva_to_file_offset(sections, image_base, directory_rva);
+    if (!directory_off || !fits_range(*directory_off, 0x48, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::size_t off = static_cast<std::size_t>(*directory_off);
+    PeClrHeader clr;
+    clr.rva = directory_rva;
+    clr.file_offset = *directory_off;
+    clr.size = rd32(b, off + 0x00, false);
+    if (clr.size < 0x48 || !fits_range(*directory_off, clr.size, static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+    clr.major_runtime_version = rd16(b, off + 0x04, false);
+    clr.minor_runtime_version = rd16(b, off + 0x06, false);
+    clr.metadata_rva = rd32(b, off + 0x08, false);
+    clr.metadata_size = rd32(b, off + 0x0C, false);
+    clr.flags = rd32(b, off + 0x10, false);
+    clr.entry_point_token_or_rva = rd32(b, off + 0x14, false);
+    clr.resources_rva = rd32(b, off + 0x18, false);
+    clr.resources_size = rd32(b, off + 0x1C, false);
+    clr.strong_name_signature_rva = rd32(b, off + 0x20, false);
+    clr.strong_name_signature_size = rd32(b, off + 0x24, false);
+    clr.code_manager_table_rva = rd32(b, off + 0x28, false);
+    clr.code_manager_table_size = rd32(b, off + 0x2C, false);
+    clr.vtable_fixups_rva = rd32(b, off + 0x30, false);
+    clr.vtable_fixups_size = rd32(b, off + 0x34, false);
+    clr.export_address_table_jumps_rva = rd32(b, off + 0x38, false);
+    clr.export_address_table_jumps_size = rd32(b, off + 0x3C, false);
+    clr.managed_native_header_rva = rd32(b, off + 0x40, false);
+    clr.managed_native_header_size = rd32(b, off + 0x44, false);
+
+    clr_out = clr;
 }
 
 [[nodiscard]] std::uint64_t align4(std::uint64_t value) noexcept {
@@ -1394,6 +1501,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
                                               ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
                                               : 0;
+    const std::uint32_t resource_dir_rva = (size_of_opt >= (is64 ? 0x88 : 0x78))
+                                               ? rd32(b, opt + (is64 ? 0x80 : 0x70), false)
+                                               : 0;
+    const std::uint32_t resource_dir_size = (size_of_opt >= (is64 ? 0x88 : 0x78))
+                                                ? rd32(b, opt + (is64 ? 0x84 : 0x74), false)
+                                                : 0;
     const std::uint32_t exception_dir_rva = (size_of_opt >= (is64 ? 0x90 : 0x80))
                                                 ? rd32(b, opt + (is64 ? 0x88 : 0x78), false)
                                                 : 0;
@@ -1429,6 +1542,12 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         : 0;
     const std::uint32_t delay_import_dir_size = (size_of_opt >= (is64 ? 0xE0 : 0xD0))
         ? rd32(b, opt + (is64 ? 0xDC : 0xCC), false)
+        : 0;
+    const std::uint32_t clr_dir_rva = (size_of_opt >= (is64 ? 0xE8 : 0xD8))
+        ? rd32(b, opt + (is64 ? 0xE0 : 0xD0), false)
+        : 0;
+    const std::uint32_t clr_dir_size = (size_of_opt >= (is64 ? 0xE8 : 0xD8))
+        ? rd32(b, opt + (is64 ? 0xE4 : 0xD4), false)
         : 0;
     const std::uint32_t base_reloc_dir_rva = (size_of_opt >= (is64 ? 0xA0 : 0x90))
         ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
@@ -1500,6 +1619,10 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                                exception_dir_size, img->runtime_functions_);
     parse_pe_bound_imports(b, img->sections_, image_base, bound_import_dir_rva,
                            bound_import_dir_size, img->bound_imports_);
+    parse_pe_resource_directory(b, img->sections_, image_base, resource_dir_rva,
+                                resource_dir_size, img->resource_directory_);
+    parse_pe_clr_header(b, img->sections_, image_base, clr_dir_rva, clr_dir_size,
+                        img->clr_header_);
 
     if (export_dir_rva != 0 && export_dir_size >= 40) {
         const auto export_off = pe_rva_to_file_offset(img->sections_, image_base, export_dir_rva);

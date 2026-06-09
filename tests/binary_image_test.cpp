@@ -548,8 +548,8 @@ TEST(BinaryImage, ParsesPeCertificateTableAcrossFixtureMatrix) {
         std::uint8_t payload_base;
     };
     constexpr std::array<ExpectedCertificate, 2> fixtures{{
-        {"known-win-x86.exe", 0x700, 0x20, 0x0200, 0x0002, 0x30},
-        {"known-win-x64.exe", 0x700, 0x20, 0x0200, 0x0002, 0x40},
+        {"known-win-x86.exe", 0x900, 0x20, 0x0200, 0x0002, 0x30},
+        {"known-win-x64.exe", 0x900, 0x20, 0x0200, 0x0002, 0x40},
     }};
 
     for (const ExpectedCertificate& expected : fixtures) {
@@ -740,6 +740,83 @@ TEST(BinaryImage, ParsesPeBoundImportsAcrossFixtureMatrix) {
         EXPECT_EQ(entry.forwarder_ref_count, 0u) << expected.name;
         EXPECT_EQ(entry.module_name, expected.module_name) << expected.name;
         EXPECT_EQ(entry.file_offset, expected.file_offset) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesPeResourceDirectoriesAcrossFixtureMatrix) {
+    struct ExpectedResourceDirectory {
+        const char* name;
+        std::uint32_t rva;
+        std::uint64_t file_offset;
+        std::uint32_t time_date_stamp;
+    };
+    constexpr std::array<ExpectedResourceDirectory, 2> fixtures{{
+        {"known-win-x86.exe", 0x3070, 0x470, 0x4A2A5A32},
+        {"known-win-x64.exe", 0x3070, 0x570, 0x4A2A5A64},
+    }};
+
+    for (const ExpectedResourceDirectory& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::PeResourceDirectory* resource = (**result).pe_resource_directory();
+        ASSERT_NE(resource, nullptr) << expected.name;
+        EXPECT_EQ(resource->rva, expected.rva) << expected.name;
+        EXPECT_EQ(resource->file_offset, expected.file_offset) << expected.name;
+        EXPECT_EQ(resource->characteristics, 0u) << expected.name;
+        EXPECT_EQ(resource->time_date_stamp, expected.time_date_stamp) << expected.name;
+        EXPECT_EQ(resource->major_version, 1u) << expected.name;
+        EXPECT_EQ(resource->minor_version, 0u) << expected.name;
+        EXPECT_EQ(resource->named_entry_count, 0u) << expected.name;
+        EXPECT_EQ(resource->id_entry_count, 1u) << expected.name;
+        ASSERT_EQ(resource->entries.size(), 1u) << expected.name;
+        EXPECT_EQ(resource->entries.front().name_or_id, 16u) << expected.name; // RT_VERSION
+        EXPECT_FALSE(resource->entries.front().name_is_string) << expected.name;
+        EXPECT_TRUE(resource->entries.front().data_is_directory) << expected.name;
+        EXPECT_EQ(resource->entries.front().offset_to_data_or_directory, 0x80000018u) << expected.name;
+    }
+}
+
+TEST(BinaryImage, ParsesPeClrHeadersAcrossFixtureMatrix) {
+    struct ExpectedClrHeader {
+        const char* name;
+        std::uint32_t rva;
+        std::uint64_t file_offset;
+    };
+    constexpr std::array<ExpectedClrHeader, 2> fixtures{{
+        {"known-win-x86.exe", 0x4100, 0x600},
+        {"known-win-x64.exe", 0x4100, 0x700},
+    }};
+
+    for (const ExpectedClrHeader& expected : fixtures) {
+        const auto path = fixture_path(expected.name);
+        ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+        const std::vector<std::uint8_t> bytes = read_all(path);
+        auto result = peelf::parse_image(bytes);
+        ASSERT_TRUE(result.has_value()) << "parse_image failed for " << expected.name;
+
+        const peelf::PeClrHeader* clr = (**result).pe_clr_header();
+        ASSERT_NE(clr, nullptr) << expected.name;
+        EXPECT_EQ(clr->rva, expected.rva) << expected.name;
+        EXPECT_EQ(clr->file_offset, expected.file_offset) << expected.name;
+        EXPECT_EQ(clr->size, 0x48u) << expected.name;
+        EXPECT_EQ(clr->major_runtime_version, 2u) << expected.name;
+        EXPECT_EQ(clr->minor_runtime_version, 5u) << expected.name;
+        EXPECT_EQ(clr->metadata_rva, 0x4150u) << expected.name;
+        EXPECT_EQ(clr->metadata_size, 0x20u) << expected.name;
+        EXPECT_EQ(clr->flags, 0x00000003u) << expected.name;
+        EXPECT_EQ(clr->entry_point_token_or_rva, 0x06000001u) << expected.name;
+        EXPECT_EQ(clr->resources_rva, 0x4180u) << expected.name;
+        EXPECT_EQ(clr->resources_size, 0x10u) << expected.name;
+        EXPECT_EQ(clr->strong_name_signature_rva, 0x4190u) << expected.name;
+        EXPECT_EQ(clr->strong_name_signature_size, 0x10u) << expected.name;
+        EXPECT_EQ(clr->vtable_fixups_rva, 0x41A0u) << expected.name;
+        EXPECT_EQ(clr->vtable_fixups_size, 0x08u) << expected.name;
     }
 }
 

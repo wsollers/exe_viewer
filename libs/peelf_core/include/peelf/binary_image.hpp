@@ -93,6 +93,25 @@ struct PeBoundImport {
     std::uint64_t file_offset = 0;
 };
 
+struct PeResourceDirectoryEntry {
+    std::uint32_t name_or_id = 0;
+    std::uint32_t offset_to_data_or_directory = 0;
+    bool name_is_string = false;
+    bool data_is_directory = false;
+};
+
+struct PeResourceDirectory {
+    std::uint32_t rva = 0;
+    std::uint64_t file_offset = 0;
+    std::uint32_t characteristics = 0;
+    std::uint32_t time_date_stamp = 0;
+    std::uint16_t major_version = 0;
+    std::uint16_t minor_version = 0;
+    std::uint16_t named_entry_count = 0;
+    std::uint16_t id_entry_count = 0;
+    std::vector<PeResourceDirectoryEntry> entries;
+};
+
 struct ExportEntry {
     std::string   name;
     std::uint32_t ordinal = 0;
@@ -181,6 +200,30 @@ struct PeRuntimeFunction {
     std::uint32_t end_address_rva = 0;
     std::uint32_t unwind_info_rva = 0;
     std::uint64_t file_offset = 0;
+};
+
+struct PeClrHeader {
+    std::uint32_t rva = 0;
+    std::uint64_t file_offset = 0;
+    std::uint32_t size = 0;
+    std::uint16_t major_runtime_version = 0;
+    std::uint16_t minor_runtime_version = 0;
+    std::uint32_t metadata_rva = 0;
+    std::uint32_t metadata_size = 0;
+    std::uint32_t flags = 0;
+    std::uint32_t entry_point_token_or_rva = 0;
+    std::uint32_t resources_rva = 0;
+    std::uint32_t resources_size = 0;
+    std::uint32_t strong_name_signature_rva = 0;
+    std::uint32_t strong_name_signature_size = 0;
+    std::uint32_t code_manager_table_rva = 0;
+    std::uint32_t code_manager_table_size = 0;
+    std::uint32_t vtable_fixups_rva = 0;
+    std::uint32_t vtable_fixups_size = 0;
+    std::uint32_t export_address_table_jumps_rva = 0;
+    std::uint32_t export_address_table_jumps_size = 0;
+    std::uint32_t managed_native_header_rva = 0;
+    std::uint32_t managed_native_header_size = 0;
 };
 
 struct ElfHeader {
@@ -310,6 +353,8 @@ public:
     [[nodiscard]] virtual const PeLoadConfigDirectory* pe_load_config_directory() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeBoundImport>& pe_bound_imports() const noexcept = 0;
+    [[nodiscard]] virtual const PeResourceDirectory* pe_resource_directory() const noexcept = 0;
+    [[nodiscard]] virtual const PeClrHeader* pe_clr_header() const noexcept = 0;
     [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
