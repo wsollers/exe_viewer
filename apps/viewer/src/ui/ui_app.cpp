@@ -33,6 +33,12 @@ namespace {
     return endianness == peelf::Endianness::Big ? viewer::Endianness::Big : viewer::Endianness::Little;
 }
 
+[[nodiscard]] bool same_selection(const ViewerSelection& lhs, const ViewerSelection& rhs) {
+    return lhs.kind == rhs.kind &&
+           lhs.object_index == rhs.object_index &&
+           lhs.label == rhs.label;
+}
+
 } // namespace
 
 UiApp::UiApp(BinaryModel& model)
@@ -138,6 +144,7 @@ void UiApp::render() {
 
     file_panel_.draw();
     structure_panel_.draw();
+    apply_structure_selection_navigation();
     details_panel_.draw();
     sections_panel_.draw();
     hex_panel_.draw();
@@ -382,11 +389,13 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             file_loaded_ = false;
             structure_tree_.reset();
             current_selection_ = {};
+            last_navigation_selection_.reset();
             return;
         }
 
         structure_tree_ = build_structure_tree(*img);
         current_selection_ = structure_tree_->selection;
+        last_navigation_selection_.reset();
 
         // Map the unified architecture onto the disassembler's enum.
         const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());
@@ -408,6 +417,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
         if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             hex_panel_.navigate_to_range(static_cast<std::size_t>(*entry_offset), 1);
+            last_navigation_selection_ = current_selection_;
         }
 
         // PE keeps its entry-point disassembly via the legacy PeModel. ELF
@@ -419,6 +429,54 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         } else if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
         }
+    }
+
+
+    void UiApp::apply_structure_selection_navigation() {
+        if (current_selection_.kind == SelectionKind::None ||
+            current_selection_.kind == SelectionKind::Group) {
+            return;
+        }
+        if (last_navigation_selection_ &&
+            same_selection(*last_navigation_selection_, current_selection_)) {
+            return;
+        }
+
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr) {
+            return;
+        }
+
+        std::optional<std::uint64_t> file_offset = current_selection_.file_offset;
+        if (!file_offset && current_selection_.virtual_address) {
+            file_offset = img->virtual_address_to_file_offset(*current_selection_.virtual_address);
+        }
+
+        if (!file_offset) {
+            last_navigation_selection_ = current_selection_;
+            return;
+        }
+        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
+            current_selection_.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            Log().warn("Selection '{}' range is too large for this platform", current_selection_.label);
+            last_navigation_selection_ = current_selection_;
+            return;
+        }
+
+        const std::size_t offset = static_cast<std::size_t>(*file_offset);
+        const std::size_t size = current_selection_.size != 0
+            ? static_cast<std::size_t>(current_selection_.size)
+            : std::size_t{1};
+        hex_panel_.navigate_to_range(offset, size);
+
+        if (current_selection_.preferred_view == PreferredView::Disassembly) {
+            const std::uint64_t display_address = current_selection_.virtual_address
+                ? *current_selection_.virtual_address
+                : *file_offset;
+            disassemble_at_offset(offset, display_address);
+        }
+
+        last_navigation_selection_ = current_selection_;
     }
 
 

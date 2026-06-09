@@ -46,6 +46,7 @@ namespace viewer {
         BinaryModel& model_;
         std::optional<StructureNode> structure_tree_;
         ViewerSelection current_selection_;
+        std::optional<ViewerSelection> last_navigation_selection_;
 
         FilePanel       file_panel_;
         StructureNavigatorPanel structure_panel_;
@@ -73,6 +74,7 @@ namespace viewer {
         void render_main_menu();
         void render_dockspace();
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
+        void apply_structure_selection_navigation();
 
 
     };
