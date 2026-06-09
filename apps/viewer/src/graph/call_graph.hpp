@@ -76,10 +76,25 @@ struct CallGraph {
     std::vector<CallGraphEdge> edges;
 };
 
+struct GraphLayoutNode {
+    std::string node_id;
+    double center_x = 0.0;
+    double center_y = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+};
+
+struct GraphLayout {
+    double width = 0.0;
+    double height = 0.0;
+    std::vector<GraphLayoutNode> nodes;
+};
+
 enum class GraphRenderFormat : std::uint8_t {
     Svg,
     Png,
-    Bmp
+    Bmp,
+    Plain
 };
 
 struct GraphRenderCommand {
@@ -109,7 +124,12 @@ public:
 [[nodiscard]] std::string to_dot(const CallGraph& graph);
 [[nodiscard]] CallGraph build_entry_call_graph(const peelf::IBinaryImage& image);
 [[nodiscard]] CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolIndex& symbol_index);
+[[nodiscard]] CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
+                                                       std::span<const std::uint8_t> image_bytes,
+                                                       const SymbolIndex& symbol_index,
+                                                       const SymbolRecord& root);
 [[nodiscard]] std::string_view graphviz_format_name(GraphRenderFormat format) noexcept;
+[[nodiscard]] std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain);
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,
                                                                     std::uint64_t virtual_address);
 [[nodiscard]] GraphRenderCommand make_graphviz_render_command(const std::filesystem::path& dot_path,

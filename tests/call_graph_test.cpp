@@ -119,6 +119,28 @@ TEST(CallGraph, BuildsGraphvizSvgAndPngCommandsWithoutAssumingArchitecture) {
                                                                                  "dot-test");
     ASSERT_FALSE(bmp.arguments.empty());
     EXPECT_EQ(bmp.arguments[0], "-Tbmp");
+
+    const viewer::GraphRenderCommand plain = viewer::make_graphviz_render_command("entry.dot", "entry.plain",
+                                                                                  viewer::GraphRenderFormat::Plain,
+                                                                                  "dot-test");
+    ASSERT_FALSE(plain.arguments.empty());
+    EXPECT_EQ(plain.arguments[0], "-Tplain");
+}
+
+TEST(CallGraph, ParsesGraphvizPlainNodeLayout) {
+    constexpr std::string_view plain =
+        "graph 1 4 2\n"
+        "node main 1 1 0.75 0.5 main solid box black lightgrey\n"
+        "stop\n";
+
+    const std::optional<viewer::GraphLayout> layout = viewer::parse_graphviz_plain_layout(plain);
+
+    ASSERT_TRUE(layout.has_value());
+    EXPECT_DOUBLE_EQ(layout->width, 4.0);
+    EXPECT_DOUBLE_EQ(layout->height, 2.0);
+    ASSERT_EQ(layout->nodes.size(), 1u);
+    EXPECT_EQ(layout->nodes.front().node_id, "main");
+    EXPECT_DOUBLE_EQ(layout->nodes.front().center_x, 1.0);
 }
 
 TEST(CallGraph, RenderWritesDotAndInvokesInjectedRunner) {
@@ -251,6 +273,37 @@ TEST(CallGraph, PrefersExactMainOverSymbolsContainingMain) {
     EXPECT_NE(dot.find("main"), std::string::npos);
     EXPECT_NE(dot.find("user entry symbol"), std::string::npos);
     EXPECT_EQ(dot.find("render_main_menu"), std::string::npos);
+}
+
+TEST(CallGraph, BuildsSymbolFanoutGraphWithoutResolvedCalls) {
+    const std::vector<std::uint8_t> bytes = read_fixture("known-win-x64.exe");
+    auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+    ASSERT_TRUE(parsed.has_value());
+    const std::unique_ptr<peelf::IBinaryImage> image = std::move(*parsed);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        viewer::DebugSymbol{
+            .name = "main",
+            .relative_virtual_address = 0x1000,
+            .virtual_address = image->entry_point(),
+            .size = 1,
+            .function = true,
+        },
+    };
+    index.add_debug_symbols(*image, symbols);
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+
+    const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_NE(dot.find("main fan-out"), std::string::npos);
+    EXPECT_NE(dot.find("No direct call targets resolved"), std::string::npos);
 }
 
 TEST(CallGraph, DefaultRunnerRendersSvgWhenGraphvizIsAvailable) {

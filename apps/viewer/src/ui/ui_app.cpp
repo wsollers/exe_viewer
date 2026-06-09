@@ -553,11 +553,14 @@ void UiApp::load_call_graph_sample(CallGraphSample sample) {
                                                       bmp->height);
     loaded_call_graph_bmp_ = bmp_path;
     call_graph_sample_ = sample;
+    current_call_graph_.reset();
+    current_call_graph_layout_.reset();
     call_graph_status_ = "Loaded " + bmp_path.filename().string();
 }
 
 void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name) {
     const std::filesystem::path bmp_path = std::filesystem::temp_directory_path() / output_name;
+    const std::filesystem::path plain_path = bmp_path.string() + ".plain";
     const DefaultProcessRunner runner;
     const GraphRenderResult render_result =
         render_graph_with_graphviz(graph, bmp_path, GraphRenderFormat::Bmp, runner);
@@ -572,6 +575,21 @@ void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesy
         return;
     }
 
+    {
+        const std::filesystem::path dot_path = bmp_path.string() + ".dot";
+        const GraphRenderCommand plain_command =
+            make_graphviz_render_command(dot_path, plain_path, GraphRenderFormat::Plain);
+        const GraphRenderResult plain_result = runner.run(plain_command.executable, plain_command.arguments);
+        if (plain_result.success) {
+            std::ifstream plain_file(plain_path, std::ios::binary);
+            const std::string plain_text{std::istreambuf_iterator<char>(plain_file),
+                                         std::istreambuf_iterator<char>()};
+            current_call_graph_layout_ = parse_graphviz_plain_layout(plain_text);
+        } else {
+            current_call_graph_layout_.reset();
+        }
+    }
+
     if (call_graph_texture_) {
         vulkan_.destroy_texture(*call_graph_texture_);
         call_graph_texture_.reset();
@@ -581,7 +599,92 @@ void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesy
                                                       bmp->width,
                                                       bmp->height);
     loaded_call_graph_bmp_ = bmp_path;
+    current_call_graph_ = graph;
     call_graph_status_ = "Loaded graph from current image";
+}
+
+const CallGraphNode* UiApp::hit_test_call_graph_node(const ImVec2& image_pos,
+                                                     const ImVec2& draw_size,
+                                                     const ImVec2& mouse_pos) const {
+    if (!current_call_graph_ || !current_call_graph_layout_ ||
+        current_call_graph_layout_->width <= 0.0 || current_call_graph_layout_->height <= 0.0 ||
+        draw_size.x <= 0.0f || draw_size.y <= 0.0f) {
+        return nullptr;
+    }
+    if (mouse_pos.x < image_pos.x || mouse_pos.y < image_pos.y ||
+        mouse_pos.x > image_pos.x + draw_size.x || mouse_pos.y > image_pos.y + draw_size.y) {
+        return nullptr;
+    }
+
+    const double graph_x = (static_cast<double>(mouse_pos.x - image_pos.x) / draw_size.x) *
+                           current_call_graph_layout_->width;
+    const double graph_y = (1.0 - static_cast<double>(mouse_pos.y - image_pos.y) / draw_size.y) *
+                           current_call_graph_layout_->height;
+
+    for (const GraphLayoutNode& layout_node : current_call_graph_layout_->nodes) {
+        const double left = layout_node.center_x - layout_node.width * 0.5;
+        const double right = layout_node.center_x + layout_node.width * 0.5;
+        const double bottom = layout_node.center_y - layout_node.height * 0.5;
+        const double top = layout_node.center_y + layout_node.height * 0.5;
+        if (graph_x >= left && graph_x <= right && graph_y >= bottom && graph_y <= top) {
+            const auto it = std::ranges::find_if(current_call_graph_->nodes, [&](const CallGraphNode& node) {
+                return node.id == layout_node.node_id;
+            });
+            return it == current_call_graph_->nodes.end() ? nullptr : &*it;
+        }
+    }
+    return nullptr;
+}
+
+void UiApp::activate_call_graph_node(const CallGraphNode& node) {
+    const peelf::IBinaryImage* img = model_.image();
+    if (img == nullptr) {
+        return;
+    }
+
+    std::optional<std::uint64_t> file_offset = node.bytes.start.file_offset;
+    if (!file_offset && node.bytes.start.virtual_address) {
+        file_offset = img->virtual_address_to_file_offset(*node.bytes.start.virtual_address);
+    }
+
+    current_selection_ = ViewerSelection{
+        .kind = SelectionKind::Symbol,
+        .label = node.label.empty() ? node.id : node.label,
+        .file_offset = file_offset,
+        .virtual_address = node.bytes.start.virtual_address,
+        .size = node.bytes.size,
+        .preferred_view = PreferredView::Disassembly,
+    };
+
+    if (file_offset && *file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        const std::size_t size = node.bytes.size != 0 &&
+                                         node.bytes.size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
+                                     ? static_cast<std::size_t>(node.bytes.size)
+                                     : std::size_t{1};
+        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), size);
+        const std::uint64_t display_address = node.bytes.start.virtual_address
+            ? *node.bytes.start.virtual_address
+            : *file_offset;
+        disassemble_at_offset(static_cast<std::size_t>(*file_offset), display_address);
+    }
+    last_navigation_selection_ = current_selection_;
+
+    const SymbolRecord* record = nullptr;
+    if (!node.label.empty()) {
+        record = symbol_index_.find_by_name(node.label);
+    }
+    if (record == nullptr && node.bytes.start.virtual_address) {
+        record = symbol_index_.find_containing_address(*node.bytes.start.virtual_address);
+    }
+    if (record != nullptr && record->virtual_address && record->file_offset) {
+        load_call_graph_from_graph(
+            build_symbol_fanout_call_graph(*img,
+                                           std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
+                                           symbol_index_,
+                                           *record),
+            "loaded_symbol_fanout_call_graph.bmp");
+        call_graph_status_ = "Loaded fan-out from " + record->name;
+    }
 }
 
 void UiApp::render_call_graph_panel() {
@@ -634,6 +737,13 @@ void UiApp::render_call_graph_panel() {
         draw_list->AddImage(texture_id,
                             image_pos,
                             ImVec2(image_pos.x + draw_size.x, image_pos.y + draw_size.y));
+        ImGui::SetCursorScreenPos(image_pos);
+        ImGui::InvisibleButton("CallGraphImageHitTarget", draw_size);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            if (const CallGraphNode* node = hit_test_call_graph_node(image_pos, draw_size, ImGui::GetIO().MousePos)) {
+                activate_call_graph_node(*node);
+            }
+        }
     } else {
         const char* message = "Call graph image unavailable";
         const ImVec2 text_size = ImGui::CalcTextSize(message);
@@ -643,7 +753,11 @@ void UiApp::render_call_graph_panel() {
                            message);
     }
 
-    ImGui::Dummy(canvas_size);
+    if (!call_graph_texture_) {
+        ImGui::Dummy(canvas_size);
+    } else {
+        ImGui::SetCursorScreenPos(ImVec2(canvas_pos.x, canvas_pos.y + canvas_size.y));
+    }
     ImGui::End();
 }
 

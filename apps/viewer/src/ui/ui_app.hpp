@@ -87,6 +87,8 @@ namespace viewer {
         bool show_call_graph_panel_ = false;
         CallGraphSample call_graph_sample_ = CallGraphSample::LoadedImage;
         std::optional<VulkanManager::Texture> call_graph_texture_;
+        std::optional<CallGraph> current_call_graph_;
+        std::optional<GraphLayout> current_call_graph_layout_;
         std::string call_graph_status_;
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
@@ -98,6 +100,10 @@ namespace viewer {
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);
         void load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name);
+        void activate_call_graph_node(const CallGraphNode& node);
+        const CallGraphNode* hit_test_call_graph_node(const ImVec2& image_pos,
+                                                      const ImVec2& draw_size,
+                                                      const ImVec2& mouse_pos) const;
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
         void apply_structure_selection_navigation();
 

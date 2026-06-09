@@ -2,11 +2,16 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <string_view>
 #include <utility>
+
+#include "disasm/disassembler.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -94,8 +99,91 @@ namespace {
     return out.str();
 }
 
+[[nodiscard]] std::optional<std::uint64_t> parse_hex_u64(std::string_view text) {
+    if (text.starts_with("0x") || text.starts_with("0X")) {
+        text.remove_prefix(2);
+    }
+    std::uint64_t value = 0;
+    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+    if (ec != std::errc{} || ptr != text.data() + text.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> parse_direct_call_target(std::string_view operands) {
+    if (operands.find('[') != std::string_view::npos) {
+        return std::nullopt;
+    }
+    const std::size_t begin = operands.find("0x");
+    if (begin == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::size_t end = begin + 2;
+    while (end < operands.size() && std::isxdigit(static_cast<unsigned char>(operands[end])) != 0) {
+        ++end;
+    }
+    return parse_hex_u64(operands.substr(begin, end - begin));
+}
+
+[[nodiscard]] bool is_call_instruction(const Instruction& instruction) {
+    return instruction.mnemonic == "call" ||
+           instruction.mnemonic == "bl" ||
+           instruction.mnemonic == "blx" ||
+           instruction.mnemonic == "jal" ||
+           instruction.mnemonic == "jalr";
+}
+
+[[nodiscard]] std::optional<Architecture> disassembler_architecture(peelf::Architecture arch) {
+    switch (arch) {
+        case peelf::Architecture::X86:       return Architecture::X86_32;
+        case peelf::Architecture::X86_64:    return Architecture::X86_64;
+        case peelf::Architecture::ARM:       return Architecture::ARM32;
+        case peelf::Architecture::ARM64:     return Architecture::ARM64;
+        case peelf::Architecture::MIPS32:    return Architecture::MIPS32;
+        case peelf::Architecture::MIPS64:    return Architecture::MIPS64;
+        case peelf::Architecture::PowerPC:   return Architecture::PowerPC32;
+        case peelf::Architecture::PowerPC64: return Architecture::PowerPC64;
+        case peelf::Architecture::RISCV32:   return Architecture::RISCV32;
+        case peelf::Architecture::RISCV64:   return Architecture::RISCV64;
+        default:                             return std::nullopt;
+    }
+}
+
+[[nodiscard]] Endianness disassembler_endianness(peelf::Endianness endianness) {
+    return endianness == peelf::Endianness::Big ? Endianness::Big : Endianness::Little;
+}
+
 [[nodiscard]] bool contains_case_sensitive(std::string_view text, std::string_view needle) {
     return text.find(needle) != std::string_view::npos;
+}
+
+[[nodiscard]] std::optional<double> parse_double_token(std::string_view token) {
+    std::string copy(token);
+    char* end = nullptr;
+    const double value = std::strtod(copy.c_str(), &end);
+    if (end == copy.c_str() || *end != '\0') {
+        return std::nullopt;
+    }
+    return value;
+}
+
+[[nodiscard]] std::string parse_plain_node_id(std::string_view token) {
+    if (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
+        token.remove_prefix(1);
+        token.remove_suffix(1);
+    }
+    return std::string(token);
+}
+
+[[nodiscard]] GraphByteRange record_range(const SymbolRecord& record) {
+    return GraphByteRange{
+        .start = GraphAddress{
+            .virtual_address = record.virtual_address,
+            .file_offset = record.file_offset,
+        },
+        .size = record.size,
+    };
 }
 
 [[nodiscard]] std::string_view msvc_decorated_function_name(std::string_view symbol) {
@@ -186,13 +274,7 @@ namespace {
         .id = std::move(id),
         .label = record.name,
         .kind = external ? CallGraphNodeKind::External : CallGraphNodeKind::Function,
-        .bytes = GraphByteRange{
-            .start = GraphAddress{
-                .virtual_address = record.virtual_address,
-                .file_offset = record.file_offset,
-            },
-            .size = record.size,
-        },
+        .bytes = record_range(record),
         .symbol = GraphSymbolRef{
             .name = record.name,
             .symbol_index = record.source_index,
@@ -333,6 +415,53 @@ std::string to_dot(const CallGraph& graph) {
 
     out << "}\n";
     return out.str();
+}
+
+std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain) {
+    std::istringstream input{std::string(plain)};
+    GraphLayout layout;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string kind;
+        row >> kind;
+        if (kind == "graph") {
+            std::string scale;
+            std::string width;
+            std::string height;
+            row >> scale >> width >> height;
+            const std::optional<double> w = parse_double_token(width);
+            const std::optional<double> h = parse_double_token(height);
+            if (w && h) {
+                layout.width = *w;
+                layout.height = *h;
+            }
+        } else if (kind == "node") {
+            std::string id;
+            std::string x;
+            std::string y;
+            std::string width;
+            std::string height;
+            row >> id >> x >> y >> width >> height;
+            const std::optional<double> cx = parse_double_token(x);
+            const std::optional<double> cy = parse_double_token(y);
+            const std::optional<double> w = parse_double_token(width);
+            const std::optional<double> h = parse_double_token(height);
+            if (cx && cy && w && h) {
+                layout.nodes.push_back(GraphLayoutNode{
+                    .node_id = parse_plain_node_id(id),
+                    .center_x = *cx,
+                    .center_y = *cy,
+                    .width = *w,
+                    .height = *h,
+                });
+            }
+        }
+    }
+    if (layout.width <= 0.0 || layout.height <= 0.0) {
+        return std::nullopt;
+    }
+    return layout;
 }
 
 CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
@@ -545,6 +674,98 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolI
     return graph;
 }
 
+CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
+                                         std::span<const std::uint8_t> image_bytes,
+                                         const SymbolIndex& symbol_index,
+                                         const SymbolRecord& root) {
+    CallGraph graph{
+        .id = "symbol_fanout_call_graph",
+        .label = root.name + " fan-out",
+        .architecture = image.architecture(),
+        .endianness = image.endianness(),
+    };
+
+    graph.nodes.push_back(node_from_record(root, "root"));
+
+    constexpr std::size_t max_function_scan = 4096;
+    bool resolved_any_call = false;
+
+    if (root.file_offset && root.virtual_address) {
+        const std::optional<Architecture> arch = disassembler_architecture(image.architecture());
+        if (arch) {
+            Disassembler disassembler;
+            if (disassembler.init(*arch, disassembler_endianness(image.endianness()))) {
+                const std::uint64_t requested_size = root.size != 0 ? root.size : max_function_scan;
+                const std::size_t start = static_cast<std::size_t>(*root.file_offset);
+                const std::size_t bytes_to_read = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(requested_size, max_function_scan));
+
+                if (start <= image_bytes.size() && bytes_to_read <= image_bytes.size() - start) {
+                    const auto instructions = disassembler.disassemble(image_bytes.data() + start,
+                                                                        bytes_to_read,
+                                                                        *root.virtual_address);
+                    std::uint64_t call_index = 0;
+                    for (const Instruction& instruction : instructions) {
+                        if (!is_call_instruction(instruction)) {
+                            continue;
+                        }
+                        const std::optional<std::uint64_t> target = parse_direct_call_target(instruction.operands);
+                        if (!target) {
+                            continue;
+                        }
+
+                        const SymbolRecord* callee = symbol_index.find_containing_address(*target);
+                        const std::string callee_id = "callee_" + std::to_string(call_index++);
+                        if (callee != nullptr && callee->name != root.name) {
+                            graph.nodes.push_back(node_from_record(*callee, callee_id));
+                            graph.edges.push_back(CallGraphEdge{
+                                .from_node_id = "root",
+                                .to_node_id = callee_id,
+                                .kind = CallGraphEdgeKind::Call,
+                                .label = "call",
+                            });
+                            resolved_any_call = true;
+                        } else {
+                            graph.nodes.push_back(CallGraphNode{
+                                .id = callee_id,
+                                .label = "call target\n" + format_hex(*target),
+                                .kind = CallGraphNodeKind::Unknown,
+                                .bytes = GraphByteRange{
+                                    .start = GraphAddress{.virtual_address = *target},
+                                    .size = 1,
+                                },
+                            });
+                            graph.edges.push_back(CallGraphEdge{
+                                .from_node_id = "root",
+                                .to_node_id = callee_id,
+                                .kind = CallGraphEdgeKind::Call,
+                                .label = "unresolved call",
+                            });
+                            resolved_any_call = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (!resolved_any_call) {
+        graph.nodes.push_back(CallGraphNode{
+            .id = "no_calls",
+            .label = "No direct call targets resolved\nsymbols/disassembly may be missing",
+            .kind = CallGraphNodeKind::Unknown,
+        });
+        graph.edges.push_back(CallGraphEdge{
+            .from_node_id = "root",
+            .to_node_id = "no_calls",
+            .kind = CallGraphEdgeKind::Unknown,
+            .label = "fan-out unavailable",
+        });
+    }
+
+    return graph;
+}
+
 std::string_view graphviz_format_name(GraphRenderFormat format) noexcept {
     switch (format) {
         case GraphRenderFormat::Svg:
@@ -553,6 +774,8 @@ std::string_view graphviz_format_name(GraphRenderFormat format) noexcept {
             return "png";
         case GraphRenderFormat::Bmp:
             return "bmp";
+        case GraphRenderFormat::Plain:
+            return "plain";
     }
     return "svg";
 }
