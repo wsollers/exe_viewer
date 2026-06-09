@@ -101,7 +101,14 @@ FetchContent_MakeAvailable(capstone)
 # future renderer integration. We do not force Graphviz's full build into every
 # configure because it is a large project with platform/system-library edges.
 set(PEELF_GRAPHVIZ_TAG "13.0.0" CACHE STRING "Graphviz git tag to fetch when PEELF_ENABLE_GRAPHVIZ is ON")
-find_program(PEELF_GRAPHVIZ_DOT_EXECUTABLE NAMES dot)
+find_program(
+        PEELF_GRAPHVIZ_DOT_EXECUTABLE
+        NAMES dot
+        HINTS
+                "$ENV{ProgramFiles}/Graphviz/bin"
+                "C:/Program Files/Graphviz/bin"
+                "C:/Program Files (x86)/Graphviz/bin"
+)
 
 add_library(peelf_graphviz INTERFACE)
 add_library(peelf::graphviz ALIAS peelf_graphviz)
