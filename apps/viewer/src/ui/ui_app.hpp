@@ -89,6 +89,8 @@ namespace viewer {
         std::optional<VulkanManager::Texture> call_graph_texture_;
         std::optional<CallGraph> current_call_graph_;
         std::optional<GraphLayout> current_call_graph_layout_;
+        std::optional<SymbolRecord> pending_call_graph_root_;
+        std::uint8_t pending_call_graph_delay_frames_ = 0;
         std::string call_graph_status_;
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;

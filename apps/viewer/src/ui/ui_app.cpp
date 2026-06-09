@@ -677,13 +677,9 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
         record = symbol_index_.find_containing_address(*node.bytes.start.virtual_address);
     }
     if (record != nullptr && record->virtual_address && record->file_offset) {
-        load_call_graph_from_graph(
-            build_symbol_fanout_call_graph(*img,
-                                           std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
-                                           symbol_index_,
-                                           *record),
-            "loaded_symbol_fanout_call_graph.bmp");
-        call_graph_status_ = "Loaded fan-out from " + record->name;
+        pending_call_graph_root_ = *record;
+        pending_call_graph_delay_frames_ = 1;
+        call_graph_status_ = "Queued fan-out from " + record->name;
     }
 }
 
@@ -692,6 +688,24 @@ void UiApp::render_call_graph_panel() {
     if (!ImGui::Begin("Call Graph", &show_call_graph_panel_)) {
         ImGui::End();
         return;
+    }
+
+    if (pending_call_graph_root_ && pending_call_graph_delay_frames_ > 0) {
+        --pending_call_graph_delay_frames_;
+    } else if (pending_call_graph_root_) {
+        const peelf::IBinaryImage* img = model_.image();
+        const SymbolRecord root = *pending_call_graph_root_;
+        pending_call_graph_root_.reset();
+        pending_call_graph_delay_frames_ = 0;
+        if (img != nullptr) {
+            load_call_graph_from_graph(
+                build_symbol_fanout_call_graph(*img,
+                                               std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
+                                               symbol_index_,
+                                               root),
+                "loaded_symbol_fanout_call_graph.bmp");
+            call_graph_status_ = "Loaded fan-out from " + root.name;
+        }
     }
 
     if (ImGui::Button("Loaded Image")) {
@@ -852,11 +866,15 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             symbol_index_ = {};
             current_selection_ = {};
             last_navigation_selection_.reset();
+            pending_call_graph_root_.reset();
+            pending_call_graph_delay_frames_ = 0;
             return;
         }
 
         structure_tree_ = build_structure_tree(*img);
         symbol_index_ = SymbolIndex::build(*img);
+        pending_call_graph_root_.reset();
+        pending_call_graph_delay_frames_ = 0;
         if (const std::optional<std::filesystem::path> pdb = find_local_codeview_pdb(*img, model_.file_info().path)) {
             load_debug_symbols(*pdb);
         } else if (!img->pe_debug_directories().empty()) {
