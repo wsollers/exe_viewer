@@ -98,6 +98,21 @@ namespace {
     return text.find(needle) != std::string_view::npos;
 }
 
+[[nodiscard]] std::string_view msvc_decorated_function_name(std::string_view symbol) {
+    if (symbol.starts_with('?')) {
+        symbol.remove_prefix(1);
+        const std::size_t at = symbol.find('@');
+        if (at != std::string_view::npos) {
+            return symbol.substr(0, at);
+        }
+    }
+    return symbol;
+}
+
+[[nodiscard]] bool is_exact_or_decorated_function_name(std::string_view symbol, std::string_view expected) {
+    return symbol == expected || msvc_decorated_function_name(symbol) == expected;
+}
+
 [[nodiscard]] std::string image_label(const peelf::IBinaryImage& image) {
     std::ostringstream out;
     out << peelf::to_string(image.format()) << ' ' << peelf::to_string(image.architecture())
@@ -134,6 +149,21 @@ namespace {
     for (const std::string_view name : names) {
         if (const SymbolRecord* record = find_symbol_record_containing_name(index, name)) {
             return record;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] const SymbolRecord* find_first_symbol_record_exact_function_name(
+    const SymbolIndex& index,
+    std::span<const std::string_view> names) {
+    const auto records = index.records();
+    for (const std::string_view name : names) {
+        const auto it = std::ranges::find_if(records, [&](const SymbolRecord& record) {
+            return is_exact_or_decorated_function_name(record.name, name);
+        });
+        if (it != records.end()) {
+            return &*it;
         }
     }
     return nullptr;
@@ -463,7 +493,8 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolI
             "wmain",
         };
         const SymbolRecord* crt_record = find_first_symbol_record_containing_name(symbol_index, crt_names);
-        const SymbolRecord* user_entry_record = find_first_symbol_record_containing_name(symbol_index, user_entry_names);
+        const SymbolRecord* user_entry_record =
+            find_first_symbol_record_exact_function_name(symbol_index, user_entry_names);
 
         graph.nodes.push_back(CallGraphNode{
             .id = "crt_startup",

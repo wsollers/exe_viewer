@@ -199,6 +199,60 @@ TEST(CallGraph, UsesLoadedDebugSymbolsForPeUserEntry) {
     EXPECT_NE(dot.find("user entry symbol"), std::string::npos);
 }
 
+TEST(CallGraph, DoesNotTreatMainSubstringAsPeUserEntry) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        viewer::DebugSymbol{
+            .name = "?render_main_menu@UiApp@viewer@@AEAAXXZ",
+            .relative_virtual_address = 0x1339E0,
+            .virtual_address = 0x1401339E0,
+            .size = 0x80,
+            .function = true,
+        },
+    };
+    index.add_debug_symbols(*image, symbols);
+
+    const viewer::CallGraph graph = viewer::build_entry_call_graph(*image, index);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_EQ(dot.find("render_main_menu"), std::string::npos);
+    EXPECT_NE(dot.find("unresolved from current symbols"), std::string::npos);
+}
+
+TEST(CallGraph, PrefersExactMainOverSymbolsContainingMain) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        viewer::DebugSymbol{
+            .name = "?render_main_menu@UiApp@viewer@@AEAAXXZ",
+            .relative_virtual_address = 0x1339E0,
+            .virtual_address = 0x1401339E0,
+            .size = 0x80,
+            .function = true,
+        },
+        viewer::DebugSymbol{
+            .name = "main",
+            .relative_virtual_address = 0x1200,
+            .virtual_address = 0x140001200,
+            .size = 0x40,
+            .function = true,
+        },
+    };
+    index.add_debug_symbols(*image, symbols);
+
+    const viewer::CallGraph graph = viewer::build_entry_call_graph(*image, index);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_NE(dot.find("main"), std::string::npos);
+    EXPECT_NE(dot.find("user entry symbol"), std::string::npos);
+    EXPECT_EQ(dot.find("render_main_menu"), std::string::npos);
+}
+
 TEST(CallGraph, DefaultRunnerRendersSvgWhenGraphvizIsAvailable) {
 #if defined(PEELF_GRAPHVIZ_DOT_AVAILABLE) && PEELF_GRAPHVIZ_DOT_AVAILABLE
     const std::filesystem::path output_path =
