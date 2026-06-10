@@ -729,8 +729,13 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
     last_navigation_selection_ = current_selection_;
 
     const SymbolRecord* record = nullptr;
+    if (node.symbol && !node.symbol->name.empty()) {
+        record = symbol_index_.find_by_name(node.symbol->name);
+    }
     if (!node.label.empty()) {
-        record = symbol_index_.find_by_name(node.label);
+        if (record == nullptr) {
+            record = symbol_index_.find_by_name(node.label);
+        }
     }
     if (record == nullptr && node.bytes.start.virtual_address) {
         record = symbol_index_.find_containing_address(*node.bytes.start.virtual_address);

@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "graph/call_graph.hpp"
+#include "symbols/debug_symbols.hpp"
 #include <peelf/binary_image.hpp>
 
 namespace {
@@ -40,6 +41,22 @@ public:
     std::vector<std::uint8_t> bytes = read_fixture(name);
     auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
     EXPECT_TRUE(parsed.has_value()) << name;
+    if (!parsed) {
+        return {};
+    }
+    return std::move(*parsed);
+}
+
+[[nodiscard]] std::vector<std::uint8_t> read_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary);
+    EXPECT_TRUE(file) << path.string();
+    return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+}
+
+[[nodiscard]] std::unique_ptr<peelf::IBinaryImage> parse_file(const std::filesystem::path& path) {
+    std::vector<std::uint8_t> bytes = read_file(path);
+    auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+    EXPECT_TRUE(parsed.has_value()) << path.string();
     if (!parsed) {
         return {};
     }
@@ -362,6 +379,52 @@ TEST(CallGraph, LabelsFanoutTargetsWithNearestSymbolsAndOffsets) {
     EXPECT_NE(dot.find("helper_target+0x4"), std::string::npos);
     EXPECT_NE(dot.find("VA 0x"), std::string::npos);
     EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos);
+}
+
+TEST(CallGraph, DebugFixtureNamesTargetsAndSupportsSecondHopFanout) {
+    const std::filesystem::path exe_path = PEELF_CALLGRAPH_FIXTURE_EXE;
+    const std::filesystem::path pdb_path = PEELF_CALLGRAPH_FIXTURE_PDB;
+    ASSERT_TRUE(std::filesystem::exists(exe_path)) << exe_path.string();
+    if (pdb_path.empty() || !std::filesystem::exists(pdb_path)) {
+        GTEST_SKIP() << "debug fixture PDB not available: " << pdb_path.string();
+    }
+
+    const std::vector<std::uint8_t> bytes = read_file(exe_path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(exe_path);
+    ASSERT_NE(image, nullptr);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbolLoadResult pdb = viewer::load_pdb_debug_symbols(pdb_path, *image);
+    if (pdb.status != viewer::DebugSymbolLoadStatus::Loaded) {
+        GTEST_SKIP() << "PDB load unavailable: " << viewer::to_string(pdb.status) << " " << pdb.diagnostic;
+    }
+    index.add_debug_symbols(*image, pdb.symbols);
+
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+    const viewer::CallGraph main_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string main_dot = viewer::to_dot(main_graph);
+
+    EXPECT_NE(main_dot.find("peelf_fixture_first"), std::string::npos);
+    EXPECT_NE(main_dot.find("peelf_fixture_second"), std::string::npos);
+    EXPECT_EQ(main_dot.find("call target\\n0x"), std::string::npos);
+
+    const viewer::SymbolRecord* first = index.find_by_name("peelf_fixture_first");
+    ASSERT_NE(first, nullptr);
+    const viewer::CallGraph first_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *first);
+    const std::string first_dot = viewer::to_dot(first_graph);
+
+    EXPECT_NE(first_dot.find("peelf_fixture_first fan-out"), std::string::npos);
+    EXPECT_NE(first_dot.find("peelf_fixture_leaf"), std::string::npos);
+    EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos);
 }
 
 TEST(CallGraph, DefaultRunnerRendersSvgWhenGraphvizIsAvailable) {

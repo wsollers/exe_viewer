@@ -24,6 +24,19 @@ FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)
 
+add_executable(peelf_callgraph_fixture
+  fixtures/callgraph_debug_fixture.cpp
+)
+target_compile_features(peelf_callgraph_fixture PRIVATE cxx_std_23)
+if(MSVC)
+  target_compile_options(peelf_callgraph_fixture PRIVATE /Od /Ob0 /Zi)
+  target_link_options(peelf_callgraph_fixture PRIVATE /DEBUG /INCREMENTAL:NO)
+  set(PEELF_CALLGRAPH_FIXTURE_PDB_PATH "$<TARGET_PDB_FILE:peelf_callgraph_fixture>")
+else()
+  target_compile_options(peelf_callgraph_fixture PRIVATE -O0 -g -fno-inline)
+  set(PEELF_CALLGRAPH_FIXTURE_PDB_PATH "")
+endif()
+
 add_executable(peelf_tests
   smoke_test.cpp
   file_mapping_test.cpp
@@ -89,7 +102,10 @@ endif()
 # Absolute path to the test fixtures directory, available to the test code.
 target_compile_definitions(peelf_tests PRIVATE
   PEELF_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+  PEELF_CALLGRAPH_FIXTURE_EXE="$<TARGET_FILE:peelf_callgraph_fixture>"
+  PEELF_CALLGRAPH_FIXTURE_PDB="${PEELF_CALLGRAPH_FIXTURE_PDB_PATH}"
 )
+add_dependencies(peelf_tests peelf_callgraph_fixture)
 
 # Register every TEST() with CTest so `ctest` discovers and runs them.
 gtest_discover_tests(peelf_tests)
