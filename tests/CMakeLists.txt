@@ -102,6 +102,7 @@ endif()
 # Absolute path to the test fixtures directory, available to the test code.
 target_compile_definitions(peelf_tests PRIVATE
   PEELF_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+  PEELF_BIN_MATRIX_DIR="${CMAKE_SOURCE_DIR}/bin-matrix"
   PEELF_CALLGRAPH_FIXTURE_EXE="$<TARGET_FILE:peelf_callgraph_fixture>"
   PEELF_CALLGRAPH_FIXTURE_PDB="${PEELF_CALLGRAPH_FIXTURE_PDB_PATH}"
 )

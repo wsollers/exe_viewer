@@ -225,7 +225,7 @@ namespace {
     }
 
     constexpr std::int64_t relative_immediate_limit = 0x100000;
-    if ((instruction.mnemonic == "jal" || instruction.mnemonic == "j") &&
+    if ((instruction.mnemonic == "bal" || instruction.mnemonic == "jal" || instruction.mnemonic == "j") &&
         *decimal_target > -relative_immediate_limit && *decimal_target < relative_immediate_limit) {
         const std::int64_t absolute =
             static_cast<std::int64_t>(instruction.address) + *decimal_target;
@@ -284,6 +284,7 @@ namespace {
     return instruction.mnemonic == "call" ||
            instruction.mnemonic == "bl" ||
            instruction.mnemonic == "blx" ||
+           instruction.mnemonic == "bal" ||
            instruction.mnemonic == "jal" ||
            instruction.mnemonic == "jalr";
 }

@@ -1441,6 +1441,36 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     }
 }
 
+void resolve_powerpc64_function_descriptors(std::span<const std::uint8_t> b,
+                                            bool big,
+                                            const std::vector<ElfSectionHeader>& headers,
+                                            std::vector<Symbol>& symbols) {
+    for (Symbol& symbol : symbols) {
+        constexpr std::uint8_t stt_func = 2;
+        if (symbol.type != stt_func || symbol.section_index >= headers.size()) {
+            continue;
+        }
+
+        const ElfSectionHeader& section = headers[symbol.section_index];
+        if (section.name != ".opd" || symbol.virtual_address < section.address) {
+            continue;
+        }
+
+        const std::uint64_t descriptor_delta = symbol.virtual_address - section.address;
+        if (descriptor_delta > section.size ||
+            descriptor_delta > std::numeric_limits<std::uint64_t>::max() - section.offset) {
+            continue;
+        }
+
+        const std::uint64_t descriptor_offset = section.offset + descriptor_delta;
+        if (!fits_range(descriptor_offset, 8u, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+
+        symbol.virtual_address = rd64(b, static_cast<std::size_t>(descriptor_offset), big);
+    }
+}
+
 Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8_t> b) {
     if (b.size() < 0x18) {
         return make_error("ELF: too small for identification header");
@@ -1514,6 +1544,9 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
                        img->gnu_hash_tables_, img->imports_);
+    if (img->arch_ == Architecture::PowerPC64 && img->endian_ == Endianness::Big) {
+        resolve_powerpc64_function_descriptors(b, big, img->section_headers_, img->symbols_);
+    }
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }

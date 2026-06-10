@@ -174,16 +174,29 @@ void patch_direct_call(std::vector<std::uint8_t>& bytes,
     }
 }
 
-void assert_known_callgraph_fixture(const std::string& name, peelf::Architecture architecture) {
-    const std::filesystem::path path = std::filesystem::path(PEELF_TEST_FIXTURES_DIR) / name;
+struct BinMatrixCase {
+    const char* image_name;
+    peelf::Architecture architecture;
+    peelf::Endianness endianness;
+    bool is_64bit;
+};
+
+void assert_known_callgraph_fixture(const BinMatrixCase& fixture) {
+    const std::string name = fixture.image_name;
+    const std::filesystem::path path = std::filesystem::path(PEELF_BIN_MATRIX_DIR) / fixture.image_name;
+    std::filesystem::path sidecar = path;
+    sidecar.replace_extension(".debug");
     ASSERT_TRUE(std::filesystem::exists(path)) << path.string();
+    ASSERT_TRUE(std::filesystem::exists(sidecar)) << sidecar.string();
     const std::vector<std::uint8_t> bytes = read_file(path);
     const std::unique_ptr<peelf::IBinaryImage> image = parse_file(path);
     ASSERT_NE(image, nullptr);
     ASSERT_EQ(image->format(), peelf::Format::ELF) << name;
-    ASSERT_EQ(image->architecture(), architecture) << name;
-    ASSERT_EQ(image->endianness(), peelf::Endianness::Little) << name;
-    ASSERT_TRUE(image->is_64bit()) << name;
+    ASSERT_EQ(image->architecture(), fixture.architecture) << name;
+    ASSERT_EQ(image->endianness(), fixture.endianness) << name;
+    ASSERT_EQ(image->is_64bit(), fixture.is_64bit) << name;
+    ASSERT_NE(image->entry_point(), 0U) << name;
+    ASSERT_TRUE(image->virtual_address_to_file_offset(image->entry_point()).has_value()) << name;
 
     viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
     const viewer::SymbolRecord* main = index.find_by_name("main");
@@ -759,12 +772,22 @@ TEST(CallGraph, DebugElfFixtureNamesTargetsAndSupportsSecondHopFanout) {
     EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos) << first_dot;
 }
 
-TEST(CallGraph, CrossCompiledArm64FixtureNamesTargetsAndSupportsSecondHopFanout) {
-    assert_known_callgraph_fixture("cross/known-callgraph-aarch64.elf", peelf::Architecture::ARM64);
-}
+TEST(CallGraph, BinMatrixFixturesParseEntryAndKnownCallGraphsAcrossArchitectures) {
+    constexpr std::array<BinMatrixCase, 9> fixtures{{
+        {"elf-linux-x86_64-64-le-callgraph.elf", peelf::Architecture::X86_64, peelf::Endianness::Little, true},
+        {"elf-linux-x86-32-le-callgraph.elf", peelf::Architecture::X86, peelf::Endianness::Little, false},
+        {"elf-linux-arm-32-le-callgraph.elf", peelf::Architecture::ARM, peelf::Endianness::Little, false},
+        {"elf-linux-arm64-64-le-callgraph.elf", peelf::Architecture::ARM64, peelf::Endianness::Little, true},
+        {"elf-linux-riscv64-64-le-callgraph.elf", peelf::Architecture::RISCV64, peelf::Endianness::Little, true},
+        {"elf-linux-mips-32-be-callgraph.elf", peelf::Architecture::MIPS32, peelf::Endianness::Big, false},
+        {"elf-linux-mips64-64-be-callgraph.elf", peelf::Architecture::MIPS64, peelf::Endianness::Big, true},
+        {"elf-linux-ppc-32-be-callgraph.elf", peelf::Architecture::PowerPC, peelf::Endianness::Big, false},
+        {"elf-linux-ppc64-64-be-callgraph.elf", peelf::Architecture::PowerPC64, peelf::Endianness::Big, true},
+    }};
 
-TEST(CallGraph, CrossCompiledRiscv64FixtureNamesTargetsAndSupportsSecondHopFanout) {
-    assert_known_callgraph_fixture("cross/known-callgraph-riscv64.elf", peelf::Architecture::RISCV64);
+    for (const BinMatrixCase& fixture : fixtures) {
+        assert_known_callgraph_fixture(fixture);
+    }
 }
 
 TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
