@@ -111,7 +111,7 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
                                                                  : std::optional(entry_record.virtual_address),
             .file_offset = entry_record.virtual_address == 0 ? std::optional<std::uint64_t>{}
                                                             : image.virtual_address_to_file_offset(entry_record.virtual_address),
-            .size = 1,
+            .size = 0,
         });
     }
 

@@ -21,6 +21,8 @@ Naming convention:
 `elf-linux-<arch>-<bits>-<endian>-callgraph.debug`
 `elf-linux-<arch>-<bits>-<endian>-callgraph.so`
 `elf-linux-<arch>-<bits>-<endian>-callgraph.so.debug`
+`pe-windows-<arch>-<bits>-le-callgraph.dll`
+`pe-windows-<arch>-<bits>-le-callgraph.dll.debug`
 
 Where:
 
@@ -30,7 +32,8 @@ Where:
 - `<endian>` is `le` or `be`.
 - `.elf` is the stripped-debug executable image under test.
 - `.so` is the stripped-debug shared-library image under test.
-- `.debug` and `.so.debug` are detached debug sidecars produced with `objcopy --only-keep-debug`.
+- `.dll` is the stripped-debug PE shared-library image under test.
+- `.debug`, `.so.debug`, and `.dll.debug` are detached debug sidecars produced with `objcopy --only-keep-debug`.
 
 The generated files intentionally have execute permission removed.
 README
@@ -55,6 +58,18 @@ shared_flags=(
   -fPIC
   -shared
   -Wl,-Bsymbolic-functions
+)
+
+pe_dll_flags=(
+  -std=c11
+  -O0
+  -g
+  -fno-inline
+  -fno-omit-frame-pointer
+  -fno-optimize-sibling-calls
+  -DPEELF_SHARED_FIXTURE=1
+  -shared
+  -Wl,--build-id=none
 )
 
 build_executable_fixture() {
@@ -87,6 +102,21 @@ build_shared_fixture() {
   chmod a-x "${image}" "${debug}"
 }
 
+build_pe_dll_fixture() {
+  local cc="$1"
+  local objcopy="$2"
+  local name="$3"
+  shift 3
+
+  local image="${out_dir}/${name}.dll"
+  local debug="${out_dir}/${name}.dll.debug"
+
+  "${cc}" "${pe_dll_flags[@]}" "$@" "${source_file}" -o "${image}"
+  "${objcopy}" --only-keep-debug "${image}" "${debug}"
+  (cd "${out_dir}" && "${objcopy}" --strip-debug --add-gnu-debuglink="$(basename "${debug}")" "$(basename "${image}")")
+  chmod a-x "${image}" "${debug}"
+}
+
 build_pair() {
   local cc="$1"
   local objcopy="$2"
@@ -110,4 +140,7 @@ build_pair mips64-linux-gnuabi64-gcc mips64-linux-gnuabi64-objcopy elf-linux-mip
 build_pair powerpc-linux-gnu-gcc powerpc-linux-gnu-objcopy elf-linux-ppc-32-be-callgraph
 build_pair powerpc64-linux-gnu-gcc powerpc64-linux-gnu-objcopy elf-linux-ppc64-64-be-callgraph
 
-find "${out_dir}" -type f \( -name '*.elf' -o -name '*.debug' -o -name '*.so' \) | sort
+build_pe_dll_fixture x86_64-w64-mingw32-gcc x86_64-w64-mingw32-objcopy pe-windows-x86_64-64-le-callgraph
+build_pe_dll_fixture i686-w64-mingw32-gcc i686-w64-mingw32-objcopy pe-windows-x86-32-le-callgraph
+
+find "${out_dir}" -type f \( -name '*.elf' -o -name '*.debug' -o -name '*.so' -o -name '*.dll' \) | sort

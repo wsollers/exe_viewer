@@ -10,23 +10,29 @@
 #define PEELF_NOINLINE __attribute__((noinline))
 #endif
 
+#if defined(_WIN32) && defined(PEELF_SHARED_FIXTURE)
+#define PEELF_EXPORT __declspec(dllexport)
+#else
+#define PEELF_EXPORT
+#endif
+
 volatile int32_t peelf_cross_sink = 0;
 
-PEELF_NOINLINE int32_t leaf(int32_t value) {
+PEELF_EXPORT PEELF_NOINLINE int32_t leaf(int32_t value) {
     peelf_cross_sink += value;
     return value + 7;
 }
 
-PEELF_NOINLINE int32_t first(int32_t value) {
+PEELF_EXPORT PEELF_NOINLINE int32_t first(int32_t value) {
     return leaf(value + 1);
 }
 
-PEELF_NOINLINE int32_t second(int32_t value) {
+PEELF_EXPORT PEELF_NOINLINE int32_t second(int32_t value) {
     return leaf(value + 2);
 }
 
 #if defined(PEELF_SHARED_FIXTURE)
-PEELF_NOINLINE int32_t shared_anchor(int32_t value) {
+PEELF_EXPORT PEELF_NOINLINE int32_t shared_anchor(int32_t value) {
     puts("peelf shared fixture");
     return first(value) + second(value);
 }
