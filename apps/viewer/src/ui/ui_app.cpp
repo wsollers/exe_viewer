@@ -599,7 +599,7 @@ void UiApp::process_deferred_gpu_work() {
     }
 }
 
-void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name) {
+void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name) {
     const std::filesystem::path bmp_path = std::filesystem::temp_directory_path() / output_name;
     const std::filesystem::path plain_path = bmp_path.string() + ".plain";
     const DefaultProcessRunner runner;
@@ -640,7 +640,7 @@ void UiApp::load_call_graph_from_graph(const CallGraph& graph, const std::filesy
                                                       bmp->width,
                                                       bmp->height);
     loaded_call_graph_bmp_ = bmp_path;
-    current_call_graph_ = graph;
+    current_call_graph_ = std::move(graph);
     call_graph_status_ = "Loaded graph from current image";
 }
 

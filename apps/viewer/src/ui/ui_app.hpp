@@ -109,7 +109,7 @@ namespace viewer {
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);
         void queue_call_graph_sample(CallGraphSample sample);
-        void load_call_graph_from_graph(const CallGraph& graph, const std::filesystem::path& output_name);
+        void load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name);
         void activate_call_graph_node(const CallGraphNode& node);
         const CallGraphNode* hit_test_call_graph_node(const ImVec2& image_pos,
                                                       const ImVec2& draw_size,
