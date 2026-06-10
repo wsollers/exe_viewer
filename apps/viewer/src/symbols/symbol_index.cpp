@@ -23,6 +23,11 @@ namespace {
     return virtual_address >= start && virtual_address < start + size;
 }
 
+[[nodiscard]] bool is_elf_mapping_symbol(std::string_view name) noexcept {
+    return name.starts_with("$a") || name.starts_with("$d") ||
+           name.starts_with("$t") || name.starts_with("$x");
+}
+
 [[nodiscard]] std::uint8_t source_rank(SymbolSource source) noexcept {
     switch (source) {
         case SymbolSource::ImageSymbol:
@@ -49,7 +54,7 @@ namespace {
 }
 
 void add_record(std::vector<SymbolRecord>& records, SymbolRecord record) {
-    if (record.name.empty()) {
+    if (record.name.empty() || is_elf_mapping_symbol(record.name)) {
         return;
     }
     records.push_back(std::move(record));

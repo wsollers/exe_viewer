@@ -174,6 +174,49 @@ void patch_direct_call(std::vector<std::uint8_t>& bytes,
     }
 }
 
+void assert_known_callgraph_fixture(const std::string& name, peelf::Architecture architecture) {
+    const std::filesystem::path path = std::filesystem::path(PEELF_TEST_FIXTURES_DIR) / name;
+    ASSERT_TRUE(std::filesystem::exists(path)) << path.string();
+    const std::vector<std::uint8_t> bytes = read_file(path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(path);
+    ASSERT_NE(image, nullptr);
+    ASSERT_EQ(image->format(), peelf::Format::ELF) << name;
+    ASSERT_EQ(image->architecture(), architecture) << name;
+    ASSERT_EQ(image->endianness(), peelf::Endianness::Little) << name;
+    ASSERT_TRUE(image->is_64bit()) << name;
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    const viewer::SymbolRecord* first = index.find_by_name("first");
+    const viewer::SymbolRecord* second = index.find_by_name("second");
+    const viewer::SymbolRecord* leaf = index.find_by_name("leaf");
+    ASSERT_NE(main, nullptr) << name;
+    ASSERT_NE(first, nullptr) << name;
+    ASSERT_NE(second, nullptr) << name;
+    ASSERT_NE(leaf, nullptr) << name;
+
+    const viewer::CallGraph main_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string main_dot = viewer::to_dot(main_graph);
+    EXPECT_NE(main_dot.find("main fan-out"), std::string::npos) << name << "\n" << main_dot;
+    EXPECT_NE(main_dot.find("first"), std::string::npos) << name << "\n" << main_dot;
+    EXPECT_NE(main_dot.find("second"), std::string::npos) << name << "\n" << main_dot;
+    EXPECT_EQ(main_dot.find("call target\\n0x"), std::string::npos) << name << "\n" << main_dot;
+
+    const viewer::CallGraph first_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *first);
+    const std::string first_dot = viewer::to_dot(first_graph);
+    EXPECT_NE(first_dot.find("first fan-out"), std::string::npos) << name << "\n" << first_dot;
+    EXPECT_NE(first_dot.find("leaf"), std::string::npos) << name << "\n" << first_dot;
+    EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos) << name << "\n" << first_dot;
+}
+
 [[nodiscard]] viewer::CallGraph sample_graph() {
     return viewer::CallGraph{
         .id = "entry",
@@ -714,6 +757,14 @@ TEST(CallGraph, DebugElfFixtureNamesTargetsAndSupportsSecondHopFanout) {
     EXPECT_NE(first_dot.find("first"), std::string::npos) << first_dot;
     EXPECT_NE(first_dot.find("leaf"), std::string::npos) << first_dot;
     EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos) << first_dot;
+}
+
+TEST(CallGraph, CrossCompiledArm64FixtureNamesTargetsAndSupportsSecondHopFanout) {
+    assert_known_callgraph_fixture("cross/known-callgraph-aarch64.elf", peelf::Architecture::ARM64);
+}
+
+TEST(CallGraph, CrossCompiledRiscv64FixtureNamesTargetsAndSupportsSecondHopFanout) {
+    assert_known_callgraph_fixture("cross/known-callgraph-riscv64.elf", peelf::Architecture::RISCV64);
 }
 
 TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {

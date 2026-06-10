@@ -150,6 +150,71 @@ namespace {
     return value;
 }
 
+[[nodiscard]] std::optional<std::int64_t> parse_last_integer_token(std::string_view operands) {
+    std::optional<std::int64_t> result;
+    for (std::size_t i = 0; i < operands.size();) {
+        const bool negative = operands[i] == '-';
+        if (negative) {
+            ++i;
+        }
+        if (i >= operands.size() || !std::isdigit(static_cast<unsigned char>(operands[i]))) {
+            ++i;
+            continue;
+        }
+
+        const std::size_t begin = negative ? i - 1u : i;
+        int base = 10;
+        if (i + 1u < operands.size() && operands[i] == '0' && (operands[i + 1u] == 'x' || operands[i + 1u] == 'X')) {
+            base = 16;
+            i += 2u;
+        }
+        while (i < operands.size() && (base == 16 ? std::isxdigit(static_cast<unsigned char>(operands[i])) != 0
+                                                  : std::isdigit(static_cast<unsigned char>(operands[i])) != 0)) {
+            ++i;
+        }
+
+        std::int64_t value = 0;
+        std::string_view token = operands.substr(begin, i - begin);
+        if (base == 16 && negative) {
+            token.remove_prefix(3);
+            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 16);
+            if (ec == std::errc{} && ptr == token.data() + token.size()) {
+                result = -value;
+            }
+        } else if (base == 16) {
+            token.remove_prefix(2);
+            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 16);
+            if (ec == std::errc{} && ptr == token.data() + token.size()) {
+                result = value;
+            }
+        } else {
+            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 10);
+            if (ec == std::errc{} && ptr == token.data() + token.size()) {
+                result = value;
+            }
+        }
+    }
+    return result;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> resolve_riscv_auipc_jalr_target(const Instruction& previous,
+                                                                           const Instruction& instruction) {
+    if (previous.mnemonic != "auipc" || instruction.mnemonic != "jalr") {
+        return std::nullopt;
+    }
+    const std::optional<std::int64_t> high = parse_last_integer_token(previous.operands);
+    const std::optional<std::int64_t> low = parse_last_integer_token(instruction.operands);
+    if (!high || !low) {
+        return std::nullopt;
+    }
+    const std::int64_t target =
+        static_cast<std::int64_t>(previous.address) + (*high << 12) + *low;
+    if (target < 0) {
+        return std::nullopt;
+    }
+    return static_cast<std::uint64_t>(target);
+}
+
 [[nodiscard]] std::optional<std::uint64_t> parse_direct_call_target(const Instruction& instruction) {
     if (const std::optional<std::uint64_t> hex_target = parse_direct_call_target(instruction.operands)) {
         return hex_target;
@@ -878,12 +943,21 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                                                                         bytes_to_read,
                                                                         *root.virtual_address);
                     std::uint64_t call_index = 0;
+                    const Instruction* previous_instruction = nullptr;
                     for (const Instruction& instruction : instructions) {
                         if (!is_call_instruction(instruction)) {
+                            previous_instruction = &instruction;
                             continue;
                         }
-                        const std::optional<std::uint64_t> target = parse_direct_call_target(instruction);
+                        std::optional<std::uint64_t> target;
+                        if (previous_instruction != nullptr) {
+                            target = resolve_riscv_auipc_jalr_target(*previous_instruction, instruction);
+                        }
                         if (!target) {
+                            target = parse_direct_call_target(instruction);
+                        }
+                        if (!target) {
+                            previous_instruction = &instruction;
                             continue;
                         }
 
@@ -917,6 +991,7 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                             });
                             resolved_any_call = true;
                         }
+                        previous_instruction = &instruction;
                     }
                 }
             }
