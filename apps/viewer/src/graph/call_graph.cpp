@@ -126,12 +126,56 @@ namespace {
     return parse_hex_u64(operands.substr(begin, end - begin));
 }
 
+[[nodiscard]] std::optional<std::uint64_t> parse_x86_rip_relative_memory_target(const Instruction& instruction) {
+    const std::string_view operands = instruction.operands;
+    const std::size_t rip = operands.find("rip");
+    if (rip == std::string_view::npos || instruction.bytes.empty()) {
+        return std::nullopt;
+    }
+
+    const std::size_t plus = operands.find('+', rip);
+    const std::size_t minus = operands.find('-', rip);
+    const bool negative = minus != std::string_view::npos && (plus == std::string_view::npos || minus < plus);
+    const std::size_t sign = negative ? minus : plus;
+    if (sign == std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    const std::size_t begin = operands.find("0x", sign);
+    if (begin == std::string_view::npos) {
+        return std::nullopt;
+    }
+    std::size_t end = begin + 2;
+    while (end < operands.size() && std::isxdigit(static_cast<unsigned char>(operands[end])) != 0) {
+        ++end;
+    }
+
+    const std::optional<std::uint64_t> displacement = parse_hex_u64(operands.substr(begin, end - begin));
+    if (!displacement) {
+        return std::nullopt;
+    }
+
+    const std::uint64_t next_instruction =
+        instruction.address + static_cast<std::uint64_t>(instruction.bytes.size());
+    if (negative && *displacement > next_instruction) {
+        return std::nullopt;
+    }
+    if (!negative && next_instruction > std::numeric_limits<std::uint64_t>::max() - *displacement) {
+        return std::nullopt;
+    }
+    return negative ? next_instruction - *displacement : next_instruction + *displacement;
+}
+
 [[nodiscard]] bool is_call_instruction(const Instruction& instruction) {
     return instruction.mnemonic == "call" ||
            instruction.mnemonic == "bl" ||
            instruction.mnemonic == "blx" ||
            instruction.mnemonic == "jal" ||
            instruction.mnemonic == "jalr";
+}
+
+[[nodiscard]] bool is_indirect_branch_instruction(const Instruction& instruction) {
+    return instruction.mnemonic == "jmp" || instruction.mnemonic == "call";
 }
 
 [[nodiscard]] std::optional<Architecture> disassembler_architecture(peelf::Architecture arch) {
@@ -310,6 +354,57 @@ namespace {
             .dynamic = record.dynamic,
         },
     };
+}
+
+[[nodiscard]] const SymbolRecord* resolve_call_target_symbol(const peelf::IBinaryImage& image,
+                                                             std::span<const std::uint8_t> image_bytes,
+                                                             Disassembler& disassembler,
+                                                             const SymbolIndex& symbol_index,
+                                                             std::uint64_t target,
+                                                             std::uint8_t depth = 0) {
+    if (depth > 3) {
+        return nullptr;
+    }
+
+    if (const SymbolRecord* exact_or_containing = symbol_index.find_containing_address(target)) {
+        return exact_or_containing;
+    }
+
+    if (const std::optional<std::uint64_t> target_file_offset = image.virtual_address_to_file_offset(target)) {
+        const std::size_t start = static_cast<std::size_t>(*target_file_offset);
+        if (start < image_bytes.size()) {
+            constexpr std::size_t max_thunk_bytes = 16;
+            const std::size_t bytes_to_read = std::min(max_thunk_bytes, image_bytes.size() - start);
+            const std::vector<Instruction> thunk =
+                disassembler.disassemble_count(image_bytes.data() + start, bytes_to_read, target, 2);
+            if (!thunk.empty() && is_indirect_branch_instruction(thunk.front())) {
+                if (const std::optional<std::uint64_t> indirect_address =
+                        parse_x86_rip_relative_memory_target(thunk.front())) {
+                    if (const SymbolRecord* import_or_symbol =
+                            symbol_index.find_containing_address(*indirect_address)) {
+                        return import_or_symbol;
+                    }
+                }
+                if (const std::optional<std::uint64_t> branch_target =
+                        parse_direct_call_target(thunk.front().operands)) {
+                    if (*branch_target != target) {
+                        if (const SymbolRecord* chained =
+                                resolve_call_target_symbol(image,
+                                                           image_bytes,
+                                                           disassembler,
+                                                           symbol_index,
+                                                           *branch_target,
+                                                           static_cast<std::uint8_t>(depth + 1u))) {
+                            return chained;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    constexpr std::uint64_t max_symbol_offset = 4096;
+    return symbol_index.find_nearest_preceding_address(target, max_symbol_offset);
 }
 
 [[nodiscard]] GraphByteRange symbol_range(const peelf::IBinaryImage& image, const peelf::Symbol& symbol) {
@@ -743,11 +838,8 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                             continue;
                         }
 
-                        const SymbolRecord* callee = symbol_index.find_containing_address(*target);
-                        if (callee == nullptr) {
-                            constexpr std::uint64_t max_symbol_offset = 4096;
-                            callee = symbol_index.find_nearest_preceding_address(*target, max_symbol_offset);
-                        }
+                        const SymbolRecord* callee =
+                            resolve_call_target_symbol(image, image_bytes, disassembler, symbol_index, *target);
                         const std::string callee_id = "callee_" + std::to_string(call_index++);
                         if (callee != nullptr && callee->name != root.name) {
                             graph.nodes.push_back(node_from_call_target(image, *callee, *target, callee_id));

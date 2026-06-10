@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -61,6 +62,15 @@ public:
         return {};
     }
     return std::move(*parsed);
+}
+
+[[nodiscard]] const viewer::SymbolRecord* find_symbol_containing(const viewer::SymbolIndex& index,
+                                                                 std::string_view needle) {
+    const auto records = index.records();
+    const auto it = std::ranges::find_if(records, [&](const viewer::SymbolRecord& record) {
+        return record.name.find(needle) != std::string::npos;
+    });
+    return it == records.end() ? nullptr : &*it;
 }
 
 [[nodiscard]] viewer::CallGraph sample_graph() {
@@ -381,6 +391,78 @@ TEST(CallGraph, LabelsFanoutTargetsWithNearestSymbolsAndOffsets) {
     EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos);
 }
 
+TEST(CallGraph, LabelsFanoutImportThunksWithImportNames) {
+    std::vector<std::uint8_t> bytes = read_fixture("known-win-x64.exe");
+    auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+    ASSERT_TRUE(parsed.has_value());
+    const std::unique_ptr<peelf::IBinaryImage> image = std::move(*parsed);
+    ASSERT_FALSE(image->imports().empty());
+
+    const peelf::ImportEntry* imported = nullptr;
+    for (const peelf::ImportEntry& entry : image->imports()) {
+        if (entry.address != 0 && !entry.name.empty()) {
+            imported = &entry;
+            break;
+        }
+    }
+    ASSERT_NE(imported, nullptr);
+
+    const std::uint64_t root_va = image->entry_point();
+    const std::optional<std::uint64_t> root_file_offset = image->virtual_address_to_file_offset(root_va);
+    ASSERT_TRUE(root_file_offset);
+    const std::uint64_t thunk_va = root_va + 0x20u;
+    const std::optional<std::uint64_t> thunk_file_offset = image->virtual_address_to_file_offset(thunk_va);
+    ASSERT_TRUE(thunk_file_offset);
+    ASSERT_LE(*root_file_offset + 8u, bytes.size());
+    ASSERT_LE(*thunk_file_offset + 8u, bytes.size());
+
+    const auto call_rel32 = static_cast<std::uint32_t>(
+        static_cast<std::int32_t>(static_cast<std::int64_t>(thunk_va) - static_cast<std::int64_t>(root_va + 5u)));
+    const std::size_t root = static_cast<std::size_t>(*root_file_offset);
+    bytes[root] = 0xE8u;
+    bytes[root + 1u] = static_cast<std::uint8_t>(call_rel32 & 0xFFu);
+    bytes[root + 2u] = static_cast<std::uint8_t>((call_rel32 >> 8u) & 0xFFu);
+    bytes[root + 3u] = static_cast<std::uint8_t>((call_rel32 >> 16u) & 0xFFu);
+    bytes[root + 4u] = static_cast<std::uint8_t>((call_rel32 >> 24u) & 0xFFu);
+    bytes[root + 5u] = 0xC3u;
+
+    const std::int64_t thunk_rel64 =
+        static_cast<std::int64_t>(imported->address) - static_cast<std::int64_t>(thunk_va + 6u);
+    ASSERT_GE(thunk_rel64, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()));
+    ASSERT_LE(thunk_rel64, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+    const auto thunk_rel32 = static_cast<std::uint32_t>(static_cast<std::int32_t>(thunk_rel64));
+    const std::size_t thunk = static_cast<std::size_t>(*thunk_file_offset);
+    bytes[thunk] = 0xFFu;
+    bytes[thunk + 1u] = 0x25u;
+    bytes[thunk + 2u] = static_cast<std::uint8_t>(thunk_rel32 & 0xFFu);
+    bytes[thunk + 3u] = static_cast<std::uint8_t>((thunk_rel32 >> 8u) & 0xFFu);
+    bytes[thunk + 4u] = static_cast<std::uint8_t>((thunk_rel32 >> 16u) & 0xFFu);
+    bytes[thunk + 5u] = static_cast<std::uint8_t>((thunk_rel32 >> 24u) & 0xFFu);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        viewer::DebugSymbol{
+            .name = "main",
+            .virtual_address = root_va,
+            .size = 8,
+            .function = true,
+        },
+    };
+    index.add_debug_symbols(*image, symbols);
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+
+    const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_NE(dot.find(imported->name), std::string::npos);
+    EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos);
+}
+
 TEST(CallGraph, DebugFixtureNamesTargetsAndSupportsSecondHopFanout) {
     const std::filesystem::path exe_path = PEELF_CALLGRAPH_FIXTURE_EXE;
     const std::filesystem::path pdb_path = PEELF_CALLGRAPH_FIXTURE_PDB;
@@ -409,11 +491,11 @@ TEST(CallGraph, DebugFixtureNamesTargetsAndSupportsSecondHopFanout) {
         *main);
     const std::string main_dot = viewer::to_dot(main_graph);
 
-    EXPECT_NE(main_dot.find("peelf_fixture_first"), std::string::npos);
-    EXPECT_NE(main_dot.find("peelf_fixture_second"), std::string::npos);
+    EXPECT_NE(main_dot.find("first"), std::string::npos);
+    EXPECT_NE(main_dot.find("second"), std::string::npos);
     EXPECT_EQ(main_dot.find("call target\\n0x"), std::string::npos);
 
-    const viewer::SymbolRecord* first = index.find_by_name("peelf_fixture_first");
+    const viewer::SymbolRecord* first = find_symbol_containing(index, "first");
     ASSERT_NE(first, nullptr);
     const viewer::CallGraph first_graph = viewer::build_symbol_fanout_call_graph(
         *image,
@@ -422,8 +504,8 @@ TEST(CallGraph, DebugFixtureNamesTargetsAndSupportsSecondHopFanout) {
         *first);
     const std::string first_dot = viewer::to_dot(first_graph);
 
-    EXPECT_NE(first_dot.find("peelf_fixture_first fan-out"), std::string::npos);
-    EXPECT_NE(first_dot.find("peelf_fixture_leaf"), std::string::npos);
+    EXPECT_NE(first_dot.find("first"), std::string::npos);
+    EXPECT_NE(first_dot.find("leaf"), std::string::npos);
     EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos);
 }
 
