@@ -1,5 +1,6 @@
 #include "vulkan_manager.h"
 #include <cstring>
+#include <iterator>
 #include <stdexcept>
 #include <vector>
 #include <cstdio>
@@ -267,16 +268,18 @@ void VulkanManager::create_command_buffers() {
 }
 
 void VulkanManager::create_descriptor_pool() {
-    VkDescriptorPoolSize ps{};
-    ps.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    ps.descriptorCount = 100;
+    VkDescriptorPoolSize pool_sizes[] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 64},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64},
+    };
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    ci.maxSets = 100;
-    ci.poolSizeCount = 1;
-    ci.pPoolSizes = &ps;
+    ci.maxSets = 192;
+    ci.poolSizeCount = static_cast<uint32_t>(std::size(pool_sizes));
+    ci.pPoolSizes = pool_sizes;
 
     check(vkCreateDescriptorPool(device_, &ci, nullptr, &descriptor_pool_),
           "vkCreateDescriptorPool failed");
@@ -353,6 +356,8 @@ VulkanManager::Texture VulkanManager::create_rgba_texture(std::span<const std::u
         throw std::runtime_error("Invalid RGBA texture data");
     }
 
+    vkDeviceWaitIdle(device_);
+
     const VkDeviceSize image_size = static_cast<VkDeviceSize>(pixels.size());
 
     VkBuffer staging_buffer = VK_NULL_HANDLE;
@@ -377,7 +382,8 @@ VulkanManager::Texture VulkanManager::create_rgba_texture(std::span<const std::u
     vkBindBufferMemory(device_, staging_buffer, staging_memory, 0);
 
     void* mapped = nullptr;
-    vkMapMemory(device_, staging_memory, 0, image_size, 0, &mapped);
+    check(vkMapMemory(device_, staging_memory, 0, image_size, 0, &mapped),
+          "vkMapMemory failed for staging texture");
     std::memcpy(mapped, pixels.data(), pixels.size());
     vkUnmapMemory(device_, staging_memory);
 
@@ -494,6 +500,8 @@ void VulkanManager::destroy_texture(Texture& texture) {
     if (device_ == VK_NULL_HANDLE) {
         return;
     }
+    vkDeviceWaitIdle(device_);
+
     if (texture.descriptor_set != VK_NULL_HANDLE) {
         ImGui_ImplVulkan_RemoveTexture(texture.descriptor_set);
         texture.descriptor_set = VK_NULL_HANDLE;
