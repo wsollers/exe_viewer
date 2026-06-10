@@ -7,9 +7,10 @@
 
 namespace viewer {
 
-SymbolsPanel::SymbolsPanel(BinaryModel& model)
+SymbolsPanel::SymbolsPanel(BinaryModel& model, const ViewerSelection& selection)
     : UiPanel("Symbols")
     , model_(model)
+    , selection_(selection)
 {
     filter_buf_[0] = '\0';
 }
@@ -24,6 +25,10 @@ void SymbolsPanel::draw_contents() {
     ImGui::InputTextWithHint("Filter", "Name...", filter_buf_, sizeof(filter_buf_));
     const std::string filter = filter_buf_;
     const bool has_filter = !filter.empty();
+    const std::optional<std::uint64_t> selected_index = selected_symbol_index(selection_, *img);
+    if (!selected_index) {
+        last_scrolled_selected_.reset();
+    }
 
     ImGui::Separator();
     if (ImGui::BeginTable("SymbolsTable", 6,
@@ -48,10 +53,15 @@ void SymbolsPanel::draw_contents() {
             ImGui::TableNextColumn();
             ImGui::PushID(static_cast<int>(row_id));
             const char* display_name = symbol.name.empty() ? "<unnamed>" : symbol.name.c_str();
-            if (ImGui::Selectable(display_name, false, ImGuiSelectableFlags_SpanAllColumns)) {
+            const bool selected = selected_index && *selected_index == row_id;
+            if (ImGui::Selectable(display_name, selected, ImGuiSelectableFlags_SpanAllColumns)) {
                 if (on_symbol_activated_) {
                     on_symbol_activated_(symbol, row_id);
                 }
+            }
+            if (selected && last_scrolled_selected_ != row_id) {
+                ImGui::SetScrollHereY(0.5f);
+                last_scrolled_selected_ = row_id;
             }
             ImGui::PopID();
             ImGui::TableNextColumn();

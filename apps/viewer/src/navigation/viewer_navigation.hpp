@@ -61,5 +61,7 @@ struct StructureNode {
 struct CallGraphNode;
 [[nodiscard]] ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
                                                             const peelf::IBinaryImage& image);
+[[nodiscard]] std::optional<std::uint64_t> selected_symbol_index(const ViewerSelection& selection,
+                                                                 const peelf::IBinaryImage& image);
 
 } // namespace viewer

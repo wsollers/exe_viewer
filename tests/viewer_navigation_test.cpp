@@ -226,3 +226,42 @@ TEST(ViewerNavigation, BuildsDetailsOnlySelectionForUnmappedCallGraphNode) {
     EXPECT_FALSE(selection.virtual_address.has_value());
     EXPECT_EQ(selection.size, 0u);
 }
+
+TEST(ViewerNavigation, MapsSymbolAndCallGraphSelectionsToSymbolRows) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-linux-x64.elf");
+    ASSERT_NE(image, nullptr);
+    const auto symbol_it = std::ranges::find_if(image->symbols(), [](const peelf::Symbol& symbol) {
+        return !symbol.name.empty() && symbol.virtual_address != 0;
+    });
+    ASSERT_NE(symbol_it, image->symbols().end());
+    const std::uint64_t symbol_index = static_cast<std::uint64_t>(std::distance(image->symbols().begin(), symbol_it));
+
+    const viewer::ViewerSelection symbol_selection{
+        .kind = viewer::SelectionKind::Symbol,
+        .label = symbol_it->name,
+        .object_index = symbol_index,
+    };
+    EXPECT_EQ(viewer::selected_symbol_index(symbol_selection, *image), symbol_index);
+
+    const viewer::ViewerSelection graph_selection{
+        .kind = viewer::SelectionKind::CallGraphNode,
+        .label = symbol_it->name,
+        .virtual_address = symbol_it->virtual_address,
+        .object_index = symbol_index,
+    };
+    EXPECT_EQ(viewer::selected_symbol_index(graph_selection, *image), symbol_index);
+}
+
+TEST(ViewerNavigation, DoesNotMapUnresolvedCallGraphSelectionToFirstSymbol) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-linux-x64.elf");
+    ASSERT_NE(image, nullptr);
+    ASSERT_FALSE(image->symbols().empty());
+
+    const viewer::ViewerSelection graph_selection{
+        .kind = viewer::SelectionKind::CallGraphNode,
+        .label = "Imports",
+        .object_index = 0,
+    };
+
+    EXPECT_EQ(viewer::selected_symbol_index(graph_selection, *image), std::nullopt);
+}

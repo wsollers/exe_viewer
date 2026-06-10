@@ -262,7 +262,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , hex_panel_(model)
     , imports_panel_(model)
     , exports_panel_(model)
-    , symbols_panel_(model)
+    , symbols_panel_(model, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -813,12 +813,25 @@ void UiApp::render_call_graph_panel() {
             const std::string label = graph_node == current_call_graph_->nodes.end()
                                           ? layout_node.node_id
                                           : call_graph_node_display_label(*graph_node);
+            bool selected = false;
+            const peelf::IBinaryImage* img = model_.image();
+            if (graph_node != current_call_graph_->nodes.end() && img != nullptr) {
+                selected = same_selection(current_selection_, selection_from_call_graph_node(*graph_node, *img));
+            }
             const ImVec2 top_left = to_screen(layout_node.center_x - layout_node.width * 0.5,
                                               layout_node.center_y + layout_node.height * 0.5);
             const ImVec2 bottom_right = to_screen(layout_node.center_x + layout_node.width * 0.5,
                                                   layout_node.center_y - layout_node.height * 0.5);
-            draw_list->AddRectFilled(top_left, bottom_right, IM_COL32(248, 248, 248, 255), 4.0f);
-            draw_list->AddRect(top_left, bottom_right, IM_COL32(50, 50, 50, 255), 4.0f, 0, 2.0f);
+            draw_list->AddRectFilled(top_left,
+                                     bottom_right,
+                                     selected ? IM_COL32(232, 244, 255, 255) : IM_COL32(248, 248, 248, 255),
+                                     4.0f);
+            draw_list->AddRect(top_left,
+                               bottom_right,
+                               selected ? IM_COL32(26, 98, 170, 255) : IM_COL32(50, 50, 50, 255),
+                               4.0f,
+                               0,
+                               selected ? 3.0f : 2.0f);
             const ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
             const ImVec2 text_pos(top_left.x + std::max(4.0f, (bottom_right.x - top_left.x - text_size.x) * 0.5f),
                                   top_left.y + std::max(4.0f, (bottom_right.y - top_left.y - text_size.y) * 0.5f));

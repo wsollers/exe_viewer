@@ -400,4 +400,26 @@ ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
     };
 }
 
+std::optional<std::uint64_t> selected_symbol_index(const ViewerSelection& selection,
+                                                   const peelf::IBinaryImage& image) {
+    if (selection.kind != SelectionKind::Symbol && selection.kind != SelectionKind::CallGraphNode) {
+        return std::nullopt;
+    }
+    if (selection.object_index >= image.symbols().size()) {
+        return std::nullopt;
+    }
+
+    const peelf::Symbol& symbol = image.symbols()[static_cast<std::size_t>(selection.object_index)];
+    if (selection.kind == SelectionKind::Symbol) {
+        return selection.object_index;
+    }
+    if (!selection.label.empty() && selection.label == symbol.name) {
+        return selection.object_index;
+    }
+    if (selection.virtual_address && *selection.virtual_address == symbol.virtual_address) {
+        return selection.object_index;
+    }
+    return std::nullopt;
+}
+
 } // namespace viewer
