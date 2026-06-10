@@ -105,6 +105,12 @@ target_compile_definitions(peelf_tests PRIVATE
   PEELF_CALLGRAPH_FIXTURE_EXE="$<TARGET_FILE:peelf_callgraph_fixture>"
   PEELF_CALLGRAPH_FIXTURE_PDB="${PEELF_CALLGRAPH_FIXTURE_PDB_PATH}"
 )
+if(TARGET peelf_viewer AND MSVC)
+  target_compile_definitions(peelf_tests PRIVATE
+    PEELF_VIEWER_DEBUG_EXE="$<TARGET_FILE:peelf_viewer>"
+    PEELF_VIEWER_DEBUG_PDB="$<TARGET_PDB_FILE:peelf_viewer>"
+  )
+endif()
 add_dependencies(peelf_tests peelf_callgraph_fixture)
 
 # Register every TEST() with CTest so `ctest` discovers and runs them.

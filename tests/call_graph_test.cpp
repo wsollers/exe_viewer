@@ -509,6 +509,45 @@ TEST(CallGraph, DebugFixtureNamesTargetsAndSupportsSecondHopFanout) {
     EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos);
 }
 
+TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
+#if !defined(PEELF_VIEWER_DEBUG_EXE) || !defined(PEELF_VIEWER_DEBUG_PDB)
+    GTEST_SKIP() << "viewer debug executable path was not configured";
+#else
+    const std::filesystem::path exe_path = PEELF_VIEWER_DEBUG_EXE;
+    const std::filesystem::path pdb_path = PEELF_VIEWER_DEBUG_PDB;
+    ASSERT_TRUE(std::filesystem::exists(exe_path)) << exe_path.string();
+    if (pdb_path.empty() || !std::filesystem::exists(pdb_path)) {
+        GTEST_SKIP() << "viewer debug PDB not available: " << pdb_path.string();
+    }
+
+    const std::vector<std::uint8_t> bytes = read_file(exe_path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(exe_path);
+    ASSERT_NE(image, nullptr);
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbolLoadResult pdb = viewer::load_pdb_debug_symbols(pdb_path, *image);
+    if (pdb.status != viewer::DebugSymbolLoadStatus::Loaded) {
+        GTEST_SKIP() << "PDB load unavailable: " << viewer::to_string(pdb.status) << " " << pdb.diagnostic;
+    }
+    index.add_debug_symbols(*image, pdb.symbols);
+
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+    const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_NE(dot.find("main fan-out"), std::string::npos) << dot;
+    EXPECT_NE(dot.find("label=\"call\""), std::string::npos) << dot;
+    EXPECT_NE(dot.find("viewer::Application::init"), std::string::npos) << dot;
+    EXPECT_NE(dot.find("viewer::Application::run"), std::string::npos) << dot;
+    EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos) << dot;
+#endif
+}
+
 TEST(CallGraph, DefaultRunnerRendersSvgWhenGraphvizIsAvailable) {
 #if defined(PEELF_GRAPHVIZ_DOT_AVAILABLE) && PEELF_GRAPHVIZ_DOT_AVAILABLE
     const std::filesystem::path output_path =
