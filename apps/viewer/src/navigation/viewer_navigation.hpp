@@ -38,6 +38,7 @@ enum class SelectionKind : std::uint8_t {
     Note,
     HashTable,
     Interpreter,
+    CallGraphNode,
     Group
 };
 
@@ -57,5 +58,8 @@ struct StructureNode {
 };
 
 [[nodiscard]] StructureNode build_structure_tree(const peelf::IBinaryImage& image);
+struct CallGraphNode;
+[[nodiscard]] ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
+                                                            const peelf::IBinaryImage& image);
 
 } // namespace viewer

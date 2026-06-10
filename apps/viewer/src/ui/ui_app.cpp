@@ -701,28 +701,17 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
         return;
     }
 
-    std::optional<std::uint64_t> file_offset = node.bytes.start.file_offset;
-    if (!file_offset && node.bytes.start.virtual_address) {
-        file_offset = img->virtual_address_to_file_offset(*node.bytes.start.virtual_address);
-    }
-
-    current_selection_ = ViewerSelection{
-        .kind = SelectionKind::Symbol,
-        .label = node.label.empty() ? node.id : node.label,
-        .file_offset = file_offset,
-        .virtual_address = node.bytes.start.virtual_address,
-        .size = node.bytes.size,
-        .preferred_view = PreferredView::Disassembly,
-    };
+    current_selection_ = selection_from_call_graph_node(node, *img);
+    const std::optional<std::uint64_t> file_offset = current_selection_.file_offset;
 
     if (file_offset && *file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        const std::size_t size = node.bytes.size != 0 &&
-                                         node.bytes.size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
-                                     ? static_cast<std::size_t>(node.bytes.size)
+        const std::size_t size = current_selection_.size != 0 &&
+                                         current_selection_.size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
+                                     ? static_cast<std::size_t>(current_selection_.size)
                                      : std::size_t{1};
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), size);
-        const std::uint64_t display_address = node.bytes.start.virtual_address
-            ? *node.bytes.start.virtual_address
+        const std::uint64_t display_address = current_selection_.virtual_address
+            ? *current_selection_.virtual_address
             : *file_offset;
         disassemble_at_offset(static_cast<std::size_t>(*file_offset), display_address);
     }

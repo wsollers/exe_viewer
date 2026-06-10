@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include "graph/call_graph.hpp"
 #include "navigation/viewer_navigation.hpp"
 #include <peelf/binary_image.hpp>
 
@@ -171,4 +172,57 @@ TEST(ViewerNavigation, BuildsPeStructureTreeWithRelocationAndDebugSelections) {
     EXPECT_EQ(clr->selection.kind, viewer::SelectionKind::ClrHeader);
     EXPECT_TRUE(clr->selection.file_offset.has_value());
     EXPECT_EQ(clr->selection.size, 0x48u);
+}
+
+TEST(ViewerNavigation, BuildsSelectionPayloadFromCallGraphFunctionNode) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    const viewer::CallGraphNode node{
+        .id = "root",
+        .label = "known_export",
+        .kind = viewer::CallGraphNodeKind::Function,
+        .bytes = viewer::GraphByteRange{
+            .start = viewer::GraphAddress{
+                .virtual_address = 0x140001000,
+            },
+            .size = 0x10,
+        },
+        .symbol = viewer::GraphSymbolRef{
+            .name = "known_export",
+            .symbol_index = 3,
+        },
+    };
+
+    const viewer::ViewerSelection selection = viewer::selection_from_call_graph_node(node, *image);
+
+    EXPECT_EQ(selection.kind, viewer::SelectionKind::CallGraphNode);
+    EXPECT_EQ(selection.label, "known_export");
+    EXPECT_EQ(selection.preferred_view, viewer::PreferredView::Disassembly);
+    EXPECT_EQ(selection.object_index, 3u);
+    ASSERT_TRUE(selection.virtual_address.has_value());
+    EXPECT_EQ(*selection.virtual_address, 0x140001000u);
+    ASSERT_TRUE(selection.file_offset.has_value());
+    EXPECT_EQ(*selection.file_offset, 0x220u);
+    EXPECT_EQ(selection.size, 0x10u);
+}
+
+TEST(ViewerNavigation, BuildsDetailsOnlySelectionForUnmappedCallGraphNode) {
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+
+    const viewer::CallGraphNode node{
+        .id = "imports_summary",
+        .label = "Imports",
+        .kind = viewer::CallGraphNodeKind::Import,
+    };
+
+    const viewer::ViewerSelection selection = viewer::selection_from_call_graph_node(node, *image);
+
+    EXPECT_EQ(selection.kind, viewer::SelectionKind::CallGraphNode);
+    EXPECT_EQ(selection.label, "Imports");
+    EXPECT_EQ(selection.preferred_view, viewer::PreferredView::Details);
+    EXPECT_FALSE(selection.file_offset.has_value());
+    EXPECT_FALSE(selection.virtual_address.has_value());
+    EXPECT_EQ(selection.size, 0u);
 }

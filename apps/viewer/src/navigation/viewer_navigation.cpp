@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <string>
 
+#include "graph/call_graph.hpp"
+
 namespace viewer {
 namespace {
 
@@ -95,7 +97,10 @@ void add_imports(const peelf::IBinaryImage& image, StructureNode& root) {
     std::uint64_t index = 0;
     for (const peelf::ImportEntry& entry : image.imports()) {
         std::string label = entry.library;
-        if (!entry.name.empty()) {
+        if (entry.import_by_ordinal) {
+            label += "!#";
+            label += std::to_string(entry.ordinal);
+        } else if (!entry.name.empty()) {
             label += "!";
             label += entry.name;
         }
@@ -365,6 +370,34 @@ StructureNode build_structure_tree(const peelf::IBinaryImage& image) {
     add_elf_metadata(image, root);
 
     return root;
+}
+
+ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
+                                               const peelf::IBinaryImage& image) {
+    std::optional<std::uint64_t> file_offset = node.bytes.start.file_offset;
+    if (!file_offset && node.bytes.start.virtual_address) {
+        file_offset = image.virtual_address_to_file_offset(*node.bytes.start.virtual_address);
+    }
+
+    PreferredView preferred_view = PreferredView::Details;
+    if (file_offset && (node.kind == CallGraphNodeKind::Function ||
+                        node.kind == CallGraphNodeKind::BasicBlock ||
+                        node.kind == CallGraphNodeKind::Instruction ||
+                        node.kind == CallGraphNodeKind::Unknown)) {
+        preferred_view = PreferredView::Disassembly;
+    } else if (file_offset) {
+        preferred_view = PreferredView::Hex;
+    }
+
+    return ViewerSelection{
+        .kind = SelectionKind::CallGraphNode,
+        .label = node.label.empty() ? node.id : node.label,
+        .file_offset = file_offset,
+        .virtual_address = node.bytes.start.virtual_address,
+        .size = node.bytes.size,
+        .object_index = node.symbol ? node.symbol->symbol_index : 0u,
+        .preferred_view = preferred_view,
+    };
 }
 
 } // namespace viewer

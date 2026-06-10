@@ -33,6 +33,7 @@ namespace {
         case SelectionKind::HashTable:      return "Hash Table";
         case SelectionKind::Interpreter:    return "Interpreter";
         case SelectionKind::Group:          return "Group";
+        case SelectionKind::CallGraphNode:  return "Call Graph Node";
     }
     return "Unknown";
 }
