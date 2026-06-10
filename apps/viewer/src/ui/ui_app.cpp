@@ -480,11 +480,7 @@ void UiApp::render_main_menu() {
         }
 
         {
-            if (ImGui::MenuItem("Call Graph", nullptr, &show_call_graph_panel_)) {
-                if (show_call_graph_panel_ && !call_graph_texture_) {
-                    queue_call_graph_sample(call_graph_sample_);
-                }
-            }
+            ImGui::MenuItem("Call Graph", nullptr, &show_call_graph_panel_);
         }
 
         {
@@ -778,10 +774,6 @@ void UiApp::render_call_graph_panel() {
         ImGui::TextUnformatted(call_graph_status_.c_str());
     }
 
-    if (!call_graph_texture_ && !pending_call_graph_request_) {
-        queue_call_graph_sample(call_graph_sample_);
-    }
-
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const ImVec2 canvas_size(std::max(available.x, 64.0f), std::max(available.y, 64.0f));
     const ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
@@ -975,15 +967,11 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
         }
 
-        if (show_call_graph_panel_) {
-            load_call_graph_sample(CallGraphSample::LoadedImage);
-        } else {
-            call_graph_sample_ = CallGraphSample::LoadedImage;
-            call_graph_status_ = "Loaded-image graph will render when Call Graph is opened.";
-            if (call_graph_texture_) {
-                vulkan_.destroy_texture(*call_graph_texture_);
-                call_graph_texture_.reset();
-            }
+        call_graph_sample_ = CallGraphSample::LoadedImage;
+        call_graph_status_ = "Loaded image. Use Loaded Image or Reload to render the call graph.";
+        if (call_graph_texture_) {
+            vulkan_.destroy_texture(*call_graph_texture_);
+            call_graph_texture_.reset();
         }
     }
 
@@ -1008,8 +996,13 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                    path.string(),
                    symbol_index_.size());
 
-        if (show_call_graph_panel_) {
-            load_call_graph_sample(CallGraphSample::LoadedImage);
+        call_graph_status_ = "Debug symbols loaded. Use Reload to rebuild the call graph.";
+        pending_call_graph_request_.reset();
+        pending_call_graph_root_.reset();
+        pending_call_graph_delay_frames_ = 0;
+        if (call_graph_texture_) {
+            vulkan_.destroy_texture(*call_graph_texture_);
+            call_graph_texture_.reset();
         }
     }
 
