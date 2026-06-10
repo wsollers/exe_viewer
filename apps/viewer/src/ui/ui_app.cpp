@@ -541,47 +541,8 @@ void UiApp::load_call_graph_sample(CallGraphSample sample) {
         return;
     }
 
-    const std::optional<std::filesystem::path> graphs_dir = find_graphs_dir();
-    if (!graphs_dir) {
-        call_graph_status_ = "Could not find out/graphs. Generate the sample DOT files first.";
-        return;
-    }
-
-    const std::filesystem::path dot_path = *graphs_dir / graph_dot_name(sample);
-    const std::filesystem::path bmp_path = std::filesystem::temp_directory_path() / graph_bmp_name(sample);
-    if (!std::filesystem::exists(dot_path)) {
-        call_graph_status_ = "Missing DOT file: " + dot_path.string();
-        return;
-    }
-
-    const DefaultProcessRunner runner;
-    const GraphRenderCommand command =
-        make_graphviz_render_command(dot_path, bmp_path, GraphRenderFormat::Bmp);
-    const GraphRenderResult render_result = runner.run(command.executable, command.arguments);
-    if (!render_result.success) {
-        call_graph_status_ = "Graphviz failed to render BMP: " + render_result.diagnostic;
-        return;
-    }
-
-    const std::optional<BmpImage> bmp = load_bmp_rgba(bmp_path);
-    if (!bmp) {
-        call_graph_status_ = "Failed to load BMP: " + bmp_path.string();
-        return;
-    }
-
-    if (call_graph_texture_) {
-        vulkan_.destroy_texture(*call_graph_texture_);
-        call_graph_texture_.reset();
-    }
-
-    call_graph_texture_ = vulkan_.create_rgba_texture(std::span<const std::uint8_t>(bmp->rgba.data(), bmp->rgba.size()),
-                                                      bmp->width,
-                                                      bmp->height);
-    loaded_call_graph_bmp_ = bmp_path;
+    call_graph_status_ = "Sample bitmap rendering is disabled while the Vulkan texture path is isolated.";
     call_graph_sample_ = sample;
-    current_call_graph_.reset();
-    current_call_graph_layout_.reset();
-    call_graph_status_ = "Loaded " + bmp_path.filename().string();
 }
 
 void UiApp::queue_call_graph_sample(CallGraphSample sample) {
@@ -625,33 +586,25 @@ void UiApp::process_deferred_gpu_work() {
 }
 
 void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name) {
-    const std::filesystem::path bmp_path = std::filesystem::temp_directory_path() / output_name;
-    const std::filesystem::path plain_path = bmp_path.string() + ".plain";
+    const std::filesystem::path plain_path = std::filesystem::temp_directory_path() / (output_name.string() + ".plain");
     const DefaultProcessRunner runner;
     const GraphRenderResult render_result =
-        render_graph_with_graphviz(graph, bmp_path, GraphRenderFormat::Bmp, runner);
+        render_graph_with_graphviz(graph, plain_path, GraphRenderFormat::Plain, runner);
     if (!render_result.success) {
-        call_graph_status_ = "Graphviz failed to render loaded-image graph: " + render_result.diagnostic;
+        call_graph_status_ = "Graphviz failed to lay out loaded-image graph: " + render_result.diagnostic;
         return;
     }
 
-    const std::optional<BmpImage> bmp = load_bmp_rgba(bmp_path);
-    if (!bmp) {
-        call_graph_status_ = "Failed to load rendered graph BMP: " + bmp_path.string();
+    const std::optional<std::string> plain_text = read_text_file(plain_path);
+    if (!plain_text) {
+        call_graph_status_ = "Failed to load rendered graph layout: " + plain_path.string();
         return;
     }
 
-    {
-        const std::filesystem::path dot_path = bmp_path.string() + ".dot";
-        const GraphRenderCommand plain_command =
-            make_graphviz_render_command(dot_path, plain_path, GraphRenderFormat::Plain);
-        const GraphRenderResult plain_result = runner.run(plain_command.executable, plain_command.arguments);
-        if (plain_result.success) {
-            const std::optional<std::string> plain_text = read_text_file(plain_path);
-            current_call_graph_layout_ = plain_text ? parse_graphviz_plain_layout(*plain_text) : std::nullopt;
-        } else {
-            current_call_graph_layout_.reset();
-        }
+    current_call_graph_layout_ = parse_graphviz_plain_layout(*plain_text);
+    if (!current_call_graph_layout_) {
+        call_graph_status_ = "Graphviz produced an unreadable graph layout: " + plain_path.string();
+        return;
     }
 
     if (call_graph_texture_) {
@@ -659,12 +612,9 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
         call_graph_texture_.reset();
     }
 
-    call_graph_texture_ = vulkan_.create_rgba_texture(std::span<const std::uint8_t>(bmp->rgba.data(), bmp->rgba.size()),
-                                                      bmp->width,
-                                                      bmp->height);
-    loaded_call_graph_bmp_ = bmp_path;
+    loaded_call_graph_bmp_ = plain_path;
     current_call_graph_ = std::move(graph);
-    call_graph_status_ = "Loaded graph from current image";
+    call_graph_status_ = "Loaded graph layout from current image";
 }
 
 const CallGraphNode* UiApp::hit_test_call_graph_node(const ImVec2& image_pos,
@@ -782,7 +732,64 @@ void UiApp::render_call_graph_panel() {
                              ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
                              IM_COL32(255, 255, 255, 255));
 
-    if (call_graph_texture_) {
+    if (current_call_graph_ && current_call_graph_layout_) {
+        const float graph_width = static_cast<float>(current_call_graph_layout_->width);
+        const float graph_height = static_cast<float>(current_call_graph_layout_->height);
+        const float scale = std::min(canvas_size.x / graph_width, canvas_size.y / graph_height);
+        const ImVec2 draw_size(std::max(1.0f, graph_width * scale), std::max(1.0f, graph_height * scale));
+        const ImVec2 graph_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f,
+                               canvas_pos.y + (canvas_size.y - draw_size.y) * 0.5f);
+
+        const auto to_screen = [&](double graph_x, double graph_y) {
+            return ImVec2(graph_pos.x + static_cast<float>(graph_x) * scale,
+                          graph_pos.y + draw_size.y - static_cast<float>(graph_y) * scale);
+        };
+        const auto find_layout = [&](std::string_view node_id) -> const GraphLayoutNode* {
+            const auto it = std::ranges::find_if(current_call_graph_layout_->nodes, [&](const GraphLayoutNode& node) {
+                return node.node_id == node_id;
+            });
+            return it == current_call_graph_layout_->nodes.end() ? nullptr : &*it;
+        };
+
+        for (const CallGraphEdge& edge : current_call_graph_->edges) {
+            const GraphLayoutNode* from = find_layout(edge.from_node_id);
+            const GraphLayoutNode* to = find_layout(edge.to_node_id);
+            if (from == nullptr || to == nullptr) {
+                continue;
+            }
+            draw_list->AddLine(to_screen(from->center_x, from->center_y),
+                               to_screen(to->center_x, to->center_y),
+                               IM_COL32(80, 130, 180, 255),
+                               2.0f);
+        }
+
+        for (const GraphLayoutNode& layout_node : current_call_graph_layout_->nodes) {
+            const auto graph_node = std::ranges::find_if(current_call_graph_->nodes, [&](const CallGraphNode& node) {
+                return node.id == layout_node.node_id;
+            });
+            const std::string label = graph_node == current_call_graph_->nodes.end()
+                                          ? layout_node.node_id
+                                          : graph_node->label;
+            const ImVec2 top_left = to_screen(layout_node.center_x - layout_node.width * 0.5,
+                                              layout_node.center_y + layout_node.height * 0.5);
+            const ImVec2 bottom_right = to_screen(layout_node.center_x + layout_node.width * 0.5,
+                                                  layout_node.center_y - layout_node.height * 0.5);
+            draw_list->AddRectFilled(top_left, bottom_right, IM_COL32(248, 248, 248, 255), 4.0f);
+            draw_list->AddRect(top_left, bottom_right, IM_COL32(50, 50, 50, 255), 4.0f, 0, 2.0f);
+            const ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
+            const ImVec2 text_pos(top_left.x + std::max(4.0f, (bottom_right.x - top_left.x - text_size.x) * 0.5f),
+                                  top_left.y + std::max(4.0f, (bottom_right.y - top_left.y - text_size.y) * 0.5f));
+            draw_list->AddText(text_pos, IM_COL32(35, 35, 35, 255), label.c_str());
+        }
+
+        ImGui::SetCursorScreenPos(graph_pos);
+        ImGui::InvisibleButton("CallGraphVectorHitTarget", draw_size);
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+            if (const CallGraphNode* node = hit_test_call_graph_node(graph_pos, draw_size, ImGui::GetIO().MousePos)) {
+                activate_call_graph_node(*node);
+            }
+        }
+    } else if (call_graph_texture_) {
         const float image_width = static_cast<float>(call_graph_texture_->width);
         const float image_height = static_cast<float>(call_graph_texture_->height);
         const float scale = std::min(canvas_size.x / image_width, canvas_size.y / image_height);
@@ -801,7 +808,7 @@ void UiApp::render_call_graph_panel() {
             }
         }
     } else {
-        const char* message = "Call graph image unavailable";
+        const char* message = "No graph rendered yet. Click Loaded Image or Reload.";
         const ImVec2 text_size = ImGui::CalcTextSize(message);
         draw_list->AddText(ImVec2(canvas_pos.x + (canvas_size.x - text_size.x) * 0.5f,
                                   canvas_pos.y + (canvas_size.y - text_size.y) * 0.5f),
