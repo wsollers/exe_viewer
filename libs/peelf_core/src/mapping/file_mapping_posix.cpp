@@ -1,6 +1,6 @@
 #ifndef _WIN32
 
-#include "mapping/file_mapping_posix.hpp"
+#include "mapping/file_mapping.hpp"
 
 #include <cerrno>
 #include <cstring>

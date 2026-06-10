@@ -11,6 +11,9 @@ RUN apt-get update \
         cmake \
         git \
         graphviz \
+        libgtk-3-dev \
+        libc++-18-dev \
+        libc++abi-18-dev \
         libvulkan-dev \
         libwayland-dev \
         libx11-dev \

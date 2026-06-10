@@ -5,8 +5,10 @@
 
 #include <cstddef>
 #include <string>
+#include <system_error>
 
 namespace peelf {
+    enum class MapMode;
 
     struct PosixFileMappingBackend {
         int fd = -1;

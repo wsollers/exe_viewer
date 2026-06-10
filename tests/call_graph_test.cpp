@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -71,6 +72,106 @@ public:
         return record.name.find(needle) != std::string::npos;
     });
     return it == records.end() ? nullptr : &*it;
+}
+
+void write_u32(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t value, peelf::Endianness endian) {
+    ASSERT_LE(offset + 4u, bytes.size());
+    if (endian == peelf::Endianness::Big) {
+        bytes[offset] = static_cast<std::uint8_t>((value >> 24u) & 0xFFu);
+        bytes[offset + 1u] = static_cast<std::uint8_t>((value >> 16u) & 0xFFu);
+        bytes[offset + 2u] = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
+        bytes[offset + 3u] = static_cast<std::uint8_t>(value & 0xFFu);
+    } else {
+        bytes[offset] = static_cast<std::uint8_t>(value & 0xFFu);
+        bytes[offset + 1u] = static_cast<std::uint8_t>((value >> 8u) & 0xFFu);
+        bytes[offset + 2u] = static_cast<std::uint8_t>((value >> 16u) & 0xFFu);
+        bytes[offset + 3u] = static_cast<std::uint8_t>((value >> 24u) & 0xFFu);
+    }
+}
+
+[[nodiscard]] std::uint32_t encode_riscv_jal(std::int64_t offset) {
+    const auto imm = static_cast<std::uint32_t>(offset);
+    return 0x000000EFu |
+           ((imm & 0x00100000u) << 11u) |
+           ((imm & 0x000007FEu) << 20u) |
+           ((imm & 0x00000800u) << 9u) |
+           (imm & 0x000FF000u);
+}
+
+void patch_direct_call(std::vector<std::uint8_t>& bytes,
+                       const peelf::IBinaryImage& image,
+                       std::uint64_t root_va,
+                       std::uint64_t target_va) {
+    const std::optional<std::uint64_t> root_file_offset = image.virtual_address_to_file_offset(root_va);
+    ASSERT_TRUE(root_file_offset);
+    const std::size_t root = static_cast<std::size_t>(*root_file_offset);
+    ASSERT_LE(root + 8u, bytes.size());
+
+    switch (image.architecture()) {
+        case peelf::Architecture::X86:
+        case peelf::Architecture::X86_64: {
+            const std::int64_t rel64 =
+                static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(root_va + 5u);
+            ASSERT_GE(rel64, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()));
+            ASSERT_LE(rel64, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+            const auto rel32 = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel64));
+            bytes[root] = 0xE8u;
+            bytes[root + 1u] = static_cast<std::uint8_t>(rel32 & 0xFFu);
+            bytes[root + 2u] = static_cast<std::uint8_t>((rel32 >> 8u) & 0xFFu);
+            bytes[root + 3u] = static_cast<std::uint8_t>((rel32 >> 16u) & 0xFFu);
+            bytes[root + 4u] = static_cast<std::uint8_t>((rel32 >> 24u) & 0xFFu);
+            bytes[root + 5u] = 0xC3u;
+            break;
+        }
+        case peelf::Architecture::ARM: {
+            ASSERT_EQ(image.endianness(), peelf::Endianness::Little);
+            const std::int64_t offset = static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(root_va + 8u);
+            ASSERT_EQ(offset % 4, 0);
+            const auto imm24 = static_cast<std::uint32_t>((offset / 4) & 0x00FFFFFF);
+            write_u32(bytes, root, 0xEB000000u | imm24, image.endianness());
+            write_u32(bytes, root + 4u, 0xE12FFF1Eu, image.endianness());
+            break;
+        }
+        case peelf::Architecture::ARM64: {
+            ASSERT_EQ(image.endianness(), peelf::Endianness::Little);
+            const std::int64_t offset = static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(root_va);
+            ASSERT_EQ(offset % 4, 0);
+            const auto imm26 = static_cast<std::uint32_t>((offset / 4) & 0x03FFFFFF);
+            write_u32(bytes, root, 0x94000000u | imm26, image.endianness());
+            write_u32(bytes, root + 4u, 0xD65F03C0u, image.endianness());
+            break;
+        }
+        case peelf::Architecture::RISCV32:
+        case peelf::Architecture::RISCV64: {
+            ASSERT_EQ(image.endianness(), peelf::Endianness::Little);
+            const std::int64_t offset = static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(root_va);
+            ASSERT_EQ(offset % 2, 0);
+            write_u32(bytes, root, encode_riscv_jal(offset), image.endianness());
+            write_u32(bytes, root + 4u, 0x00008067u, image.endianness());
+            break;
+        }
+        case peelf::Architecture::MIPS32:
+        case peelf::Architecture::MIPS64: {
+            ASSERT_EQ(image.endianness(), peelf::Endianness::Big);
+            const std::uint32_t word = 0x0C000000u | static_cast<std::uint32_t>((target_va >> 2u) & 0x03FFFFFFu);
+            write_u32(bytes, root, word, image.endianness());
+            write_u32(bytes, root + 4u, 0x00000000u, image.endianness());
+            break;
+        }
+        case peelf::Architecture::PowerPC:
+        case peelf::Architecture::PowerPC64: {
+            ASSERT_EQ(image.endianness(), peelf::Endianness::Big);
+            const std::int64_t offset = static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(root_va);
+            ASSERT_GE(offset, -0x02000000);
+            ASSERT_LT(offset, 0x02000000);
+            const auto li = static_cast<std::uint32_t>(offset) & 0x03FFFFFCu;
+            write_u32(bytes, root, 0x48000001u | li, image.endianness());
+            write_u32(bytes, root + 4u, 0x4E800020u, image.endianness());
+            break;
+        }
+        default:
+            FAIL() << "unsupported architecture for direct-call patch";
+    }
 }
 
 [[nodiscard]] viewer::CallGraph sample_graph() {
@@ -389,6 +490,73 @@ TEST(CallGraph, LabelsFanoutTargetsWithNearestSymbolsAndOffsets) {
     EXPECT_NE(dot.find("helper_target+0x4"), std::string::npos);
     EXPECT_NE(dot.find("VA 0x"), std::string::npos);
     EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos);
+}
+
+TEST(CallGraph, LabelsDirectCallTargetsAcrossArchitectureFixtures) {
+    struct FixtureCase {
+        const char* name;
+        peelf::Architecture architecture;
+        peelf::Endianness endianness;
+    };
+
+    constexpr std::array<FixtureCase, 10> fixtures{{
+        {"known-linux-x64.elf", peelf::Architecture::X86_64, peelf::Endianness::Little},
+        {"known-linux-x86-elf32-le.elf", peelf::Architecture::X86, peelf::Endianness::Little},
+        {"known-linux-arm-elf32-le.elf", peelf::Architecture::ARM, peelf::Endianness::Little},
+        {"known-linux-arm64.elf", peelf::Architecture::ARM64, peelf::Endianness::Little},
+        {"known-linux-riscv32-elf32-le.elf", peelf::Architecture::RISCV32, peelf::Endianness::Little},
+        {"known-linux-riscv64.elf", peelf::Architecture::RISCV64, peelf::Endianness::Little},
+        {"known-linux-mips-elf32-be.elf", peelf::Architecture::MIPS32, peelf::Endianness::Big},
+        {"known-linux-mips64-elf64-be.elf", peelf::Architecture::MIPS64, peelf::Endianness::Big},
+        {"known-linux-ppc-elf32-be.elf", peelf::Architecture::PowerPC, peelf::Endianness::Big},
+        {"known-linux-ppc64-elf64-be.elf", peelf::Architecture::PowerPC64, peelf::Endianness::Big},
+    }};
+
+    for (const FixtureCase& fixture : fixtures) {
+        std::vector<std::uint8_t> bytes = read_fixture(fixture.name);
+        auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+        ASSERT_TRUE(parsed.has_value()) << fixture.name;
+        const std::unique_ptr<peelf::IBinaryImage> image = std::move(*parsed);
+        ASSERT_EQ(image->architecture(), fixture.architecture) << fixture.name;
+        ASSERT_EQ(image->endianness(), fixture.endianness) << fixture.name;
+
+        const std::uint64_t root_va = image->entry_point();
+        const std::uint64_t target_va = root_va + 0x4u;
+        ASSERT_TRUE(image->virtual_address_to_file_offset(root_va)) << fixture.name;
+        ASSERT_TRUE(image->virtual_address_to_file_offset(target_va)) << fixture.name;
+        patch_direct_call(bytes, *image, root_va, target_va);
+
+        viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+        const viewer::DebugSymbol symbols[] = {
+            viewer::DebugSymbol{
+                .name = "arch_root",
+                .virtual_address = root_va,
+                .size = 8,
+                .function = true,
+            },
+            viewer::DebugSymbol{
+                .name = "arch_callee",
+                .virtual_address = target_va,
+                .size = 4,
+                .function = true,
+            },
+        };
+        index.add_debug_symbols(*image, symbols);
+        const viewer::SymbolRecord* root = index.find_by_name("arch_root");
+        ASSERT_NE(root, nullptr) << fixture.name;
+
+        const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+            *image,
+            std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+            index,
+            *root);
+        const std::string dot = viewer::to_dot(graph);
+
+        EXPECT_NE(dot.find("arch_root fan-out"), std::string::npos) << fixture.name << "\n" << dot;
+        EXPECT_NE(dot.find("arch_callee"), std::string::npos) << fixture.name << "\n" << dot;
+        EXPECT_NE(dot.find("label=\"call\""), std::string::npos) << fixture.name << "\n" << dot;
+        EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos) << fixture.name << "\n" << dot;
+    }
 }
 
 TEST(CallGraph, LabelsFanoutImportThunksWithImportNames) {
