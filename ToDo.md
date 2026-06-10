@@ -30,6 +30,15 @@ and raising overall code quality.
 > suite builds and passes (`ctest` green). GoogleTest is the framework; tests live in `tests/`.
 > No exceptions: code without passing tests is treated as unfinished.
 
+## 1a. Current Feature Groups
+
+- [x] **FG-PE-EDGE** — PE import/export edge cases. Implement and test ordinal imports, forwarder exports, and malformed-table negative cases. Cross-links: P3-1, P3-2, P3-6, P7-7. **Completed:** ordinal-import parsing and display, forwarder-export fixture coverage, and malformed import/export RVA negative tests are implemented and pass on Windows/MSVC and Linux/Clang-in-Docker.
+- [ ] **FG-GRAPH-CLICK** — Call graph click-through hardening. Graph node selection must update Symbols, Hex, Disassembly, and Details through one UI-independent selection payload, with tests before broad UI hookup. Cross-links: P4-5, P7-10, P7-12b.
+- [ ] **FG-CFG** — Function/basic-block CFG construction. Move beyond fan-out graphs into basic blocks, conditional/unconditional branch edges, fallthrough, returns, and architecture-specific branch classification. Cross-links: P4-5, P7-9, P7-12b.
+- [ ] **FG-PE-UNWIND** — PE unwind / `.pdata` / `.xdata` detail. Parse and display runtime-function ranges, unwind versions/flags, prolog size, unwind codes, chained info, and exception/termination handlers. Cross-links: P3-6, P4-2, P7-7.
+- [ ] **FG-DEPS** — Dependency tree panel. Static mode uses PE imports/delay-load/bound imports and ELF `DT_NEEDED`; live mode reuses the same model for loaded process modules. Cross-links: P6-20a, P7-12a.
+- [ ] **FG-SECURITY** — Security hardening report. PE first: ASLR, NX, CFG, high-entropy VA, relocations, certs, debug info, W+X sections; ELF later: PIE, NX, RELRO, RPATH/RUNPATH, W+X, stripped/debug info. Cross-links: P6-19, P7-16.
+
 ## 2. Key decisions & open questions
 
 Resolve these before the phases they gate; defaults are the recommended path.

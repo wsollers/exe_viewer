@@ -37,9 +37,12 @@ void ImportsPanel::draw_contents() {
 
         std::uint64_t row_id = 0;
         for (const peelf::ImportEntry& entry : img->imports()) {
+            const std::string symbol_name = entry.import_by_ordinal
+                ? "#" + std::to_string(entry.ordinal)
+                : entry.name;
             if (has_filter &&
                 entry.library.find(filter) == std::string::npos &&
-                entry.name.find(filter) == std::string::npos) {
+                symbol_name.find(filter) == std::string::npos) {
                 ++row_id;
                 continue;
             }
@@ -54,7 +57,7 @@ void ImportsPanel::draw_contents() {
             }
             ImGui::PopID();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(entry.name.empty() ? "-" : entry.name.c_str());
+            ImGui::TextUnformatted(symbol_name.empty() ? "-" : symbol_name.c_str());
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(entry.delay_load ? "Delay" : "Import");
             ImGui::TableNextColumn();

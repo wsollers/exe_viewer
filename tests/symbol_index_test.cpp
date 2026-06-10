@@ -80,6 +80,15 @@ TEST(SymbolIndex, LoadsPeExportsImportsAndEntryPoint) {
     EXPECT_TRUE(imported->external);
 }
 
+TEST(SymbolIndex, FormatsOrdinalImportNames) {
+    peelf::ImportEntry entry;
+    entry.library = "KERNEL32.dll";
+    entry.ordinal = 0x004D;
+    entry.import_by_ordinal = true;
+
+    EXPECT_EQ(viewer::import_symbol_name(entry), "KERNEL32.dll!#77");
+}
+
 TEST(SymbolIndex, MergesPdbDebugSymbolsAboveParserSymbols) {
     const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
     ASSERT_NE(image, nullptr);

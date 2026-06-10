@@ -81,7 +81,9 @@ struct Symbol {
 struct ImportEntry {
     std::string   library;
     std::string   name;
+    std::uint16_t ordinal = 0;
     std::uint64_t address = 0;
+    bool          import_by_ordinal = false;
     bool          delay_load = false;
 };
 

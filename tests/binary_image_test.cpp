@@ -15,6 +15,7 @@
 #include <fstream>
 #include <optional>
 #include <ranges>
+#include <string_view>
 #include <vector>
 
 #ifndef PEELF_TEST_FIXTURES_DIR
@@ -54,6 +55,13 @@ void put64(std::vector<std::uint8_t>& b, std::size_t off, std::uint64_t v) {
     for (std::size_t i = 0; i < 8; ++i) {
         b[off + i] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF);
     }
+}
+
+void put_ascii(std::vector<std::uint8_t>& b, std::size_t off, std::string_view text) {
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        b[off + i] = static_cast<std::uint8_t>(text[i]);
+    }
+    b[off + text.size()] = 0;
 }
 
 struct ExpectedImage {
@@ -287,6 +295,8 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             const peelf::ImportEntry& imported = *normal_import;
             EXPECT_EQ(imported.library, "KERNEL32.dll") << expected.name;
             EXPECT_EQ(imported.name, "ExitProcess") << expected.name;
+            EXPECT_FALSE(imported.import_by_ordinal) << expected.name;
+            EXPECT_EQ(imported.ordinal, 0u) << expected.name;
             EXPECT_EQ(imported.address, 0x1400011D0ULL) << expected.name;
             EXPECT_FALSE(imported.delay_load) << expected.name;
 
@@ -298,6 +308,84 @@ TEST(BinaryImage, ParsesKnownArchitectureFixtures) {
             EXPECT_TRUE(exported.forwarder.empty()) << expected.name;
         }
     }
+}
+
+TEST(BinaryImage, ParsesPeOrdinalImports) {
+    const auto path = fixture_path("known-win-x64.exe");
+    ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+    std::vector<std::uint8_t> bytes = read_all(path);
+    ASSERT_GT(bytes.size(), 0x3F8u);
+    put64(bytes, 0x3E0, (1ull << 63) | 0x004Dull);
+
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value());
+
+    const peelf::IBinaryImage& img = **result;
+    const auto ordinal_import = std::ranges::find_if(img.imports(), [](const peelf::ImportEntry& entry) {
+        return entry.library == "KERNEL32.dll" && entry.import_by_ordinal;
+    });
+    ASSERT_NE(ordinal_import, img.imports().end());
+    EXPECT_TRUE(ordinal_import->name.empty());
+    EXPECT_EQ(ordinal_import->ordinal, 0x004Du);
+    EXPECT_EQ(ordinal_import->address, 0x1400011D0ULL);
+    EXPECT_FALSE(ordinal_import->delay_load);
+}
+
+TEST(BinaryImage, ParsesPeForwarderExports) {
+    const auto path = fixture_path("known-win-x64.exe");
+    ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+    std::vector<std::uint8_t> bytes = read_all(path);
+    ASSERT_GT(bytes.size(), 0x3A0u);
+    put32(bytes, 0x370, 0x1170);
+    put_ascii(bytes, 0x390, "KERNEL32.Sleep");
+
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value());
+
+    const peelf::IBinaryImage& img = **result;
+    ASSERT_EQ(img.exports().size(), 1u);
+    const peelf::ExportEntry& exported = img.exports().front();
+    EXPECT_EQ(exported.name, "known_export");
+    EXPECT_EQ(exported.ordinal, 1u);
+    EXPECT_EQ(exported.virtual_address, 0x140001170ULL);
+    EXPECT_EQ(exported.forwarder, "KERNEL32.Sleep");
+}
+
+TEST(BinaryImage, IgnoresMalformedPeImportNameRva) {
+    const auto path = fixture_path("known-win-x64.exe");
+    ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+    std::vector<std::uint8_t> bytes = read_all(path);
+    ASSERT_GT(bytes.size(), 0x3F8u);
+    put64(bytes, 0x3E0, 0x7FFF'FFF0ull);
+
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value());
+
+    const peelf::IBinaryImage& img = **result;
+    const auto normal_import = std::ranges::find_if(img.imports(), [](const peelf::ImportEntry& entry) {
+        return entry.library == "KERNEL32.dll";
+    });
+    EXPECT_EQ(normal_import, img.imports().end());
+    const auto delay_import = std::ranges::find_if(img.imports(), [](const peelf::ImportEntry& entry) {
+        return entry.library == "USER32.dll" && entry.name == "MessageBoxA" && entry.delay_load;
+    });
+    EXPECT_NE(delay_import, img.imports().end());
+}
+
+TEST(BinaryImage, IgnoresMalformedPeExportNameRva) {
+    const auto path = fixture_path("known-win-x64.exe");
+    ASSERT_TRUE(std::filesystem::exists(path)) << "missing fixture: " << path.string();
+
+    std::vector<std::uint8_t> bytes = read_all(path);
+    ASSERT_GT(bytes.size(), 0x378u);
+    put32(bytes, 0x374, 0xFFFF'FFF0u);
+
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE((**result).exports().empty());
 }
 
 TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {

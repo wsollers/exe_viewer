@@ -951,6 +951,13 @@ void parse_pe_import_thunks(std::span<const std::uint8_t> b,
 
         const std::uint64_t ordinal_mask = is64 ? (1ull << 63) : (1ull << 31);
         if ((thunk_value & ordinal_mask) != 0) {
+            ImportEntry entry;
+            entry.library = library;
+            entry.ordinal = static_cast<std::uint16_t>(thunk_value & 0xFFFFu);
+            entry.address = image_base + address_table_rva + thunk_index * thunk_size;
+            entry.import_by_ordinal = true;
+            entry.delay_load = delay_load;
+            imports_out.push_back(std::move(entry));
             continue;
         }
 

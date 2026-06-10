@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <string>
 #include <utility>
 
 namespace viewer {
@@ -134,13 +135,16 @@ void add_record(std::vector<SymbolRecord>& records, SymbolRecord record) {
 } // namespace
 
 std::string import_symbol_name(const peelf::ImportEntry& entry) {
+    const std::string import_name = entry.import_by_ordinal
+        ? "#" + std::to_string(entry.ordinal)
+        : entry.name;
     if (entry.library.empty()) {
-        return entry.name.empty() ? "<import>" : entry.name;
+        return import_name.empty() ? "<import>" : import_name;
     }
-    if (entry.name.empty()) {
+    if (import_name.empty()) {
         return entry.library;
     }
-    return entry.library + "!" + entry.name;
+    return entry.library + "!" + import_name;
 }
 
 SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
