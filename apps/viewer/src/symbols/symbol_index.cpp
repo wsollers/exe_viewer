@@ -53,6 +53,77 @@ namespace {
     return normalized_size(candidate.size) < normalized_size(current.size);
 }
 
+[[nodiscard]] const peelf::Section* executable_section_containing(const peelf::IBinaryImage& image,
+                                                                  std::uint64_t virtual_address) noexcept {
+    for (const peelf::Section& section : image.sections()) {
+        if (!section.executable) {
+            continue;
+        }
+        const std::uint64_t mapped_size = section.virtual_size != 0 ? section.virtual_size : section.file_size;
+        if (mapped_size == 0) {
+            continue;
+        }
+        if (virtual_address >= section.virtual_address &&
+            virtual_address - section.virtual_address < mapped_size) {
+            return &section;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] bool section_contains(const peelf::Section& section, std::uint64_t virtual_address) noexcept {
+    const std::uint64_t mapped_size = section.virtual_size != 0 ? section.virtual_size : section.file_size;
+    return mapped_size != 0 &&
+           virtual_address >= section.virtual_address &&
+           virtual_address - section.virtual_address < mapped_size;
+}
+
+[[nodiscard]] std::uint64_t recover_pe_function_size(const peelf::IBinaryImage& image,
+                                                     std::uint64_t virtual_address,
+                                                     std::uint64_t fallback_size = 0) noexcept {
+    if (image.format() != peelf::Format::PE || virtual_address < image.image_base()) {
+        return fallback_size;
+    }
+
+    const std::uint64_t rva = virtual_address - image.image_base();
+    for (const peelf::PeRuntimeFunction& function : image.pe_runtime_functions()) {
+        if (rva >= function.begin_address_rva && rva < function.end_address_rva) {
+            return function.end_address_rva - rva;
+        }
+    }
+
+    for (const peelf::Symbol& symbol : image.symbols()) {
+        if (symbol.virtual_address == virtual_address && symbol.size != 0) {
+            return symbol.size;
+        }
+    }
+
+    const peelf::Section* section = executable_section_containing(image, virtual_address);
+    if (section == nullptr) {
+        return fallback_size;
+    }
+
+    std::uint64_t nearest_after = 0;
+    for (const peelf::Symbol& symbol : image.symbols()) {
+        if (symbol.virtual_address <= virtual_address || !section_contains(*section, symbol.virtual_address)) {
+            continue;
+        }
+        if (nearest_after == 0 || symbol.virtual_address < nearest_after) {
+            nearest_after = symbol.virtual_address;
+        }
+    }
+    for (const peelf::ExportEntry& exported : image.exports()) {
+        if (exported.virtual_address <= virtual_address || !section_contains(*section, exported.virtual_address)) {
+            continue;
+        }
+        if (nearest_after == 0 || exported.virtual_address < nearest_after) {
+            nearest_after = exported.virtual_address;
+        }
+    }
+
+    return nearest_after > virtual_address ? nearest_after - virtual_address : fallback_size;
+}
+
 void add_record(std::vector<SymbolRecord>& records, SymbolRecord record) {
     if (record.name.empty() || is_elf_mapping_symbol(record.name)) {
         return;
@@ -111,7 +182,7 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
                                                                  : std::optional(entry_record.virtual_address),
             .file_offset = entry_record.virtual_address == 0 ? std::optional<std::uint64_t>{}
                                                             : image.virtual_address_to_file_offset(entry_record.virtual_address),
-            .size = 0,
+            .size = entry_record.virtual_address == 0 ? 0 : recover_pe_function_size(image, entry_record.virtual_address),
         });
     }
 
@@ -145,7 +216,9 @@ void SymbolIndex::add_debug_symbols(const peelf::IBinaryImage& image, std::span<
                                                            : std::optional(symbol.virtual_address),
             .file_offset = symbol.virtual_address == 0 ? std::optional<std::uint64_t>{}
                                                        : image.virtual_address_to_file_offset(symbol.virtual_address),
-            .size = symbol.size,
+            .size = symbol.size == 0 && symbol.virtual_address != 0
+                         ? recover_pe_function_size(image, symbol.virtual_address)
+                         : symbol.size,
             .dynamic = false,
             .external = symbol.virtual_address == 0,
         });

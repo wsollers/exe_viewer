@@ -65,6 +65,7 @@ public:
     [[nodiscard]] Architecture architecture() const noexcept override { return arch_; }
     [[nodiscard]] Endianness endianness() const noexcept override { return endian_; }
     [[nodiscard]] bool is_64bit() const noexcept override { return is_64_; }
+    [[nodiscard]] std::uint64_t image_base() const noexcept override { return image_base_; }
     [[nodiscard]] std::uint64_t entry_point() const noexcept override { return entry_; }
     [[nodiscard]] const std::vector<Section>& sections() const noexcept override { return sections_; }
     [[nodiscard]] const std::vector<Segment>& segments() const noexcept override { return segments_; }
@@ -181,6 +182,7 @@ protected:
     Architecture arch_   = Architecture::Unknown;
     Endianness   endian_ = Endianness::Little;
     bool         is_64_  = false;
+    std::uint64_t image_base_ = 0;
     std::uint64_t entry_ = 0;
     std::vector<Section> sections_;
     std::vector<Segment> segments_;
@@ -483,6 +485,103 @@ void parse_pe_runtime_functions(std::span<const std::uint8_t> b,
         entry.unwind_info_rva = rd32(b, off + 0x08, false);
         entry.file_offset = entry_off;
         runtime_functions_out.push_back(entry);
+    }
+}
+
+[[nodiscard]] std::string read_pe_coff_symbol_name(std::span<const std::uint8_t> b,
+                                                   std::size_t symbol_offset,
+                                                   std::uint64_t string_table_offset,
+                                                   std::uint64_t string_table_size) {
+    if (rd32(b, symbol_offset, false) == 0) {
+        const std::uint32_t name_offset = rd32(b, symbol_offset + 4u, false);
+        if (name_offset < 4u || name_offset >= string_table_size) {
+            return {};
+        }
+        return read_c_string(b, string_table_offset + name_offset);
+    }
+
+    std::string name;
+    for (std::size_t i = 0; i < 8u && b[symbol_offset + i] != 0; ++i) {
+        name.push_back(static_cast<char>(b[symbol_offset + i]));
+    }
+    return name;
+}
+
+void parse_pe_coff_symbols(std::span<const std::uint8_t> b,
+                           const std::vector<Section>& sections,
+                           std::uint32_t symbol_table_offset,
+                           std::uint32_t symbol_count,
+                           std::vector<Symbol>& symbols_out) {
+    constexpr std::uint64_t kSymbolSize = 18;
+    if (symbol_table_offset == 0 || symbol_count == 0 ||
+        !fits_range(symbol_table_offset, static_cast<std::uint64_t>(symbol_count) * kSymbolSize,
+                    static_cast<std::uint64_t>(b.size()))) {
+        return;
+    }
+
+    const std::uint64_t string_table_offset =
+        static_cast<std::uint64_t>(symbol_table_offset) + static_cast<std::uint64_t>(symbol_count) * kSymbolSize;
+    std::uint64_t string_table_size = 0;
+    if (fits_range(string_table_offset, 4, static_cast<std::uint64_t>(b.size()))) {
+        string_table_size = rd32(b, static_cast<std::size_t>(string_table_offset), false);
+        if (!fits_range(string_table_offset, string_table_size, static_cast<std::uint64_t>(b.size()))) {
+            string_table_size = 0;
+        }
+    }
+
+    const std::size_t original_size = symbols_out.size();
+    for (std::uint32_t index = 0; index < symbol_count;) {
+        const std::uint64_t symbol_offset64 =
+            static_cast<std::uint64_t>(symbol_table_offset) + static_cast<std::uint64_t>(index) * kSymbolSize;
+        const std::size_t symbol_offset = static_cast<std::size_t>(symbol_offset64);
+        const std::uint32_t value = rd32(b, symbol_offset + 8u, false);
+        const auto section_number = static_cast<std::int16_t>(rd16(b, symbol_offset + 12u, false));
+        const std::uint16_t type = rd16(b, symbol_offset + 14u, false);
+        const std::uint8_t storage_class = b[symbol_offset + 16u];
+        const std::uint8_t auxiliary_count = b[symbol_offset + 17u];
+
+        const bool defined_section = section_number > 0 &&
+                                     static_cast<std::size_t>(section_number) <= sections.size();
+        constexpr std::uint16_t kFunctionDerivedType = 0x20;
+        constexpr std::uint8_t kExternal = 2;
+        constexpr std::uint8_t kStatic = 3;
+        constexpr std::uint8_t kLabel = 6;
+        const bool function = (type & kFunctionDerivedType) != 0;
+        const bool useful_storage = storage_class == kExternal || storage_class == kStatic || storage_class == kLabel;
+
+        if (defined_section && function && useful_storage) {
+            Symbol symbol;
+            symbol.name = read_pe_coff_symbol_name(b, symbol_offset, string_table_offset, string_table_size);
+            if (!symbol.name.empty()) {
+                const Section& section = sections[static_cast<std::size_t>(section_number - 1)];
+                symbol.virtual_address = section.virtual_address + value;
+                symbol.binding = storage_class;
+                symbol.type = static_cast<std::uint8_t>(type & 0xFFu);
+                symbol.section_index = static_cast<std::uint16_t>(section_number);
+                symbol.dynamic = false;
+                symbols_out.push_back(std::move(symbol));
+            }
+        }
+
+        index += static_cast<std::uint32_t>(1u + auxiliary_count);
+    }
+
+    auto begin = symbols_out.begin() + static_cast<std::ptrdiff_t>(original_size);
+    std::ranges::sort(begin, symbols_out.end(), [](const Symbol& lhs, const Symbol& rhs) {
+        if (lhs.section_index != rhs.section_index) {
+            return lhs.section_index < rhs.section_index;
+        }
+        return lhs.virtual_address < rhs.virtual_address;
+    });
+
+    for (auto it = begin; it != symbols_out.end(); ++it) {
+        const auto next = std::find_if(std::next(it), symbols_out.end(), [&](const Symbol& candidate) {
+            return candidate.section_index == it->section_index &&
+                   candidate.virtual_address > it->virtual_address;
+        });
+        if (next != symbols_out.end()) {
+            it->size = next->virtual_address - it->virtual_address;
+        }
     }
 }
 
@@ -1571,6 +1670,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
 
     const std::size_t coff = static_cast<std::size_t>(e_lfanew) + 4;
     const std::uint16_t machine         = rd16(b, coff + 0, false);
+    const std::uint32_t symbol_table_offset = rd32(b, coff + 8, false);
+    const std::uint32_t symbol_count = rd32(b, coff + 12, false);
     const std::uint16_t size_of_opt     = rd16(b, coff + 16, false);
     const std::uint16_t characteristics = rd16(b, coff + 18, false);
 
@@ -1676,6 +1777,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     img->format_ = Format::PE;
     img->endian_ = Endianness::Little;
     img->is_64_  = is64;
+    img->image_base_ = image_base;
     img->arch_   = pe_arch(machine);
     // IMAGE_FILE_DLL = 0x2000.
     img->kind_   = (characteristics & 0x2000) ? ImageKind::SharedLibrary : ImageKind::Executable;
@@ -1714,6 +1816,8 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         sec.writable   = (chars & 0x80000000u) != 0;  // IMAGE_SCN_MEM_WRITE
         img->sections_.push_back(std::move(sec));
     }
+
+    parse_pe_coff_symbols(b, img->sections_, symbol_table_offset, symbol_count, img->symbols_);
 
     parse_pe_base_relocations(b, img->sections_, image_base, base_reloc_dir_rva,
                               base_reloc_dir_size, img->base_relocations_);

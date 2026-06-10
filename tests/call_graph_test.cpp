@@ -267,6 +267,16 @@ void assert_known_shared_library_fixture(const BinMatrixCase& fixture) {
     ASSERT_NE(second, nullptr) << name;
     ASSERT_NE(leaf, nullptr) << name;
     ASSERT_NE(shared_anchor, nullptr) << name;
+    EXPECT_GT(first->size, 0u) << name;
+    EXPECT_GT(second->size, 0u) << name;
+    EXPECT_GT(leaf->size, 0u) << name;
+    EXPECT_GT(shared_anchor->size, 0u) << name;
+    EXPECT_LT(shared_anchor->size, 0x100u) << name;
+    EXPECT_GT(first->size, 0u) << name;
+    EXPECT_GT(second->size, 0u) << name;
+    EXPECT_GT(leaf->size, 0u) << name;
+    EXPECT_GT(shared_anchor->size, 0u) << name;
+    EXPECT_LT(shared_anchor->size, 0x100u) << name;
 
     const viewer::CallGraph first_graph = viewer::build_symbol_fanout_call_graph(
         *image,
@@ -287,6 +297,9 @@ void assert_known_shared_library_fixture(const BinMatrixCase& fixture) {
     EXPECT_NE(anchor_dot.find("shared_anchor fan-out"), std::string::npos) << name << "\n" << anchor_dot;
     EXPECT_NE(anchor_dot.find("first"), std::string::npos) << name << "\n" << anchor_dot;
     EXPECT_NE(anchor_dot.find("second"), std::string::npos) << name << "\n" << anchor_dot;
+    if (fixture.is_64bit) {
+        EXPECT_EQ(anchor_dot.find("call target\\n0x"), std::string::npos) << name << "\n" << anchor_dot;
+    }
 }
 
 void assert_known_pe_dll_fixture(const BinMatrixCase& fixture) {
@@ -334,6 +347,9 @@ void assert_known_pe_dll_fixture(const BinMatrixCase& fixture) {
     EXPECT_NE(anchor_dot.find("shared_anchor fan-out"), std::string::npos) << name << "\n" << anchor_dot;
     EXPECT_NE(anchor_dot.find("first"), std::string::npos) << name << "\n" << anchor_dot;
     EXPECT_NE(anchor_dot.find("second"), std::string::npos) << name << "\n" << anchor_dot;
+    if (fixture.is_64bit) {
+        EXPECT_EQ(anchor_dot.find("call target\\n0x"), std::string::npos) << name << "\n" << anchor_dot;
+    }
 }
 
 [[nodiscard]] viewer::CallGraph sample_graph() {

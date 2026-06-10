@@ -351,6 +351,7 @@ public:
     [[nodiscard]] virtual Architecture  architecture() const noexcept = 0;
     [[nodiscard]] virtual Endianness    endianness()   const noexcept = 0;
     [[nodiscard]] virtual bool          is_64bit()     const noexcept = 0;
+    [[nodiscard]] virtual std::uint64_t image_base()   const noexcept = 0;
     // Entry-point virtual address (ELF e_entry; PE ImageBase + AddressOfEntryPoint).
     [[nodiscard]] virtual std::uint64_t entry_point()  const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Section>& sections() const noexcept = 0;
