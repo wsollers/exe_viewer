@@ -15,6 +15,8 @@ endif()
 
 add_executable(peelf_viewer
   src/main.cpp
+        src/crash/crash_handler.hpp
+        src/crash/crash_handler.cpp
         src/application.h
         src/application.cpp
         src/vulkan/vulkan_manager.h
@@ -77,6 +79,8 @@ target_link_libraries(peelf_viewer PRIVATE
 )
 
 if(MSVC)
+  target_link_libraries(peelf_viewer PRIVATE Dbghelp)
+
   find_path(PEELF_DIA_INCLUDE_DIR dia2.h
     PATHS
       "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/include"
