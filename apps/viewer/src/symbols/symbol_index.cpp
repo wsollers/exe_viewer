@@ -174,4 +174,25 @@ const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_a
     return best;
 }
 
+const SymbolRecord* SymbolIndex::find_nearest_preceding_address(std::uint64_t virtual_address,
+                                                                std::uint64_t max_distance) const noexcept {
+    const SymbolRecord* best = nullptr;
+    std::uint64_t best_distance = max_distance + (max_distance == std::numeric_limits<std::uint64_t>::max() ? 0u : 1u);
+    for (const SymbolRecord& record : records_) {
+        if (!record.virtual_address || *record.virtual_address > virtual_address) {
+            continue;
+        }
+        const std::uint64_t distance = virtual_address - *record.virtual_address;
+        if (distance > max_distance) {
+            continue;
+        }
+        if (best == nullptr || distance < best_distance ||
+            (distance == best_distance && is_better_address_match(record, *best))) {
+            best = &record;
+            best_distance = distance;
+        }
+    }
+    return best;
+}
+
 } // namespace viewer

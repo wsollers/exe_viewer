@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -304,6 +305,63 @@ TEST(CallGraph, BuildsSymbolFanoutGraphWithoutResolvedCalls) {
 
     EXPECT_NE(dot.find("main fan-out"), std::string::npos);
     EXPECT_NE(dot.find("No direct call targets resolved"), std::string::npos);
+}
+
+TEST(CallGraph, LabelsFanoutTargetsWithNearestSymbolsAndOffsets) {
+    std::vector<std::uint8_t> bytes = read_fixture("known-win-x64.exe");
+    auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+    ASSERT_TRUE(parsed.has_value());
+    const std::unique_ptr<peelf::IBinaryImage> image = std::move(*parsed);
+
+    const std::uint64_t root_va = image->entry_point();
+    const std::optional<std::uint64_t> root_file_offset = image->virtual_address_to_file_offset(root_va);
+    ASSERT_TRUE(root_file_offset);
+    ASSERT_LE(*root_file_offset + 8u, bytes.size());
+
+    const std::uint64_t helper_va = root_va + 0x20u;
+    const std::uint64_t call_target_va = helper_va + 0x4u;
+    const std::int64_t rel64 = static_cast<std::int64_t>(call_target_va) - static_cast<std::int64_t>(root_va + 5u);
+    ASSERT_GE(rel64, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::min()));
+    ASSERT_LE(rel64, static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()));
+    const auto rel32 = static_cast<std::uint32_t>(static_cast<std::int32_t>(rel64));
+
+    const std::size_t start = static_cast<std::size_t>(*root_file_offset);
+    bytes[start] = 0xE8u;
+    bytes[start + 1u] = static_cast<std::uint8_t>(rel32 & 0xFFu);
+    bytes[start + 2u] = static_cast<std::uint8_t>((rel32 >> 8u) & 0xFFu);
+    bytes[start + 3u] = static_cast<std::uint8_t>((rel32 >> 16u) & 0xFFu);
+    bytes[start + 4u] = static_cast<std::uint8_t>((rel32 >> 24u) & 0xFFu);
+    bytes[start + 5u] = 0xC3u;
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        viewer::DebugSymbol{
+            .name = "main",
+            .virtual_address = root_va,
+            .size = 8,
+            .function = true,
+        },
+        viewer::DebugSymbol{
+            .name = "helper_target",
+            .virtual_address = helper_va,
+            .size = 0,
+            .function = true,
+        },
+    };
+    index.add_debug_symbols(*image, symbols);
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+
+    const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_NE(dot.find("helper_target+0x4"), std::string::npos);
+    EXPECT_NE(dot.find("VA 0x"), std::string::npos);
+    EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos);
 }
 
 TEST(CallGraph, DefaultRunnerRendersSvgWhenGraphvizIsAvailable) {

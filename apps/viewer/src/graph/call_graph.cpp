@@ -283,6 +283,35 @@ namespace {
     };
 }
 
+[[nodiscard]] CallGraphNode node_from_call_target(const peelf::IBinaryImage& image,
+                                                  const SymbolRecord& record,
+                                                  std::uint64_t target,
+                                                  std::string id) {
+    const bool external = record.external || record.source == SymbolSource::Import;
+    std::string label = record.name;
+    if (record.virtual_address && target > *record.virtual_address) {
+        label += "+" + format_hex(target - *record.virtual_address);
+    }
+
+    return CallGraphNode{
+        .id = std::move(id),
+        .label = std::move(label),
+        .kind = external ? CallGraphNodeKind::External : CallGraphNodeKind::Function,
+        .bytes = GraphByteRange{
+            .start = GraphAddress{
+                .virtual_address = target,
+                .file_offset = image.virtual_address_to_file_offset(target),
+            },
+            .size = record.size == 0 ? 1u : record.size,
+        },
+        .symbol = GraphSymbolRef{
+            .name = record.name,
+            .symbol_index = record.source_index,
+            .dynamic = record.dynamic,
+        },
+    };
+}
+
 [[nodiscard]] GraphByteRange symbol_range(const peelf::IBinaryImage& image, const peelf::Symbol& symbol) {
     return GraphByteRange{
         .start = GraphAddress{
@@ -715,9 +744,13 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                         }
 
                         const SymbolRecord* callee = symbol_index.find_containing_address(*target);
+                        if (callee == nullptr) {
+                            constexpr std::uint64_t max_symbol_offset = 4096;
+                            callee = symbol_index.find_nearest_preceding_address(*target, max_symbol_offset);
+                        }
                         const std::string callee_id = "callee_" + std::to_string(call_index++);
                         if (callee != nullptr && callee->name != root.name) {
-                            graph.nodes.push_back(node_from_record(*callee, callee_id));
+                            graph.nodes.push_back(node_from_call_target(image, *callee, *target, callee_id));
                             graph.edges.push_back(CallGraphEdge{
                                 .from_node_id = "root",
                                 .to_node_id = callee_id,
