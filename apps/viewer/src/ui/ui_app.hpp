@@ -112,7 +112,9 @@ namespace viewer {
         void load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name);
         void activate_call_graph_node(const CallGraphNode& node);
         const CallGraphNode* hit_test_call_graph_node(const ImVec2& image_pos,
-                                                      const ImVec2& draw_size,
+                                                      float graph_scale,
+                                                      double graph_min_x,
+                                                      double graph_max_y,
                                                       const ImVec2& mouse_pos) const;
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
         void apply_structure_selection_navigation();

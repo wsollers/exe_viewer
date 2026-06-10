@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -53,6 +54,55 @@ struct BmpImage {
     std::uint32_t height = 0;
     std::vector<std::uint8_t> rgba;
 };
+
+struct GraphLayoutBounds {
+    double min_x = 0.0;
+    double min_y = 0.0;
+    double max_x = 0.0;
+    double max_y = 0.0;
+};
+
+[[nodiscard]] std::string format_graph_hex(std::uint64_t value) {
+    std::array<char, 32> buffer{};
+    std::snprintf(buffer.data(), buffer.size(), "0x%llX", static_cast<unsigned long long>(value));
+    return buffer.data();
+}
+
+[[nodiscard]] std::string call_graph_node_display_label(const CallGraphNode& node) {
+    const std::string base_label = node.label.empty() ? node.id : node.label;
+    std::string label = base_label;
+    if (node.bytes.start.virtual_address) {
+        label += "\nVA " + format_graph_hex(*node.bytes.start.virtual_address);
+    }
+    if (node.bytes.start.file_offset) {
+        label += "\nfile " + format_graph_hex(*node.bytes.start.file_offset);
+    }
+    if (node.symbol && !node.symbol->name.empty() && node.symbol->name != base_label) {
+        label += "\n" + node.symbol->name;
+    }
+    return label;
+}
+
+[[nodiscard]] GraphLayoutBounds graph_layout_bounds(const GraphLayout& layout) {
+    if (layout.nodes.empty()) {
+        return {.min_x = 0.0, .min_y = 0.0, .max_x = layout.width, .max_y = layout.height};
+    }
+
+    GraphLayoutBounds bounds{
+        .min_x = layout.nodes.front().center_x - layout.nodes.front().width * 0.5,
+        .min_y = layout.nodes.front().center_y - layout.nodes.front().height * 0.5,
+        .max_x = layout.nodes.front().center_x + layout.nodes.front().width * 0.5,
+        .max_y = layout.nodes.front().center_y + layout.nodes.front().height * 0.5,
+    };
+
+    for (const GraphLayoutNode& node : layout.nodes) {
+        bounds.min_x = std::min(bounds.min_x, node.center_x - node.width * 0.5);
+        bounds.min_y = std::min(bounds.min_y, node.center_y - node.height * 0.5);
+        bounds.max_x = std::max(bounds.max_x, node.center_x + node.width * 0.5);
+        bounds.max_y = std::max(bounds.max_y, node.center_y + node.height * 0.5);
+    }
+    return bounds;
+}
 
 [[nodiscard]] std::uint16_t read_u16_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
     return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8u));
@@ -618,22 +668,17 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
 }
 
 const CallGraphNode* UiApp::hit_test_call_graph_node(const ImVec2& image_pos,
-                                                     const ImVec2& draw_size,
+                                                     float graph_scale,
+                                                     double graph_min_x,
+                                                     double graph_max_y,
                                                      const ImVec2& mouse_pos) const {
     if (!current_call_graph_ || !current_call_graph_layout_ ||
         current_call_graph_layout_->width <= 0.0 || current_call_graph_layout_->height <= 0.0 ||
-        draw_size.x <= 0.0f || draw_size.y <= 0.0f) {
+        graph_scale <= 0.0f) {
         return nullptr;
     }
-    if (mouse_pos.x < image_pos.x || mouse_pos.y < image_pos.y ||
-        mouse_pos.x > image_pos.x + draw_size.x || mouse_pos.y > image_pos.y + draw_size.y) {
-        return nullptr;
-    }
-
-    const double graph_x = (static_cast<double>(mouse_pos.x - image_pos.x) / draw_size.x) *
-                           current_call_graph_layout_->width;
-    const double graph_y = (1.0 - static_cast<double>(mouse_pos.y - image_pos.y) / draw_size.y) *
-                           current_call_graph_layout_->height;
+    const double graph_x = graph_min_x + static_cast<double>(mouse_pos.x - image_pos.x) / graph_scale;
+    const double graph_y = graph_max_y - static_cast<double>(mouse_pos.y - image_pos.y) / graph_scale;
 
     for (const GraphLayoutNode& layout_node : current_call_graph_layout_->nodes) {
         const double left = layout_node.center_x - layout_node.width * 0.5;
@@ -733,16 +778,20 @@ void UiApp::render_call_graph_panel() {
                              IM_COL32(255, 255, 255, 255));
 
     if (current_call_graph_ && current_call_graph_layout_) {
-        const float graph_width = static_cast<float>(current_call_graph_layout_->width);
-        const float graph_height = static_cast<float>(current_call_graph_layout_->height);
-        const float scale = std::min(canvas_size.x / graph_width, canvas_size.y / graph_height);
+        const GraphLayoutBounds bounds = graph_layout_bounds(*current_call_graph_layout_);
+        const float graph_width = static_cast<float>(std::max(1.0, bounds.max_x - bounds.min_x));
+        const float graph_height = static_cast<float>(std::max(1.0, bounds.max_y - bounds.min_y));
+        constexpr float kGraphPadding = 32.0f;
+        const ImVec2 padded_canvas_size(std::max(1.0f, canvas_size.x - kGraphPadding * 2.0f),
+                                        std::max(1.0f, canvas_size.y - kGraphPadding * 2.0f));
+        const float scale = std::min(padded_canvas_size.x / graph_width, padded_canvas_size.y / graph_height);
         const ImVec2 draw_size(std::max(1.0f, graph_width * scale), std::max(1.0f, graph_height * scale));
         const ImVec2 graph_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f,
                                canvas_pos.y + (canvas_size.y - draw_size.y) * 0.5f);
 
         const auto to_screen = [&](double graph_x, double graph_y) {
-            return ImVec2(graph_pos.x + static_cast<float>(graph_x) * scale,
-                          graph_pos.y + draw_size.y - static_cast<float>(graph_y) * scale);
+            return ImVec2(graph_pos.x + static_cast<float>(graph_x - bounds.min_x) * scale,
+                          graph_pos.y + static_cast<float>(bounds.max_y - graph_y) * scale);
         };
         const auto find_layout = [&](std::string_view node_id) -> const GraphLayoutNode* {
             const auto it = std::ranges::find_if(current_call_graph_layout_->nodes, [&](const GraphLayoutNode& node) {
@@ -769,7 +818,7 @@ void UiApp::render_call_graph_panel() {
             });
             const std::string label = graph_node == current_call_graph_->nodes.end()
                                           ? layout_node.node_id
-                                          : graph_node->label;
+                                          : call_graph_node_display_label(*graph_node);
             const ImVec2 top_left = to_screen(layout_node.center_x - layout_node.width * 0.5,
                                               layout_node.center_y + layout_node.height * 0.5);
             const ImVec2 bottom_right = to_screen(layout_node.center_x + layout_node.width * 0.5,
@@ -785,7 +834,8 @@ void UiApp::render_call_graph_panel() {
         ImGui::SetCursorScreenPos(graph_pos);
         ImGui::InvisibleButton("CallGraphVectorHitTarget", draw_size);
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-            if (const CallGraphNode* node = hit_test_call_graph_node(graph_pos, draw_size, ImGui::GetIO().MousePos)) {
+            if (const CallGraphNode* node =
+                    hit_test_call_graph_node(graph_pos, scale, bounds.min_x, bounds.max_y, ImGui::GetIO().MousePos)) {
                 activate_call_graph_node(*node);
             }
         }
@@ -803,7 +853,16 @@ void UiApp::render_call_graph_panel() {
         ImGui::SetCursorScreenPos(image_pos);
         ImGui::InvisibleButton("CallGraphImageHitTarget", draw_size);
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-            if (const CallGraphNode* node = hit_test_call_graph_node(image_pos, draw_size, ImGui::GetIO().MousePos)) {
+            const float image_scale = current_call_graph_layout_ && current_call_graph_layout_->width > 0.0
+                                          ? draw_size.x / static_cast<float>(current_call_graph_layout_->width)
+                                          : 1.0f;
+            if (const CallGraphNode* node = hit_test_call_graph_node(image_pos,
+                                                                     image_scale,
+                                                                     0.0,
+                                                                     current_call_graph_layout_
+                                                                         ? current_call_graph_layout_->height
+                                                                         : 0.0,
+                                                                     ImGui::GetIO().MousePos)) {
                 activate_call_graph_node(*node);
             }
         }
