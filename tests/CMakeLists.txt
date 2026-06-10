@@ -105,9 +105,13 @@ target_compile_definitions(peelf_tests PRIVATE
   PEELF_CALLGRAPH_FIXTURE_EXE="$<TARGET_FILE:peelf_callgraph_fixture>"
   PEELF_CALLGRAPH_FIXTURE_PDB="${PEELF_CALLGRAPH_FIXTURE_PDB_PATH}"
 )
-if(TARGET peelf_viewer AND MSVC)
+if(TARGET peelf_viewer)
   target_compile_definitions(peelf_tests PRIVATE
     PEELF_VIEWER_DEBUG_EXE="$<TARGET_FILE:peelf_viewer>"
+  )
+endif()
+if(TARGET peelf_viewer AND MSVC)
+  target_compile_definitions(peelf_tests PRIVATE
     PEELF_VIEWER_DEBUG_PDB="$<TARGET_PDB_FILE:peelf_viewer>"
   )
 endif()

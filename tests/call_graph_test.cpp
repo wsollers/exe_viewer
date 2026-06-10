@@ -509,6 +509,45 @@ TEST(CallGraph, DebugFixtureNamesTargetsAndSupportsSecondHopFanout) {
     EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos);
 }
 
+TEST(CallGraph, DebugElfFixtureNamesTargetsAndSupportsSecondHopFanout) {
+    const std::filesystem::path exe_path = PEELF_CALLGRAPH_FIXTURE_EXE;
+    ASSERT_TRUE(std::filesystem::exists(exe_path)) << exe_path.string();
+
+    const std::vector<std::uint8_t> bytes = read_file(exe_path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(exe_path);
+    ASSERT_NE(image, nullptr);
+    if (image->format() != peelf::Format::ELF) {
+        GTEST_SKIP() << "call graph debug fixture is not an ELF binary on this platform";
+    }
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+    const viewer::CallGraph main_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string main_dot = viewer::to_dot(main_graph);
+
+    EXPECT_NE(main_dot.find("first"), std::string::npos) << main_dot;
+    EXPECT_NE(main_dot.find("second"), std::string::npos) << main_dot;
+    EXPECT_EQ(main_dot.find("call target\\n0x"), std::string::npos) << main_dot;
+
+    const viewer::SymbolRecord* first = find_symbol_containing(index, "first");
+    ASSERT_NE(first, nullptr);
+    const viewer::CallGraph first_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *first);
+    const std::string first_dot = viewer::to_dot(first_graph);
+
+    EXPECT_NE(first_dot.find("first"), std::string::npos) << first_dot;
+    EXPECT_NE(first_dot.find("leaf"), std::string::npos) << first_dot;
+    EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos) << first_dot;
+}
+
 TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
 #if !defined(PEELF_VIEWER_DEBUG_EXE) || !defined(PEELF_VIEWER_DEBUG_PDB)
     GTEST_SKIP() << "viewer debug executable path was not configured";
@@ -544,6 +583,37 @@ TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
     EXPECT_NE(dot.find("label=\"call\""), std::string::npos) << dot;
     EXPECT_NE(dot.find("viewer::Application::init"), std::string::npos) << dot;
     EXPECT_NE(dot.find("viewer::Application::run"), std::string::npos) << dot;
+    EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos) << dot;
+#endif
+}
+
+TEST(CallGraph, DebugElfViewerMainFanoutResolvesRealTargetNames) {
+#if !defined(PEELF_VIEWER_DEBUG_EXE)
+    GTEST_SKIP() << "viewer debug executable path was not configured";
+#else
+    const std::filesystem::path exe_path = PEELF_VIEWER_DEBUG_EXE;
+    ASSERT_TRUE(std::filesystem::exists(exe_path)) << exe_path.string();
+
+    const std::vector<std::uint8_t> bytes = read_file(exe_path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(exe_path);
+    ASSERT_NE(image, nullptr);
+    if (image->format() != peelf::Format::ELF) {
+        GTEST_SKIP() << "viewer debug executable is not an ELF binary on this platform";
+    }
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::SymbolRecord* main = index.find_by_name("main");
+    ASSERT_NE(main, nullptr);
+    const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *main);
+    const std::string dot = viewer::to_dot(graph);
+
+    EXPECT_NE(dot.find("main fan-out"), std::string::npos) << dot;
+    EXPECT_NE(dot.find("label=\"call\""), std::string::npos) << dot;
+    EXPECT_NE(dot.find("Application"), std::string::npos) << dot;
     EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos) << dot;
 #endif
 }
