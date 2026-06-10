@@ -20,6 +20,40 @@ namespace {
 
 #ifdef _WIN32
 void print_stack_trace_addresses() noexcept;
+void write_stderr(std::string_view text) noexcept;
+void diagnostic_printf(const char* format, ...) noexcept;
+
+int crt_report_hook(int report_type, char* message, int* return_value) noexcept {
+    const char* type = "CRT report";
+    switch (report_type) {
+        case _CRT_ASSERT:
+            type = "CRT assert";
+            break;
+        case _CRT_ERROR:
+            type = "CRT error";
+            break;
+        case _CRT_WARN:
+            type = "CRT warning";
+            break;
+        default:
+            break;
+    }
+
+    write_stderr("\n==== PE/ELF Viewer CRT diagnostic ====\n");
+    diagnostic_printf("%s\n", type);
+    if (message != nullptr) {
+        write_stderr(message);
+        const std::string_view text{message};
+        if (text.empty() || text.back() != '\n') {
+            write_stderr("\n");
+        }
+    }
+    print_stack_trace_addresses();
+    if (return_value != nullptr) {
+        *return_value = 0;
+    }
+    return FALSE;
+}
 #endif
 
 void write_stderr(std::string_view text) noexcept {
@@ -218,6 +252,7 @@ void install_fatal_diagnostics() noexcept {
 #endif
 #ifdef _WIN32
     SetUnhandledExceptionFilter(unhandled_exception_filter);
+    _CrtSetReportHook(crt_report_hook);
     _set_invalid_parameter_handler(invalid_parameter_handler);
     _set_purecall_handler(purecall_handler);
     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);

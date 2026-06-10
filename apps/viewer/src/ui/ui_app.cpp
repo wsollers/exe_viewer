@@ -8,7 +8,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -70,12 +69,42 @@ struct BmpImage {
     return static_cast<std::int32_t>(read_u32_le(bytes, offset));
 }
 
-[[nodiscard]] std::optional<BmpImage> load_bmp_rgba(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> read_binary_file(const std::filesystem::path& path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
         return std::nullopt;
     }
-    std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+
+    const std::streamoff end = file.tellg();
+    if (end < 0) {
+        return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(end));
+    file.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (!file) {
+            return std::nullopt;
+        }
+    }
+    return bytes;
+}
+
+[[nodiscard]] std::optional<std::string> read_text_file(const std::filesystem::path& path) {
+    const std::optional<std::vector<std::uint8_t>> bytes = read_binary_file(path);
+    if (!bytes) {
+        return std::nullopt;
+    }
+    return std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+}
+
+[[nodiscard]] std::optional<BmpImage> load_bmp_rgba(const std::filesystem::path& path) {
+    const std::optional<std::vector<std::uint8_t>> loaded_bytes = read_binary_file(path);
+    if (!loaded_bytes) {
+        return std::nullopt;
+    }
+    const std::vector<std::uint8_t>& bytes = *loaded_bytes;
     if (bytes.size() < 54 || bytes[0] != 'B' || bytes[1] != 'M') {
         return std::nullopt;
     }
@@ -622,10 +651,8 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
             make_graphviz_render_command(dot_path, plain_path, GraphRenderFormat::Plain);
         const GraphRenderResult plain_result = runner.run(plain_command.executable, plain_command.arguments);
         if (plain_result.success) {
-            std::ifstream plain_file(plain_path, std::ios::binary);
-            const std::string plain_text{std::istreambuf_iterator<char>(plain_file),
-                                         std::istreambuf_iterator<char>()};
-            current_call_graph_layout_ = parse_graphviz_plain_layout(plain_text);
+            const std::optional<std::string> plain_text = read_text_file(plain_path);
+            current_call_graph_layout_ = plain_text ? parse_graphviz_plain_layout(*plain_text) : std::nullopt;
         } else {
             current_call_graph_layout_.reset();
         }
