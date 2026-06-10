@@ -22,6 +22,9 @@ option(PEELF_BUILD_VIEWER "Build the GUI viewer application" ON)
 option(PEELF_BUILD_SHARED "Build peelf_core as a shared library" ON)
 option(PEELF_BUILD_TESTS "Build unit tests (GoogleTest)" ON)
 option(PEELF_ENABLE_CLANG_TIDY "Run clang-tidy on peelf targets during build (Ninja/Makefile generators only)" OFF)
+option(PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST "Register the Docker-backed bin-matrix refresh test with CTest" OFF)
+
+set(PEELF_BIN_MATRIX_DOCKER_IMAGE "exe-viewer-clang" CACHE STRING "Docker image tag used for bin-matrix fixture generation")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
@@ -42,6 +45,52 @@ endif()
 if(PEELF_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Cross-architecture fixture matrix.
+#
+# The checked-in bin-matrix/ artifacts keep normal builds and tests independent
+# from Docker. These opt-in helpers rebuild the cross-compiler image, refresh
+# bin-matrix/, and can run the focused parser/entry/call-graph matrix test.
+# ---------------------------------------------------------------------------
+find_program(PEELF_DOCKER_EXE NAMES docker)
+if(PEELF_DOCKER_EXE)
+    add_custom_target(bin-matrix-docker-image
+        COMMAND ${PEELF_DOCKER_EXE} build
+                -f ${CMAKE_SOURCE_DIR}/docker/Dockerfile.clang
+                -t ${PEELF_BIN_MATRIX_DOCKER_IMAGE}
+                ${CMAKE_SOURCE_DIR}
+        COMMENT "Building Docker image for cross-architecture bin-matrix generation"
+        VERBATIM)
+
+    add_custom_target(generate-bin-matrix
+        COMMAND ${PEELF_DOCKER_EXE} run --rm
+                -v ${CMAKE_SOURCE_DIR}:/workspace/exe_viewer
+                -w /workspace/exe_viewer
+                ${PEELF_BIN_MATRIX_DOCKER_IMAGE}
+                bash tests/fixtures/build_cross_callgraph_fixtures.sh
+        DEPENDS bin-matrix-docker-image
+        COMMENT "Generating cross-architecture ELF/debug fixtures into bin-matrix/"
+        VERBATIM)
+
+    add_custom_target(test-bin-matrix
+        COMMAND ${CMAKE_COMMAND}
+                -D BUILD_DIR=${CMAKE_BINARY_DIR}
+                -D CONFIG=$<CONFIG>
+                -P ${CMAKE_SOURCE_DIR}/cmake/RunBinMatrixTests.cmake
+        COMMENT "Refreshing bin-matrix/ and running focused bin-matrix parser/call-graph tests"
+        VERBATIM)
+
+    if(PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST)
+        add_test(NAME BinMatrix.GenerateAndRunFocusedTests
+            COMMAND ${CMAKE_COMMAND}
+                    -D BUILD_DIR=${CMAKE_BINARY_DIR}
+                    -D CONFIG=$<CONFIG>
+                    -P ${CMAKE_SOURCE_DIR}/cmake/RunBinMatrixTests.cmake)
+    endif()
+elseif(PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST)
+    message(FATAL_ERROR "PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST=ON but docker was not found")
 endif()
 
 # ---------------------------------------------------------------------------

@@ -93,7 +93,8 @@ Output binary: `out/build/<preset>/apps/viewer/peelf_viewer`
 
 ### Clang Docker image
 
-The repository includes a Clang 18 build image with Graphviz installed:
+The repository includes a Clang 18 build image with Graphviz and cross compilers
+for fixture generation:
 
 ```bash
 docker build -f docker/Dockerfile.clang -t peelf-viewer-clang .
@@ -108,6 +109,30 @@ The first configure will take a while because it clones and builds GLFW, ImGui,
 nativefiledialog-extended, and Capstone. Enabling `PEELF_ENABLE_GRAPHVIZ` also
 fetches the pinned Graphviz source tree for future DOT rendering hooks.
 
+### Cross-architecture fixture matrix
+
+The checked-in `bin-matrix/` directory contains non-executable ELF/debug fixture
+pairs used by parser, symbol, disassembly, and call-graph tests. Normal builds
+use those committed files directly.
+
+To refresh the matrix with Docker:
+
+```powershell
+cmake --build out/build/msvc-debug --target generate-bin-matrix
+cmake --build out/build/msvc-debug --target test-bin-matrix
+```
+
+The generated filenames follow:
+
+```text
+elf-linux-<arch>-<bits>-<endian>-callgraph.elf
+elf-linux-<arch>-<bits>-<endian>-callgraph.debug
+```
+
+To register the Docker-backed refresh as a CTest test, configure with
+`-DPEELF_ENABLE_BIN_MATRIX_DOCKER_TEST=ON`. It is off by default because it
+requires Docker and rewrites `bin-matrix/`.
+
 ## Build options
 
 These CMake options are defined in the top-level `CMakeLists.txt`:
@@ -119,6 +144,7 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 | `PEELF_BUILD_TESTS` | `ON` | Build the GoogleTest unit suite |
 | `PEELF_ENABLE_GRAPHVIZ` | `OFF` | Fetch optional Graphviz source and expose Graphviz feature macros through `peelf::graphviz` |
 | `PEELF_ENABLE_CLANG_TIDY` | `OFF` | Run clang-tidy on project targets for supported generators |
+| `PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST` | `OFF` | Register an opt-in CTest test that refreshes `bin-matrix/` with Docker and runs the focused matrix test |
 
 ## Running
 
