@@ -7,6 +7,8 @@ Naming convention:
 
 `elf-linux-<arch>-<bits>-<endian>-callgraph.elf`
 `elf-linux-<arch>-<bits>-<endian>-callgraph.debug`
+`elf-linux-<arch>-<bits>-<endian>-callgraph.so`
+`elf-linux-<arch>-<bits>-<endian>-callgraph.so.debug`
 
 Where:
 
@@ -15,6 +17,7 @@ Where:
 - `<bits>` is `32` or `64`.
 - `<endian>` is `le` or `be`.
 - `.elf` is the stripped-debug executable image under test.
-- `.debug` is the detached debug sidecar produced with `objcopy --only-keep-debug`.
+- `.so` is the stripped-debug shared-library image under test.
+- `.debug` and `.so.debug` are detached debug sidecars produced with `objcopy --only-keep-debug`.
 
 The generated files intentionally have execute permission removed.

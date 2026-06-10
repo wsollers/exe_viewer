@@ -175,17 +175,25 @@ void patch_direct_call(std::vector<std::uint8_t>& bytes,
 }
 
 struct BinMatrixCase {
-    const char* image_name;
+    const char* fixture_stem;
     peelf::Architecture architecture;
     peelf::Endianness endianness;
     bool is_64bit;
 };
 
-void assert_known_callgraph_fixture(const BinMatrixCase& fixture) {
-    const std::string name = fixture.image_name;
-    const std::filesystem::path path = std::filesystem::path(PEELF_BIN_MATRIX_DIR) / fixture.image_name;
-    std::filesystem::path sidecar = path;
+[[nodiscard]] std::filesystem::path bin_matrix_sidecar_path(const std::filesystem::path& image_path) {
+    if (image_path.extension() == ".so") {
+        return std::filesystem::path(image_path.string() + ".debug");
+    }
+    std::filesystem::path sidecar = image_path;
     sidecar.replace_extension(".debug");
+    return sidecar;
+}
+
+void assert_known_callgraph_fixture(const BinMatrixCase& fixture) {
+    const std::string name = std::string(fixture.fixture_stem) + ".elf";
+    const std::filesystem::path path = std::filesystem::path(PEELF_BIN_MATRIX_DIR) / name;
+    const std::filesystem::path sidecar = bin_matrix_sidecar_path(path);
     ASSERT_TRUE(std::filesystem::exists(path)) << path.string();
     ASSERT_TRUE(std::filesystem::exists(sidecar)) << sidecar.string();
     const std::vector<std::uint8_t> bytes = read_file(path);
@@ -228,6 +236,57 @@ void assert_known_callgraph_fixture(const BinMatrixCase& fixture) {
     EXPECT_NE(first_dot.find("first fan-out"), std::string::npos) << name << "\n" << first_dot;
     EXPECT_NE(first_dot.find("leaf"), std::string::npos) << name << "\n" << first_dot;
     EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos) << name << "\n" << first_dot;
+}
+
+void assert_known_shared_library_fixture(const BinMatrixCase& fixture) {
+    const std::string name = std::string(fixture.fixture_stem) + ".so";
+    const std::filesystem::path path = std::filesystem::path(PEELF_BIN_MATRIX_DIR) / name;
+    const std::filesystem::path sidecar = bin_matrix_sidecar_path(path);
+    ASSERT_TRUE(std::filesystem::exists(path)) << path.string();
+    ASSERT_TRUE(std::filesystem::exists(sidecar)) << sidecar.string();
+    const std::vector<std::uint8_t> bytes = read_file(path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(path);
+    ASSERT_NE(image, nullptr);
+    ASSERT_EQ(image->format(), peelf::Format::ELF) << name;
+    ASSERT_EQ(image->kind(), peelf::ImageKind::SharedLibrary) << name;
+    ASSERT_EQ(image->architecture(), fixture.architecture) << name;
+    ASSERT_EQ(image->endianness(), fixture.endianness) << name;
+    ASSERT_EQ(image->is_64bit(), fixture.is_64bit) << name;
+
+    const auto libc = std::ranges::find_if(image->imports(), [](const peelf::ImportEntry& entry) {
+        return entry.library == "libc.so.6";
+    });
+    ASSERT_NE(libc, image->imports().end()) << name;
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::SymbolRecord* first = index.find_by_name("first");
+    const viewer::SymbolRecord* second = index.find_by_name("second");
+    const viewer::SymbolRecord* leaf = index.find_by_name("leaf");
+    const viewer::SymbolRecord* shared_anchor = index.find_by_name("shared_anchor");
+    ASSERT_NE(first, nullptr) << name;
+    ASSERT_NE(second, nullptr) << name;
+    ASSERT_NE(leaf, nullptr) << name;
+    ASSERT_NE(shared_anchor, nullptr) << name;
+
+    const viewer::CallGraph first_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *first);
+    const std::string first_dot = viewer::to_dot(first_graph);
+    EXPECT_NE(first_dot.find("first fan-out"), std::string::npos) << name << "\n" << first_dot;
+    EXPECT_NE(first_dot.find("leaf"), std::string::npos) << name << "\n" << first_dot;
+    EXPECT_EQ(first_dot.find("No direct call targets resolved"), std::string::npos) << name << "\n" << first_dot;
+
+    const viewer::CallGraph anchor_graph = viewer::build_symbol_fanout_call_graph(
+        *image,
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        index,
+        *shared_anchor);
+    const std::string anchor_dot = viewer::to_dot(anchor_graph);
+    EXPECT_NE(anchor_dot.find("shared_anchor fan-out"), std::string::npos) << name << "\n" << anchor_dot;
+    EXPECT_NE(anchor_dot.find("first"), std::string::npos) << name << "\n" << anchor_dot;
+    EXPECT_NE(anchor_dot.find("second"), std::string::npos) << name << "\n" << anchor_dot;
 }
 
 [[nodiscard]] viewer::CallGraph sample_graph() {
@@ -774,19 +833,37 @@ TEST(CallGraph, DebugElfFixtureNamesTargetsAndSupportsSecondHopFanout) {
 
 TEST(CallGraph, BinMatrixFixturesParseEntryAndKnownCallGraphsAcrossArchitectures) {
     constexpr std::array<BinMatrixCase, 9> fixtures{{
-        {"elf-linux-x86_64-64-le-callgraph.elf", peelf::Architecture::X86_64, peelf::Endianness::Little, true},
-        {"elf-linux-x86-32-le-callgraph.elf", peelf::Architecture::X86, peelf::Endianness::Little, false},
-        {"elf-linux-arm-32-le-callgraph.elf", peelf::Architecture::ARM, peelf::Endianness::Little, false},
-        {"elf-linux-arm64-64-le-callgraph.elf", peelf::Architecture::ARM64, peelf::Endianness::Little, true},
-        {"elf-linux-riscv64-64-le-callgraph.elf", peelf::Architecture::RISCV64, peelf::Endianness::Little, true},
-        {"elf-linux-mips-32-be-callgraph.elf", peelf::Architecture::MIPS32, peelf::Endianness::Big, false},
-        {"elf-linux-mips64-64-be-callgraph.elf", peelf::Architecture::MIPS64, peelf::Endianness::Big, true},
-        {"elf-linux-ppc-32-be-callgraph.elf", peelf::Architecture::PowerPC, peelf::Endianness::Big, false},
-        {"elf-linux-ppc64-64-be-callgraph.elf", peelf::Architecture::PowerPC64, peelf::Endianness::Big, true},
+        {"elf-linux-x86_64-64-le-callgraph", peelf::Architecture::X86_64, peelf::Endianness::Little, true},
+        {"elf-linux-x86-32-le-callgraph", peelf::Architecture::X86, peelf::Endianness::Little, false},
+        {"elf-linux-arm-32-le-callgraph", peelf::Architecture::ARM, peelf::Endianness::Little, false},
+        {"elf-linux-arm64-64-le-callgraph", peelf::Architecture::ARM64, peelf::Endianness::Little, true},
+        {"elf-linux-riscv64-64-le-callgraph", peelf::Architecture::RISCV64, peelf::Endianness::Little, true},
+        {"elf-linux-mips-32-be-callgraph", peelf::Architecture::MIPS32, peelf::Endianness::Big, false},
+        {"elf-linux-mips64-64-be-callgraph", peelf::Architecture::MIPS64, peelf::Endianness::Big, true},
+        {"elf-linux-ppc-32-be-callgraph", peelf::Architecture::PowerPC, peelf::Endianness::Big, false},
+        {"elf-linux-ppc64-64-be-callgraph", peelf::Architecture::PowerPC64, peelf::Endianness::Big, true},
     }};
 
     for (const BinMatrixCase& fixture : fixtures) {
         assert_known_callgraph_fixture(fixture);
+    }
+}
+
+TEST(CallGraph, BinMatrixSharedLibrariesParseImportsAndKnownCallGraphsAcrossArchitectures) {
+    constexpr std::array<BinMatrixCase, 9> fixtures{{
+        {"elf-linux-x86_64-64-le-callgraph", peelf::Architecture::X86_64, peelf::Endianness::Little, true},
+        {"elf-linux-x86-32-le-callgraph", peelf::Architecture::X86, peelf::Endianness::Little, false},
+        {"elf-linux-arm-32-le-callgraph", peelf::Architecture::ARM, peelf::Endianness::Little, false},
+        {"elf-linux-arm64-64-le-callgraph", peelf::Architecture::ARM64, peelf::Endianness::Little, true},
+        {"elf-linux-riscv64-64-le-callgraph", peelf::Architecture::RISCV64, peelf::Endianness::Little, true},
+        {"elf-linux-mips-32-be-callgraph", peelf::Architecture::MIPS32, peelf::Endianness::Big, false},
+        {"elf-linux-mips64-64-be-callgraph", peelf::Architecture::MIPS64, peelf::Endianness::Big, true},
+        {"elf-linux-ppc-32-be-callgraph", peelf::Architecture::PowerPC, peelf::Endianness::Big, false},
+        {"elf-linux-ppc64-64-be-callgraph", peelf::Architecture::PowerPC64, peelf::Endianness::Big, true},
+    }};
+
+    for (const BinMatrixCase& fixture : fixtures) {
+        assert_known_shared_library_fixture(fixture);
     }
 }
 

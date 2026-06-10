@@ -18,7 +18,7 @@ set(ctest_command
     "${CMAKE_CTEST_COMMAND}"
     --test-dir "${BUILD_DIR}"
     --output-on-failure
-    -R "^CallGraph\\.BinMatrixFixturesParseEntryAndKnownCallGraphsAcrossArchitectures$"
+    -R "^CallGraph\\.BinMatrix"
 )
 if(NOT CONFIG STREQUAL "")
     list(APPEND ctest_command --build-config "${CONFIG}")

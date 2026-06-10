@@ -1,5 +1,9 @@
 #include <stdint.h>
 
+#if defined(PEELF_SHARED_FIXTURE)
+#include <stdio.h>
+#endif
+
 #if defined(_MSC_VER)
 #define PEELF_NOINLINE __declspec(noinline)
 #else
@@ -20,6 +24,13 @@ PEELF_NOINLINE int32_t first(int32_t value) {
 PEELF_NOINLINE int32_t second(int32_t value) {
     return leaf(value + 2);
 }
+
+#if defined(PEELF_SHARED_FIXTURE)
+PEELF_NOINLINE int32_t shared_anchor(int32_t value) {
+    puts("peelf shared fixture");
+    return first(value) + second(value);
+}
+#endif
 
 int main(void) {
     const int32_t a = first(10);
