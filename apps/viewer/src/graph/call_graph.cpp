@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <string_view>
 #include <utility>
@@ -291,6 +293,43 @@ namespace {
 
 [[nodiscard]] bool is_indirect_branch_instruction(const Instruction& instruction) {
     return instruction.mnemonic == "jmp" || instruction.mnemonic == "call";
+}
+
+[[nodiscard]] bool is_return_instruction(const Instruction& instruction) {
+    return instruction.mnemonic == "ret" ||
+           instruction.mnemonic == "retn" ||
+           instruction.mnemonic == "retq" ||
+           instruction.mnemonic == "jr" ||
+           instruction.mnemonic == "blr";
+}
+
+[[nodiscard]] bool is_unconditional_branch_instruction(const Instruction& instruction) {
+    return instruction.mnemonic == "jmp" ||
+           instruction.mnemonic == "j" ||
+           instruction.mnemonic == "b" ||
+           instruction.mnemonic == "br";
+}
+
+[[nodiscard]] bool is_conditional_branch_instruction(const Instruction& instruction) {
+    const std::string& mnemonic = instruction.mnemonic;
+    if (mnemonic.empty() || is_unconditional_branch_instruction(instruction) || is_call_instruction(instruction) ||
+        is_return_instruction(instruction)) {
+        return false;
+    }
+    if (mnemonic[0] == 'j') {
+        return true;
+    }
+    return mnemonic == "cbz" ||
+           mnemonic == "cbnz" ||
+           mnemonic == "tbz" ||
+           mnemonic == "tbnz" ||
+           mnemonic == "beq" ||
+           mnemonic == "bne" ||
+           mnemonic == "blt" ||
+           mnemonic == "bge" ||
+           mnemonic == "bltu" ||
+           mnemonic == "bgeu" ||
+           mnemonic == "bc";
 }
 
 [[nodiscard]] std::optional<Architecture> disassembler_architecture(peelf::Architecture arch) {
@@ -1011,6 +1050,196 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
             .kind = CallGraphEdgeKind::Unknown,
             .label = "fan-out unavailable",
         });
+    }
+
+    return graph;
+}
+
+CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_bytes,
+                                        std::uint64_t virtual_address,
+                                        peelf::Architecture architecture,
+                                        peelf::Endianness endianness,
+                                        std::optional<std::uint64_t> file_offset,
+                                        std::string label) {
+    CallGraph graph{
+        .id = "function_cfg",
+        .label = std::move(label),
+        .architecture = architecture,
+        .endianness = endianness,
+    };
+
+    const std::optional<Architecture> arch = disassembler_architecture(architecture);
+    if (!arch || function_bytes.empty()) {
+        return graph;
+    }
+
+    Disassembler disassembler;
+    if (!disassembler.init(*arch, disassembler_endianness(endianness))) {
+        return graph;
+    }
+
+    const std::vector<Instruction> instructions =
+        disassembler.disassemble(function_bytes.data(), function_bytes.size(), virtual_address);
+    if (instructions.empty()) {
+        return graph;
+    }
+
+    std::map<std::uint64_t, std::size_t> instruction_by_address;
+    for (std::size_t index = 0; index < instructions.size(); ++index) {
+        instruction_by_address.emplace(instructions[index].address, index);
+    }
+
+    const std::uint64_t function_end =
+        virtual_address + static_cast<std::uint64_t>(function_bytes.size());
+    std::set<std::uint64_t> leaders{instructions.front().address};
+
+    for (std::size_t index = 0; index < instructions.size(); ++index) {
+        const Instruction& instruction = instructions[index];
+        const std::uint64_t next_address =
+            instruction.address + static_cast<std::uint64_t>(instruction.bytes.size());
+        const std::optional<std::uint64_t> target = parse_direct_call_target(instruction);
+        const bool target_in_function = target && *target >= virtual_address && *target < function_end &&
+                                        instruction_by_address.contains(*target);
+
+        if (is_conditional_branch_instruction(instruction)) {
+            if (target_in_function) {
+                leaders.insert(*target);
+            }
+            if (index + 1u < instructions.size()) {
+                leaders.insert(next_address);
+            }
+        } else if (is_unconditional_branch_instruction(instruction)) {
+            if (target_in_function) {
+                leaders.insert(*target);
+            }
+            if (index + 1u < instructions.size()) {
+                leaders.insert(next_address);
+            }
+        }
+    }
+
+    struct Block {
+        std::string id;
+        std::size_t first_instruction = 0;
+        std::size_t instruction_count = 0;
+        std::uint64_t start = 0;
+        std::uint64_t end = 0;
+    };
+
+    std::vector<Block> blocks;
+    std::map<std::uint64_t, std::string> block_by_start;
+    std::size_t index = 0;
+    while (index < instructions.size()) {
+        const std::size_t first = index;
+        const std::uint64_t start = instructions[index].address;
+        ++index;
+        while (index < instructions.size() && !leaders.contains(instructions[index].address)) {
+            const Instruction& previous = instructions[index - 1u];
+            if (is_conditional_branch_instruction(previous) ||
+                is_unconditional_branch_instruction(previous) ||
+                is_return_instruction(previous)) {
+                break;
+            }
+            ++index;
+        }
+
+        const Instruction& last = instructions[index - 1u];
+        const std::uint64_t end = last.address + static_cast<std::uint64_t>(last.bytes.size());
+        const std::string id = "bb_" + std::to_string(blocks.size());
+        block_by_start.emplace(start, id);
+        blocks.push_back(Block{
+            .id = id,
+            .first_instruction = first,
+            .instruction_count = index - first,
+            .start = start,
+            .end = end,
+        });
+    }
+
+    graph.nodes.reserve(blocks.size() + 1u);
+    for (const Block& block : blocks) {
+        const std::optional<std::uint64_t> block_file_offset =
+            file_offset ? std::optional(*file_offset + (block.start - virtual_address)) : std::nullopt;
+        graph.nodes.push_back(CallGraphNode{
+            .id = block.id,
+            .label = "basic block\n" + format_hex(block.start),
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{
+                .start = GraphAddress{
+                    .virtual_address = block.start,
+                    .relative_virtual_address = block.start - virtual_address,
+                    .file_offset = block_file_offset,
+                },
+                .size = block.end - block.start,
+            },
+            .first_instruction_index = static_cast<std::uint64_t>(block.first_instruction),
+            .instruction_count = static_cast<std::uint64_t>(block.instruction_count),
+        });
+    }
+
+    graph.nodes.push_back(CallGraphNode{
+        .id = "return",
+        .label = "return",
+        .kind = CallGraphNodeKind::External,
+    });
+
+    for (std::size_t block_index = 0; block_index < blocks.size(); ++block_index) {
+        const Block& block = blocks[block_index];
+        const Instruction& last = instructions[block.first_instruction + block.instruction_count - 1u];
+        const std::uint64_t next_address = last.address + static_cast<std::uint64_t>(last.bytes.size());
+        const auto target = parse_direct_call_target(last);
+        const bool target_in_function = target && block_by_start.contains(*target);
+
+        if (is_return_instruction(last)) {
+            graph.edges.push_back(CallGraphEdge{
+                .from_node_id = block.id,
+                .to_node_id = "return",
+                .kind = CallGraphEdgeKind::Return,
+                .label = "return",
+            });
+            continue;
+        }
+
+        if (is_conditional_branch_instruction(last)) {
+            if (target_in_function) {
+                graph.edges.push_back(CallGraphEdge{
+                    .from_node_id = block.id,
+                    .to_node_id = block_by_start[*target],
+                    .kind = CallGraphEdgeKind::ConditionalBranch,
+                    .label = "taken",
+                });
+            }
+            if (block_by_start.contains(next_address)) {
+                graph.edges.push_back(CallGraphEdge{
+                    .from_node_id = block.id,
+                    .to_node_id = block_by_start[next_address],
+                    .kind = CallGraphEdgeKind::Fallthrough,
+                    .label = "fallthrough",
+                });
+            }
+            continue;
+        }
+
+        if (is_unconditional_branch_instruction(last)) {
+            if (target_in_function) {
+                graph.edges.push_back(CallGraphEdge{
+                    .from_node_id = block.id,
+                    .to_node_id = block_by_start[*target],
+                    .kind = CallGraphEdgeKind::UnconditionalBranch,
+                    .label = "branch",
+                });
+            }
+            continue;
+        }
+
+        if (block_index + 1u < blocks.size() && block_by_start.contains(next_address)) {
+            graph.edges.push_back(CallGraphEdge{
+                .from_node_id = block.id,
+                .to_node_id = block_by_start[next_address],
+                .kind = CallGraphEdgeKind::Fallthrough,
+                .label = "fallthrough",
+            });
+        }
     }
 
     return graph;

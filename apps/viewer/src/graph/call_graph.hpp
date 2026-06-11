@@ -128,6 +128,12 @@ public:
                                                        std::span<const std::uint8_t> image_bytes,
                                                        const SymbolIndex& symbol_index,
                                                        const SymbolRecord& root);
+[[nodiscard]] CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_bytes,
+                                                      std::uint64_t virtual_address,
+                                                      peelf::Architecture architecture,
+                                                      peelf::Endianness endianness,
+                                                      std::optional<std::uint64_t> file_offset = std::nullopt,
+                                                      std::string label = "function");
 [[nodiscard]] std::string_view graphviz_format_name(GraphRenderFormat format) noexcept;
 [[nodiscard]] std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain);
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,

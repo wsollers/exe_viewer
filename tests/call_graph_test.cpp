@@ -74,6 +74,23 @@ public:
     return it == records.end() ? nullptr : &*it;
 }
 
+[[nodiscard]] const viewer::CallGraphNode* find_node(const viewer::CallGraph& graph,
+                                                     std::string_view id) {
+    const auto it = std::ranges::find_if(graph.nodes, [&](const viewer::CallGraphNode& node) {
+        return node.id == id;
+    });
+    return it == graph.nodes.end() ? nullptr : &*it;
+}
+
+[[nodiscard]] bool has_edge(const viewer::CallGraph& graph,
+                            std::string_view from,
+                            std::string_view to,
+                            viewer::CallGraphEdgeKind kind) {
+    return std::ranges::any_of(graph.edges, [&](const viewer::CallGraphEdge& edge) {
+        return edge.from_node_id == from && edge.to_node_id == to && edge.kind == kind;
+    });
+}
+
 void write_u32(std::vector<std::uint8_t>& bytes, std::size_t offset, std::uint32_t value, peelf::Endianness endian) {
     ASSERT_LE(offset + 4u, bytes.size());
     if (endian == peelf::Endianness::Big) {
@@ -471,6 +488,70 @@ TEST(CallGraph, RenderWritesDotAndInvokesInjectedRunner) {
 
     std::filesystem::remove(output_path);
     std::filesystem::remove(dot_path);
+}
+
+TEST(CallGraph, BuildsFunctionCfgWithConditionalBranchFallthroughAndReturn) {
+    const std::array<std::uint8_t, 11> bytes{
+        0x83, 0xF8, 0x01,             // cmp eax, 1
+        0x74, 0x05,                   // je 0x100A
+        0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2
+        0xC3,                         // ret
+    };
+
+    const viewer::CallGraph graph = viewer::build_function_cfg_call_graph(
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        0x1000,
+        peelf::Architecture::X86_64,
+        peelf::Endianness::Little,
+        0x200,
+        "conditional fixture");
+
+    EXPECT_EQ(graph.nodes.size(), 4u);
+    EXPECT_EQ(graph.edges.size(), 4u);
+    ASSERT_NE(find_node(graph, "bb_0"), nullptr);
+    ASSERT_NE(find_node(graph, "bb_1"), nullptr);
+    ASSERT_NE(find_node(graph, "bb_2"), nullptr);
+    ASSERT_NE(find_node(graph, "return"), nullptr);
+
+    const viewer::CallGraphNode* entry = find_node(graph, "bb_0");
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->kind, viewer::CallGraphNodeKind::BasicBlock);
+    EXPECT_EQ(entry->bytes.start.virtual_address, 0x1000u);
+    EXPECT_EQ(entry->bytes.start.relative_virtual_address, 0u);
+    EXPECT_EQ(entry->bytes.start.file_offset, 0x200u);
+    EXPECT_EQ(entry->bytes.size, 5u);
+    EXPECT_EQ(entry->first_instruction_index, 0u);
+    EXPECT_EQ(entry->instruction_count, 2u);
+
+    EXPECT_TRUE(has_edge(graph, "bb_0", "bb_2", viewer::CallGraphEdgeKind::ConditionalBranch));
+    EXPECT_TRUE(has_edge(graph, "bb_0", "bb_1", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(graph, "bb_1", "bb_2", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(graph, "bb_2", "return", viewer::CallGraphEdgeKind::Return));
+}
+
+TEST(CallGraph, BuildsFunctionCfgWithUnconditionalBranch) {
+    const std::array<std::uint8_t, 8> bytes{
+        0xEB, 0x05,                   // jmp 0x3007
+        0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0xC3,                         // ret
+    };
+
+    const viewer::CallGraph graph = viewer::build_function_cfg_call_graph(
+        std::span<const std::uint8_t>(bytes.data(), bytes.size()),
+        0x3000,
+        peelf::Architecture::X86_64,
+        peelf::Endianness::Little,
+        std::nullopt,
+        "jump fixture");
+
+    EXPECT_EQ(graph.nodes.size(), 4u);
+    ASSERT_NE(find_node(graph, "bb_0"), nullptr);
+    ASSERT_NE(find_node(graph, "bb_1"), nullptr);
+    ASSERT_NE(find_node(graph, "bb_2"), nullptr);
+    EXPECT_TRUE(has_edge(graph, "bb_0", "bb_2", viewer::CallGraphEdgeKind::UnconditionalBranch));
+    EXPECT_FALSE(has_edge(graph, "bb_0", "bb_1", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(graph, "bb_1", "bb_2", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(graph, "bb_2", "return", viewer::CallGraphEdgeKind::Return));
 }
 
 TEST(CallGraph, BuildsLoadedElfStartupGraphFromParsedImage) {
