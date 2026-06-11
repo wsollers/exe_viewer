@@ -3,11 +3,13 @@ add_library(peelf_core
   src/elf/elf_parser.cpp
   src/file_reader.cpp
   src/binary_image.cpp
+  src/patching.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
   include/peelf/error.hpp
   include/peelf/binary_image.hpp
+  include/peelf/patching.hpp
   include/mapping/file_mapping.hpp
   src/mapping/map_errors.cpp
   src/mapping/file_mapping_posix.cpp
