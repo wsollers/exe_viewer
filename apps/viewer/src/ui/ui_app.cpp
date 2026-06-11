@@ -260,6 +260,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , details_panel_(current_selection_)
     , sections_panel_(model)
     , hex_panel_(model)
+    , shellcode_panel_()
     , imports_panel_(model)
     , exports_panel_(model)
     , symbols_panel_(model, current_selection_)
@@ -416,6 +417,7 @@ void UiApp::render() {
     details_panel_.draw();
     sections_panel_.draw();
     hex_panel_.draw();
+    shellcode_panel_.draw();
     imports_panel_.draw();
     exports_panel_.draw();
     symbols_panel_.draw();
@@ -487,6 +489,12 @@ void UiApp::render_main_menu() {
             bool v = hex_panel_.visible();
             if (ImGui::MenuItem(hex_panel_.name().c_str(), nullptr, &v))
                 hex_panel_.set_visible(v);
+        }
+
+        {
+            bool v = shellcode_panel_.visible();
+            if (ImGui::MenuItem(shellcode_panel_.name().c_str(), nullptr, &v))
+                shellcode_panel_.set_visible(v);
         }
 
         {
@@ -914,6 +922,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(pe_exports_panel_.name().c_str(), right_id);
 
     ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), main_id);
+    ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), main_id);
     ImGui::DockBuilderDockWindow("Disassembly", center_bottom_id);
     ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
 

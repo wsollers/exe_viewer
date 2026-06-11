@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -80,6 +81,23 @@ namespace viewer {
         std::optional<std::size_t> pending_scroll_offset_;
         std::size_t bytes_per_row_ = 16;
         std::function<void(std::size_t)> on_byte_activated_;
+    };
+
+    class ShellcodeScratchPanel : public UiPanel {
+    public:
+        ShellcodeScratchPanel();
+    protected:
+        void draw_contents() override;
+    private:
+        bool assembly_mode_ = false;
+        char input_buf_[32768] = {};
+        std::vector<std::uint8_t> output_bytes_;
+        std::string hex_view_;
+        std::string diagnostic_;
+        bool last_assembly_mode_ = false;
+
+        void rebuild_output();
+        void draw_hex_output() const;
     };
 
     class DisassemblyPanel : public UiPanel {

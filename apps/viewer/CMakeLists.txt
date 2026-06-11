@@ -42,8 +42,11 @@ add_executable(peelf_viewer
         src/ui/ui_panels_imports.cpp
         src/ui/ui_panels_symbols.cpp
         src/ui/ui_panels_log.cpp
+        src/ui/ui_panels_shellcode.cpp
         src/ui/logger.hpp
         src/ui/logger.cpp
+        src/tools/shellcode_converter.hpp
+        src/tools/shellcode_converter.cpp
         src/model/pe_machine_types.hpp
         src/model/pe_characteristics.hpp
         src/model/pe_optional_image.hpp

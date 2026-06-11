@@ -75,6 +75,7 @@ namespace viewer {
         SelectionDetailsPanel details_panel_;
         SectionsPanel   sections_panel_;
         HexViewPanel    hex_panel_;
+        ShellcodeScratchPanel shellcode_panel_;
         ImportsPanel    imports_panel_;
         ExportsPanel    exports_panel_;
         SymbolsPanel    symbols_panel_;
