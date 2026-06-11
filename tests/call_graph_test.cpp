@@ -414,6 +414,52 @@ void assert_known_pe_dll_fixture(const BinMatrixCase& fixture) {
     }
 }
 
+void assert_known_pe_dll_cfg_fixture(const BinMatrixCase& fixture) {
+    const std::string name = std::string(fixture.fixture_stem) + ".dll";
+    const std::filesystem::path path = std::filesystem::path(PEELF_BIN_MATRIX_DIR) / name;
+    ASSERT_TRUE(std::filesystem::exists(path)) << path.string();
+    const std::vector<std::uint8_t> bytes = read_file(path);
+    const std::unique_ptr<peelf::IBinaryImage> image = parse_file(path);
+    ASSERT_NE(image, nullptr);
+    ASSERT_EQ(image->format(), peelf::Format::PE) << name;
+    ASSERT_EQ(image->kind(), peelf::ImageKind::SharedLibrary) << name;
+    ASSERT_EQ(image->architecture(), fixture.architecture) << name;
+    ASSERT_EQ(image->endianness(), fixture.endianness) << name;
+
+    const viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::SymbolRecord* first = index.find_by_name("first");
+    ASSERT_NE(first, nullptr) << name;
+    ASSERT_TRUE(first->virtual_address) << name;
+    ASSERT_TRUE(first->file_offset) << name;
+    ASSERT_GT(first->size, 0u) << name;
+    ASSERT_LE(*first->file_offset, bytes.size()) << name;
+    ASSERT_LE(first->size, static_cast<std::uint64_t>(bytes.size() - static_cast<std::size_t>(*first->file_offset))) << name;
+
+    const std::size_t start = static_cast<std::size_t>(*first->file_offset);
+    const std::size_t size = static_cast<std::size_t>(first->size);
+    const viewer::CallGraph cfg = viewer::build_function_cfg_call_graph(
+        std::span<const std::uint8_t>(bytes.data() + start, size),
+        *first->virtual_address,
+        image->architecture(),
+        image->endianness(),
+        *first->file_offset,
+        name + " first CFG");
+
+    EXPECT_EQ(cfg.architecture, fixture.architecture) << name;
+    EXPECT_EQ(cfg.endianness, fixture.endianness) << name;
+    EXPECT_NE(find_node(cfg, "bb_0"), nullptr) << name;
+    EXPECT_TRUE(std::ranges::any_of(cfg.nodes, [](const viewer::CallGraphNode& node) {
+        return node.kind == viewer::CallGraphNodeKind::BasicBlock &&
+               node.bytes.start.virtual_address &&
+               node.bytes.start.file_offset &&
+               node.bytes.size != 0 &&
+               node.instruction_count != 0;
+    })) << name;
+    EXPECT_TRUE(std::ranges::any_of(cfg.edges, [](const viewer::CallGraphEdge& edge) {
+        return edge.kind == viewer::CallGraphEdgeKind::Return;
+    })) << name << "\n" << viewer::to_dot(cfg);
+}
+
 [[nodiscard]] viewer::CallGraph sample_graph() {
     return viewer::CallGraph{
         .id = "entry",
@@ -1082,6 +1128,17 @@ TEST(CallGraph, BinMatrixPeDllsParseExportsImportsAndKnownCallGraphsAcrossArchit
 
     for (const BinMatrixCase& fixture : fixtures) {
         assert_known_pe_dll_fixture(fixture);
+    }
+}
+
+TEST(CallGraph, BinMatrixPeDllFunctionCfgsBuildAcrossArchitectures) {
+    constexpr std::array<BinMatrixCase, 2> fixtures{{
+        {"pe-windows-x86_64-64-le-callgraph", peelf::Architecture::X86_64, peelf::Endianness::Little, true},
+        {"pe-windows-x86-32-le-callgraph", peelf::Architecture::X86, peelf::Endianness::Little, false},
+    }};
+
+    for (const BinMatrixCase& fixture : fixtures) {
+        assert_known_pe_dll_cfg_fixture(fixture);
     }
 }
 
