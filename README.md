@@ -1,10 +1,13 @@
 # PE / ELF Explorer (C++23)
 
 A cross-platform executable & shared-library viewer:
-- **Core parsing library**: `peelf_core` (ELF + PE parsers, plus a cross-platform memory-mapping wrapper)
-- **GUI app**: `peelf_viewer` (Vulkan + GLFW + Dear ImGui), with section listing, PE header inspection, a hex view, and Capstone-based disassembly
+- **Core parsing library**: `peelf_core` (ELF + PE parsers, binary identity, sections/segments, imports/exports, symbols, relocations, PE data directories, and parser fixtures)
+- **GUI app**: `peelf_viewer` (Vulkan + GLFW + Dear ImGui), with structure navigation, Details/Hex/Disassembly panels, PE-specific tables, symbol/import/export browsing, call graph rendering, and a shellcode scratch panel
+- **Analysis integrations**: Capstone-backed disassembly, Graphviz-backed call graph layout, PDB/DIA symbol loading on Windows, and early AsmJit/AsmTK dependency support for future assembly-to-bytes providers
 
-> Status: initial scaffold. The core library currently parses only minimal ELF/PE header fields, and the GUI's live load path handles PE (`MZ`) files. ELF wiring in the GUI is not complete yet.
+> Status: active development. The static PE/ELF parser and UI navigation paths are useful today, with richer PE/ELF spec coverage, live-process analysis, patch editing, and assembler/decompiler providers tracked in `ToDo.md`.
+
+For architecture diagrams and data-flow notes, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Toolchains
 
@@ -69,21 +72,35 @@ The Vulkan loader/headers are **not** fetched; they come from the installed Vulk
 
 ## Build (CMake Presets)
 
-### Visual Studio 2022 (MSVC)
+Use the presets whenever possible. They keep build directories under `out/build/`
+and match the paths used by the tests and fixture tooling.
+
+### Windows: Visual Studio 2022 (MSVC)
+
+Open a normal PowerShell prompt where Visual Studio and the Vulkan SDK are
+discoverable. Graphviz is optional but recommended for call graph rendering.
 
 ```powershell
 cmake --preset msvc-debug
 cmake --build --preset msvc-debug
+ctest --test-dir out/build/msvc-debug -C Debug --output-on-failure
 ```
 
 Output binary: `out/build/msvc-debug/apps/viewer/Debug/peelf_viewer.exe`
 
-### Clang 18 + Ninja
+To run the viewer directly:
+
+```powershell
+.\out\build\msvc-debug\apps\viewer\Debug\peelf_viewer.exe
+```
+
+### Linux: Clang 18 + Ninja
 
 ```bash
 # Debug
 cmake --preset clang18-debug
 cmake --build --preset clang18-debug
+ctest --test-dir out/build/clang18-debug --output-on-failure
 
 # Release
 cmake --preset clang18-release
@@ -92,14 +109,30 @@ cmake --build --preset clang18-release
 
 Output binary: `out/build/<preset>/apps/viewer/peelf_viewer`
 
+### Configure with options
+
+Presets can be combined with `-D` cache options when configuring:
+
+```bash
+cmake --preset clang18-debug -DPEELF_ENABLE_GRAPHVIZ=ON -DPEELF_ENABLE_ASMTK=ON
+cmake --build --preset clang18-debug
+```
+
+For Visual Studio multi-config builds, pass the configuration at build/test time:
+
+```powershell
+cmake --build --preset msvc-debug --config Debug
+ctest --test-dir out/build/msvc-debug -C Debug --output-on-failure
+```
+
 ### Clang Docker image
 
 The repository includes a Clang 18 build image with Graphviz and cross compilers
 for fixture generation:
 
 ```bash
-docker build -f docker/Dockerfile.clang -t peelf-viewer-clang .
-docker run --rm -it -v "$PWD":/workspace/exe_viewer peelf-viewer-clang
+docker build -f docker/Dockerfile.clang -t exe-viewer-clang .
+docker run --rm -it -v "$PWD":/workspace/exe_viewer -w /workspace/exe_viewer exe-viewer-clang
 
 cmake --preset clang18-debug
 cmake --build --preset clang18-debug
@@ -107,8 +140,9 @@ ctest --test-dir out/build/clang18-debug --output-on-failure
 ```
 
 The first configure will take a while because it clones and builds GLFW, ImGui,
-nativefiledialog-extended, and Capstone. Enabling `PEELF_ENABLE_GRAPHVIZ` also
-fetches the pinned Graphviz source tree for future DOT rendering hooks.
+nativefiledialog-extended, Capstone, and, by default, AsmJit/AsmTK. Enabling
+`PEELF_ENABLE_GRAPHVIZ` also fetches the pinned Graphviz source tree for future
+DOT rendering hooks.
 
 ### Cross-architecture fixture matrix
 
@@ -151,12 +185,12 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 ## Running
 
 Launch `peelf_viewer`, then **File → Open** and pick an executable
-(`.exe`, `.dll`, `.so`, `.elf`). Press `Esc` to quit.
+(`.exe`, `.dll`, `.so`, `.elf`). Use **File → Open Debug Symbols...** to load a
+matching PDB when available. Use **View** to show or reset panels, including
+Call Graph, Disassembly, Symbols, Imports/Exports, PE tables, Log, and
+Shellcode. Press `Esc` to quit.
 
 ## Notes
 
-- Dear ImGui is currently pinned to its moving `docking` branch tip, and the Vulkan
-  backend integration relies on recent backend API fields. If a fresh `FetchContent`
-  pull breaks the viewer build, pin ImGui to a known-good commit in
-  `third_party/dependencies.cmake`.
+- Dear ImGui is pinned to a known `docking` commit in `third_party/dependencies.cmake`.
 - Vulkan integration uses the system Vulkan loader from the SDK.
