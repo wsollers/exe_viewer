@@ -2,7 +2,10 @@
 #include "pe_model.hpp"
 #include "pe_parser.hpp"
 
+#include <peelf/error.hpp>
+
 #include <fstream>
+#include <utility>
 
 namespace viewer {
 
@@ -19,6 +22,7 @@ namespace viewer {
         format_ = BinaryFormat::None;
         pe_.reset();
         image_.reset();
+        editable_image_.reset();
         sections_.clear();
 
         if (bytes_.size() < 2) {
@@ -34,12 +38,24 @@ namespace viewer {
 
         // PE (MZ) -> legacy PE model, which drives the PE-specific panels.
         if (bytes_[0] == 'M' && bytes_[1] == 'Z') {
-            return load_pe(path);
+            const bool loaded = load_pe(path);
+            if (loaded) {
+                if (auto editable = peelf::PagedBinaryImage::open(path)) {
+                    editable_image_ = std::move(*editable);
+                }
+            }
+            return loaded;
         }
 
         // ELF -> identity from the unified image.
         if (image_ && image_->format() == peelf::Format::ELF) {
-            return load_elf(path);
+            const bool loaded = load_elf(path);
+            if (loaded) {
+                if (auto editable = peelf::PagedBinaryImage::open(path)) {
+                    editable_image_ = std::move(*editable);
+                }
+            }
+            return loaded;
         }
 
         return false;
@@ -111,6 +127,44 @@ namespace viewer {
         }
 
         return true;
+    }
+
+    peelf::Result<std::vector<std::uint8_t>> BinaryModel::read_effective_bytes(std::uint64_t offset,
+                                                                               std::uint64_t size) const {
+        if (!editable_image_) {
+            return peelf::make_error("no editable binary image is loaded");
+        }
+        return editable_image_->read_effective(offset, size);
+    }
+
+    peelf::Result<void> BinaryModel::apply_patch_bytes(std::uint64_t offset,
+                                                       std::span<const std::uint8_t> bytes,
+                                                       std::string label) {
+        if (!editable_image_) {
+            return peelf::make_error("no editable binary image is loaded");
+        }
+        return editable_image_->apply_patch(offset, bytes, std::move(label));
+    }
+
+    peelf::Result<void> BinaryModel::undo_patch() {
+        if (!editable_image_) {
+            return peelf::make_error("no editable binary image is loaded");
+        }
+        return editable_image_->undo();
+    }
+
+    peelf::Result<void> BinaryModel::redo_patch() {
+        if (!editable_image_) {
+            return peelf::make_error("no editable binary image is loaded");
+        }
+        return editable_image_->redo();
+    }
+
+    std::vector<peelf::PatchInterval> BinaryModel::changed_intervals() const {
+        if (!editable_image_) {
+            return {};
+        }
+        return editable_image_->changed_intervals();
     }
 
 } // namespace viewer

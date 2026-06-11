@@ -85,10 +85,12 @@ namespace viewer {
 
     class ShellcodeScratchPanel : public UiPanel {
     public:
-        ShellcodeScratchPanel();
+        ShellcodeScratchPanel(BinaryModel& model, const ViewerSelection& selection);
     protected:
         void draw_contents() override;
     private:
+        BinaryModel& model_;
+        const ViewerSelection& selection_;
         bool assembly_mode_ = false;
         char input_buf_[32768] = {};
         std::vector<std::uint8_t> output_bytes_;
@@ -98,6 +100,8 @@ namespace viewer {
 
         void rebuild_output();
         void draw_hex_output() const;
+        void apply_to_selection();
+        [[nodiscard]] std::optional<std::uint64_t> selected_file_offset() const;
     };
 
     class DisassemblyPanel : public UiPanel {

@@ -1,11 +1,14 @@
 #pragma once
 #include <cstdint>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include <memory>
 #include "pe_model.hpp"
 
 #include <peelf/binary_image.hpp>
+#include <peelf/patching.hpp>
 
 namespace viewer {
 
@@ -52,6 +55,18 @@ namespace viewer {
         // Unified core image (format-agnostic identity). Non-null once a PE or ELF
         // file parses; the migration target as panels move onto it (ToDo.md P1-6).
         const peelf::IBinaryImage* image() const { return image_.get(); }
+        const peelf::PagedBinaryImage* editable_image() const {
+            return editable_image_ ? &*editable_image_ : nullptr;
+        }
+
+        peelf::Result<std::vector<std::uint8_t>> read_effective_bytes(std::uint64_t offset,
+                                                                      std::uint64_t size) const;
+        peelf::Result<void> apply_patch_bytes(std::uint64_t offset,
+                                              std::span<const std::uint8_t> bytes,
+                                              std::string label);
+        peelf::Result<void> undo_patch();
+        peelf::Result<void> redo_patch();
+        std::vector<peelf::PatchInterval> changed_intervals() const;
 
     private:
         BinaryFormat format_ = BinaryFormat::None;
@@ -60,6 +75,7 @@ namespace viewer {
         std::vector<SectionInfo> sections_;
         std::unique_ptr<PeModel> pe_;
         std::unique_ptr<peelf::IBinaryImage> image_;
+        std::optional<peelf::PagedBinaryImage> editable_image_;
 
         bool load_pe(const std::string& path);
         bool load_elf(const std::string& path);

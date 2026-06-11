@@ -50,10 +50,13 @@ add_executable(peelf_tests
   shellcode_converter_test.cpp
   assembler_dependency_test.cpp
   patching_test.cpp
+  binary_model_patch_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/binary_model.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/pe_parser.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/tools/shellcode_converter.cpp
 )
 

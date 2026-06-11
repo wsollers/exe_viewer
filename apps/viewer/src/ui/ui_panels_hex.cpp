@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <vector>
 
 namespace viewer {
 
@@ -54,6 +55,13 @@ void HexViewPanel::draw_contents() {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             size_t start = row * row_bytes;
             size_t end = std::min(start + row_bytes, total);
+            std::vector<std::uint8_t> row_data;
+            if (auto effective = model_.read_effective_bytes(start, end - start)) {
+                row_data = std::move(*effective);
+            } else {
+                row_data.assign(bytes.begin() + static_cast<std::ptrdiff_t>(start),
+                                bytes.begin() + static_cast<std::ptrdiff_t>(end));
+            }
 
             char addr[32];
             std::snprintf(addr, sizeof(addr), "%08zx: ", start);
@@ -67,7 +75,7 @@ void HexViewPanel::draw_contents() {
                 // ImGui ID unique; without it, repeated byte values (e.g. many
                 // 0x00s) collide and ImGui reports a duplicate ID.
                 char buf[32];
-                std::snprintf(buf, sizeof(buf), "%02X##%zu", bytes[i], i);
+                std::snprintf(buf, sizeof(buf), "%02X##%zu", row_data[i - start], i);
 
                 const bool in_highlight =
                     highlighted_size_ != 0 &&
@@ -91,7 +99,7 @@ void HexViewPanel::draw_contents() {
             ImGui::SameLine(ascii_start);
 
             for (size_t i = start; i < end; ++i) {
-                unsigned char c = bytes[i];
+                unsigned char c = row_data[i - start];
                 char ch = (c >= 32 && c < 127) ? (char)c : '.';
                 ImGui::TextUnformatted(&ch, &ch + 1);
                 if (i + 1 < end)
