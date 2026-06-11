@@ -260,6 +260,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , details_panel_(current_selection_)
     , sections_panel_(model)
     , hex_panel_(model)
+    , patch_set_panel_(model, current_selection_)
     , shellcode_panel_(model, current_selection_)
     , imports_panel_(model)
     , exports_panel_(model)
@@ -417,6 +418,7 @@ void UiApp::render() {
     details_panel_.draw();
     sections_panel_.draw();
     hex_panel_.draw();
+    patch_set_panel_.draw();
     shellcode_panel_.draw();
     imports_panel_.draw();
     exports_panel_.draw();
@@ -489,6 +491,12 @@ void UiApp::render_main_menu() {
             bool v = hex_panel_.visible();
             if (ImGui::MenuItem(hex_panel_.name().c_str(), nullptr, &v))
                 hex_panel_.set_visible(v);
+        }
+
+        {
+            bool v = patch_set_panel_.visible();
+            if (ImGui::MenuItem(patch_set_panel_.name().c_str(), nullptr, &v))
+                patch_set_panel_.set_visible(v);
         }
 
         {
@@ -913,6 +921,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), left_id);
 
     ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
@@ -1237,7 +1246,12 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         constexpr std::size_t kWindow = 256;
         const std::size_t avail = bytes.size() - file_offset;
         const std::size_t size = std::min(kWindow, avail);
-        current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, display_address);
+        auto effective = model_.read_effective_bytes(file_offset, size);
+        if (effective) {
+            current_instructions_ = disasm_.disassemble(effective->data(), effective->size(), display_address);
+        } else {
+            current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, display_address);
+        }
     }
 
     void UiApp::disassemble_entry_point(std::size_t max_size) {

@@ -104,6 +104,16 @@ namespace viewer {
         [[nodiscard]] std::optional<std::uint64_t> selected_file_offset() const;
     };
 
+    class PatchSetPanel : public UiPanel {
+    public:
+        PatchSetPanel(BinaryModel& model, ViewerSelection& selection);
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        ViewerSelection& selection_;
+    };
+
     class DisassemblyPanel : public UiPanel {
     public:
         explicit DisassemblyPanel(BinaryModel& model, std::vector<Instruction>& instructions);

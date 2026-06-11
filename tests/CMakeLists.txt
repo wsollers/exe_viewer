@@ -45,6 +45,7 @@ add_executable(peelf_tests
   binary_image_test.cpp
   disassembler_test.cpp
   viewer_navigation_test.cpp
+  patch_navigation_test.cpp
   call_graph_test.cpp
   symbol_index_test.cpp
   shellcode_converter_test.cpp

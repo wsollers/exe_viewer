@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <peelf/binary_image.hpp>
+#include <peelf/patching.hpp>
 
 namespace viewer {
 
@@ -39,6 +40,7 @@ enum class SelectionKind : std::uint8_t {
     HashTable,
     Interpreter,
     CallGraphNode,
+    Patch,
     Group
 };
 
@@ -61,6 +63,8 @@ struct StructureNode {
 struct CallGraphNode;
 [[nodiscard]] ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
                                                             const peelf::IBinaryImage& image);
+[[nodiscard]] ViewerSelection selection_from_patch_interval(const peelf::PatchInterval& patch,
+                                                            std::uint64_t patch_index);
 [[nodiscard]] std::optional<std::uint64_t> selected_symbol_index(const ViewerSelection& selection,
                                                                  const peelf::IBinaryImage& image);
 

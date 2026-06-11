@@ -1,6 +1,8 @@
 #include "navigation/viewer_navigation.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <string>
 
 #include "graph/call_graph.hpp"
@@ -34,6 +36,12 @@ namespace {
 
 [[nodiscard]] PreferredView section_view(const peelf::Section& section) {
     return section.executable ? PreferredView::Disassembly : PreferredView::Hex;
+}
+
+[[nodiscard]] std::string hex64(std::uint64_t value) {
+    std::array<char, 32> buffer{};
+    std::snprintf(buffer.data(), buffer.size(), "%llX", static_cast<unsigned long long>(value));
+    return buffer.data();
 }
 
 void add_headers(const peelf::IBinaryImage& image, StructureNode& root) {
@@ -397,6 +405,19 @@ ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
         .size = node.bytes.size,
         .object_index = node.symbol ? node.symbol->symbol_index : 0u,
         .preferred_view = preferred_view,
+    };
+}
+
+ViewerSelection selection_from_patch_interval(const peelf::PatchInterval& patch,
+                                              std::uint64_t patch_index) {
+    return ViewerSelection{
+        .kind = SelectionKind::Patch,
+        .label = "Patch 0x" + hex64(patch.offset),
+        .file_offset = patch.offset,
+        .virtual_address = std::nullopt,
+        .size = static_cast<std::uint64_t>(patch.patched.size()),
+        .object_index = patch_index,
+        .preferred_view = PreferredView::Hex
     };
 }
 

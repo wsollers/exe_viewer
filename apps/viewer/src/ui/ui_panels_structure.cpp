@@ -34,6 +34,7 @@ namespace {
         case SelectionKind::Interpreter:    return "Interpreter";
         case SelectionKind::Group:          return "Group";
         case SelectionKind::CallGraphNode:  return "Call Graph Node";
+        case SelectionKind::Patch:          return "Patch";
     }
     return "Unknown";
 }
