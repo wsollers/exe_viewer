@@ -131,3 +131,54 @@ TEST(PagedBinaryImage, CoalescesAdjacentPatches) {
     EXPECT_EQ(intervals[0].original, (std::vector<std::uint8_t>{4, 5, 6, 7}));
     EXPECT_EQ(intervals[0].patched, (std::vector<std::uint8_t>{0xA0, 0xA1, 0xB0, 0xB1}));
 }
+
+TEST(PagedBinaryImage, WritesEffectiveBytesToNewFileWithoutMutatingOriginal) {
+    std::vector<std::uint8_t> bytes(16);
+    for (std::uint8_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = i;
+    }
+    const std::filesystem::path input_path = write_temp_binary(bytes);
+    const std::filesystem::path output_path =
+        std::filesystem::temp_directory_path() / "peelf_patching_test_output.bin";
+    std::filesystem::remove(output_path);
+
+    auto image = peelf::PagedBinaryImage::open(input_path, 4);
+    ASSERT_TRUE(image.has_value()) << image.error().message;
+    ASSERT_TRUE(image->apply_patch(6, std::vector<std::uint8_t>{0xAA, 0xBB, 0xCC}, "export patch")
+                    .has_value());
+
+    ASSERT_TRUE(image->write_effective_to(output_path).has_value());
+
+    auto exported = peelf::PagedBinaryImage::open(output_path, 4);
+    ASSERT_TRUE(exported.has_value()) << exported.error().message;
+    auto exported_bytes = exported->read_original(0, exported->size());
+    ASSERT_TRUE(exported_bytes.has_value()) << exported_bytes.error().message;
+    EXPECT_EQ(*exported_bytes,
+              (std::vector<std::uint8_t>{0, 1, 2, 3, 4, 5, 0xAA, 0xBB, 0xCC, 9, 10, 11, 12, 13, 14, 15}));
+
+    auto original = image->read_original(6, 3);
+    ASSERT_TRUE(original.has_value()) << original.error().message;
+    EXPECT_EQ(*original, (std::vector<std::uint8_t>{6, 7, 8}));
+}
+
+TEST(PagedBinaryImage, RefusesToOverwriteExistingOutputByDefault) {
+    const std::filesystem::path input_path = write_temp_binary({0, 1, 2, 3});
+    const std::filesystem::path output_path =
+        std::filesystem::temp_directory_path() / "peelf_patching_existing_output.bin";
+    {
+        std::ofstream file(output_path, std::ios::binary | std::ios::trunc);
+        const std::uint8_t marker = 0xFE;
+        file.write(reinterpret_cast<const char*>(&marker), 1);
+    }
+
+    auto image = peelf::PagedBinaryImage::open(input_path, 4);
+    ASSERT_TRUE(image.has_value()) << image.error().message;
+    EXPECT_FALSE(image->write_effective_to(output_path).has_value());
+
+    ASSERT_TRUE(image->write_effective_to(output_path, true).has_value());
+    auto exported = peelf::PagedBinaryImage::open(output_path, 4);
+    ASSERT_TRUE(exported.has_value()) << exported.error().message;
+    auto exported_bytes = exported->read_original(0, exported->size());
+    ASSERT_TRUE(exported_bytes.has_value()) << exported_bytes.error().message;
+    EXPECT_EQ(*exported_bytes, (std::vector<std::uint8_t>{0, 1, 2, 3}));
+}

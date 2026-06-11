@@ -449,6 +449,9 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open Debug Symbols...")) {
             if (on_open_debug_symbols_) { on_open_debug_symbols_(); }
         }
+        if (ImGui::MenuItem("Save Patched As...")) {
+            if (on_save_patched_as_) { on_save_patched_as_(); }
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Alt+F4")) {
             // handled by Application

@@ -386,4 +386,59 @@ Result<void> PagedBinaryImage::redo() {
     return {};
 }
 
+Result<void> PagedBinaryImage::write_effective_to(const std::filesystem::path& output_path,
+                                                  bool overwrite) const {
+    if (output_path.empty()) {
+        return make_error("output path is empty");
+    }
+
+    std::error_code ec;
+    const auto input_absolute = std::filesystem::weakly_canonical(path_, ec);
+    const std::filesystem::path normalized_input = ec ? std::filesystem::absolute(path_) : input_absolute;
+    ec.clear();
+    const auto output_parent = output_path.parent_path();
+    const std::filesystem::path output_base =
+        output_parent.empty() ? std::filesystem::current_path(ec) : std::filesystem::weakly_canonical(output_parent, ec);
+    if (ec) {
+        return make_error("failed to resolve output directory");
+    }
+    const std::filesystem::path normalized_output = output_base / output_path.filename();
+    if (normalized_input == normalized_output && !overwrite) {
+        return make_error("refusing to overwrite the input file");
+    }
+
+    if (!overwrite && std::filesystem::exists(output_path, ec)) {
+        return make_error("output file already exists");
+    }
+    if (ec) {
+        return make_error("failed to query output path");
+    }
+
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        return make_error("failed to open output file");
+    }
+
+    std::uint64_t offset = 0;
+    while (offset < size_) {
+        const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
+        auto bytes = read_effective(offset, chunk_size);
+        if (!bytes) {
+            return std::unexpected(bytes.error());
+        }
+        output.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+        if (!output) {
+            return make_error("failed to write output file");
+        }
+        offset += chunk_size;
+    }
+
+    output.flush();
+    if (!output) {
+        return make_error("failed to flush output file");
+    }
+
+    return {};
+}
+
 } // namespace peelf

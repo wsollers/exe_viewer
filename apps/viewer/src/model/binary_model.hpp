@@ -66,6 +66,8 @@ namespace viewer {
                                               std::string label);
         peelf::Result<void> undo_patch();
         peelf::Result<void> redo_patch();
+        peelf::Result<void> save_patched_as(const std::filesystem::path& output_path,
+                                            bool overwrite = false) const;
         std::vector<peelf::PatchInterval> changed_intervals() const;
 
     private:

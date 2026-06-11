@@ -33,6 +33,7 @@ namespace viewer {
 
         void open_file_dialog();
         void open_debug_symbols_dialog();
+        void save_patched_as_dialog();
 
     private:
         void init_glfw(const AppConfig& config);

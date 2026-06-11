@@ -160,6 +160,14 @@ namespace viewer {
         return editable_image_->redo();
     }
 
+    peelf::Result<void> BinaryModel::save_patched_as(const std::filesystem::path& output_path,
+                                                     bool overwrite) const {
+        if (!editable_image_) {
+            return peelf::make_error("no editable binary image is loaded");
+        }
+        return editable_image_->write_effective_to(output_path, overwrite);
+    }
+
     std::vector<peelf::PatchInterval> BinaryModel::changed_intervals() const {
         if (!editable_image_) {
             return {};

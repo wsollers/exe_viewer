@@ -27,6 +27,7 @@ namespace viewer {
 
         void set_open_file_callback(std::function<void()> cb) { on_open_file_ = std::move(cb); }
         void set_open_debug_symbols_callback(std::function<void()> cb) { on_open_debug_symbols_ = std::move(cb); }
+        void set_save_patched_as_callback(std::function<void()> cb) { on_save_patched_as_ = std::move(cb); }
 
         LogPanel& log_panel() { return log_panel_; }
 
@@ -87,6 +88,7 @@ namespace viewer {
 
         std::function<void()> on_open_file_;
         std::function<void()> on_open_debug_symbols_;
+        std::function<void()> on_save_patched_as_;
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;

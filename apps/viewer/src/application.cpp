@@ -78,6 +78,9 @@ namespace viewer {
         ui_->set_open_debug_symbols_callback([this]() {
             open_debug_symbols_dialog();
         });
+        ui_->set_save_patched_as_callback([this]() {
+            save_patched_as_dialog();
+        });
         Logger::instance().init(&ui_->log_panel());
 
         init_imgui();
@@ -327,6 +330,43 @@ namespace viewer {
             ui_->load_debug_symbols(path);
         } else if (result == NFD_ERROR) {
             Log().error(std::string("Debug symbol dialog error: ") + NFD_GetError());
+        }
+    }
+
+    void Application::save_patched_as_dialog() {
+        if (!nfd_initialized_) {
+            Log().error("Cannot open save dialog: NFD not initialized");
+            return;
+        }
+
+        if (model_.editable_image() == nullptr) {
+            Log().warn("Open a static executable before saving patched bytes");
+            return;
+        }
+
+        if (model_.changed_intervals().empty()) {
+            Log().warn("No staged patches to save");
+            return;
+        }
+
+        nfdchar_t *out_path = nullptr;
+        nfdfilteritem_t filters[2] = {
+            {"Executables", "exe,dll,so,elf,bin"},
+            {"All Files", "*"}
+        };
+
+        nfdresult_t result = NFD_SaveDialog(&out_path, filters, 2, nullptr, nullptr);
+        if (result == NFD_OKAY) {
+            std::string path(out_path);
+            NFD_FreePath(out_path);
+            auto saved = model_.save_patched_as(path);
+            if (saved) {
+                Log().info("Saved patched image: " + path);
+            } else {
+                Log().error("Did not save patched image: " + saved.error().message);
+            }
+        } else if (result == NFD_ERROR) {
+            Log().error(std::string("Save dialog error: ") + NFD_GetError());
         }
     }
 
