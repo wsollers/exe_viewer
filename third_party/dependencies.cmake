@@ -92,6 +92,73 @@ set(CAPSTONE_RISCV_SUPPORT ON CACHE BOOL "" FORCE)    # RISC-V RV32/RV64
 
 FetchContent_MakeAvailable(capstone)
 
+# AsmJit + AsmTK
+#
+# AsmJit has a normal CMake target (`asmjit::asmjit`). AsmTK's current
+# CMakeLists requires a newer CMake than this project, so we fetch its source
+# and build the small parser library locally from the same source list it uses.
+add_library(peelf_asmtk INTERFACE)
+add_library(peelf::asmtk ALIAS peelf_asmtk)
+
+if(PEELF_ENABLE_ASMTK)
+        set(PEELF_ASMJIT_TAG "0bd5787b54b575ed94bf32ac452153b34385c514" CACHE STRING "Pinned AsmJit commit")
+        set(PEELF_ASMTK_TAG "1261a46fabb0b353be1f52ff77b0245aa9c170f4" CACHE STRING "Pinned AsmTK commit")
+
+        set(ASMJIT_STATIC ON CACHE BOOL "" FORCE)
+        set(ASMJIT_TEST OFF CACHE BOOL "" FORCE)
+        set(ASMJIT_NO_INSTALL ON CACHE BOOL "" FORCE)
+        set(ASMJIT_NO_CUSTOM_FLAGS ON CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+                asmjit_src
+                GIT_REPOSITORY https://github.com/asmjit/asmjit.git
+                GIT_TAG        ${PEELF_ASMJIT_TAG}
+                GIT_SHALLOW    FALSE
+                DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(asmjit_src)
+
+        FetchContent_Declare(
+                asmtk_src
+                GIT_REPOSITORY https://github.com/asmjit/asmtk.git
+                GIT_TAG        ${PEELF_ASMTK_TAG}
+                GIT_SHALLOW    FALSE
+                DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_GetProperties(asmtk_src)
+        if(NOT asmtk_src_POPULATED)
+                if(POLICY CMP0169)
+                        cmake_policy(PUSH)
+                        cmake_policy(SET CMP0169 OLD)
+                endif()
+                FetchContent_Populate(asmtk_src)
+                if(POLICY CMP0169)
+                        cmake_policy(POP)
+                endif()
+        endif()
+
+        add_library(asmtk STATIC
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/asmtk.h
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/asmparser.cpp
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/asmparser.h
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/asmtokenizer.cpp
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/asmtokenizer.h
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/elfdefs.h
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/globals.h
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/parserutils.h
+                ${asmtk_src_SOURCE_DIR}/src/asmtk/strtod.h
+        )
+        target_compile_features(asmtk PUBLIC cxx_std_17)
+        target_compile_definitions(asmtk PUBLIC ASMTK_STATIC)
+        target_include_directories(asmtk SYSTEM PUBLIC ${asmtk_src_SOURCE_DIR}/src)
+        target_link_libraries(asmtk PUBLIC asmjit::asmjit)
+        add_library(asmjit::asmtk ALIAS asmtk)
+
+        target_link_libraries(peelf_asmtk INTERFACE asmjit::asmjit asmjit::asmtk)
+        target_compile_definitions(peelf_asmtk INTERFACE PEELF_ASMTK_AVAILABLE=1)
+else()
+        target_compile_definitions(peelf_asmtk INTERFACE PEELF_ASMTK_AVAILABLE=0)
+endif()
+
 # Graphviz
 #
 # We primarily need Graphviz as a DOT renderer/export target for call-flow and

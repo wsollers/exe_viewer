@@ -48,6 +48,7 @@ add_executable(peelf_tests
   call_graph_test.cpp
   symbol_index_test.cpp
   shellcode_converter_test.cpp
+  assembler_dependency_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
@@ -61,6 +62,7 @@ target_link_libraries(peelf_tests PRIVATE
   peelf::core
   capstone
   peelf::graphviz
+  peelf::asmtk
   GTest::gtest_main
 )
 

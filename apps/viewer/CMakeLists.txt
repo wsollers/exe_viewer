@@ -79,6 +79,7 @@ target_link_libraries(peelf_viewer PRIVATE
         nfd
         capstone
         peelf::graphviz
+        peelf::asmtk
 )
 
 if(MSVC)

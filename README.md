@@ -58,6 +58,7 @@ the following the first time you configure:
 | Dear ImGui | `docking` branch |
 | nativefiledialog-extended | 1.2.1 |
 | Capstone | 5.0.6 |
+| AsmJit + AsmTK | pinned commits, optional assembly provider dependency |
 | Graphviz | 13.0.0, optional source fetch |
 
 Graphviz is optional and is not fetched unless `PEELF_ENABLE_GRAPHVIZ=ON`.
@@ -142,6 +143,7 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 | `PEELF_BUILD_VIEWER` | `ON` | Build the GUI viewer app (`peelf_viewer`) |
 | `PEELF_BUILD_SHARED` | `ON` | Build `peelf_core` as a shared library |
 | `PEELF_BUILD_TESTS` | `ON` | Build the GoogleTest unit suite |
+| `PEELF_ENABLE_ASMTK` | `ON` | Fetch and build pinned AsmJit + AsmTK sources for optional assembly-to-bytes providers |
 | `PEELF_ENABLE_GRAPHVIZ` | `OFF` | Fetch optional Graphviz source and expose Graphviz feature macros through `peelf::graphviz` |
 | `PEELF_ENABLE_CLANG_TIDY` | `OFF` | Run clang-tidy on project targets for supported generators |
 | `PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST` | `OFF` | Register an opt-in CTest test that refreshes `bin-matrix/` with Docker and runs the focused matrix test |

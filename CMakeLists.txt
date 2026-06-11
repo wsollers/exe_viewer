@@ -10,6 +10,7 @@ project(peelf_explorer
 include(FetchContent)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 option(PEELF_ENABLE_GRAPHVIZ "Fetch optional Graphviz source and enable Graphviz-backed graph rendering hooks" OFF)
+option(PEELF_ENABLE_ASMTK "Fetch and build AsmJit plus AsmTK for optional assembly-to-bytes providers" ON)
 include(third_party/dependencies.cmake)
 
 set(CMAKE_CXX_STANDARD 23)
