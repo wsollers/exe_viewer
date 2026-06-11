@@ -300,7 +300,9 @@ namespace {
            instruction.mnemonic == "retn" ||
            instruction.mnemonic == "retq" ||
            instruction.mnemonic == "jr" ||
-           instruction.mnemonic == "blr";
+           instruction.mnemonic == "blr" ||
+           ((instruction.mnemonic == "pop" || instruction.mnemonic == "ldm" || instruction.mnemonic == "ldmia") &&
+            instruction.operands.find("pc") != std::string::npos);
 }
 
 [[nodiscard]] bool is_unconditional_branch_instruction(const Instruction& instruction) {
