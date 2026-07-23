@@ -44,3 +44,7 @@
 build/
 out/
 cmake-build-*/
+
+# Local Google Drive upload scratch directories
+.tmp.driveupload/
+**/.tmp.driveupload/
