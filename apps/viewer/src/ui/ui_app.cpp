@@ -942,8 +942,10 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 }
 
     void UiApp::render_disassembly_panel() {
-    ImGui::Begin("Disassembly");
-
+    if (!ImGui::Begin("Disassembly", &show_disassembly_panel_)) {
+        ImGui::End();
+        return;
+    }
 
     if (!file_loaded_ || !disasm_.is_initialized()) {
         ImGui::Text("No file loaded or disassembler not initialized");
@@ -961,31 +963,48 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
-        for (const auto &inst: current_instructions_) {
+        for (std::size_t row = 0; row < current_instructions_.size(); ++row) {
+            const Instruction& inst = current_instructions_[row];
+            // The table is keyed by "DisasmTable". Each row has its own scoped
+            // ID, independent of its mnemonic or other potentially repeated
+            // labels (e.g., consecutive nop instructions).
+            ImGui::PushID(static_cast<int>(row));
             ImGui::TableNextRow();
 
-            // Address
             ImGui::TableNextColumn();
-            ImGui::Text("%016llX", inst.address);
+            char address_label[32];
+            std::snprintf(address_label, sizeof(address_label), "%016llX",
+                          static_cast<unsigned long long>(inst.address));
+            const bool selected = selected_disassembly_address_ == inst.address;
+            if (ImGui::Selectable(address_label, selected,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                selected_disassembly_address_ = inst.address;
+                if (const peelf::IBinaryImage* image = model_.image()) {
+                    if (const auto offset = image->virtual_address_to_file_offset(inst.address)) {
+                        if (*offset < model_.bytes().size()) {
+                            hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset),
+                                                         std::max<std::size_t>(inst.bytes.size(), 1u));
+                        }
+                    }
+                }
+            }
 
-            // Bytes
             ImGui::TableNextColumn();
             std::string bytes_str;
-            for (std::uint8_t b: inst.bytes) {
+            for (std::uint8_t byte : inst.bytes) {
                 char buf[4];
-                snprintf(buf, sizeof(buf), "%02X ", b);
+                std::snprintf(buf, sizeof(buf), "%02X ", byte);
                 bytes_str += buf;
             }
             ImGui::TextDisabled("%s", bytes_str.c_str());
 
-            // Mnemonic (color-coded)
             ImGui::TableNextColumn();
-            ImVec4 color = get_mnemonic_color(inst.mnemonic);
+            const ImVec4 color = get_mnemonic_color(inst.mnemonic);
             ImGui::TextColored(color, "%s", inst.mnemonic.c_str());
 
-            // Operands
             ImGui::TableNextColumn();
-            ImGui::Text("%s", inst.operands.c_str());
+            ImGui::TextUnformatted(inst.operands.c_str());
+            ImGui::PopID();
         }
 
         ImGui::EndTable();
@@ -1045,6 +1064,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
         file_loaded_ = true;
         current_instructions_.clear();
+        selected_disassembly_address_.reset();
 
         if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             hex_panel_.navigate_to_range(static_cast<std::size_t>(*entry_offset), 1);
@@ -1239,6 +1259,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     }
 
     void UiApp::disassemble_at_offset(std::size_t file_offset, std::uint64_t display_address) {
+        selected_disassembly_address_.reset();
         if (!file_loaded_ || !disasm_.is_initialized()) {
             return;
         }
@@ -1259,6 +1280,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     void UiApp::disassemble_entry_point(std::size_t max_size) {
         current_instructions_.clear();
+        selected_disassembly_address_.reset();
         auto offset = pe_model_.entry_point_offset();
         if (!offset) {
             Log().error("Failed to get entry point offset\n");
