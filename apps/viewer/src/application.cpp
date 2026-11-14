@@ -234,6 +234,8 @@ namespace viewer {
 
             if (framebuffer_resized_) {
                 vulkan_.recreate_swapchain(window_);
+                if (glfwWindowShouldClose(window_)) break;
+                ImGui_ImplVulkan_SetMinImageCount(vulkan_.image_count());
                 framebuffer_resized_ = false;
             }
 
@@ -245,8 +247,14 @@ namespace viewer {
                 Log().error("Deferred GPU/UI work failed with an unknown exception");
             }
 
-            // Start frame
-            vulkan_.begin_frame();
+            // Acquire may indicate an out-of-date surface. Skip this frame safely.
+            if (!vulkan_.begin_frame()) {
+                vulkan_.recreate_swapchain(window_);
+                if (glfwWindowShouldClose(window_)) break;
+                ImGui_ImplVulkan_SetMinImageCount(vulkan_.image_count());
+                framebuffer_resized_ = false;
+                continue;
+            }
 
             // ImGui frame
             ImGui_ImplVulkan_NewFrame();
@@ -259,8 +267,13 @@ namespace viewer {
             ImGui::Render();
             ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), vulkan_.current_command_buffer());
 
-            // End frame
-            vulkan_.end_frame();
+            // Present may also report an out-of-date or suboptimal swapchain.
+            if (!vulkan_.end_frame()) {
+                vulkan_.recreate_swapchain(window_);
+                if (glfwWindowShouldClose(window_)) break;
+                ImGui_ImplVulkan_SetMinImageCount(vulkan_.image_count());
+                framebuffer_resized_ = false;
+            }
         }
     }
 
