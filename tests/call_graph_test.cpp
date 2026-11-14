@@ -16,6 +16,20 @@
 #include "symbols/debug_symbols.hpp"
 #include <peelf/binary_image.hpp>
 
+TEST(CallGraphRelations, SeparatesDirectionsDeduplicatesAndPreservesRecursion) {
+    viewer::CallGraph graph;
+    graph.edges = {
+        {.from_node_id="a", .to_node_id="b", .kind=viewer::CallGraphEdgeKind::Call},
+        {.from_node_id="a", .to_node_id="b", .kind=viewer::CallGraphEdgeKind::Call},
+        {.from_node_id="a", .to_node_id="a", .kind=viewer::CallGraphEdgeKind::Call},
+        {.from_node_id="b", .to_node_id="c", .kind=viewer::CallGraphEdgeKind::Fallthrough}
+    };
+    EXPECT_EQ(viewer::call_neighbors(graph, "a", false), (std::vector<std::string>{"b", "a"}));
+    EXPECT_EQ(viewer::call_neighbors(graph, "b", true), (std::vector<std::string>{"a"}));
+    EXPECT_TRUE(viewer::call_neighbors(graph, "c", true).empty());
+    EXPECT_TRUE(viewer::call_neighbors(graph, "missing", false).empty());
+}
+
 namespace {
 
 class FakeProcessRunner final : public viewer::IProcessRunner {

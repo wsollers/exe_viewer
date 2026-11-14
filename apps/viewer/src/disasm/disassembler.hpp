@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <optional>
 
 namespace viewer {
 
@@ -33,6 +34,7 @@ struct Instruction {
     std::string mnemonic;
     std::string operands;
     std::string comment;
+    std::optional<std::uint64_t> branch_target;
 
     std::string to_string() const {
         return mnemonic + (operands.empty() ? "" : " " + operands);
@@ -164,6 +166,7 @@ public:
                 inst.bytes.assign(insn[i].bytes, insn[i].bytes + insn[i].size);
                 inst.mnemonic = insn[i].mnemonic;
                 inst.operands = insn[i].op_str;
+                inst.branch_target = direct_target(insn[i]);
                 result.push_back(std::move(inst));
             }
             cs_free(insn, count);
@@ -188,6 +191,7 @@ public:
                 inst.bytes.assign(insn[i].bytes, insn[i].bytes + insn[i].size);
                 inst.mnemonic = insn[i].mnemonic;
                 inst.operands = insn[i].op_str;
+                inst.branch_target = direct_target(insn[i]);
                 result.push_back(std::move(inst));
             }
             cs_free(insn, actual);
@@ -260,6 +264,36 @@ public:
     }
 
 private:
+    [[nodiscard]] std::optional<std::uint64_t> direct_target(const cs_insn& instruction) const {
+        if (!instruction.detail) return std::nullopt;
+        bool branch = false;
+        for (std::uint8_t i = 0; i < instruction.detail->groups_count; ++i)
+            branch |= instruction.detail->groups[i] == CS_GRP_CALL || instruction.detail->groups[i] == CS_GRP_JUMP;
+        if (!branch) return std::nullopt;
+        std::optional<std::uint64_t> target;
+        const auto scan = [&target](const auto& detail, auto immediate_type) {
+            for (std::uint8_t i = 0; i < detail.op_count; ++i)
+                if (detail.operands[i].type == immediate_type)
+                    target = static_cast<std::uint64_t>(detail.operands[i].imm);
+        };
+        switch (arch_) {
+            case Architecture::X86_32: case Architecture::X86_64: scan(instruction.detail->x86, X86_OP_IMM); break;
+            case Architecture::ARM32: scan(instruction.detail->arm, ARM_OP_IMM); break;
+            case Architecture::ARM64: scan(instruction.detail->arm64, ARM64_OP_IMM); break;
+            case Architecture::MIPS32: case Architecture::MIPS64: scan(instruction.detail->mips, MIPS_OP_IMM); break;
+            case Architecture::PowerPC32: case Architecture::PowerPC64: scan(instruction.detail->ppc, PPC_OP_IMM); break;
+            case Architecture::RISCV32: case Architecture::RISCV64:
+                if (instruction.id != RISCV_INS_JALR && instruction.id != RISCV_INS_C_JR && instruction.id != RISCV_INS_C_JALR) {
+                    scan(instruction.detail->riscv, RISCV_OP_IMM);
+                    if (target) {
+                        *target += instruction.address;
+                        if (arch_ == Architecture::RISCV32) *target &= 0xFFFFFFFFULL;
+                    }
+                }
+                break;
+        }
+        return target;
+    }
     csh handle_ = 0;
     Architecture arch_ = Architecture::X86_64;
     Endianness endian_ = Endianness::Little;

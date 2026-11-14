@@ -807,6 +807,34 @@ void UiApp::render_call_graph_panel() {
     }
 
     ImGui::InputTextWithHint("Find node", "Any part of a function name...", graph_search_, sizeof(graph_search_));
+    if (current_call_graph_ && ImGui::CollapsingHeader("Callers / Callees (current graph)")) {
+        ImGui::BeginChild("CallRelations", ImVec2(0, 160), true);
+        for (const auto& root : current_call_graph_->nodes) {
+            if (graph_search_[0] && !symbol_name_matches(root.label, graph_search_)) continue;
+            ImGui::PushID(root.id.c_str());
+            if (ImGui::TreeNode(root.label.c_str())) {
+                for (const bool callers : {true, false}) {
+                    if (ImGui::TreeNode(callers ? "Callers" : "Callees")) {
+                        const auto ids = call_neighbors(*current_call_graph_, root.id, callers);
+                        if (ids.empty()) ImGui::TextDisabled("No known calls in this graph");
+                        for (const auto& id : ids) {
+                            const auto node = std::ranges::find_if(current_call_graph_->nodes,
+                                [&](const auto& candidate) { return candidate.id == id; });
+                            if (node == current_call_graph_->nodes.end()) continue;
+                            ImGui::PushID(id.c_str());
+                            const auto label = node->label + (id == root.id ? " (recursive)" : "");
+                            if (ImGui::Selectable(label.c_str())) activate_call_graph_node(*node);
+                            ImGui::PopID();
+                        }
+                        ImGui::TreePop();
+                    }
+                }
+                ImGui::TreePop();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
     if (current_call_graph_ && graph_search_[0] != '\0') {
         ImGui::BeginChild("GraphSearchResults", ImVec2(0, 100), true);
         for (const auto& node : current_call_graph_->nodes) {
@@ -1063,6 +1091,15 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             // Operands
             ImGui::TableNextColumn();
             ImGui::Text("%s", inst.operands.c_str());
+            if (inst.branch_target) {
+                const auto* target = symbol_index_.find_containing_address(*inst.branch_target);
+                if (target && target->virtual_address) {
+                    const auto delta = *inst.branch_target - *target->virtual_address;
+                    const auto label = delta ? std::format("{}+0x{:X}", target->name, delta) : target->name;
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("; %s", label.c_str());
+                }
+            }
             ImGui::TableNextColumn();
             if (const auto* symbol = symbol_index_.find_containing_address(inst.address); symbol && symbol->virtual_address) {
                 const auto offset = inst.address - *symbol->virtual_address;

@@ -76,6 +76,21 @@ struct CallGraph {
     std::vector<CallGraphEdge> edges;
 };
 
+// Relationships are limited to the currently analyzed graph, not a whole-image call index.
+[[nodiscard]] inline std::vector<std::string> call_neighbors(const CallGraph& graph,
+                                                            std::string_view node_id, bool callers) {
+    std::vector<std::string> result;
+    for (const auto& edge : graph.edges) {
+        if (edge.kind != CallGraphEdgeKind::Call) continue;
+        if ((callers ? edge.to_node_id : edge.from_node_id) != node_id) continue;
+        const auto& id = callers ? edge.from_node_id : edge.to_node_id;
+        bool seen = false;
+        for (const auto& existing : result) if (existing == id) { seen = true; break; }
+        if (!seen) result.push_back(id);
+    }
+    return result;
+}
+
 struct GraphLayoutNode {
     std::string node_id;
     double center_x = 0.0;
