@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <ranges>
 #include <utility>
 
 namespace peelf {
@@ -193,6 +194,47 @@ protected:
 
 class ElfImage final : public ImageBase {
 public:
+    // PT_LOAD, not section headers, defines an ELF executable's file/VA map.
+    // Sectionless executables are valid, and zero-filled memory has no file bytes.
+    [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
+        std::uint64_t offset) const noexcept override {
+        for (const Segment& segment : segments_) {
+            if (segment.type != 1u || segment.file_size > segment.virtual_size ||
+                !fits_range(segment.file_offset, segment.file_size, file_size_)) {
+                continue;
+            }
+            if (offset >= segment.file_offset && offset - segment.file_offset < segment.file_size) {
+                return checked_add_u64(segment.virtual_address, offset - segment.file_offset);
+            }
+        }
+        // Objects may have sections but no PT_LOAD program headers.
+        if (std::ranges::none_of(segments_, [](const Segment& segment) { return segment.type == 1u; })) {
+            return ImageBase::file_offset_to_virtual_address(offset);
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
+        std::uint64_t address) const noexcept override {
+        for (const Segment& segment : segments_) {
+            if (segment.type != 1u || segment.file_size > segment.virtual_size ||
+                !fits_range(segment.file_offset, segment.file_size, file_size_)) {
+                continue;
+            }
+            if (address >= segment.virtual_address &&
+                address - segment.virtual_address < segment.virtual_size) {
+                const std::uint64_t delta = address - segment.virtual_address;
+                if (delta >= segment.file_size) {
+                    return std::nullopt; // PT_LOAD .bss / zero-fill memory
+                }
+                return checked_add_u64(segment.file_offset, delta);
+            }
+        }
+        if (std::ranges::none_of(segments_, [](const Segment& segment) { return segment.type == 1u; })) {
+            return ImageBase::virtual_address_to_file_offset(address);
+        }
+        return std::nullopt;
+    }
     [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return &elf_header_; }
     [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override {
         return program_headers_;
@@ -224,6 +266,7 @@ public:
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
 
 private:
+    std::uint64_t file_size_ = 0;
     ElfHeader elf_header_;
     std::vector<ElfProgramHeader> program_headers_;
     std::vector<ElfSectionHeader> section_headers_;
@@ -1617,6 +1660,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
 
     auto img = std::unique_ptr<ElfImage>(new ElfImage());
     img->format_ = Format::ELF;
+    img->file_size_ = static_cast<std::uint64_t>(b.size());
     img->is_64_  = is64;
     img->endian_ = big ? Endianness::Big : Endianness::Little;
     img->kind_   = elf_kind(e_type);
