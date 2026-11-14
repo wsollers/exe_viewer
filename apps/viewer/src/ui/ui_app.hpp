@@ -109,6 +109,12 @@ namespace viewer {
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
         std::vector<Instruction> current_instructions_;
+        struct DisassemblyLocation {
+            std::size_t file_offset;
+            std::uint64_t address;
+        };
+        // Keep the requested location even when edited bytes cannot be decoded.
+        std::optional<DisassemblyLocation> disassembly_location_;
         std::uint64_t rendered_edit_revision_ = 0;
 
 

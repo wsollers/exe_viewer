@@ -69,7 +69,10 @@ void HexViewPanel::draw_contents() {
             } else {
             const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
             edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
-            if (applied && on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
+            if (applied) {
+                highlighted_size_ = parsed.bytes.size();
+                if (on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
+            }
             }
         }
     }

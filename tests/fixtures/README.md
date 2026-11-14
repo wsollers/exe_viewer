@@ -92,6 +92,19 @@ Small binary samples used by the unit tests.
 
 ## Adding more fixtures
 
+The `InstructionPatchRoundTrip` tests patch entry-point instructions, decode the
+effective bytes, undo/redo, export to a unique temporary file and reopen that file
+for every `known-*` CPU family above. They also compare the entire exported file
+and reopen the source to verify it is unchanged. These are decoding and file
+integrity checks, not execution tests: arbitrary instruction replacement can
+change program behavior or invalidate signatures.
+
+Decoder scope: ARM32 uses the selected ARM/Thumb mode; ARM64 and RISC-V use
+little-endian instruction encoding even in fixtures with big-endian ELF headers.
+The matrix checks those encodings, not arbitrary big-endian instruction streams.
+Capstone's supported instruction sets still bound decoding; this is not a
+decompiler or an assembler-based relocation system.
+
 Prefer small, license-clean samples (compile your own where possible). Suggested
 additions as parsing features land:
 

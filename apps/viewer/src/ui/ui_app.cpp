@@ -316,6 +316,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         const auto file_offset = symbol.file_offset;
         pending_call_graph_root_.reset();
         current_instructions_.clear();
+        disassembly_location_.reset();
         hex_panel_.clear_selection();
         if (!file_offset) {
             Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
@@ -1013,12 +1014,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     void UiApp::render_disassembly_panel() {
     if (rendered_edit_revision_ != model_.edit_revision()) {
         rendered_edit_revision_ = model_.edit_revision();
-        if (!current_instructions_.empty() && model_.image()) {
-            const auto address = current_instructions_.front().address;
-            if (const auto offset = model_.image()->virtual_address_to_file_offset(address))
-                disassemble_at_offset(static_cast<std::size_t>(*offset), address);
-            else current_instructions_.clear();
-        }
+        if (disassembly_location_)
+            disassemble_at_offset(disassembly_location_->file_offset, disassembly_location_->address);
     }
     ImGui::Begin("Disassembly");
 
@@ -1031,11 +1028,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     if (disasm_.architecture() == Architecture::ARM32 && ImGui::Checkbox("Thumb mode", &thumb_mode_)) {
         if (disasm_.set_thumb_mode(thumb_mode_)) {
-            if (!current_instructions_.empty()) {
-                const auto address = current_instructions_.front().address;
-                if (const auto offset = model_.image()->virtual_address_to_file_offset(address))
-                    disassemble_at_offset(static_cast<std::size_t>(*offset), address);
-            }
+            if (disassembly_location_)
+                disassemble_at_offset(disassembly_location_->file_offset, disassembly_location_->address);
         } else {
             thumb_mode_ = !thumb_mode_;
             Log().error("Unable to change ARM instruction mode");
@@ -1122,6 +1116,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 }
     // Called after a file (PE or ELF) is loaded into the model.
     void UiApp::on_file_loaded() {
+        disassembly_location_.reset();
         thumb_mode_ = false;
         const peelf::IBinaryImage* img = model_.image();
         if (!img) {
@@ -1366,6 +1361,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     }
 
     void UiApp::disassemble_at_offset(std::size_t file_offset, std::uint64_t display_address) {
+        disassembly_location_ = DisassemblyLocation{file_offset, display_address};
         if (!file_loaded_ || !disasm_.is_initialized()) {
             return;
         }
