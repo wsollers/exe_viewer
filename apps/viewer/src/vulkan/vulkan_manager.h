@@ -40,8 +40,9 @@ public:
     void init(GLFWwindow* window, const VulkanConfig& config = {});
     void shutdown();
 
-    void begin_frame();
-    void end_frame();
+    // False means the swapchain must be recreated before rendering another frame.
+    [[nodiscard]] bool begin_frame();
+    [[nodiscard]] bool end_frame();
 
     void wait_idle();
     void recreate_swapchain(GLFWwindow* window);
@@ -74,6 +75,7 @@ private:
     void create_command_buffers();
     void create_descriptor_pool();
     void create_sync_objects();
+    void create_render_finished_semaphores();
 
     void cleanup_swapchain();
     [[nodiscard]] uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const;
@@ -99,14 +101,17 @@ private:
     std::vector<VkCommandBuffer> command_buffers_;
 
     VkFormat swapchain_format_ = VK_FORMAT_B8G8R8A8_SRGB;
+    VkColorSpaceKHR swapchain_color_space_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     VkExtent2D swapchain_extent_ = {};
     uint32_t graphics_family_ = 0;
     uint32_t current_image_index_ = 0;
 
     VkSemaphore image_available_semaphore_ = VK_NULL_HANDLE;
-    VkSemaphore render_finished_semaphore_ = VK_NULL_HANDLE;
+    // Per-swapchain-image semaphores avoid reuse before presentation completes.
+    std::vector<VkSemaphore> render_finished_semaphores_;
     VkFence in_flight_fence_ = VK_NULL_HANDLE;
 
+    bool frame_suboptimal_ = false;
     bool initialized_ = false;
 };
 
