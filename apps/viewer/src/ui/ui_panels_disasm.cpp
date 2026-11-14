@@ -4,6 +4,10 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
 
+#include <cinttypes>
+#include <cstdio>
+#include <string>
+
 namespace viewer {
 
     DisassemblyPanel::DisassemblyPanel(BinaryModel& model, std::vector<Instruction>& instructions)
@@ -19,11 +23,16 @@ namespace viewer {
 
         ImGui::BeginChild("InstructionsScroll", ImVec2(0,0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
-        // Display current instructions
-        for (const auto& instruction : current_instructions_) {
+        // Scope any per-instruction controls by row index, not mnemonic/label.
+        // Identical instructions at distinct addresses must never share ImGui IDs.
+        for (std::size_t index = 0; index < current_instructions_.size(); ++index) {
+            const auto& instruction = current_instructions_[index];
+            ImGui::PushID(static_cast<int>(index));
             char addr[32];
             std::snprintf(addr, sizeof(addr), "%08" PRIx64 ": ", instruction.address);
-            ImGui::TextUnformatted(addr);
+            if (ImGui::Selectable(addr, selected_instr_ == index)) {
+                selected_instr_ = index;
+            }
             ImGui::SameLine();
 
             // Construct the full instruction string
@@ -35,8 +44,9 @@ namespace viewer {
             // Optional: Display comment if available
             if (!instruction.comment.empty()) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), instruction.comment.c_str());
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s", instruction.comment.c_str());
             }
+            ImGui::PopID();
         }
 
         ImGui::EndChild();
