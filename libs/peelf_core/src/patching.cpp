@@ -3,6 +3,15 @@
 #include <algorithm>
 #include <fstream>
 #include <limits>
+#include <random>
+#include <system_error>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <utility>
 
 namespace peelf {
@@ -387,57 +396,154 @@ Result<void> PagedBinaryImage::redo() {
 }
 
 Result<void> PagedBinaryImage::write_effective_to(const std::filesystem::path& output_path,
-                                                  bool overwrite) const {
-    if (output_path.empty()) {
-        return make_error("output path is empty");
+                                                   bool overwrite) const {
+    if (output_path.empty() || output_path.filename().empty()) {
+        return make_error("output path is empty or does not name a file");
     }
 
     std::error_code ec;
-    const auto input_absolute = std::filesystem::weakly_canonical(path_, ec);
-    const std::filesystem::path normalized_input = ec ? std::filesystem::absolute(path_) : input_absolute;
+    const std::filesystem::path normalized_input = std::filesystem::weakly_canonical(path_, ec);
+    if (ec) {
+        return make_error("failed to resolve input file path");
+    }
+
+    const std::filesystem::path output_parent = output_path.has_parent_path()
+        ? output_path.parent_path() : std::filesystem::current_path(ec);
+    if (ec) {
+        return make_error("failed to resolve working directory");
+    }
+    const std::filesystem::path normalized_parent =
+        std::filesystem::weakly_canonical(output_parent, ec);
+    if (ec || !std::filesystem::is_directory(normalized_parent, ec)) {
+        return make_error("output directory does not exist");
+    }
+    const std::filesystem::path target = normalized_parent / output_path.filename();
+    if (target == normalized_input) {
+        // The model retains immutable original pages from path_ for undo/redo.
+        return make_error("refusing to replace the currently loaded input file");
+    }
+
     ec.clear();
-    const auto output_parent = output_path.parent_path();
-    const std::filesystem::path output_base =
-        output_parent.empty() ? std::filesystem::current_path(ec) : std::filesystem::weakly_canonical(output_parent, ec);
+    const bool exists = std::filesystem::exists(target, ec);
     if (ec) {
-        return make_error("failed to resolve output directory");
+        return make_error("failed to query destination");
     }
-    const std::filesystem::path normalized_output = output_base / output_path.filename();
-    if (normalized_input == normalized_output && !overwrite) {
-        return make_error("refusing to overwrite the input file");
-    }
-
-    if (!overwrite && std::filesystem::exists(output_path, ec)) {
-        return make_error("output file already exists");
-    }
-    if (ec) {
-        return make_error("failed to query output path");
-    }
-
-    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        return make_error("failed to open output file");
-    }
-
-    std::uint64_t offset = 0;
-    while (offset < size_) {
-        const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
-        auto bytes = read_effective(offset, chunk_size);
-        if (!bytes) {
-            return std::unexpected(bytes.error());
+    if (exists) {
+        if (std::filesystem::equivalent(normalized_input, target, ec) && !ec) {
+            return make_error("destination refers to the currently loaded input file");
         }
-        output.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+        if (ec) {
+            return make_error("failed to compare input and destination");
+        }
+        if (!overwrite) {
+            return make_error("output file already exists");
+        }
+    }
+
+    // Create an exclusive staging directory on the destination filesystem.
+    // Even a name collision cannot let a partial save truncate another file.
+    std::random_device entropy;
+    std::mt19937_64 random(entropy());
+    std::filesystem::path staging_dir;
+    for (unsigned attempt = 0; attempt < 32; ++attempt) {
+        staging_dir = normalized_parent /
+            (".peelf-staging-" + std::to_string(random()) + "-" + std::to_string(attempt));
+        ec.clear();
+        if (std::filesystem::create_directory(staging_dir, ec)) {
+            break;
+        }
+        if (ec) {
+            return make_error("cannot create staging directory");
+        }
+        staging_dir.clear();
+    }
+    if (staging_dir.empty()) {
+        return make_error("could not allocate a unique staging directory");
+    }
+
+    struct RemoveStagingDirectory {
+        std::filesystem::path directory;
+        ~RemoveStagingDirectory() {
+            std::error_code ignored;
+            std::filesystem::remove_all(directory, ignored);
+        }
+    } cleanup{staging_dir};
+
+    const std::filesystem::path staged_file = staging_dir / "patched-image.tmp";
+    {
+        std::ofstream output(staged_file, std::ios::binary | std::ios::trunc);
         if (!output) {
-            return make_error("failed to write output file");
+            return make_error("failed to open staged output");
         }
-        offset += chunk_size;
+        std::uint64_t offset = 0;
+        while (offset < size_) {
+            const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
+            auto bytes = read_effective(offset, chunk_size);
+            if (!bytes) {
+                return std::unexpected(bytes.error());
+            }
+            output.write(reinterpret_cast<const char*>(bytes->data()),
+                         static_cast<std::streamsize>(bytes->size()));
+            if (!output) {
+                return make_error("failed to write complete staged output");
+            }
+            offset += chunk_size;
+        }
+        output.flush();
+        if (!output) {
+            return make_error("failed to flush staged output");
+        }
+        output.close();
+        if (!output) {
+            return make_error("failed to close staged output");
+        }
     }
 
-    output.flush();
-    if (!output) {
-        return make_error("failed to flush output file");
+    ec.clear();
+    if (std::filesystem::file_size(staged_file, ec) != size_ || ec) {
+        return make_error("staged output length does not match input length");
     }
 
+#ifndef _WIN32
+    // Preserve ordinary executable/read permissions, excluding suid/sgid bits.
+    ec.clear();
+    const auto input_status = std::filesystem::status(normalized_input, ec);
+    if (!ec) {
+        constexpr auto ordinary_permissions =
+            std::filesystem::perms::owner_all |
+            std::filesystem::perms::group_all |
+            std::filesystem::perms::others_all;
+        std::filesystem::permissions(
+            staged_file, input_status.permissions() & ordinary_permissions,
+            std::filesystem::perm_options::replace, ec);
+        if (ec) {
+            return make_error("failed to copy output file permissions");
+        }
+    }
+#endif
+
+    // Publish only after the staged bytes have been completely written.
+    // The non-overwrite path is no-clobber even if another process races to
+    // create the destination while the new file is being prepared.
+#ifdef _WIN32
+    const DWORD flags = MOVEFILE_WRITE_THROUGH |
+                        (overwrite ? MOVEFILE_REPLACE_EXISTING : DWORD{0});
+    if (!MoveFileExW(staged_file.c_str(), target.c_str(), flags)) {
+        return make_error("failed to publish staged output (destination may exist)");
+    }
+#else
+    ec.clear();
+    if (overwrite) {
+        // POSIX rename replaces an existing regular file atomically.
+        std::filesystem::rename(staged_file, target, ec);
+    } else {
+        // Hard-link publication is an atomic no-clobber operation.
+        std::filesystem::create_hard_link(staged_file, target, ec);
+    }
+    if (ec) {
+        return make_error("failed to publish staged output (destination may exist)");
+    }
+#endif
     return {};
 }
 
