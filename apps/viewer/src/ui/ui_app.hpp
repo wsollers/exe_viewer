@@ -106,6 +106,7 @@ namespace viewer {
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
         std::vector<Instruction> current_instructions_;
+        std::optional<std::uint64_t> selected_disassembly_address_;
 
 
         void render_main_menu();
