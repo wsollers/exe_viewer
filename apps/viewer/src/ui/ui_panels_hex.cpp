@@ -46,7 +46,7 @@ void HexViewPanel::draw_contents() {
     if (ImGui::Button("Go")) {
         if (goto_offset_ < bytes.size()) {
             navigate_to_range(static_cast<std::size_t>(goto_offset_), 1);
-            if (on_byte_activated_) on_byte_activated_(selected_offset_);
+            if (on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
             edit_status_.clear();
         } else edit_status_ = "Offset is outside the file.";
     }
@@ -61,7 +61,7 @@ void HexViewPanel::draw_contents() {
             } else {
             const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
             edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
-            if (applied && on_byte_activated_) on_byte_activated_(selected_offset_);
+            if (applied && on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
             }
         }
     }
@@ -135,7 +135,7 @@ void HexViewPanel::draw_contents() {
                         highlighted_size_ = 1;
                     }
                     if (on_byte_activated_) {
-                        on_byte_activated_(i);
+                        on_byte_activated_(highlighted_offset_, highlighted_size_);
                     }
                 }
 

@@ -35,6 +35,7 @@ namespace {
         case SelectionKind::Group:          return "Group";
         case SelectionKind::CallGraphNode:  return "Call Graph Node";
         case SelectionKind::Patch:          return "Patch";
+        case SelectionKind::ByteRange:      return "Bytes";
     }
     return "Unknown";
 }

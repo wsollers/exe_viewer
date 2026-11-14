@@ -41,6 +41,7 @@ enum class SelectionKind : std::uint8_t {
     Interpreter,
     CallGraphNode,
     Patch,
+    ByteRange,
     Group
 };
 

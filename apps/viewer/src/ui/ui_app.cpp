@@ -270,7 +270,16 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , pe_imports_panel_(model)
     , pe_exports_panel_(model)
 {
-    hex_panel_.set_byte_activated_callback([this](std::size_t off) {
+    hex_panel_.set_byte_activated_callback([this](std::size_t off, std::size_t size) {
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::ByteRange,
+            .label = "Hex selection",
+            .file_offset = off,
+            .virtual_address = model_.image() ? model_.image()->file_offset_to_virtual_address(off) : std::nullopt,
+            .size = size,
+            .preferred_view = PreferredView::Hex
+        };
+        last_navigation_selection_ = current_selection_;
         disassemble_at_offset(off);
     });
     sections_panel_.set_section_activated_callback(
@@ -993,8 +1002,18 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             ImGui::TableNextColumn();
             ImGui::PushID(row);
             if (ImGui::Selectable(std::format("{:016X}", inst.address).c_str())) {
-                if (const auto offset = model_.image()->virtual_address_to_file_offset(inst.address))
+                if (const auto offset = model_.image()->virtual_address_to_file_offset(inst.address)) {
                     hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), inst.bytes.size());
+                    current_selection_ = ViewerSelection{
+                        .kind = SelectionKind::ByteRange,
+                        .label = "Instruction: " + inst.to_string(),
+                        .file_offset = *offset,
+                        .virtual_address = inst.address,
+                        .size = inst.bytes.size(),
+                        .preferred_view = PreferredView::Hex
+                    };
+                    last_navigation_selection_ = current_selection_;
+                }
             }
             ImGui::PopID();
 
