@@ -31,6 +31,7 @@ void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) 
     highlighted_offset_ = file_offset;
     highlighted_size_ = std::min(size, bytes.size() - file_offset);
     pending_scroll_offset_ = file_offset;
+    goto_offset_ = file_offset;
 }
 
 void HexViewPanel::draw_contents() {
@@ -50,7 +51,8 @@ void HexViewPanel::draw_contents() {
             edit_status_.clear();
         } else edit_status_ = "Offset is outside the file.";
     }
-    ImGui::InputTextWithHint("Replacement", "Hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
+    ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Apply bytes").x - 28.0f));
+    ImGui::InputTextWithHint("##Replacement", "Replacement hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
     ImGui::SameLine();
     if (ImGui::Button("Apply bytes")) {
         const auto parsed = parse_hex_shellcode(edit_bytes_);
@@ -66,7 +68,6 @@ void HexViewPanel::draw_contents() {
         }
     }
     ImGui::TextDisabled("Selected offset: 0x%llX", static_cast<unsigned long long>(selected_offset_));
-    ImGui::SameLine();
     ImGui::TextDisabled("%zu bytes selected (Shift-click to extend)", highlighted_size_);
     if (ImGui::Button("Copy selected hex")) {
         const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);
@@ -84,14 +85,10 @@ void HexViewPanel::draw_contents() {
     const size_t row_bytes = bytes_per_row_;
     const size_t rows = (total + row_bytes - 1) / row_bytes;
 
-    if (pending_scroll_offset_) {
-        const std::size_t row = *pending_scroll_offset_ / row_bytes;
-        ImGui::SetScrollY(static_cast<float>(row) * ImGui::GetTextLineHeightWithSpacing());
-        pending_scroll_offset_.reset();
-    }
-
     ImGuiListClipper clipper;
-    clipper.Begin((int)rows);
+    clipper.Begin(static_cast<int>(rows), ImGui::GetTextLineHeightWithSpacing());
+    if (pending_scroll_offset_)
+        clipper.IncludeItemByIndex(static_cast<int>(*pending_scroll_offset_ / row_bytes));
     while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             size_t start = row * row_bytes;
@@ -152,6 +149,10 @@ void HexViewPanel::draw_contents() {
                 ImGui::TextUnformatted(&ch, &ch + 1);
                 if (i + 1 < end)
                     ImGui::SameLine(0.0f, 0.0f);
+            }
+            if (pending_scroll_offset_ && *pending_scroll_offset_ / row_bytes == static_cast<std::size_t>(row)) {
+                ImGui::SetScrollHereY(0.5f);
+                pending_scroll_offset_.reset();
             }
         }
     }

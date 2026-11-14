@@ -94,6 +94,7 @@ namespace viewer {
         bool file_loaded_ = false;
         bool thumb_mode_ = false;
         bool reset_dock_layout_ = false;
+        std::optional<bool> compact_dock_layout_;
         bool show_disassembly_panel_ = true;
         bool show_call_graph_panel_ = false;
         CallGraphSample call_graph_sample_ = CallGraphSample::LoadedImage;

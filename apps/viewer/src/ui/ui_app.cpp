@@ -612,10 +612,13 @@ void UiApp::render_dockspace() {
 
     const ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
-    if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr) {
+    const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
+    if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
+        (compact_dock_layout_ && *compact_dock_layout_ != compact)) {
         build_default_dock_layout(dockspace_id, viewport->WorkSize);
         reset_dock_layout_ = false;
     }
+    compact_dock_layout_ = compact;
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dock_flags);
 
     ImGui::End();
@@ -979,9 +982,10 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderSetNodeSize(dockspace_id, dockspace_size);
 
     ImGuiID main_id = dockspace_id;
-    const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, 0.22f, nullptr, &main_id);
-    const ImGuiID right_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.24f, nullptr, &main_id);
-    const ImGuiID bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.22f, nullptr, &main_id);
+    const bool compact = dockspace_size.x < ImGui::GetFontSize() * 100.0f;
+    const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, compact ? 0.28f : 0.22f, nullptr, &main_id);
+    const ImGuiID right_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.24f, nullptr, &main_id);
+    const ImGuiID bottom_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.22f, nullptr, &main_id);
     const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.42f, nullptr, &main_id);
 
     ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
@@ -1037,14 +1041,15 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
     }
     // Simple table view
-    if (ImGui::BeginTable("DisasmTableSymbols", 5,
+    if (ImGui::BeginTable("DisasmTableReadable", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("0000000000000000").x + 16.0f);
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, ImGui::CalcTextSize("0000000000000000").x + 16.0f);
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 180.0f);
         ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 22.0f);
+        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 28.0f);
+        ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
