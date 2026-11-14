@@ -1,5 +1,6 @@
 #include "model/binary_model.hpp"
 #include "navigation/byte_range.hpp"
+#include "disasm/disassembler.hpp"
 
 #include <gtest/gtest.h>
 
@@ -20,6 +21,26 @@ namespace {
 }
 
 } // namespace
+
+#if defined(_WIN32) && defined(PEELF_VIEWER_DEBUG_EXE)
+TEST(BinaryModelPatching, ViewerExecutableEntryBytesAreReadableAndDecode) {
+    viewer::BinaryModel model;
+    ASSERT_TRUE(model.load_file(PEELF_VIEWER_DEBUG_EXE));
+    ASSERT_NE(model.pe(), nullptr);
+    ASSERT_NE(model.image(), nullptr);
+    const auto entry = model.image()->entry_point();
+    const auto offset = model.image()->virtual_address_to_file_offset(entry);
+    ASSERT_TRUE(offset);
+    ASSERT_NE(model.pe()->data_at_offset(static_cast<std::size_t>(*offset)), nullptr);
+    const auto bytes = model.read_effective_bytes(*offset, 16);
+    ASSERT_TRUE(bytes);
+    viewer::Disassembler decoder;
+    ASSERT_TRUE(decoder.init(viewer::Architecture::X86_64));
+    const auto instructions = decoder.disassemble(bytes->data(), bytes->size(), entry);
+    ASSERT_FALSE(instructions.empty());
+    EXPECT_EQ(instructions.front().address, entry);
+}
+#endif
 
 TEST(HexSelection, IncludesBothEndpointsInEitherDirectionAndRejectsInvalidOffsets) {
     const auto forward = viewer::selected_byte_range(15, 17, 32);

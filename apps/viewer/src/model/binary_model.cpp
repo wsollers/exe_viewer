@@ -73,6 +73,9 @@ namespace viewer {
 
         format_ = BinaryFormat::PE;
         pe_ = std::make_unique<PeModel>(std::move(pe_model));
+        // The legacy model borrows storage owned by this BinaryModel.
+        pe_->raw_data = bytes_.data();
+        pe_->raw_size = bytes_.size();
 
         file_info_.path = path;
         file_info_.format_str = "PE";

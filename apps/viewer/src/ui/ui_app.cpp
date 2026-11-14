@@ -1102,13 +1102,12 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             last_navigation_selection_ = current_selection_;
         }
 
-        // PE keeps its entry-point disassembly via the legacy PeModel. ELF
-        // entry-point disassembly via the unified image is future work (P4);
-        // for now, click a byte in the Hex view to disassemble at that offset.
+        // Keep legacy metadata for PE-only tools, but decode both formats from
+        // the same effective-byte source used by the hex editor.
         if (const PeModel* pe = model_.pe()) {
             pe_model_ = *pe;
-            disassemble_entry_point(4096);
-        } else if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
+        }
+        if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
         }
 
