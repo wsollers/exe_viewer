@@ -1,4 +1,7 @@
 #include "vulkan_manager.h"
+#include <algorithm>
+#include <array>
+#include <limits>
 #include <cstring>
 #include <iterator>
 #include <stdexcept>
@@ -37,7 +40,10 @@ void VulkanManager::shutdown() {
     vkDeviceWaitIdle(device_);
 
     vkDestroyFence(device_, in_flight_fence_, nullptr);
-    vkDestroySemaphore(device_, render_finished_semaphore_, nullptr);
+    for (VkSemaphore semaphore : render_finished_semaphores_) {
+        if (semaphore != VK_NULL_HANDLE) vkDestroySemaphore(device_, semaphore, nullptr);
+    }
+    render_finished_semaphores_.clear();
     vkDestroySemaphore(device_, image_available_semaphore_, nullptr);
 
     vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
@@ -131,58 +137,108 @@ void VulkanManager::create_logical_device() {
 }
 
 void VulkanManager::create_swapchain(GLFWwindow* window) {
-    // Query surface formats
-    uint32_t fcount = 0;
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &fcount, nullptr);
-    std::vector<VkSurfaceFormatKHR> formats(fcount);
-    vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &fcount, formats.data());
+    uint32_t format_count = 0;
+    check(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &format_count, nullptr),
+          "Failed to query surface formats");
+    if (format_count == 0) {
+        throw std::runtime_error("Surface supports no swapchain formats");
+    }
+    std::vector<VkSurfaceFormatKHR> formats(format_count);
+    check(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &format_count, formats.data()),
+          "Failed to read surface formats");
 
-    VkSurfaceFormatKHR chosen = formats[0];
-    for (auto& f : formats) {
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
-            f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            chosen = f;
-            break;
+    VkSurfaceFormatKHR chosen = formats.front();
+    if (render_pass_ != VK_NULL_HANDLE) {
+        // The existing ImGui Vulkan pipeline uses this render-pass format.
+        const auto existing = std::find_if(formats.begin(), formats.end(),
+            [this](const VkSurfaceFormatKHR& f) {
+                return f.format == swapchain_format_ && f.colorSpace == swapchain_color_space_;
+            });
+        if (existing == formats.end()) {
+            throw std::runtime_error("Surface format changed; ImGui Vulkan backend must be reinitialized");
+        }
+        chosen = *existing;
+    } else {
+        for (const auto& f : formats) {
+            if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
+                f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                chosen = f;
+                break;
+            }
         }
     }
-
     swapchain_format_ = chosen.format;
-
-    int w, h;
-    glfwGetFramebufferSize(window, &w, &h);
-    swapchain_extent_ = { (uint32_t)w, (uint32_t)h };
+    swapchain_color_space_ = chosen.colorSpace;
 
     VkSurfaceCapabilitiesKHR caps{};
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &caps);
+    check(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &caps),
+          "Failed to query surface capabilities");
+
+    if (caps.currentExtent.width != std::numeric_limits<std::uint32_t>::max()) {
+        swapchain_extent_ = caps.currentExtent;
+    } else {
+        int width = 0;
+        int height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        swapchain_extent_ = {
+            std::clamp(static_cast<std::uint32_t>(std::max(width, 1)),
+                       caps.minImageExtent.width, caps.maxImageExtent.width),
+            std::clamp(static_cast<std::uint32_t>(std::max(height, 1)),
+                       caps.minImageExtent.height, caps.maxImageExtent.height)
+        };
+    }
 
     uint32_t image_count = caps.minImageCount + 1;
-    if (caps.maxImageCount > 0 && image_count > caps.maxImageCount)
+    if (caps.maxImageCount != 0 && image_count > caps.maxImageCount) {
         image_count = caps.maxImageCount;
+    }
+    if (image_count < 2) {
+        throw std::runtime_error("ImGui Vulkan backend requires at least two swapchain images");
+    }
+
+    VkCompositeAlphaFlagBitsKHR composite_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    if ((caps.supportedCompositeAlpha & composite_alpha) == 0) {
+        constexpr std::array alternatives{
+            VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR,
+            VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR,
+            VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR
+        };
+        const auto it = std::find_if(alternatives.begin(), alternatives.end(),
+            [&caps](VkCompositeAlphaFlagBitsKHR flag) {
+                return (caps.supportedCompositeAlpha & flag) != 0;
+            });
+        if (it == alternatives.end()) {
+            throw std::runtime_error("Surface supports no composite alpha mode");
+        }
+        composite_alpha = *it;
+    }
 
     VkSwapchainCreateInfoKHR ci{};
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     ci.surface = surface_;
     ci.minImageCount = image_count;
     ci.imageFormat = swapchain_format_;
-    ci.imageColorSpace = chosen.colorSpace;
+    ci.imageColorSpace = swapchain_color_space_;
     ci.imageExtent = swapchain_extent_;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
-    ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    ci.compositeAlpha = composite_alpha;
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     ci.clipped = VK_TRUE;
 
     check(vkCreateSwapchainKHR(device_, &ci, nullptr, &swapchain_),
           "vkCreateSwapchain failed");
 
-    vkGetSwapchainImagesKHR(device_, swapchain_, &image_count, nullptr);
+    check(vkGetSwapchainImagesKHR(device_, swapchain_, &image_count, nullptr),
+          "Failed to query swapchain images");
     swapchain_images_.resize(image_count);
-    vkGetSwapchainImagesKHR(device_, swapchain_, &image_count, swapchain_images_.data());
+    check(vkGetSwapchainImagesKHR(device_, swapchain_, &image_count, swapchain_images_.data()),
+          "Failed to get swapchain images");
 
     swapchain_image_views_.resize(image_count);
-    for (uint32_t i = 0; i < image_count; i++) {
+    for (uint32_t i = 0; i < image_count; ++i) {
         VkImageViewCreateInfo vi{};
         vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vi.image = swapchain_images_[i];
@@ -294,11 +350,20 @@ void VulkanManager::create_sync_objects() {
     fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
     check(vkCreateSemaphore(device_, &si, nullptr, &image_available_semaphore_),
-          "Failed to create semaphore");
-    check(vkCreateSemaphore(device_, &si, nullptr, &render_finished_semaphore_),
-          "Failed to create semaphore");
+          "Failed to create acquire semaphore");
+    create_render_finished_semaphores();
     check(vkCreateFence(device_, &fi, nullptr, &in_flight_fence_),
-          "Failed to create fence");
+          "Failed to create frame fence");
+}
+
+void VulkanManager::create_render_finished_semaphores() {
+    VkSemaphoreCreateInfo si{};
+    si.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    render_finished_semaphores_.assign(swapchain_images_.size(), VK_NULL_HANDLE);
+    for (VkSemaphore& semaphore : render_finished_semaphores_) {
+        check(vkCreateSemaphore(device_, &si, nullptr, &semaphore),
+              "Failed to create present semaphore");
+    }
 }
 
 uint32_t VulkanManager::find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const {
@@ -522,21 +587,30 @@ void VulkanManager::destroy_texture(Texture& texture) {
     texture.height = 0;
 }
 
-void VulkanManager::begin_frame() {
-    vkWaitForFences(device_, 1, &in_flight_fence_, VK_TRUE, UINT64_MAX);
-    vkResetFences(device_, 1, &in_flight_fence_);
+bool VulkanManager::begin_frame() {
+    check(vkWaitForFences(device_, 1, &in_flight_fence_, VK_TRUE, UINT64_MAX),
+          "vkWaitForFences failed");
 
-    check(vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
-                                image_available_semaphore_, VK_NULL_HANDLE,
-                                &current_image_index_),
-          "vkAcquireNextImageKHR failed");
+    const VkResult acquire = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
+                                                   image_available_semaphore_, VK_NULL_HANDLE,
+                                                   &current_image_index_);
+    if (acquire == VK_ERROR_OUT_OF_DATE_KHR) {
+        return false; // Do not reset the fence; no frame was submitted.
+    }
+    if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) {
+        check(acquire, "vkAcquireNextImageKHR failed");
+    }
+    frame_suboptimal_ = acquire == VK_SUBOPTIMAL_KHR;
 
-    VkCommandBuffer cmd = command_buffers_[current_image_index_];
-    vkResetCommandBuffer(cmd, 0);
+    // Reset only after a successful acquire so a skipped frame cannot deadlock.
+    check(vkResetFences(device_, 1, &in_flight_fence_), "vkResetFences failed");
+
+    VkCommandBuffer cmd = command_buffers_.at(current_image_index_);
+    check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer failed");
 
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    vkBeginCommandBuffer(cmd, &bi);
+    check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer failed");
 
     VkClearValue clear{};
     clear.color = { 0.1f, 0.1f, 0.1f, 1.0f };
@@ -544,23 +618,24 @@ void VulkanManager::begin_frame() {
     VkRenderPassBeginInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
     rp.renderPass = render_pass_;
-    rp.framebuffer = framebuffers_[current_image_index_];
+    rp.framebuffer = framebuffers_.at(current_image_index_);
     rp.renderArea.extent = swapchain_extent_;
     rp.clearValueCount = 1;
     rp.pClearValues = &clear;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    return true;
 }
 
-void VulkanManager::end_frame() {
-    VkCommandBuffer cmd = command_buffers_[current_image_index_];
+bool VulkanManager::end_frame() {
+    VkCommandBuffer cmd = command_buffers_.at(current_image_index_);
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
+    check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer failed");
 
     VkSemaphore wait[] = { image_available_semaphore_ };
     VkPipelineStageFlags stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-    VkSemaphore signal[] = { render_finished_semaphore_ };
+    VkSemaphore signal[] = { render_finished_semaphores_.at(current_image_index_) };
 
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -583,37 +658,64 @@ void VulkanManager::end_frame() {
     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &current_image_index_;
 
-    vkQueuePresentKHR(graphics_queue_, &pi);
+    const VkResult present = vkQueuePresentKHR(graphics_queue_, &pi);
+    if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR) {
+        return false;
+    }
+    check(present, "vkQueuePresentKHR failed");
+    return !frame_suboptimal_;
 }
+
     void VulkanManager::wait_idle() {
     if (device_) {
         vkDeviceWaitIdle(device_);
     }
 }
 
-    void VulkanManager::recreate_swapchain(GLFWwindow* window) {
-    int width = 0, height = 0;
+void VulkanManager::recreate_swapchain(GLFWwindow* window) {
+    int width = 0;
+    int height = 0;
     glfwGetFramebufferSize(window, &width, &height);
-
-    // Handle minimized window
     while (width == 0 || height == 0) {
-        glfwGetFramebufferSize(window, &width, &height);
+        if (glfwWindowShouldClose(window)) {
+            return;
+        }
         glfwWaitEvents();
+        glfwGetFramebufferSize(window, &width, &height);
     }
 
-    vkDeviceWaitIdle(device_);
+    check(vkDeviceWaitIdle(device_), "vkDeviceWaitIdle failed during swapchain recreation");
 
-    // Destroy old swapchain resources
-    for (auto fb : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
-    for (auto iv : swapchain_image_views_) vkDestroyImageView(device_, iv, nullptr);
+    if (!command_buffers_.empty()) {
+        vkFreeCommandBuffers(device_, command_pool_,
+                             static_cast<std::uint32_t>(command_buffers_.size()),
+                             command_buffers_.data());
+        command_buffers_.clear();
+    }
+    for (VkSemaphore semaphore : render_finished_semaphores_) {
+        if (semaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device_, semaphore, nullptr);
+        }
+    }
+    render_finished_semaphores_.clear();
+
+    for (VkFramebuffer fb : framebuffers_) {
+        vkDestroyFramebuffer(device_, fb, nullptr);
+    }
+    for (VkImageView view : swapchain_image_views_) {
+        vkDestroyImageView(device_, view, nullptr);
+    }
     vkDestroySwapchainKHR(device_, swapchain_, nullptr);
-
     framebuffers_.clear();
     swapchain_image_views_.clear();
     swapchain_images_.clear();
+    swapchain_ = VK_NULL_HANDLE;
 
-    // Recreate swapchain + framebuffers
     create_swapchain(window);
     create_framebuffers();
+    create_command_buffers();
+    create_render_finished_semaphores();
+    frame_suboptimal_ = false;
 }
+
 } // namespace viewer
