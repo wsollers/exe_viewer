@@ -1,4 +1,5 @@
 ﻿include(FetchContent)
+if(PEELF_BUILD_VIEWER AND PEELF_BUILD_GUI)
 find_package(Vulkan REQUIRED)
 # GLFW
 FetchContent_Declare(
@@ -68,6 +69,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(nfd)
 
 target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
+endif()
 
 # Capstone
 FetchContent_Declare(

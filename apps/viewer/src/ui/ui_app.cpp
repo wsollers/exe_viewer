@@ -1,4 +1,5 @@
 #include "ui_app.hpp"
+#include "theme.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 
@@ -436,6 +437,28 @@ UiApp::~UiApp() {
 
 void UiApp::render() {
     render_main_menu();
+    auto* viewport = ImGui::GetMainViewport();
+    if (ImGui::BeginViewportSideBar("##workspace-actions", viewport, ImGuiDir_Up,
+            ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2,
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(ImGui::GetStyleColorVec4(ImGuiCol_CheckMark), "PE / ELF");
+        ImGui::SameLine(0, 24);
+        if (ImGui::Button("Open binary") && on_open_file_) on_open_file_();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!model_.has_file());
+        if (ImGui::Button("Symbols")) symbols_panel_.set_visible(true);
+        ImGui::SameLine();
+        if (ImGui::Button("Patches")) patch_set_panel_.set_visible(true);
+        ImGui::SameLine();
+        if (ImGui::Button("Export copy") && on_save_patched_as_) on_save_patched_as_();
+        ImGui::EndDisabled();
+        ImGui::SameLine(0, 24);
+        ImGui::TextDisabled("%s", model_.has_file()
+            ? std::filesystem::path(model_.file_info().path).filename().string().c_str()
+            : "Ready to inspect");
+    }
+    ImGui::End();
     render_dockspace();
 
     file_panel_.draw();
@@ -443,7 +466,9 @@ void UiApp::render() {
     apply_structure_selection_navigation();
     details_panel_.draw();
     sections_panel_.draw();
+    ImGui::PushFont(code_font_, 0.0f);
     hex_panel_.draw();
+    ImGui::PopFont();
     patch_set_panel_.draw();
     shellcode_panel_.draw();
     imports_panel_.draw();
@@ -455,7 +480,9 @@ void UiApp::render() {
     log_panel_.draw();
 
     if (show_disassembly_panel_) {
+        ImGui::PushFont(code_font_, 0.0f);
         render_disassembly_panel();
+        ImGui::PopFont();
     }
     if (show_call_graph_panel_) {
         render_call_graph_panel();
@@ -465,6 +492,8 @@ void UiApp::render() {
 }
 
 void UiApp::render_main_menu() {
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal) && on_open_file_) on_open_file_();
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal) && model_.has_file() && on_save_patched_as_) on_save_patched_as_();
     if (!ImGui::BeginMainMenuBar())
         return;
 
@@ -472,25 +501,64 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) {
             if (on_open_file_) { on_open_file_(); }
         }
-        if (ImGui::MenuItem("Open Debug Symbols...")) {
+        if (ImGui::MenuItem("Open Debug Symbols...", nullptr, false, model_.has_file())) {
             if (on_open_debug_symbols_) { on_open_debug_symbols_(); }
         }
-        if (ImGui::MenuItem("Save Patched As...")) {
+        if (ImGui::MenuItem("Save Patched As...", "Ctrl+Shift+S", false, model_.has_file())) {
             if (on_save_patched_as_) { on_save_patched_as_(); }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Alt+F4")) {
-            // handled by Application
+            if (on_exit_) on_exit_();
         }
         ImGui::EndMenu();
     }
 
+    if (ImGui::BeginMenu("Edit")) {
+        const auto* image = model_.editable_image();
+        if (ImGui::MenuItem("Undo patch", nullptr, false, image && image->can_undo())) {
+            if (auto result = model_.undo_patch(); !result) Log().error("{}", result.error().message);
+        }
+        if (ImGui::MenuItem("Redo patch", nullptr, false, image && image->can_redo())) {
+            if (auto result = model_.redo_patch(); !result) Log().error("{}", result.error().message);
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Patch workspace")) patch_set_panel_.set_visible(true);
+        if (ImGui::MenuItem("Byte input workspace")) shellcode_panel_.set_visible(true);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Navigate")) {
+        if (ImGui::MenuItem("Entry point", nullptr, false, model_.image() != nullptr)) {
+            const auto* image = model_.image();
+            if (const auto offset = image->virtual_address_to_file_offset(image->entry_point())) {
+                hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), 1);
+                disassemble_at_offset(static_cast<std::size_t>(*offset), image->entry_point());
+            }
+        }
+        if (ImGui::MenuItem("Symbols")) symbols_panel_.set_visible(true);
+        if (ImGui::MenuItem("Structure")) structure_panel_.set_visible(true);
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Analyze")) {
+        ImGui::MenuItem("Disassembly", nullptr, &show_disassembly_panel_);
+        ImGui::MenuItem("Call graph", nullptr, &show_call_graph_panel_);
+        if (ImGui::MenuItem("Rebuild loaded call graph", nullptr, false, model_.has_file())) queue_call_graph_sample(CallGraphSample::LoadedImage);
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("View")) {
         if (ImGui::MenuItem("Reset Layout")) {
             reset_dock_layout_ = true;
         }
         ImGui::Separator();
-        ImGui::MenuItem("ImGui Demo", nullptr, &show_demo_window_);
+        if (ImGui::MenuItem("Reload theme")) ui::load_theme();
+        if (ImGui::BeginMenu("Interface scale")) {
+            for (const float scale : {1.0f, 1.25f, 1.5f, 2.0f}) {
+                const auto label = std::format("{:.0f}%", scale * 100);
+                if (ImGui::MenuItem(label.c_str(), nullptr, ImGui::GetStyle().FontScaleMain == scale))
+                    ImGui::GetStyle().FontScaleMain = scale;
+            }
+            ImGui::EndMenu();
+        }
 
         {
             bool v = file_panel_.visible();
@@ -587,7 +655,26 @@ void UiApp::render_main_menu() {
         ImGui::EndMenu();
     }
 
+    if (ImGui::BeginMenu("Help")) {
+        if (ImGui::MenuItem("About PE/ELF Explorer")) show_about_ = true;
+        ImGui::EndMenu();
+    }
     ImGui::EndMainMenuBar();
+    if (show_about_) {
+        ImGui::OpenPopup("About PE/ELF Explorer");
+        show_about_ = false;
+    }
+    if (ImGui::BeginPopupModal("About PE/ELF Explorer", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("PE/ELF Explorer");
+        ImGui::Separator();
+        ImGui::TextUnformatted("Inspect binaries, resolve symbols, and stage byte patches.");
+        ImGui::Spacing();
+        ImGui::TextDisabled("Ctrl+O  Open binary    |    Ctrl+Shift+S  Export patched copy");
+        ImGui::TextDisabled("Theme: resources/theme.ini  |  View > Reload theme");
+        ImGui::Spacing();
+        if (ImGui::Button("Close", ImVec2(100, 0))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
 }
 
 void UiApp::render_dockspace() {
@@ -857,7 +944,7 @@ void UiApp::render_call_graph_panel() {
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
     draw_list->AddRectFilled(canvas_pos,
                              ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
-                             IM_COL32(255, 255, 255, 255));
+                             ImGui::GetColorU32(ImGuiCol_ChildBg));
 
     if (current_call_graph_ && current_call_graph_layout_) {
         const GraphLayoutBounds bounds = graph_layout_bounds(*current_call_graph_layout_);
@@ -890,7 +977,7 @@ void UiApp::render_call_graph_panel() {
             }
             draw_list->AddLine(to_screen(from->center_x, from->center_y),
                                to_screen(to->center_x, to->center_y),
-                               IM_COL32(80, 130, 180, 255),
+                               ImGui::GetColorU32(ImGuiCol_SliderGrab),
                                2.0f);
         }
 
@@ -912,18 +999,18 @@ void UiApp::render_call_graph_panel() {
                                                   layout_node.center_y - layout_node.height * 0.5);
             draw_list->AddRectFilled(top_left,
                                      bottom_right,
-                                     selected ? IM_COL32(232, 244, 255, 255) : IM_COL32(248, 248, 248, 255),
+                                     ImGui::GetColorU32(selected ? ImGuiCol_HeaderActive : ImGuiCol_FrameBg),
                                      4.0f);
             draw_list->AddRect(top_left,
                                bottom_right,
-                               selected ? IM_COL32(26, 98, 170, 255) : IM_COL32(50, 50, 50, 255),
+                               ImGui::GetColorU32(selected ? ImGuiCol_CheckMark : ImGuiCol_Border),
                                4.0f,
                                0,
                                selected ? 3.0f : 2.0f);
             const ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
             const ImVec2 text_pos(top_left.x + std::max(4.0f, (bottom_right.x - top_left.x - text_size.x) * 0.5f),
                                   top_left.y + std::max(4.0f, (bottom_right.y - top_left.y - text_size.y) * 0.5f));
-            draw_list->AddText(text_pos, IM_COL32(35, 35, 35, 255), label.c_str());
+            draw_list->AddText(text_pos, ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
         }
 
         ImGui::SetCursorScreenPos(graph_pos);
@@ -966,7 +1053,7 @@ void UiApp::render_call_graph_panel() {
         const ImVec2 text_size = ImGui::CalcTextSize(message);
         draw_list->AddText(ImVec2(canvas_pos.x + (canvas_size.x - text_size.x) * 0.5f,
                                   canvas_pos.y + (canvas_size.y - text_size.y) * 0.5f),
-                           IM_COL32(80, 80, 80, 255),
+                           ImGui::GetColorU32(ImGuiCol_TextDisabled),
                            message);
     }
 

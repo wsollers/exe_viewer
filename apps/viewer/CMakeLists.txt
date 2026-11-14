@@ -13,8 +13,14 @@ if(TARGET vulkan)
   message(STATUS "vulkan exists")
 endif()
 
-add_executable(peelf_viewer
-  src/main.cpp
+add_executable(peelf_viewer src/launcher.cpp)
+target_compile_features(peelf_viewer PRIVATE cxx_std_23)
+target_link_libraries(peelf_viewer PRIVATE ${CMAKE_DL_LIBS})
+if(NOT PEELF_BUILD_GUI)
+  return()
+endif()
+add_library(peelf_gui SHARED
+  src/gui_entry.cpp
         src/crash/crash_handler.hpp
         src/crash/crash_handler.cpp
         src/application.h
@@ -65,14 +71,18 @@ add_executable(peelf_viewer
         src/disasm/disassembler.hpp
 )
 
-target_include_directories(peelf_viewer PRIVATE
+target_include_directories(peelf_gui PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-target_compile_features(peelf_viewer PRIVATE cxx_std_23)
-peelf_apply_project_warnings(peelf_viewer)
+target_compile_features(peelf_gui PRIVATE cxx_std_23)
+peelf_apply_project_warnings(peelf_gui)
+add_dependencies(peelf_viewer peelf_gui)
+add_custom_command(TARGET peelf_gui POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_CURRENT_SOURCE_DIR}/resources" "$<TARGET_FILE_DIR:peelf_gui>/resources")
 
-target_link_libraries(peelf_viewer PRIVATE
+target_link_libraries(peelf_gui PRIVATE
         peelf::core
         glfw
         imgui
@@ -84,7 +94,7 @@ target_link_libraries(peelf_viewer PRIVATE
 )
 
 if(MSVC)
-  target_link_libraries(peelf_viewer PRIVATE Dbghelp)
+  target_link_libraries(peelf_gui PRIVATE Dbghelp)
 
   find_path(PEELF_DIA_INCLUDE_DIR dia2.h
     PATHS
@@ -108,12 +118,12 @@ if(MSVC)
       "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/Common7/IDE"
   )
   if(PEELF_DIA_INCLUDE_DIR AND PEELF_DIA_GUIDS_LIBRARY)
-    target_include_directories(peelf_viewer PRIVATE ${PEELF_DIA_INCLUDE_DIR})
-    target_link_libraries(peelf_viewer PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)
-    target_compile_definitions(peelf_viewer PRIVATE PEELF_HAS_DIA=1)
+    target_include_directories(peelf_gui PRIVATE ${PEELF_DIA_INCLUDE_DIR})
+    target_link_libraries(peelf_gui PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)
+    target_compile_definitions(peelf_gui PRIVATE PEELF_HAS_DIA=1)
     if(PEELF_DIA_DLL)
       file(TO_CMAKE_PATH "${PEELF_DIA_DLL}" PEELF_DIA_DLL_NORMALIZED)
-      target_compile_definitions(peelf_viewer PRIVATE PEELF_DIA_DLL_PATH="${PEELF_DIA_DLL_NORMALIZED}")
+      target_compile_definitions(peelf_gui PRIVATE PEELF_DIA_DLL_PATH="${PEELF_DIA_DLL_NORMALIZED}")
     endif()
   endif()
 endif()

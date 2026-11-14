@@ -1156,7 +1156,7 @@ TEST(CallGraph, BinMatrixPeDllFunctionCfgsBuildAcrossArchitectures) {
     }
 }
 
-TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
+TEST(CallGraph, DebugViewerGuiEntryFanoutResolvesRealTargetNames) {
 #if !defined(PEELF_VIEWER_DEBUG_EXE) || !defined(PEELF_VIEWER_DEBUG_PDB)
     GTEST_SKIP() << "viewer debug executable path was not configured";
 #else
@@ -1178,7 +1178,15 @@ TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
     }
     index.add_debug_symbols(*image, pdb.symbols);
 
-    const viewer::SymbolRecord* main = index.find_by_name("main");
+    // The DLL export may point at an incremental-link jump thunk. Analyze the
+    // PDB function body, whose extent describes the actual direct calls.
+    const viewer::SymbolRecord* main = nullptr;
+    for (const auto& symbol : index.records()) {
+        if (symbol.name == "peelf_run_gui" && symbol.source == viewer::SymbolSource::DebugSymbol && symbol.size > 0) {
+            main = &symbol;
+            break;
+        }
+    }
     ASSERT_NE(main, nullptr);
     const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
         *image,
@@ -1187,7 +1195,7 @@ TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
         *main);
     const std::string dot = viewer::to_dot(graph);
 
-    EXPECT_NE(dot.find("main fan-out"), std::string::npos) << dot;
+    EXPECT_NE(dot.find("peelf_run_gui fan-out"), std::string::npos) << dot;
     EXPECT_NE(dot.find("label=\"call\""), std::string::npos) << dot;
     EXPECT_NE(dot.find("viewer::Application::init"), std::string::npos) << dot;
     EXPECT_NE(dot.find("viewer::Application::run"), std::string::npos) << dot;
@@ -1195,7 +1203,7 @@ TEST(CallGraph, DebugViewerMainFanoutResolvesRealTargetNames) {
 #endif
 }
 
-TEST(CallGraph, DebugElfViewerMainFanoutResolvesRealTargetNames) {
+TEST(CallGraph, DebugElfViewerGuiEntryFanoutResolvesRealTargetNames) {
 #if !defined(PEELF_VIEWER_DEBUG_EXE)
     GTEST_SKIP() << "viewer debug executable path was not configured";
 #else
@@ -1210,7 +1218,7 @@ TEST(CallGraph, DebugElfViewerMainFanoutResolvesRealTargetNames) {
     }
 
     viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
-    const viewer::SymbolRecord* main = index.find_by_name("main");
+    const viewer::SymbolRecord* main = index.find_by_name("peelf_run_gui");
     ASSERT_NE(main, nullptr);
     const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
         *image,
@@ -1219,7 +1227,7 @@ TEST(CallGraph, DebugElfViewerMainFanoutResolvesRealTargetNames) {
         *main);
     const std::string dot = viewer::to_dot(graph);
 
-    EXPECT_NE(dot.find("main fan-out"), std::string::npos) << dot;
+    EXPECT_NE(dot.find("peelf_run_gui fan-out"), std::string::npos) << dot;
     EXPECT_NE(dot.find("label=\"call\""), std::string::npos) << dot;
     EXPECT_NE(dot.find("Application"), std::string::npos) << dot;
     EXPECT_EQ(dot.find("call target\\n0x"), std::string::npos) << dot;

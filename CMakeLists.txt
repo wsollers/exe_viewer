@@ -9,6 +9,9 @@ project(peelf_explorer
 # Prevent FetchContent from re-running
 include(FetchContent)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
+option(PEELF_BUILD_VIEWER "Build the viewer launcher" ON)
+option(PEELF_BUILD_GUI "Build the optional GUI module" ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(PEELF_ENABLE_GRAPHVIZ "Fetch optional Graphviz source and enable Graphviz-backed graph rendering hooks" OFF)
 option(PEELF_ENABLE_ASMTK "Fetch and build AsmJit plus AsmTK for optional assembly-to-bytes providers" ON)
 include(third_party/dependencies.cmake)

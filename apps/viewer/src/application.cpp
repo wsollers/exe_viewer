@@ -1,4 +1,5 @@
 #include "application.h"
+#include "ui/theme.hpp"
 
 #include <array>
 #include <cstdio>
@@ -72,6 +73,7 @@ namespace viewer {
 
         // Initialize model/UI
         ui_ = new UiApp(model_, vulkan_);
+        ui_->set_exit_callback([this]() { glfwSetWindowShouldClose(window_, GLFW_TRUE); });
         ui_->set_open_file_callback([this]() {
             open_file_dialog();
         });
@@ -133,6 +135,7 @@ namespace viewer {
         ImGuiIO &io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.ConfigDpiScaleFonts = true;
 
         const std::filesystem::path font_path = find_monospace_font();
         if (!font_path.empty()) {
@@ -153,7 +156,15 @@ namespace viewer {
             Log().warn("No system monospace font found; using enlarged ImGui default");
         }
 
-        ImGui::StyleColorsDark();
+        ui_->set_code_font(io.Fonts->Fonts[0]);
+#ifdef _WIN32
+        const std::filesystem::path ui_font = LR"(C:\Windows\Fonts\segoeui.ttf)";
+        if (std::filesystem::exists(ui_font)) {
+            if (auto* font = io.Fonts->AddFontFromFileTTF(ui_font.string().c_str(), kUiFontSize))
+                io.FontDefault = font;
+        }
+#endif
+        ui::load_theme();
         ImGui_ImplGlfw_InitForVulkan(window_, true);
 
         ImGui_ImplVulkan_InitInfo init_info{};

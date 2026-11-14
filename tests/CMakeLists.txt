@@ -38,6 +38,7 @@ else()
 endif()
 
 add_executable(peelf_tests
+  theme_resource_test.cpp
   smoke_test.cpp
   file_mapping_test.cpp
   peelf_core_test.cpp
@@ -115,17 +116,25 @@ target_compile_definitions(peelf_tests PRIVATE
   PEELF_CALLGRAPH_FIXTURE_EXE="$<TARGET_FILE:peelf_callgraph_fixture>"
   PEELF_CALLGRAPH_FIXTURE_PDB="${PEELF_CALLGRAPH_FIXTURE_PDB_PATH}"
 )
-if(TARGET peelf_viewer)
+if(TARGET peelf_gui)
   target_compile_definitions(peelf_tests PRIVATE
-    PEELF_VIEWER_DEBUG_EXE="$<TARGET_FILE:peelf_viewer>"
+    PEELF_VIEWER_DEBUG_EXE="$<TARGET_FILE:peelf_gui>"
   )
 endif()
-if(TARGET peelf_viewer AND MSVC)
+if(TARGET peelf_gui AND MSVC)
   target_compile_definitions(peelf_tests PRIVATE
-    PEELF_VIEWER_DEBUG_PDB="$<TARGET_PDB_FILE:peelf_viewer>"
+    PEELF_VIEWER_DEBUG_PDB="$<TARGET_PDB_FILE:peelf_gui>"
   )
 endif()
 add_dependencies(peelf_tests peelf_callgraph_fixture)
 
 # Register every TEST() with CTest so `ctest` discovers and runs them.
 gtest_discover_tests(peelf_tests)
+if(TARGET peelf_viewer)
+  add_test(NAME Startup.Headless COMMAND peelf_viewer --headless)
+  add_test(NAME Startup.Help COMMAND peelf_viewer --help)
+  add_test(NAME Startup.WithoutGuiModule COMMAND ${CMAKE_COMMAND}
+    -DLAUNCHER=$<TARGET_FILE:peelf_viewer>
+    -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-isolated
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/startup_without_gui.cmake)
+endif()

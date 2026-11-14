@@ -28,6 +28,8 @@ namespace viewer {
         void set_open_file_callback(std::function<void()> cb) { on_open_file_ = std::move(cb); }
         void set_open_debug_symbols_callback(std::function<void()> cb) { on_open_debug_symbols_ = std::move(cb); }
         void set_save_patched_as_callback(std::function<void()> cb) { on_save_patched_as_ = std::move(cb); }
+        void set_exit_callback(std::function<void()> cb) { on_exit_ = std::move(cb); }
+        void set_code_font(ImFont* font) { code_font_ = font; }
 
         LogPanel& log_panel() { return log_panel_; }
 
@@ -64,6 +66,8 @@ namespace viewer {
 
 
     private:
+        ImFont* code_font_ = nullptr; // Owned by the ImGui font atlas.
+        bool show_about_ = false;
         BinaryModel& model_;
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
@@ -89,6 +93,7 @@ namespace viewer {
         std::function<void()> on_open_file_;
         std::function<void()> on_open_debug_symbols_;
         std::function<void()> on_save_patched_as_;
+        std::function<void()> on_exit_;
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;

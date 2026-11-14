@@ -11,6 +11,29 @@ For architecture diagrams and data-flow notes, see [`docs/ARCHITECTURE.md`](docs
 
 ## Toolchains
 
+### UI resources and headless startup
+
+The executable is a small launcher. It loads the optional `peelf_gui` module only
+for interactive use. `peelf_viewer --headless` exits successfully without loading
+graphics dependencies. A missing GUI module or unavailable graphics initialization
+also exits successfully; failures after interactive startup still report failure.
+Configure with `-DPEELF_BUILD_GUI=OFF` to build the launcher without Vulkan, GLFW,
+ImGui, or native file dialogs. Headless analysis commands are not implemented yet.
+
+The GUI loads `resources/theme.ini` beside the executable at startup. It contains
+RGBA color tokens and spacing/rounding metrics. Use **View > Reload theme** to
+apply edits, or **View > Interface scale** to adjust text size. Invalid resource
+entries are ignored, with built-in defaults for missing values. Build outputs
+include the resource directory; distribute it alongside the GUI module and launcher.
+
+Theme parsing, fonts, menus, and rendering belong exclusively to the UI layer.
+Binary models, parsers, navigation, symbols, disassembly, and patch operations
+have no ImGui/GLFW/Vulkan dependency and are exercised by the non-GUI test binary.
+
+Menus provide File, Edit, Navigate, Analyze, View, and Help commands. Ctrl+O opens
+a binary; Ctrl+Shift+S exports a patched copy. Code views retain monospace fonts;
+Windows interface controls use Segoe UI when available.
+
 - **Visual Studio 2022** (MSVC v143, **17.6 or newer** — required for `std::expected`, `std::format`, and `std::byteswap`)
 - **Clang 18** with **Ninja** (recommended on Linux)
 

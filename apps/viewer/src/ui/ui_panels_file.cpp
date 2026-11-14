@@ -10,9 +10,11 @@ namespace viewer {
 
     void FilePanel::draw_contents() {
         if (!model_.has_file()) {
-            ImGui::TextUnformatted("No file loaded.");
+            ImGui::TextUnformatted("Start an inspection");
             ImGui::Separator();
-            ImGui::TextUnformatted("Drag and drop a PE file to analyze.");
+            ImGui::TextWrapped("Open a PE or ELF binary using File > Open or Ctrl+O.");
+            ImGui::Spacing();
+            ImGui::TextDisabled("Inspect  /  Navigate  /  Patch  /  Export");
             return;
         }
 
