@@ -314,6 +314,9 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             .preferred_view = PreferredView::Details
         };
         const auto file_offset = symbol.file_offset;
+        pending_call_graph_root_.reset();
+        current_instructions_.clear();
+        hex_panel_.clear_selection();
         if (!file_offset) {
             Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
                        symbol.name.empty() ? "<unnamed>" : symbol.name,
@@ -338,17 +341,15 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             .virtual_address = symbol.virtual_address,
             .size = symbol.size,
             .object_index = object_index,
-            .preferred_view = PreferredView::Disassembly
+            .preferred_view = symbol_has_code(*img, symbol) ? PreferredView::Disassembly : PreferredView::Hex
         };
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
-        if (symbol.virtual_address) {
+        if (symbol_has_code(*img, symbol)) {
             disassemble_at_offset(static_cast<std::size_t>(*file_offset), *symbol.virtual_address);
-            if (symbol.source != SymbolSource::Import) {
-                pending_call_graph_root_ = symbol;
-                pending_call_graph_delay_frames_ = 1;
-                show_call_graph_panel_ = true;
-                call_graph_status_ = "Queued fan-out from " + symbol.name;
-            }
+            pending_call_graph_root_ = symbol;
+            pending_call_graph_delay_frames_ = 1;
+            show_call_graph_panel_ = true;
+            call_graph_status_ = "Queued fan-out from " + symbol.name;
         }
         last_navigation_selection_ = current_selection_;
     });

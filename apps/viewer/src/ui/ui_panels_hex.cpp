@@ -17,13 +17,18 @@ HexViewPanel::HexViewPanel(BinaryModel& model)
     : UiPanel("Hex View"), model_(model)
 {}
 
+void HexViewPanel::clear_selection() noexcept {
+    selected_offset_ = 0;
+    highlighted_offset_ = 0;
+    highlighted_size_ = 0;
+    pending_scroll_offset_.reset();
+    edit_status_.clear();
+}
+
 void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) {
     const auto& bytes = model_.bytes();
     if (bytes.empty() || file_offset >= bytes.size()) {
-        selected_offset_ = 0;
-        highlighted_offset_ = 0;
-        highlighted_size_ = 0;
-        pending_scroll_offset_.reset();
+        clear_selection();
         return;
     }
 
@@ -54,6 +59,7 @@ void HexViewPanel::draw_contents() {
     ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Apply bytes").x - 28.0f));
     ImGui::InputTextWithHint("##Replacement", "Replacement hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
     ImGui::SameLine();
+    ImGui::BeginDisabled(highlighted_size_ == 0);
     if (ImGui::Button("Apply bytes")) {
         const auto parsed = parse_hex_shellcode(edit_bytes_);
         if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
@@ -67,7 +73,10 @@ void HexViewPanel::draw_contents() {
             }
         }
     }
-    ImGui::TextDisabled("Selected offset: 0x%llX", static_cast<unsigned long long>(selected_offset_));
+    ImGui::EndDisabled();
+    if (highlighted_size_ != 0)
+        ImGui::TextDisabled("Selected offset: 0x%llX", static_cast<unsigned long long>(selected_offset_));
+    else ImGui::TextDisabled("No file bytes selected");
     ImGui::TextDisabled("%zu bytes selected (Shift-click to extend)", highlighted_size_);
     if (ImGui::Button("Copy selected hex")) {
         const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);

@@ -72,6 +72,7 @@ namespace viewer {
         // Invoked with the file offset of the byte the user clicks.
         void set_byte_activated_callback(std::function<void(std::size_t, std::size_t)> cb) { on_byte_activated_ = std::move(cb); }
         void navigate_to_range(std::size_t file_offset, std::size_t size);
+        void clear_selection() noexcept;
     protected:
         void draw_contents() override;
     private:

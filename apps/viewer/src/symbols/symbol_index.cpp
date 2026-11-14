@@ -147,6 +147,13 @@ std::string import_symbol_name(const peelf::ImportEntry& entry) {
     return entry.library + "!" + import_name;
 }
 
+bool symbol_has_code(const peelf::IBinaryImage& image, const SymbolRecord& symbol) noexcept {
+    if (symbol.source == SymbolSource::Import || !symbol.file_offset || !symbol.virtual_address)
+        return false;
+    if (symbol.function) return *symbol.function;
+    return executable_section_containing(image, *symbol.virtual_address) != nullptr;
+}
+
 SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
     SymbolIndex index;
     index.records_.reserve(1u + image.symbols().size() + image.imports().size() + image.exports().size());
@@ -220,11 +227,12 @@ void SymbolIndex::add_debug_symbols(const peelf::IBinaryImage& image, std::span<
                                                            : std::optional(symbol.virtual_address),
             .file_offset = symbol.virtual_address == 0 ? std::optional<std::uint64_t>{}
                                                        : image.virtual_address_to_file_offset(symbol.virtual_address),
-            .size = symbol.size == 0 && symbol.virtual_address != 0
+            .size = symbol.function && symbol.size == 0 && symbol.virtual_address != 0
                          ? recover_pe_function_size(image, symbol.virtual_address)
                          : symbol.size,
             .dynamic = false,
             .external = symbol.virtual_address == 0,
+            .function = symbol.function,
         });
     }
 }

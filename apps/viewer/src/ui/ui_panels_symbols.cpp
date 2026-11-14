@@ -24,16 +24,20 @@ void SymbolsPanel::draw_contents() {
     ImGui::InputTextWithHint("Filter", "Any part of a name...", filter_buf_, sizeof(filter_buf_));
     const std::string filter = filter_buf_;
     const bool has_filter = !filter.empty();
-    const std::optional<std::uint64_t> selected_index = selection_.kind == SelectionKind::Symbol ? std::optional(selection_.object_index) : std::nullopt;
-    if (!selected_index) {
-        last_scrolled_selected_.reset();
-    }
+    const auto records = index_.records();
+    std::optional<std::size_t> selected_index;
+    for (std::size_t i = 0; i < records.size(); ++i)
+        if (selection_.label == records[i].name && selection_.virtual_address == records[i].virtual_address) {
+            selected_index = i;
+            break;
+        }
+    if (!selected_index) last_scrolled_selected_.reset();
 
     ImGui::Separator();
     if (ImGui::BeginTable("SymbolsTable", 6,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                          ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+                          ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX)) {
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 300.0f);
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 72.0f);
         ImGui::TableSetupColumn("External", ImGuiTableColumnFlags_WidthFixed, 56.0f);
@@ -41,12 +45,17 @@ void SymbolsPanel::draw_contents() {
         ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableHeadersRow();
 
-        const auto records = index_.records();
         std::vector<std::size_t> matches;
+        std::optional<int> selected_row;
         for (std::size_t i = 0; i < records.size(); ++i)
-            if (!has_filter || symbol_name_matches(records[i].name, filter)) matches.push_back(i);
+            if (!has_filter || symbol_name_matches(records[i].name, filter)) {
+                if (selected_index == i) selected_row = static_cast<int>(matches.size());
+                matches.push_back(i);
+            }
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(matches.size()));
+        if (selected_row && last_scrolled_selected_ != selected_index)
+            clipper.IncludeItemByIndex(*selected_row);
         while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const auto row_id = matches[static_cast<std::size_t>(row)];

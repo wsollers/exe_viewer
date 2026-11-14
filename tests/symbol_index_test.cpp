@@ -120,6 +120,28 @@ TEST(SymbolIndex, MergesPdbDebugSymbolsAboveParserSymbols) {
     ASSERT_TRUE(winmain->virtual_address.has_value());
     EXPECT_EQ(*winmain->virtual_address, image->entry_point());
     EXPECT_EQ(index.find_containing_address(image->entry_point()), winmain);
+    EXPECT_EQ(winmain->function, true);
+    EXPECT_TRUE(viewer::symbol_has_code(*image, *winmain));
+}
+
+TEST(SymbolIndex, DataAndUnmappedSymbolsDoNotBecomeCode) {
+    const auto image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+    auto index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol symbols[] = {
+        {.name = "data_in_code", .virtual_address = image->entry_point(), .function = false},
+        {.name = "unmapped_function", .function = true},
+    };
+    index.add_debug_symbols(*image, symbols);
+    const auto* data = index.find_by_name("data_in_code");
+    ASSERT_NE(data, nullptr);
+    EXPECT_EQ(data->size, 0u);
+    EXPECT_FALSE(viewer::symbol_has_code(*image, *data));
+    EXPECT_FALSE(viewer::symbol_has_code(*image, *index.find_by_name("unmapped_function")));
+    for (const auto& symbol : index.records())
+        if (symbol.source == viewer::SymbolSource::Import)
+            EXPECT_FALSE(viewer::symbol_has_code(*image, symbol));
+    EXPECT_TRUE(viewer::symbol_has_code(*image, *index.find_by_name("Entry Point")));
 }
 
 TEST(DebugSymbols, DiscoversMissingCodeViewPdbAndReportsMissingExplicitPath) {

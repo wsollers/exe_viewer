@@ -36,6 +36,8 @@ struct SymbolRecord {
     std::uint64_t size = 0;
     bool dynamic = false;
     bool external = false;
+    // Known PDB classification; other symbol formats use executable section membership.
+    std::optional<bool> function;
 };
 
 class SymbolIndex {
@@ -58,6 +60,7 @@ private:
 };
 
 [[nodiscard]] std::string import_symbol_name(const peelf::ImportEntry& entry);
+[[nodiscard]] bool symbol_has_code(const peelf::IBinaryImage& image, const SymbolRecord& symbol) noexcept;
 [[nodiscard]] inline bool symbol_name_matches(std::string_view name, std::string_view query) noexcept {
     const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c; };
     if (query.size() > name.size()) return false;
