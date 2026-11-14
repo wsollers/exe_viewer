@@ -203,9 +203,10 @@ TEST(PagedBinaryImage, FailedSavePreservesPreexistingDestinationAndCleansStaging
 
     auto image = peelf::PagedBinaryImage::open(source, 4);
     ASSERT_TRUE(image.has_value());
-    // Make only the first page readable from cache. The second page must fail.
+    // Cache page one and truncate the source to force a mid-export read
+    // failure after staging has started. The existing target must survive.
     ASSERT_TRUE(image->read_original(0, 4).has_value());
-    std::filesystem::remove(source);
+    std::filesystem::resize_file(source, 4);
 
     EXPECT_FALSE(image->write_effective_to(target, true).has_value());
     std::ifstream output(target, std::ios::binary);
