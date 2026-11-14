@@ -100,6 +100,77 @@ TEST(BinaryImage, DetectFormat) {
     EXPECT_EQ(peelf::detect_format(junk), peelf::Format::Unknown);
 }
 
+TEST(BinaryImage, MapsSectionlessElfUsingLoadSegments) {
+    // A fully valid ELF64 PT_LOAD mapping does not require a section-header table.
+    std::vector<std::uint8_t> bytes(0x100, 0);
+    bytes[0] = 0x7f;
+    bytes[1] = 'E';
+    bytes[2] = 'L';
+    bytes[3] = 'F';
+    bytes[4] = 2;  // ELFCLASS64
+    bytes[5] = 1;  // little endian
+    bytes[6] = 1;  // EV_CURRENT
+    put16(bytes, 0x10, 2);        // ET_EXEC
+    put16(bytes, 0x12, 62);       // EM_X86_64
+    put32(bytes, 0x14, 1);
+    put64(bytes, 0x18, 0x401010); // e_entry
+    put64(bytes, 0x20, 0x40);     // e_phoff
+    put64(bytes, 0x28, 0);        // No section headers
+    put16(bytes, 0x34, 0x40);     // e_ehsize
+    put16(bytes, 0x36, 0x38);     // e_phentsize
+    put16(bytes, 0x38, 1);        // e_phnum
+    put16(bytes, 0x3c, 0);        // e_shnum
+
+    put32(bytes, 0x40, 1);        // PT_LOAD
+    put32(bytes, 0x44, 5);        // PF_R | PF_X
+    put64(bytes, 0x48, 0x80);     // p_offset
+    put64(bytes, 0x50, 0x401000); // p_vaddr
+    put64(bytes, 0x60, 0x20);     // p_filesz
+    put64(bytes, 0x68, 0x60);     // p_memsz (remaining 0x40 is zero-fill)
+    put64(bytes, 0x70, 0x1000);   // p_align
+    bytes[0x90] = 0x90;           // NOP at entry
+
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value()) << result.error().message;
+    const peelf::IBinaryImage& image = **result;
+    ASSERT_TRUE(image.sections().empty());
+    ASSERT_EQ(image.segments().size(), 1u);
+    EXPECT_EQ(image.entry_point(), 0x401010u);
+    EXPECT_EQ(image.virtual_address_to_file_offset(image.entry_point()),
+              std::optional<std::uint64_t>(0x90));
+    EXPECT_EQ(image.file_offset_to_virtual_address(0x90),
+              std::optional<std::uint64_t>(0x401010));
+    EXPECT_EQ(image.file_offset_to_virtual_address(0x9f),
+              std::optional<std::uint64_t>(0x40101f));
+    EXPECT_FALSE(image.file_offset_to_virtual_address(0xa0).has_value());
+    EXPECT_FALSE(image.virtual_address_to_file_offset(0x401020).has_value());
+    EXPECT_FALSE(image.virtual_address_to_file_offset(0x402000).has_value());
+}
+
+TEST(BinaryImage, RejectsInvalidLoadSegmentMappings) {
+    std::vector<std::uint8_t> bytes(0x100, 0);
+    bytes[0] = 0x7f; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
+    bytes[4] = 2; bytes[5] = 1; bytes[6] = 1;
+    put16(bytes, 0x10, 2);
+    put16(bytes, 0x12, 62);
+    put32(bytes, 0x14, 1);
+    put64(bytes, 0x20, 0x40);
+    put16(bytes, 0x34, 0x40);
+    put16(bytes, 0x36, 0x38);
+    put16(bytes, 0x38, 1);
+    put32(bytes, 0x40, 1);
+    put64(bytes, 0x48, 0x80);
+    put64(bytes, 0x50, 0x401000);
+    put64(bytes, 0x60, 0x1000);  // File extends past buffer and p_memsz
+    put64(bytes, 0x68, 0x20);
+
+    auto result = peelf::parse_image(bytes);
+    ASSERT_TRUE(result.has_value()) << result.error().message;
+    const peelf::IBinaryImage& image = **result;
+    EXPECT_FALSE(image.file_offset_to_virtual_address(0x80).has_value());
+    EXPECT_FALSE(image.virtual_address_to_file_offset(0x401000).has_value());
+}
+
 TEST(BinaryImage, ParsesElfFixtureIdentity) {
     const auto path = fixture_path("hello.elf");
     if (!std::filesystem::exists(path)) {
