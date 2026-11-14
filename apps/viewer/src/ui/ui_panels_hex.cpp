@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <vector>
+#include <format>
+#include "tools/shellcode_converter.hpp"
 
 namespace viewer {
 
@@ -37,6 +39,30 @@ void HexViewPanel::draw_contents() {
         return;
     }
 
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::InputScalar("Offset (hex)", ImGuiDataType_U64, &goto_offset_, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
+    ImGui::SameLine();
+    if (ImGui::Button("Go")) {
+        if (goto_offset_ < bytes.size()) {
+            navigate_to_range(static_cast<std::size_t>(goto_offset_), 1);
+            if (on_byte_activated_) on_byte_activated_(selected_offset_);
+            edit_status_.clear();
+        } else edit_status_ = "Offset is outside the file.";
+    }
+    ImGui::InputTextWithHint("Replacement", "Hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
+    ImGui::SameLine();
+    if (ImGui::Button("Apply bytes")) {
+        const auto parsed = parse_hex_shellcode(edit_bytes_);
+        if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
+        else {
+            const auto applied = model_.apply_patch_bytes(selected_offset_, parsed.bytes, "Hex editor replacement");
+            edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
+            if (applied && on_byte_activated_) on_byte_activated_(selected_offset_);
+        }
+    }
+    ImGui::TextDisabled("Selected offset: 0x%llX", static_cast<unsigned long long>(selected_offset_));
+    if (!edit_status_.empty()) ImGui::TextUnformatted(edit_status_.c_str());
+    ImGui::Separator();
     ImGui::BeginChild("HexScroll", ImVec2(0,0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
     const size_t total = bytes.size();
@@ -82,7 +108,7 @@ void HexViewPanel::draw_contents() {
                     i >= highlighted_offset_ &&
                     i - highlighted_offset_ < highlighted_size_;
                 bool selected = (i == selected_offset_) || in_highlight;
-                if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(ImGui::CalcTextSize("FF").x, 0))) {
                     selected_offset_ = i;
                     highlighted_offset_ = i;
                     highlighted_size_ = 1;

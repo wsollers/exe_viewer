@@ -80,6 +80,9 @@ namespace viewer {
         std::size_t highlighted_size_ = 0;
         std::optional<std::size_t> pending_scroll_offset_;
         std::size_t bytes_per_row_ = 16;
+        std::uint64_t goto_offset_ = 0;
+        char edit_bytes_[4096] = {};
+        std::string edit_status_;
         std::function<void(std::size_t)> on_byte_activated_;
     };
 

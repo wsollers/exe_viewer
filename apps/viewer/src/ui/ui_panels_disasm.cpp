@@ -3,6 +3,7 @@
 //
 #include "ui_panels.hpp"
 #include <imgui.h>
+#include <format>
 
 namespace viewer {
 
@@ -19,24 +20,30 @@ namespace viewer {
 
         ImGui::BeginChild("InstructionsScroll", ImVec2(0,0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
-        // Display current instructions
-        for (const auto& instruction : current_instructions_) {
-            char addr[32];
-            std::snprintf(addr, sizeof(addr), "%08" PRIx64 ": ", instruction.address);
-            ImGui::TextUnformatted(addr);
-            ImGui::SameLine();
-
-            // Construct the full instruction string
-            std::string instruction_string = instruction.to_string();
-
-            // Display mnemonic and operands
-            ImGui::TextUnformatted(instruction_string.c_str());
-
-            // Optional: Display comment if available
-            if (!instruction.comment.empty()) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), instruction.comment.c_str());
+        if (ImGui::BeginTable("Instructions", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+            for (const char* column : {"Address", "Bytes", "Mnemonic", "Operands", "Comment"}) ImGui::TableSetupColumn(column);
+            ImGui::TableHeadersRow();
+            ImGuiListClipper clipper;
+            clipper.Begin(static_cast<int>(current_instructions_.size()));
+            while (clipper.Step()) {
+                for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                    const auto& instruction = current_instructions_[static_cast<std::size_t>(row)];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(std::format("{:016X}", instruction.address).c_str());
+                    ImGui::TableNextColumn();
+                    std::string bytes;
+                    for (auto byte : instruction.bytes) bytes += std::format("{:02X} ", byte);
+                    ImGui::TextUnformatted(bytes.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(instruction.mnemonic.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(instruction.operands.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(instruction.comment.c_str());
+                }
             }
+            ImGui::EndTable();
         }
 
         ImGui::EndChild();

@@ -20,6 +20,19 @@ namespace {
 
 } // namespace
 
+TEST(BinaryModelPatching, RejectsReplacementPastEndWithoutChangingBytes) {
+    viewer::BinaryModel model;
+    ASSERT_TRUE(model.load_file(fixture_path("hello.elf").string()));
+    ASSERT_FALSE(model.bytes().empty());
+    const auto offset = model.bytes().size() - 1;
+    const std::vector<std::uint8_t> replacement{0xAA, 0xBB};
+    EXPECT_FALSE(model.apply_patch_bytes(offset, replacement, "invalid hex edit").has_value());
+    EXPECT_TRUE(model.changed_intervals().empty());
+    const auto effective = model.read_effective_bytes(offset, 1);
+    ASSERT_TRUE(effective.has_value());
+    EXPECT_EQ(effective->front(), model.bytes().back());
+}
+
 TEST(BinaryModelPatching, LoadsEditableImageForStaticElf) {
     viewer::BinaryModel model;
 
