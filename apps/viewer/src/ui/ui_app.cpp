@@ -942,6 +942,15 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 }
 
     void UiApp::render_disassembly_panel() {
+    if (rendered_edit_revision_ != model_.edit_revision()) {
+        rendered_edit_revision_ = model_.edit_revision();
+        if (!current_instructions_.empty() && model_.image()) {
+            const auto address = current_instructions_.front().address;
+            if (const auto offset = model_.image()->virtual_address_to_file_offset(address))
+                disassemble_at_offset(static_cast<std::size_t>(*offset), address);
+            else current_instructions_.clear();
+        }
+    }
     ImGui::Begin("Disassembly");
 
 
@@ -961,12 +970,21 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
-        for (const auto &inst: current_instructions_) {
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(current_instructions_.size()));
+        while (clipper.Step()) {
+        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+            const auto& inst = current_instructions_[static_cast<std::size_t>(row)];
             ImGui::TableNextRow();
 
             // Address
             ImGui::TableNextColumn();
-            ImGui::Text("%016llX", inst.address);
+            ImGui::PushID(row);
+            if (ImGui::Selectable(std::format("{:016X}", inst.address).c_str())) {
+                if (const auto offset = model_.image()->virtual_address_to_file_offset(inst.address))
+                    hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), inst.bytes.size());
+            }
+            ImGui::PopID();
 
             // Bytes
             ImGui::TableNextColumn();
@@ -986,6 +1004,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             // Operands
             ImGui::TableNextColumn();
             ImGui::Text("%s", inst.operands.c_str());
+        }
         }
 
         ImGui::EndTable();
@@ -1248,12 +1267,21 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
         constexpr std::size_t kWindow = 256;
         const std::size_t avail = bytes.size() - file_offset;
-        const std::size_t size = std::min(kWindow, avail);
+        std::size_t size = std::min(kWindow, avail);
+        if (const auto* image = model_.image()) {
+            for (const auto& section : image->sections()) {
+                if (file_offset >= section.file_offset && file_offset - section.file_offset < section.file_size) {
+                    size = std::min(size, static_cast<std::size_t>(section.file_size - (file_offset - section.file_offset)));
+                    break;
+                }
+            }
+        }
         auto effective = model_.read_effective_bytes(file_offset, size);
         if (effective) {
             current_instructions_ = disasm_.disassemble(effective->data(), effective->size(), display_address);
         } else {
-            current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, display_address);
+            current_instructions_.clear();
+            Log().error("Unable to read effective bytes: {}", effective.error().message);
         }
     }
 

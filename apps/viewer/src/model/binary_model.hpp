@@ -69,9 +69,11 @@ namespace viewer {
         peelf::Result<void> save_patched_as(const std::filesystem::path& output_path,
                                             bool overwrite = false) const;
         std::vector<peelf::PatchInterval> changed_intervals() const;
+        [[nodiscard]] std::uint64_t edit_revision() const noexcept { return edit_revision_; }
 
     private:
         BinaryFormat format_ = BinaryFormat::None;
+        std::uint64_t edit_revision_ = 0;
         FileInfo file_info_;
         std::vector<std::uint8_t> bytes_;
         std::vector<SectionInfo> sections_;

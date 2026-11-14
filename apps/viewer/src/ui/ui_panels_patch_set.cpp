@@ -36,6 +36,22 @@ PatchSetPanel::PatchSetPanel(BinaryModel& model, ViewerSelection& selection)
     : UiPanel("Patch Set"), model_(model), selection_(selection) {}
 
 void PatchSetPanel::draw_contents() {
+    const auto* editable = model_.editable_image();
+    ImGui::BeginDisabled(!editable || !editable->can_undo());
+    if (ImGui::Button("Undo")) {
+        const auto result = model_.undo_patch();
+        status_ = result ? "Patch undone." : result.error().message;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!editable || !editable->can_redo());
+    if (ImGui::Button("Redo")) {
+        const auto result = model_.redo_patch();
+        status_ = result ? "Patch redone." : result.error().message;
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Export with File > Save Patched As...");
+    if (!status_.empty()) ImGui::TextUnformatted(status_.c_str());
     const std::vector<peelf::PatchInterval> patches = model_.changed_intervals();
     if (patches.empty()) {
         ImGui::TextDisabled("No staged patches.");
@@ -46,7 +62,7 @@ void PatchSetPanel::draw_contents() {
     ImGui::Separator();
 
     if (ImGui::BeginTable("PatchSetTable",
-                          4,
+                          5,
                           ImGuiTableFlags_Borders |
                               ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_Resizable |
@@ -55,6 +71,7 @@ void PatchSetPanel::draw_contents() {
         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableSetupColumn("Original", ImGuiTableColumnFlags_WidthStretch, 0.5f);
         ImGui::TableSetupColumn("Patched", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableHeadersRow();
 
         for (std::size_t i = 0; i < patches.size(); ++i) {
@@ -85,6 +102,13 @@ void PatchSetPanel::draw_contents() {
             ImGui::TableNextColumn();
             const std::string patched = format_bytes(patch.patched);
             ImGui::TextUnformatted(patched.c_str());
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(i));
+            if (ImGui::SmallButton("Revert")) {
+                const auto result = model_.apply_patch_bytes(patch.offset, patch.original, "Revert patch range");
+                status_ = result ? "Range restored; Undo can recover it." : result.error().message;
+            }
+            ImGui::PopID();
         }
 
         ImGui::EndTable();

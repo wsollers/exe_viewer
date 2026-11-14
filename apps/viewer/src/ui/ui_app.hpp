@@ -106,6 +106,7 @@ namespace viewer {
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
         std::vector<Instruction> current_instructions_;
+        std::uint64_t rendered_edit_revision_ = 0;
 
 
         void render_main_menu();

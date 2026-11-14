@@ -115,6 +115,7 @@ namespace viewer {
     private:
         BinaryModel& model_;
         ViewerSelection& selection_;
+        std::string status_;
     };
 
     class DisassemblyPanel : public UiPanel {

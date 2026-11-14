@@ -143,21 +143,27 @@ namespace viewer {
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
         }
-        return editable_image_->apply_patch(offset, bytes, std::move(label));
+        auto result = editable_image_->apply_patch(offset, bytes, std::move(label));
+        if (result) ++edit_revision_;
+        return result;
     }
 
     peelf::Result<void> BinaryModel::undo_patch() {
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
         }
-        return editable_image_->undo();
+        auto result = editable_image_->undo();
+        if (result) ++edit_revision_;
+        return result;
     }
 
     peelf::Result<void> BinaryModel::redo_patch() {
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
         }
-        return editable_image_->redo();
+        auto result = editable_image_->redo();
+        if (result) ++edit_revision_;
+        return result;
     }
 
     peelf::Result<void> BinaryModel::save_patched_as(const std::filesystem::path& output_path,

@@ -41,6 +41,30 @@ TEST(BinaryModelPatching, LoadsEditableImageForStaticElf) {
     EXPECT_FALSE(model.editable_image()->dirty());
 }
 
+TEST(BinaryModelPatching, RevertingRangeIsUndoableAndTracksRevision) {
+    viewer::BinaryModel model;
+    ASSERT_TRUE(model.load_file(fixture_path("hello.elf").string()));
+    const auto revision = model.edit_revision();
+    EXPECT_FALSE(model.editable_image()->can_undo());
+    const std::vector<std::uint8_t> replacement{0xAA, 0xBB};
+    ASSERT_TRUE(model.apply_patch_bytes(4, replacement, "edit"));
+    EXPECT_GT(model.edit_revision(), revision);
+    EXPECT_TRUE(model.editable_image()->can_undo());
+    const auto patches = model.changed_intervals();
+    ASSERT_EQ(patches.size(), 1u);
+    ASSERT_TRUE(model.apply_patch_bytes(patches.front().offset, patches.front().original, "revert"));
+    EXPECT_TRUE(model.changed_intervals().empty());
+    const auto reverted_revision = model.edit_revision();
+    ASSERT_TRUE(model.undo_patch());
+    EXPECT_GT(model.edit_revision(), reverted_revision);
+    EXPECT_TRUE(model.editable_image()->can_redo());
+    const auto restored = model.read_effective_bytes(4, 2);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(*restored, replacement);
+    ASSERT_TRUE(model.redo_patch());
+    EXPECT_TRUE(model.changed_intervals().empty());
+}
+
 TEST(BinaryModelPatching, AppliesPatchWithoutMutatingOriginalBytesVector) {
     viewer::BinaryModel model;
     ASSERT_TRUE(model.load_file(fixture_path("hello.elf").string()));

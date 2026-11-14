@@ -68,6 +68,8 @@ public:
     [[nodiscard]] std::uint64_t page_size() const noexcept { return page_size_; }
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] bool dirty() const noexcept { return !patches_.empty(); }
+    [[nodiscard]] bool can_undo() const noexcept { return !undo_stack_.empty(); }
+    [[nodiscard]] bool can_redo() const noexcept { return !redo_stack_.empty(); }
 
     [[nodiscard]] Result<std::vector<std::uint8_t>> read_original(std::uint64_t offset,
                                                                   std::uint64_t size) const;
