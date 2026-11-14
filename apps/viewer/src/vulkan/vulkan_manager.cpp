@@ -159,11 +159,18 @@ void VulkanManager::create_swapchain(GLFWwindow* window) {
         }
         chosen = *existing;
     } else {
-        for (const auto& f : formats) {
-            if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
-                f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                chosen = f;
-                break;
+        // Vulkan permits a single VK_FORMAT_UNDEFINED entry when the surface
+        // accepts any pixel format; pick a format supported by ImGui.
+        if (formats.size() == 1 && formats.front().format == VK_FORMAT_UNDEFINED) {
+            chosen.format = VK_FORMAT_B8G8R8A8_UNORM;
+            chosen.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        } else {
+            for (const auto& f : formats) {
+                if (f.format == VK_FORMAT_B8G8R8A8_UNORM &&
+                    f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                    chosen = f;
+                    break;
+                }
             }
         }
     }
