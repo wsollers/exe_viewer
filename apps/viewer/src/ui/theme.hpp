@@ -18,10 +18,12 @@
 #endif
 #endif
 namespace viewer::ui {
-inline void load_theme() {
+inline void load_theme(float content_scale = 0.0f) {
     const float font_scale = ImGui::GetStyle().FontScaleMain;
+    const float font_dpi = ImGui::GetStyle().FontScaleDpi;
     ImGui::GetStyle() = ImGuiStyle{};
     ImGui::GetStyle().FontScaleMain = font_scale;
+    ImGui::GetStyle().FontScaleDpi = font_dpi;
     ImGui::StyleColorsDark();
     auto& style = ImGui::GetStyle();
     style.WindowPadding = {12,12};
@@ -59,7 +61,7 @@ inline void load_theme() {
     metric("FramePaddingY", style.FramePadding.y);
     metric("ItemSpacingX", style.ItemSpacing.x);
     metric("ItemSpacingY", style.ItemSpacing.y);
-    const float dpi = ImGui::GetMainViewport()->DpiScale;
+    const float dpi = content_scale > 0.0f ? content_scale : ImGui::GetMainViewport()->DpiScale;
     style.ScaleAllSizes(dpi > 0.0f ? dpi : 1.0f);
 }
 }

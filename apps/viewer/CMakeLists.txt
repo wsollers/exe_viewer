@@ -78,9 +78,10 @@ target_include_directories(peelf_gui PRIVATE
 target_compile_features(peelf_gui PRIVATE cxx_std_23)
 peelf_apply_project_warnings(peelf_gui)
 add_dependencies(peelf_viewer peelf_gui)
-add_custom_command(TARGET peelf_gui POST_BUILD
+add_custom_target(peelf_viewer_resources ALL
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_CURRENT_SOURCE_DIR}/resources" "$<TARGET_FILE_DIR:peelf_gui>/resources")
+add_dependencies(peelf_viewer peelf_viewer_resources)
 
 target_link_libraries(peelf_gui PRIVATE
         peelf::core

@@ -164,7 +164,10 @@ namespace viewer {
                 io.FontDefault = font;
         }
 #endif
-        ui::load_theme();
+        float content_scale_x = 1.0f;
+        float content_scale_y = 1.0f;
+        glfwGetWindowContentScale(window_, &content_scale_x, &content_scale_y);
+        ui::load_theme(content_scale_x);
         ImGui_ImplGlfw_InitForVulkan(window_, true);
 
         ImGui_ImplVulkan_InitInfo init_info{};
