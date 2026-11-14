@@ -5,6 +5,32 @@
 #include <array>
 #include <cstdint>
 
+TEST(Disassembler, ArmModeSwitchPreservesBigEndianAfterMove) {
+    viewer::Disassembler original;
+    ASSERT_TRUE(original.init(viewer::Architecture::ARM32, viewer::Endianness::Big));
+    viewer::Disassembler disasm(std::move(original));
+    ASSERT_TRUE(disasm.set_thumb_mode(true));
+    constexpr std::array<std::uint8_t, 2> thumb{0xBF, 0x00};
+    const auto decoded = disasm.disassemble(thumb.data(), thumb.size(), 0x1000);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded.front().mnemonic, "nop");
+    ASSERT_TRUE(disasm.set_thumb_mode(false));
+    constexpr std::array<std::uint8_t, 4> arm{0xE3, 0x20, 0xF0, 0x00};
+    const auto restored = disasm.disassemble(arm.data(), arm.size(), 0x1000);
+    ASSERT_EQ(restored.size(), 1u);
+    EXPECT_EQ(restored.front().mnemonic, "nop");
+}
+
+TEST(Disassembler, DecodesX86_32AndRejectsThumbMode) {
+    viewer::Disassembler disasm;
+    ASSERT_TRUE(disasm.init(viewer::Architecture::X86_32));
+    EXPECT_FALSE(disasm.set_thumb_mode(true));
+    constexpr std::array<std::uint8_t, 1> code{0x90};
+    const auto decoded = disasm.disassemble(code.data(), code.size(), 0x1000);
+    ASSERT_EQ(decoded.size(), 1u);
+    EXPECT_EQ(decoded.front().mnemonic, "nop");
+}
+
 TEST(Disassembler, DecodesX86_64Nop) {
     viewer::Disassembler disasm;
     ASSERT_TRUE(disasm.init(viewer::Architecture::X86_64));

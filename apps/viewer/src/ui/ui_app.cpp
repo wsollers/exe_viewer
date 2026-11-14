@@ -960,6 +960,18 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         return;
     }
 
+    if (disasm_.architecture() == Architecture::ARM32 && ImGui::Checkbox("Thumb mode", &thumb_mode_)) {
+        if (disasm_.set_thumb_mode(thumb_mode_)) {
+            if (!current_instructions_.empty()) {
+                const auto address = current_instructions_.front().address;
+                if (const auto offset = model_.image()->virtual_address_to_file_offset(address))
+                    disassemble_at_offset(static_cast<std::size_t>(*offset), address);
+            }
+        } else {
+            thumb_mode_ = !thumb_mode_;
+            Log().error("Unable to change ARM instruction mode");
+        }
+    }
     // Simple table view
     if (ImGui::BeginTable("DisasmTable", 4,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -1014,6 +1026,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 }
     // Called after a file (PE or ELF) is loaded into the model.
     void UiApp::on_file_loaded() {
+        thumb_mode_ = false;
         const peelf::IBinaryImage* img = model_.image();
         if (!img) {
             file_loaded_ = false;

@@ -92,6 +92,7 @@ namespace viewer {
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;
+        bool thumb_mode_ = false;
         bool reset_dock_layout_ = false;
         bool show_disassembly_panel_ = true;
         bool show_call_graph_panel_ = false;

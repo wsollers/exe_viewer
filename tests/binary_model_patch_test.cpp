@@ -1,4 +1,5 @@
 #include "model/binary_model.hpp"
+#include "navigation/byte_range.hpp"
 
 #include <gtest/gtest.h>
 
@@ -19,6 +20,22 @@ namespace {
 }
 
 } // namespace
+
+TEST(HexSelection, IncludesBothEndpointsInEitherDirectionAndRejectsInvalidOffsets) {
+    const auto forward = viewer::selected_byte_range(15, 17, 32);
+    const auto backward = viewer::selected_byte_range(17, 15, 32);
+    ASSERT_TRUE(forward);
+    ASSERT_TRUE(backward);
+    EXPECT_EQ(forward->offset, 15u);
+    EXPECT_EQ(forward->size, 3u);
+    EXPECT_EQ(backward->offset, forward->offset);
+    EXPECT_EQ(backward->size, forward->size);
+    EXPECT_FALSE(viewer::selected_byte_range(0, 0, 0));
+    EXPECT_FALSE(viewer::selected_byte_range(0, 32, 32));
+    const auto last = viewer::selected_byte_range(31, 31, 32);
+    ASSERT_TRUE(last);
+    EXPECT_EQ(last->size, 1u);
+}
 
 TEST(BinaryModelPatching, RejectsReplacementPastEndWithoutChangingBytes) {
     viewer::BinaryModel model;

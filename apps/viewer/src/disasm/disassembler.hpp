@@ -50,6 +50,7 @@ public:
     Disassembler(Disassembler&& other) noexcept
         : handle_(other.handle_)
         , arch_(other.arch_)
+        , endian_(other.endian_)
         , initialized_(other.initialized_)
     {
         other.handle_ = 0;
@@ -61,6 +62,7 @@ public:
             close();
             handle_ = other.handle_;
             arch_ = other.arch_;
+            endian_ = other.endian_;
             initialized_ = other.initialized_;
             other.handle_ = 0;
             other.initialized_ = false;
@@ -71,6 +73,7 @@ public:
     bool init(Architecture arch, Endianness endian = Endianness::Little) {
         close();
         arch_ = arch;
+        endian_ = endian;
 
         cs_arch cs_architecture;
         cs_mode cs_mode_flags;
@@ -86,7 +89,7 @@ public:
                 break;
             case Architecture::ARM32:
                 cs_architecture = CS_ARCH_ARM;
-                cs_mode_flags = CS_MODE_ARM;
+                cs_mode_flags = static_cast<cs_mode>(CS_MODE_ARM | (endian == Endianness::Big ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN));
                 break;
             case Architecture::ARM64:
                 cs_architecture = CS_ARCH_ARM64;
@@ -200,7 +203,8 @@ public:
 
     bool set_thumb_mode(bool enable) {
         if (!initialized_ || arch_ != Architecture::ARM32) return false;
-        cs_mode mode = enable ? CS_MODE_THUMB : CS_MODE_ARM;
+        const auto mode = static_cast<cs_mode>((enable ? CS_MODE_THUMB : CS_MODE_ARM) |
+            (endian_ == Endianness::Big ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN));
         return cs_option(handle_, CS_OPT_MODE, mode) == CS_ERR_OK;
     }
 
@@ -258,6 +262,7 @@ public:
 private:
     csh handle_ = 0;
     Architecture arch_ = Architecture::X86_64;
+    Endianness endian_ = Endianness::Little;
     bool initialized_ = false;
 };
 

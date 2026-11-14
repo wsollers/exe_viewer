@@ -9,6 +9,7 @@
 #include <vector>
 #include <format>
 #include "tools/shellcode_converter.hpp"
+#include "navigation/byte_range.hpp"
 
 namespace viewer {
 
@@ -55,12 +56,26 @@ void HexViewPanel::draw_contents() {
         const auto parsed = parse_hex_shellcode(edit_bytes_);
         if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
         else {
-            const auto applied = model_.apply_patch_bytes(selected_offset_, parsed.bytes, "Hex editor replacement");
+            if (highlighted_size_ > 1 && parsed.bytes.size() != highlighted_size_) {
+                edit_status_ = "Replacement length must match the selected range.";
+            } else {
+            const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
             edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
             if (applied && on_byte_activated_) on_byte_activated_(selected_offset_);
+            }
         }
     }
     ImGui::TextDisabled("Selected offset: 0x%llX", static_cast<unsigned long long>(selected_offset_));
+    ImGui::SameLine();
+    ImGui::TextDisabled("%zu bytes selected (Shift-click to extend)", highlighted_size_);
+    if (ImGui::Button("Copy selected hex")) {
+        const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);
+        if (selected) {
+            std::string text;
+            for (const auto byte : *selected) text += std::format("{:02X} ", byte);
+            ImGui::SetClipboardText(text.c_str());
+        } else edit_status_ = selected.error().message;
+    }
     if (!edit_status_.empty()) ImGui::TextUnformatted(edit_status_.c_str());
     ImGui::Separator();
     ImGui::BeginChild("HexScroll", ImVec2(0,0), false, ImGuiWindowFlags_HorizontalScrollbar);
@@ -109,9 +124,16 @@ void HexViewPanel::draw_contents() {
                     i - highlighted_offset_ < highlighted_size_;
                 bool selected = (i == selected_offset_) || in_highlight;
                 if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(ImGui::CalcTextSize("FF").x, 0))) {
-                    selected_offset_ = i;
-                    highlighted_offset_ = i;
-                    highlighted_size_ = 1;
+                    if (ImGui::GetIO().KeyShift) {
+                        if (const auto range = selected_byte_range(selected_offset_, i, bytes.size())) {
+                            highlighted_offset_ = range->offset;
+                            highlighted_size_ = range->size;
+                        }
+                    } else {
+                        selected_offset_ = i;
+                        highlighted_offset_ = i;
+                        highlighted_size_ = 1;
+                    }
                     if (on_byte_activated_) {
                         on_byte_activated_(i);
                     }
