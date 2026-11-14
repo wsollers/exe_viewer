@@ -58,5 +58,16 @@ private:
 };
 
 [[nodiscard]] std::string import_symbol_name(const peelf::ImportEntry& entry);
+[[nodiscard]] inline bool symbol_name_matches(std::string_view name, std::string_view query) noexcept {
+    const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c + ('a' - 'A')) : c; };
+    if (query.size() > name.size()) return false;
+    for (std::size_t i = 0; i <= name.size() - query.size(); ++i) {
+        bool matches = true;
+        for (std::size_t j = 0; j < query.size(); ++j)
+            if (lower(name[i + j]) != lower(query[j])) { matches = false; break; }
+        if (matches) return true;
+    }
+    return false;
+}
 
 } // namespace viewer

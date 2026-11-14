@@ -264,7 +264,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , shellcode_panel_(model, current_selection_)
     , imports_panel_(model)
     , exports_panel_(model)
-    , symbols_panel_(model, current_selection_)
+    , symbols_panel_(symbol_index_, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -301,17 +301,24 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             }
             last_navigation_selection_ = current_selection_;
         });
-    symbols_panel_.set_symbol_activated_callback([this](const peelf::Symbol& symbol, std::uint64_t object_index) {
+    symbols_panel_.set_symbol_activated_callback([this](const SymbolRecord& symbol, std::uint64_t object_index) {
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr) {
             return;
         }
 
-        const auto file_offset = img->virtual_address_to_file_offset(symbol.virtual_address);
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::Symbol, .label = symbol.name,
+            .file_offset = symbol.file_offset, .virtual_address = symbol.virtual_address,
+            .size = symbol.size, .object_index = object_index,
+            .preferred_view = PreferredView::Details
+        };
+        const auto file_offset = symbol.file_offset;
         if (!file_offset) {
             Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
                        symbol.name.empty() ? "<unnamed>" : symbol.name,
-                       symbol.virtual_address);
+                       symbol.virtual_address.value_or(0));
+            current_instructions_.clear();
             return;
         }
         if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
@@ -334,7 +341,15 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             .preferred_view = PreferredView::Disassembly
         };
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
-        disassemble_at_offset(static_cast<std::size_t>(*file_offset), symbol.virtual_address);
+        if (symbol.virtual_address) {
+            disassemble_at_offset(static_cast<std::size_t>(*file_offset), *symbol.virtual_address);
+            if (symbol.source != SymbolSource::Import) {
+                pending_call_graph_root_ = symbol;
+                pending_call_graph_delay_frames_ = 1;
+                show_call_graph_panel_ = true;
+                call_graph_status_ = "Queued fan-out from " + symbol.name;
+            }
+        }
         last_navigation_selection_ = current_selection_;
     });
     imports_panel_.set_import_activated_callback([this](const peelf::ImportEntry& entry, std::uint64_t object_index) {
@@ -791,6 +806,18 @@ void UiApp::render_call_graph_panel() {
         ImGui::TextUnformatted(call_graph_status_.c_str());
     }
 
+    ImGui::InputTextWithHint("Find node", "Any part of a function name...", graph_search_, sizeof(graph_search_));
+    if (current_call_graph_ && graph_search_[0] != '\0') {
+        ImGui::BeginChild("GraphSearchResults", ImVec2(0, 100), true);
+        for (const auto& node : current_call_graph_->nodes) {
+            if (!symbol_name_matches(node.label, graph_search_) &&
+                (!node.symbol || !symbol_name_matches(node.symbol->name, graph_search_))) continue;
+            ImGui::PushID(node.id.c_str());
+            if (ImGui::Selectable(node.label.c_str())) activate_call_graph_node(node);
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const ImVec2 canvas_size(std::max(available.x, 64.0f), std::max(available.y, 64.0f));
     const ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
@@ -982,13 +1009,14 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
     }
     // Simple table view
-    if (ImGui::BeginTable("DisasmTable", 4,
+    if (ImGui::BeginTable("DisasmTableSymbols", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ImGui::CalcTextSize("0000000000000000").x + 16.0f);
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 180.0f);
         ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
@@ -1035,6 +1063,12 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             // Operands
             ImGui::TableNextColumn();
             ImGui::Text("%s", inst.operands.c_str());
+            ImGui::TableNextColumn();
+            if (const auto* symbol = symbol_index_.find_containing_address(inst.address); symbol && symbol->virtual_address) {
+                const auto offset = inst.address - *symbol->virtual_address;
+                const auto label = offset == 0 ? symbol->name : std::format("{}+0x{:X}", symbol->name, offset);
+                ImGui::TextUnformatted(label.c_str());
+            }
         }
         }
 

@@ -11,6 +11,7 @@
 #include "model/binary_model.hpp"
 #include "navigation/viewer_navigation.hpp"
 #include "ui_panel.hpp"
+#include "symbols/symbol_index.hpp"
 
 namespace viewer {
 
@@ -135,19 +136,19 @@ namespace viewer {
 
     class SymbolsPanel : public UiPanel {
     public:
-        SymbolsPanel(BinaryModel& model, const ViewerSelection& selection);
+        SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection);
         void set_symbol_activated_callback(
-            std::function<void(const peelf::Symbol& symbol, std::uint64_t object_index)> cb) {
+            std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> cb) {
             on_symbol_activated_ = std::move(cb);
         }
     protected:
         void draw_contents() override;
     private:
-        BinaryModel& model_;
+        const SymbolIndex& index_;
         const ViewerSelection& selection_;
         char filter_buf_[128] = {};
         std::optional<std::uint64_t> last_scrolled_selected_;
-        std::function<void(const peelf::Symbol& symbol, std::uint64_t object_index)> on_symbol_activated_;
+        std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> on_symbol_activated_;
     };
 
     class ImportsPanel : public UiPanel {

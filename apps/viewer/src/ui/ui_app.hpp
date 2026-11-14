@@ -104,6 +104,7 @@ namespace viewer {
         std::uint8_t pending_call_graph_delay_frames_ = 0;
         std::optional<PendingCallGraphRequest> pending_call_graph_request_;
         std::string call_graph_status_;
+        char graph_search_[128] = {};
         std::filesystem::path loaded_call_graph_bmp_;
         PeModel pe_model_;
         std::vector<Instruction> current_instructions_;

@@ -35,6 +35,14 @@ namespace {
 
 } // namespace
 
+TEST(SymbolIndex, SubstringSearchIsCaseInsensitiveAndHandlesEmptyQueries) {
+    EXPECT_TRUE(viewer::symbol_name_matches("HeapAlloc", "alloc"));
+    EXPECT_TRUE(viewer::symbol_name_matches("allocate_buffer", "CATE_b"));
+    EXPECT_TRUE(viewer::symbol_name_matches("main", ""));
+    EXPECT_FALSE(viewer::symbol_name_matches("main", "main_extra"));
+    EXPECT_FALSE(viewer::symbol_name_matches("HeapFree", "alloc"));
+}
+
 TEST(SymbolIndex, LoadsElfImageSymbolsAndRuntimeSymbols) {
     const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("hello.elf");
     ASSERT_NE(image, nullptr);
