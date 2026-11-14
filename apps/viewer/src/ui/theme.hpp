@@ -61,6 +61,11 @@ inline void load_theme(float content_scale = 0.0f) {
     metric("FramePaddingY", style.FramePadding.y);
     metric("ItemSpacingX", style.ItemSpacing.x);
     metric("ItemSpacingY", style.ItemSpacing.y);
+    metric("CellPaddingX", style.CellPadding.x);
+    metric("CellPaddingY", style.CellPadding.y);
+    metric("FrameBorderSize", style.FrameBorderSize);
+    metric("ChildBorderSize", style.ChildBorderSize);
+    metric("DockingSeparatorSize", style.DockingSeparatorSize);
     const float dpi = content_scale > 0.0f ? content_scale : ImGui::GetMainViewport()->DpiScale;
     style.ScaleAllSizes(dpi > 0.0f ? dpi : 1.0f);
 }

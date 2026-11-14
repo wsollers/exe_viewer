@@ -77,11 +77,7 @@ void HexViewPanel::draw_contents() {
         }
     }
     ImGui::EndDisabled();
-    if (highlighted_size_ != 0)
-        ImGui::TextDisabled("Selected offset: 0x%llX", static_cast<unsigned long long>(selected_offset_));
-    else ImGui::TextDisabled("No file bytes selected");
-    ImGui::TextDisabled("%zu bytes selected (Shift-click to extend)", highlighted_size_);
-    if (ImGui::Button("Copy selected hex")) {
+    if (ImGui::Button("Copy hex")) {
         const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);
         if (selected) {
             std::string text;
@@ -89,6 +85,9 @@ void HexViewPanel::draw_contents() {
             ImGui::SetClipboardText(text.c_str());
         } else edit_status_ = selected.error().message;
     }
+    ImGui::SameLine();
+    ImGui::TextDisabled("0x%llX | %zu bytes", static_cast<unsigned long long>(selected_offset_), highlighted_size_);
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shift-click a byte to extend the selection.");
     if (!edit_status_.empty()) ImGui::TextUnformatted(edit_status_.c_str());
     ImGui::Separator();
     ImGui::BeginChild("HexScroll", ImVec2(0,0), false, ImGuiWindowFlags_HorizontalScrollbar);

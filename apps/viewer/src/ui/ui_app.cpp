@@ -1074,8 +1074,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     const bool compact = dockspace_size.x < ImGui::GetFontSize() * 100.0f;
     const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, compact ? 0.28f : 0.22f, nullptr, &main_id);
     const ImGuiID right_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.24f, nullptr, &main_id);
-    const ImGuiID bottom_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.22f, nullptr, &main_id);
-    const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.42f, nullptr, &main_id);
+    const ImGuiID bottom_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.14f, nullptr, &main_id);
+    const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.54f, nullptr, &main_id);
 
     ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), left_id);

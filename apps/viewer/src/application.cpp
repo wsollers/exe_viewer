@@ -21,7 +21,7 @@
 
 namespace viewer {
     namespace {
-        constexpr float kUiFontSize = 18.0f;
+        constexpr float kUiFontSize = 16.0f;
 
         std::filesystem::path find_monospace_font() {
 #ifdef _WIN32
