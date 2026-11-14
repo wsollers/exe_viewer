@@ -182,3 +182,52 @@ TEST(PagedBinaryImage, RefusesToOverwriteExistingOutputByDefault) {
     ASSERT_TRUE(exported_bytes.has_value()) << exported_bytes.error().message;
     EXPECT_EQ(*exported_bytes, (std::vector<std::uint8_t>{0, 1, 2, 3}));
 }
+
+
+TEST(PagedBinaryImage, FailedSavePreservesPreexistingDestinationAndCleansStaging) {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "peelf_atomic_save_failure_test";
+    std::filesystem::remove_all(dir);
+    ASSERT_TRUE(std::filesystem::create_directory(dir));
+    const std::filesystem::path source = dir / "input.bin";
+    const std::filesystem::path target = dir / "existing.bin";
+
+    {
+        std::ofstream input(source, std::ios::binary);
+        const std::uint8_t original[8]{0, 1, 2, 3, 4, 5, 6, 7};
+        input.write(reinterpret_cast<const char*>(original), sizeof(original));
+        std::ofstream output(target, std::ios::binary);
+        const std::uint8_t marker[4]{0xAA, 0xBB, 0xCC, 0xDD};
+        output.write(reinterpret_cast<const char*>(marker), sizeof(marker));
+    }
+
+    auto image = peelf::PagedBinaryImage::open(source, 4);
+    ASSERT_TRUE(image.has_value());
+    // Make only the first page readable from cache. The second page must fail.
+    ASSERT_TRUE(image->read_original(0, 4).has_value());
+    std::filesystem::remove(source);
+
+    EXPECT_FALSE(image->write_effective_to(target, true).has_value());
+    std::ifstream output(target, std::ios::binary);
+    const std::vector<std::uint8_t> actual{std::istreambuf_iterator<char>(output), {}};
+    EXPECT_EQ(actual, (std::vector<std::uint8_t>{0xAA, 0xBB, 0xCC, 0xDD}));
+
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        EXPECT_EQ(entry.path(), target) << "Failed save left a staging file behind";
+    }
+    std::filesystem::remove_all(dir);
+}
+
+TEST(PagedBinaryImage, SaveAsNeverReplacesItsLoadedSource) {
+    const std::filesystem::path source = write_temp_binary({0, 1, 2, 3, 4, 5});
+    auto image = peelf::PagedBinaryImage::open(source, 3);
+    ASSERT_TRUE(image.has_value());
+    ASSERT_TRUE(image->apply_patch(0, std::vector<std::uint8_t>{0xFF}, "test").has_value());
+
+    // Save-as must not silently invalidate the model's immutable on-disk base.
+    EXPECT_FALSE(image->write_effective_to(source, false).has_value());
+    EXPECT_FALSE(image->write_effective_to(source, true).has_value());
+    const auto original = image->read_original(0, 6);
+    ASSERT_TRUE(original.has_value());
+    EXPECT_EQ(*original, (std::vector<std::uint8_t>{0, 1, 2, 3, 4, 5}));
+}
