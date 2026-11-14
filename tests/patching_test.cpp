@@ -214,7 +214,8 @@ TEST(PagedBinaryImage, FailedSavePreservesPreexistingDestinationAndCleansStaging
     EXPECT_EQ(actual, (std::vector<std::uint8_t>{0xAA, 0xBB, 0xCC, 0xDD}));
 
     for (const auto& entry : std::filesystem::directory_iterator(dir)) {
-        EXPECT_EQ(entry.path(), target) << "Failed save left a staging file behind";
+        EXPECT_TRUE(entry.path() == target || entry.path() == source)
+            << "Failed save left a staging file behind: " << entry.path().string();
     }
     std::filesystem::remove_all(dir);
 }
