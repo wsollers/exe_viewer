@@ -171,19 +171,20 @@ hit-testing. Clicking a function-like node updates the shared selection and can
 queue a new fan-out graph rooted at that symbol. The next major step is richer
 basic-block CFG construction and more precise indirect-call handling.
 
-## Assembly / Patch Provider Direction
+## Assembly Providers & Reusable Patch Bundles (`.pepatch.json`)
 
 ```mermaid
 flowchart TD
-    shellcode["Shellcode panel<br/>paste hex or assembly"]
-    patch["Future patch editor<br/>staged edits"]
-    request["AssembleRequest<br/>arch, mode, endian, syntax, base address, text"]
-    manager["Assembler provider manager"]
-    asmtk["AsmTK / AsmJit provider<br/>x86/x64 fast path"]
-    llvm["LLVM MC provider<br/>external llvm-mc + objcopy first"]
-    unavailable["Unavailable provider<br/>explicit unsupported result"]
-    result["AssembleResult<br/>bytes or diagnostic"]
-    hex["Hex output / staged patch bytes"]
+    shellcode["Shellcode panel<br/>hex or live assembly scratchpad"]
+    patch["Patch Set panel<br/>Hex OR Assemble at Selection / VA + .pepatch.json"]
+    request["AssembleRequest<br/>arch, mode, endian, syntax, base_address, asm_text"]
+    manager["AssemblerRegistry / assemble_instructions"]
+    asmtk["AsmTkAssemblerProvider<br/>in-process x86/x86_64 @ base_address"]
+    llvm["LlvmMcAssemblerProvider<br/>safe argv llvm-mc --show-encoding multi-arch"]
+    unavailable["SubsystemStatus::Unavailable<br/>explicit diagnostic"]
+    result["AssembleOutput<br/>encoded bytes + per-instruction spans"]
+    preview["PatchPreview + PatchBundlePreview<br/>Capstone round-trip + slack warning + SHA-256/byte conflict check"]
+    tx["PagedBinaryImage::begin_transaction<br/>atomic static-file staging (read-only live sessions rejected)"]
 
     shellcode --> request
     patch --> request
@@ -193,14 +194,11 @@ flowchart TD
     manager --> unavailable
     asmtk --> result
     llvm --> result
-    unavailable --> result
-    result --> hex
+    result --> preview
+    preview --> tx
 ```
 
-AsmJit/AsmTK is now available as `peelf::asmtk` and has a smoke test proving
-x64 `nop; ret` assembly. The provider wrapper is still pending. Unsupported
-architectures must return an explicit unsupported/unavailable result so the UI
-can show a useful message instead of failing silently.
+`IAssemblerProvider` (`peelf/assembler.hpp`) selects `AsmTkAssemblerProvider` first for little-endian x86/x86_64 targets when `PEELF_ASMTK_AVAILABLE` is enabled and falls back to `LlvmMcAssemblerProvider` across ARM, Thumb, AArch64, RISC-V 32/64, PowerPC 32/64, and MIPS 32/64 when `llvm-mc` is installed. Portable `.pepatch.json` patch bundles (`peelf/patch_bundle.hpp`) verify target `expected_sha256`, `expected_size`, and per-entry `original_bytes_hex` before staging all entries inside a single `PagedBinaryImage` transaction, and strictly reject read-only live process sessions.
 
 ## Dependency Shape
 

@@ -22,6 +22,7 @@
 #include <peelf/forgiving.hpp>
 #include <peelf/handlers.hpp>
 #include <peelf/memory_search.hpp>
+#include <peelf/patch_bundle.hpp>
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
@@ -180,6 +181,7 @@ namespace viewer {
         [[nodiscard]] std::uint64_t bookmark_revision() const noexcept { return bookmark_revision_; }
         [[nodiscard]] bool demangle_symbols() const noexcept { return demangle_symbols_; }
         void set_demangle_symbols(bool enabled) noexcept { demangle_symbols_ = enabled; }
+        [[nodiscard]] bool analysis_thumb_mode() const noexcept { return analysis_thumb_mode_; }
         void set_analysis_thumb_mode(bool thumb_mode);
         [[nodiscard]] std::string resolve_address_symbol(std::uint64_t virtual_address) const;
 
@@ -270,6 +272,21 @@ namespace viewer {
         [[nodiscard]] std::vector<peelf::PatchInterval> committed_live_patches() const;
         [[nodiscard]] BytePatchState byte_patch_state_at_offset(std::uint64_t offset) const noexcept;
         peelf::Result<void> apply_patch_set(std::span<const peelf::PatchInterval> patches);
+
+        // Reusable JSON Patch Bundles (.pepatch.json) — static binaries only; strictly rejected on live processes.
+        void record_patch_metadata(std::uint64_t offset,
+                                   std::string label,
+                                   std::optional<std::string> asm_source = std::nullopt);
+        [[nodiscard]] peelf::Result<peelf::PatchBundle> export_patch_bundle(
+            std::string name = {},
+            std::string description = {}) const;
+        [[nodiscard]] peelf::Result<peelf::PatchBundlePreview> preview_patch_bundle(
+            const peelf::PatchBundle& bundle,
+            const peelf::PatchBundleApplyOptions& options = {}) const;
+        [[nodiscard]] peelf::Result<void> apply_patch_bundle(
+            const peelf::PatchBundle& bundle,
+            const peelf::PatchBundleApplyOptions& options = {});
+
         [[nodiscard]] std::uint64_t edit_revision() const noexcept { return edit_revision_; }
         [[nodiscard]] const std::string& content_sha256() const;
 
@@ -301,8 +318,14 @@ namespace viewer {
         std::set<std::string> auto_loaded_debug_keys_;
         std::vector<DataTypeRecord> active_debug_types_;
         std::vector<SourceLineMapping> active_source_lines_;
+        struct PatchEntryMetadata {
+            std::string label{};
+            std::optional<std::string> asm_source{};
+        };
+
         std::vector<AppliedStructureBinding> applied_structures_;
         std::vector<Bookmark> bookmarks_;
+        std::map<std::uint64_t, PatchEntryMetadata> patch_metadata_by_offset_;
         std::uint64_t structure_binding_revision_ = 0;
         std::uint64_t bookmark_revision_ = 0;
 

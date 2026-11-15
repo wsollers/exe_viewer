@@ -94,6 +94,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         active_source_lines_.clear();
         applied_structures_.clear();
         bookmarks_.clear();
+        patch_metadata_by_offset_.clear();
         ++structure_binding_revision_;
         ++bookmark_revision_;
         session_.reset();
@@ -1315,6 +1316,84 @@ std::filesystem::path utf8_path(std::string_view text) {
         auto result = transaction.commit();
         if (result) ++edit_revision_;
         return result;
+    }
+
+    void BinaryModel::record_patch_metadata(std::uint64_t offset,
+                                            std::string label,
+                                            std::optional<std::string> asm_source) {
+        if (is_live_process()) {
+            return;
+        }
+        patch_metadata_by_offset_[offset] = PatchEntryMetadata{
+            .label = std::move(label),
+            .asm_source = std::move(asm_source),
+        };
+    }
+
+    peelf::Result<peelf::PatchBundle> BinaryModel::export_patch_bundle(
+        std::string name,
+        std::string description) const {
+        if (is_live_process()) {
+            return peelf::make_error(
+                "Live process inspection is strictly read-only; patch bundles can only be exported from static files");
+        }
+        if (!editable_image_) {
+            return peelf::make_error("No editable static binary image is loaded");
+        }
+        auto bundle_res = peelf::export_patch_bundle_from_image(
+            *editable_image_, image_.get(), std::move(name), std::move(description));
+        if (!bundle_res.has_value()) {
+            return bundle_res;
+        }
+        for (peelf::PatchBundleEntry& entry : bundle_res->entries) {
+            if (const auto it = patch_metadata_by_offset_.find(entry.offset);
+                it != patch_metadata_by_offset_.end()) {
+                if (!it->second.label.empty()) {
+                    entry.label = it->second.label;
+                }
+                if (it->second.asm_source.has_value()) {
+                    entry.asm_source = it->second.asm_source;
+                }
+            }
+        }
+        return bundle_res;
+    }
+
+    peelf::Result<peelf::PatchBundlePreview> BinaryModel::preview_patch_bundle(
+        const peelf::PatchBundle& bundle,
+        const peelf::PatchBundleApplyOptions& options) const {
+        if (is_live_process()) {
+            return peelf::make_error(
+                "Live process inspection is strictly read-only; patch bundles cannot be previewed or applied to live memory");
+        }
+        if (!editable_image_) {
+            return peelf::make_error("No editable static binary image is loaded");
+        }
+        return peelf::preview_patch_bundle(bundle, *editable_image_, options, nullptr);
+    }
+
+    peelf::Result<void> BinaryModel::apply_patch_bundle(
+        const peelf::PatchBundle& bundle,
+        const peelf::PatchBundleApplyOptions& options) {
+        if (is_live_process()) {
+            last_diagnostic_ =
+                "Live process inspection is strictly read-only; patch bundles cannot be applied to live memory";
+            return peelf::make_error(last_diagnostic_);
+        }
+        if (!editable_image_) {
+            return peelf::make_error("No editable static binary image is loaded");
+        }
+        auto applied = peelf::apply_patch_bundle(bundle, *editable_image_, options, nullptr);
+        if (applied.has_value()) {
+            for (const peelf::PatchBundleEntry& entry : bundle.entries) {
+                patch_metadata_by_offset_[entry.offset] = PatchEntryMetadata{
+                    .label = entry.label,
+                    .asm_source = entry.asm_source,
+                };
+            }
+            ++edit_revision_;
+        }
+        return applied;
     }
 
     peelf::Result<void> BinaryModel::stage_patch_at_va(std::uint64_t /*virtual_address*/,

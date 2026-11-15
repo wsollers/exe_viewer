@@ -8,7 +8,9 @@ add_library(peelf_core
   src/dependency_tree.cpp
   src/demangle.cpp
   src/dwarf.cpp
+  src/assembler.cpp
   src/patching.cpp
+  src/patch_bundle.cpp
   src/process_common.cpp
   src/process_linux.cpp
   src/process_win32.cpp
@@ -30,7 +32,9 @@ add_library(peelf_core
   include/peelf/dependency_tree.hpp
   include/peelf/demangle.hpp
   include/peelf/dwarf.hpp
+  include/peelf/assembler.hpp
   include/peelf/patching.hpp
+  include/peelf/patch_bundle.hpp
   include/peelf/process.hpp
   include/peelf/process_internals.hpp
   include/peelf/stack_tls.hpp
@@ -54,6 +58,7 @@ target_include_directories(peelf_core
 
 target_compile_features(peelf_core PUBLIC cxx_std_23)
 
+target_link_libraries(peelf_core PRIVATE peelf::asmtk)
 
 peelf_apply_project_warnings(peelf_core)
 

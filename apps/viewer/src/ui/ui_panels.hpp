@@ -158,21 +158,34 @@ namespace viewer {
         char input_buf_[32768] = {};
         std::vector<std::uint8_t> output_bytes_;
         std::string hex_view_;
+        std::string roundtrip_disasm_view_;
         std::string diagnostic_;
         bool last_assembly_mode_ = false;
+        std::uint64_t last_base_address_ = 0;
         std::function<void()> on_patch_changed_;
 
         void rebuild_output();
         void draw_hex_output() const;
         void apply_to_selection();
         [[nodiscard]] std::optional<std::uint64_t> selected_file_offset() const;
+        [[nodiscard]] std::uint64_t effective_base_address() const;
     };
 
     class PatchSetPanel : public UiPanel {
     public:
         PatchSetPanel(BinaryModel& model, ViewerSelection& selection);
         void set_analysis_context(const SymbolIndex* symbols, const bool* thumb) { symbols_ = symbols; thumb_ = thumb; }
-        void reset_preview() { preview_.reset(); replacement_[0] = 0; status_.clear(); }
+        void reset_preview() {
+            preview_.reset();
+            live_asm_bytes_.clear();
+            live_asm_disasm_.clear();
+            live_asm_diag_.clear();
+            imported_bundle_.reset();
+            imported_bundle_preview_.reset();
+            bundle_status_.clear();
+            replacement_[0] = 0;
+            status_.clear();
+        }
         void set_patch_activated_callback(std::function<void(const ViewerSelection&)> cb) {
             on_patch_activated_ = std::move(cb);
         }
@@ -182,13 +195,30 @@ namespace viewer {
     protected:
         void draw_contents() override;
     private:
+        void refresh_live_assembly_preview();
+        void refresh_imported_bundle_preview();
+
         BinaryModel& model_;
         ViewerSelection& selection_;
         std::string status_;
         const SymbolIndex* symbols_ = nullptr;
         const bool* thumb_ = nullptr;
+        int input_mode_ = 0; // 0 = Hex Bytes, 1 = Assemble Instructions
+        bool pad_nops_to_boundary_ = false;
         char replacement_[4096]{};
+        char asm_input_[8192]{};
+        std::uint64_t last_asm_base_va_ = 0;
+        std::vector<std::uint8_t> live_asm_bytes_;
+        std::vector<Instruction> live_asm_disasm_;
+        std::string live_asm_diag_;
         std::optional<PatchPreview> preview_;
+        char bundle_path_[1024]{};
+        char bundle_name_[256]{};
+        char bundle_desc_[512]{};
+        bool bundle_allow_hash_mismatch_ = false;
+        std::string bundle_status_;
+        std::optional<peelf::PatchBundle> imported_bundle_;
+        std::optional<peelf::PatchBundlePreview> imported_bundle_preview_;
         std::string status_message_;
         std::function<void(const ViewerSelection&)> on_patch_activated_;
         std::function<void()> on_patch_mutated_;

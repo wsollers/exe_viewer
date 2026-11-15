@@ -62,6 +62,7 @@ add_executable(peelf_tests
   recent_binaries_test.cpp
   shellcode_converter_test.cpp
   assembler_dependency_test.cpp
+  assembler_patch_bundle_test.cpp
   patching_test.cpp
   binary_model_patch_test.cpp
   process_memmap_test.cpp
