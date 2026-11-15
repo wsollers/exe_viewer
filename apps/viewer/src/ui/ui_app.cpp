@@ -329,6 +329,13 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , struct_view_panel_(model, current_selection_)
     , process_internals_panel_(model)
     , dependencies_panel_(model, symbol_index_, reference_index_, current_selection_)
+    , binary_diff_panel_(
+          model,
+          current_selection_,
+          [this](std::uint64_t address, PreferredView view) { navigate_to_address(address, view); },
+          [this]() {
+              if (on_analysis_file_) on_analysis_file_(3);
+          })
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -338,6 +345,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     strings_panel_.set_visible(false);
     struct_view_panel_.set_visible(false);
     process_internals_panel_.set_visible(false);
+    binary_diff_panel_.set_visible(false);
     dependencies_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
@@ -961,6 +969,7 @@ void UiApp::render() {
     struct_view_panel_.draw();
     process_internals_panel_.draw();
     dependencies_panel_.draw();
+    binary_diff_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
@@ -1369,6 +1378,15 @@ peelf::Result<void> UiApp::save_patch_report(const std::filesystem::path& path) 
     return write_analysis_file(path,patch_report(model_));
 }
 
+peelf::Result<void> UiApp::compare_with_binary(const std::filesystem::path& path) {
+    auto res = binary_diff_panel_.compare_with_file(path);
+    if (res) {
+        binary_diff_panel_.set_visible(true);
+        activate_panel(binary_diff_panel_.name().c_str());
+    }
+    return res;
+}
+
 void UiApp::open_references() {
     references_panel_.set_visible(true);
     focus_references_ = true;
@@ -1525,6 +1543,18 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open Analysis Project...", nullptr, false, static_cast<bool>(on_analysis_file_))) on_analysis_file_(0);
         if (ImGui::MenuItem("Save Analysis Project...", nullptr, false, model_.has_file() && static_cast<bool>(on_analysis_file_))) on_analysis_file_(1);
         if (ImGui::MenuItem("Export Patch Report...", nullptr, false, model_.has_file() && static_cast<bool>(on_analysis_file_))) on_analysis_file_(2);
+        if (ImGui::MenuItem("Compare With Binary...", nullptr, false, model_.has_file())) {
+            binary_diff_panel_.set_visible(true);
+            activate_panel(binary_diff_panel_.name().c_str());
+            if (on_analysis_file_) on_analysis_file_(3);
+        }
+        if (ImGui::MenuItem("Compare Active Live Module vs. Disk", nullptr, false, model_.is_live_process())) {
+            binary_diff_panel_.set_visible(true);
+            activate_panel(binary_diff_panel_.name().c_str());
+            if (auto r = binary_diff_panel_.compare_active_live_module_vs_disk(); !r) {
+                Log().error("Live Module Integrity Diff: {}", r.error().message);
+            }
+        }
         if (ImGui::MenuItem("Attach to Process...", "Ctrl+P")) {
             open_attach_process_modal();
         }
@@ -1727,7 +1757,8 @@ void UiApp::render_main_menu() {
                 symbols_panel_.set_visible(v);
         }
 
-        for (UiPanel* extra : {static_cast<UiPanel*>(&dependencies_panel_),
+        for (UiPanel* extra : {static_cast<UiPanel*>(&binary_diff_panel_),
+                               static_cast<UiPanel*>(&dependencies_panel_),
                                static_cast<UiPanel*>(&functions_panel_),
                                static_cast<UiPanel*>(&strings_panel_),
                                static_cast<UiPanel*>(&struct_view_panel_),
@@ -2727,6 +2758,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(memory_search_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow("Disassembly", main_id);
+    ImGui::DockBuilderDockWindow(binary_diff_panel_.name().c_str(), main_id);
     ImGui::DockBuilderDockWindow("Flow Graph", main_id);
     ImGui::DockBuilderDockWindow("Decompiler", right_id);
     if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(functions_panel_.name().c_str());
@@ -2996,6 +3028,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         if (!model_.is_live_process() || model_.process_session() == nullptr) {
             return;
         }
+        binary_diff_panel_.invalidate();
         sync_live_process_view(true);
         struct_view_panel_.reset_for_new_binary();
         Log().info("Attached to PID {} ({}): {} regions, {} modules, {} symbols",
@@ -3009,6 +3042,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     // Called after a file (PE or ELF) is loaded into the model, or after detaching.
     void UiApp::on_file_loaded() {
         patch_set_panel_.reset_preview();
+        binary_diff_panel_.invalidate();
         decompile_stop_.request_stop(); ++file_generation_; decompiled_ = {};
         annotations_.clear();
         debug_types_.clear(); ++symbol_revision_; decompiled_root_.reset();

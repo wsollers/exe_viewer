@@ -257,3 +257,10 @@ flowchart TD
 The checked-in `bin-matrix/` files let normal builds run parser, symbol,
 disassembly, and call-graph tests without regenerating fixtures. The Docker
 targets refresh the matrix when cross-toolchain coverage changes.
+
+## Binary Comparison & Disk-vs-Live-RAM Integrity Diff (`WU-12`)
+
+- `peelf::compare_binaries` (`libs/peelf_core/include/peelf/binary_diff.hpp`) diffs PE/ELF headers, sections (with SHA-256 and byte-change deltas), imports, exports, bounded coalesced byte hunks, and functions using a three-tier relocation- and address-shift-tolerant matcher (`ExactName`, `NormalizedFingerprint` masking PC/RIP-relative displacements and `.reloc`/ELF fixups, and n-gram `Similarity`).
+- `peelf::compare_module_disk_to_live` rebases an on-disk PE/ELF module to its live runtime `ModuleInfo::base_address`, normalizes `.reloc` / ELF `RELATIVE` entries, LoadConfig security cookies, and legitimate IAT/GOT loader resolutions, and surfaces unexpected `.text` `InlineCodeHook` detours and `IatGotPointerHook` hijacks.
+- `viewer::BinaryDiffPanel` (`View > Binary Diff`, `File > Compare With Binary...`) provides tabbed inspection plus synchronized side-by-side Hex and Disassembly views.
+

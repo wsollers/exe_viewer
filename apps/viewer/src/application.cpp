@@ -361,6 +361,22 @@ namespace viewer {
     void Application::analysis_file_dialog(int action) {
         if (!nfd_initialized_) return;
         nfdchar_t* path = nullptr;
+        if (action == 3) {
+            nfdfilteritem_t filters[2] = {
+                {"Executables", "exe,dll,so,elf,bin,sys"},
+                {"All Files", "*"},
+            };
+            if (NFD_OpenDialog(&path, filters, 2, nullptr) == NFD_OKAY) {
+                std::filesystem::path selected = utf8_path(path);
+                NFD_FreePath(path);
+                if (auto cmp = ui_->compare_with_binary(selected); cmp) {
+                    Log().info("Compared binary against: {}", selected.string());
+                } else {
+                    Log().error("Binary Diff: {}", cmp.error().message);
+                }
+            }
+            return;
+        }
         nfdfilteritem_t filter{action == 2 ? "Patch report" : "Analysis project", action == 2 ? "txt" : "peproj"};
         auto result = action == 0 ? NFD_OpenDialog(&path, &filter, 1, nullptr) : NFD_SaveDialog(&path, &filter, 1, nullptr, nullptr);
         if (result == NFD_OKAY) {

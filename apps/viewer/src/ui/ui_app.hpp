@@ -20,6 +20,7 @@
 #include "ui_panels_struct_view.hpp"
 #include "ui_panels_process_internals.hpp"
 #include "ui_panels_dependencies.hpp"
+#include "ui_panels_diff.hpp"
 #include "decompile/decompiler.hpp"
 #include <future>
 #include "disasm/disassembler.hpp"
@@ -48,6 +49,7 @@ namespace viewer {
                                          bool allow_modified_binary = false,
                                          bool skip_mismatched_patches = false);
         peelf::Result<void> save_patch_report(const std::filesystem::path&);
+        peelf::Result<void> compare_with_binary(const std::filesystem::path& path);
         void set_code_font(ImFont* font) { code_font_ = font; }
 
         LogPanel& log_panel() { return log_panel_; }
@@ -172,6 +174,7 @@ namespace viewer {
         StructureViewPanel struct_view_panel_;
         ProcessInternalsPanel process_internals_panel_;
         DependenciesPanel dependencies_panel_;
+        BinaryDiffPanel binary_diff_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;

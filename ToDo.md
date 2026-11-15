@@ -74,7 +74,7 @@ Each work unit below is sized as a self-contained, testable commit+push slice on
   - Turn PE imports/delay-load/bound imports + API-set names and ELF `DT_NEEDED` (`DT_RPATH`/`DT_RUNPATH`, interpreter, configurable search roots) + live loaded modules into a navigable dependency DAG/tree surfacing unresolved libraries/symbols, architecture/bitness mismatches, and explicit resolution-path provenance.
 - [x] **WU-11** — **Assembler Providers (`AsmTK` + `llvm-mc`) & Reusable Patch Bundles.** *(Depends on: `WU-01`, `WU-09`)*
   - Wire `peelf::asmtk` (x86/x64 fast path) and external `llvm-mc` + `llvm-objcopy` (multi-arch path) behind `IAssemblerProvider`, complete the split Patch Editor preview (`P6-22`), and add reusable JSON patch bundles with target `SHA-256` & original-byte verification, conflict previews, and transactional apply/rollback for static files.
-- [ ] **WU-12** — **Binary Comparison & Disk-vs-Live-RAM Diff Workspace (Feedback Priority #3).** *(Depends on: `WU-01`, `WU-03`, `WU-05`)*
+- [x] **WU-12** — **Binary Comparison & Disk-vs-Live-RAM Diff Workspace (Feedback Priority #3).** *(Depends on: `WU-01`, `WU-03`, `WU-05`)*
   - Compare two static builds—or an on-disk module against its live attached RAM image (surfacing inline hooks and IAT/GOT modifications after relocation normalization)—across headers, sections, imports, exports, and changed byte intervals, with synchronized dual Hex/Disassembly navigation and relocation-tolerant function matching.
 - [ ] **WU-13** — **Formalized BinSkim-Style Security Rules & Headless CLI Export (Feedback Priority #7).** *(Depends on: `WU-01`, `WU-10`, `WU-12`)*
   - Formalize rule-ID-backed PE/ELF security findings (severity, evidence, affected VA/table, remediation) and upgrade `peelf_viewer --headless` to export JSON/SARIF reports (metadata, sections, imports/dependencies, symbols, strings, security findings, and binary comparison diffs) with deterministic CI exit codes.
@@ -318,7 +318,7 @@ Items promoted into the active **Next-Gen Execution Queue (`§1b`)** carry their
 - [x] PDB / DWARF debug-info association — Windows PDB/DIA + ELF/MinGW DWARF v2–v5 & `.gnu_debuglink`/`.note.gnu.build-id` separate-debug discovery + live ASLR rebasing (`WU-05`).
 - [x] Endian-aware search across static sections and live memory regions (byte/wildcard patterns, ASCII/UTF-16 strings, scalars, pointer xrefs — shipped in `Memory Search`); regex filter stretch remains open.
 - [ ] Headless CLI & report export to JSON/SARIF/CSV (`WU-13`).
-- [ ] Binary comparison & disk-vs-live-RAM diff workspace (`WU-12`).
+- [x] Binary comparison & disk-vs-live-RAM diff workspace (`WU-12`).
 - [x] Reusable JSON patch bundles with `SHA-256`/original-byte conflict checks (`WU-11`); IPS/BPS export stretch.
 - [x] Process Explorer / System Informer user-mode harvest — threads/registers/stacks/TLS/PEB-TEB/Linux `status`/`auxv`/handlers plus lazy-loaded open handles/FDs, TCP/UDP/UNIX sockets, security tokens/capabilities/mitigations, and thread start-address/wait-reason/CPU deltas (`WU-08`).
 - [x] Sysinternals VMMap feature harvest — region classification & protection table (`P6-16`) plus `smaps`/working-set visual stacked bars, thread-stack/heap attribution, & compressed canonical VA heat strip (`WU-07`).
