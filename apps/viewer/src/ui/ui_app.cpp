@@ -1,4 +1,5 @@
 #include "ui_app.hpp"
+#include "graph/layout_edit.hpp"
 #include "theme.hpp"
 #include "analysis/project.hpp"
 #include <imgui.h>
@@ -1038,6 +1039,8 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
     }
     current_call_graph_.reset();
     current_call_graph_layout_.reset();
+    original_call_graph_layout_.reset();
+    dragged_graph_card_.reset();
     const std::filesystem::path plain_path = std::filesystem::temp_directory_path() / (output_name.string() + ".plain");
     const DefaultProcessRunner runner;
     const GraphRenderResult render_result =
@@ -1065,6 +1068,7 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
     }
 
     loaded_call_graph_bmp_ = plain_path;
+    original_call_graph_layout_ = current_call_graph_layout_;
     current_call_graph_ = std::move(graph);
     center_graph_selection_ = current_selection_.virtual_address.has_value();
     call_graph_status_ = "Loaded graph layout from current image";
@@ -1195,7 +1199,12 @@ void UiApp::render_call_graph_panel() {
     ImGui::SameLine();
     if (ImGui::Button("100%")) { graph_zoom_ = 1; graph_pan_ = {}; }
     ImGui::SameLine();
-    ImGui::TextDisabled("Wheel: zoom  |  Middle-drag: pan  |  Click: inspect block");
+    if (ImGui::Button("Reset cards") && original_call_graph_layout_) {
+        current_call_graph_layout_ = original_call_graph_layout_;
+        dragged_graph_card_.reset(); fit_graph_ = true; graph_pan_ = {};
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Wheel: zoom  |  Middle-drag: pan  |  Drag: move card  |  Click: inspect");
 
     if (!call_graph_status_.empty()) {
         ImGui::TextUnformatted(call_graph_status_.c_str());
@@ -1384,8 +1393,34 @@ void UiApp::render_call_graph_panel() {
                             if (target) navigate_to_address(*target, PreferredView::Graph);
                         }
                     }
-                } else activate_call_graph_node(*node);
+                } else {
+                    dragged_graph_card_ = node->id;
+                    graph_card_moved_ = false;
+                    graph_card_mouse_ = ImGui::GetIO().MousePos;
+                }
             }
+        }
+        if (dragged_graph_card_) {
+            const auto mouse = ImGui::GetIO().MousePos;
+            const ImVec2 delta(mouse.x - graph_card_mouse_.x, mouse.y - graph_card_mouse_.y);
+            const auto threshold = ImGui::GetIO().MouseDragThreshold;
+            if ((graph_card_moved_ || delta.x*delta.x + delta.y*delta.y >= threshold*threshold) &&
+                move_graph_card(*current_call_graph_layout_, *dragged_graph_card_, delta.x, delta.y, scale)) {
+                graph_card_moved_ = true;
+                graph_card_mouse_ = mouse;
+                const auto moved_bounds = graph_layout_bounds(*current_call_graph_layout_);
+                // Changing the outer bounds must not move the other cards on screen.
+                graph_pan_.x += static_cast<float>((moved_bounds.min_x + moved_bounds.max_x - bounds.min_x - bounds.max_x) * 0.5) * scale;
+                graph_pan_.y += static_cast<float>(bounds.max_y - moved_bounds.max_y) * scale;
+                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+            }
+        }
+        if (dragged_graph_card_ && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            if (!graph_card_moved_ && ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+                const auto node = std::ranges::find(current_call_graph_->nodes, *dragged_graph_card_, &CallGraphNode::id);
+                if (node != current_call_graph_->nodes.end()) activate_call_graph_node(*node);
+            }
+            dragged_graph_card_.reset();
         }
     } else if (call_graph_texture_) {
         const float image_width = static_cast<float>(call_graph_texture_->width);

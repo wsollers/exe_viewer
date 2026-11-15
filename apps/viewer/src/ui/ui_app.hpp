@@ -158,6 +158,10 @@ namespace viewer {
         std::optional<VulkanManager::Texture> call_graph_texture_;
         std::optional<CallGraph> current_call_graph_;
         std::optional<GraphLayout> current_call_graph_layout_;
+        std::optional<GraphLayout> original_call_graph_layout_;
+        std::optional<std::string> dragged_graph_card_;
+        bool graph_card_moved_ = false;
+        ImVec2 graph_card_mouse_{};
         std::optional<SymbolRecord> pending_call_graph_root_;
         std::optional<SymbolRecord> active_graph_root_;
         bool function_cfg_ = true;

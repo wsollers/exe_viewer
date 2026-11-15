@@ -1466,3 +1466,19 @@ TEST(CallGraph, FindsSymbolsByVirtualAddressAcrossArchitectures) {
     ASSERT_TRUE(riscv_ref.has_value());
     EXPECT_EQ(riscv_ref->name, riscv_symbol.name);
 }
+
+#include "graph/layout_edit.hpp"
+TEST(CallGraph, MovingCardsRespectsZoomAndPreservesOtherNodes) {
+    viewer::GraphLayout layout{10,10,{{"a",2,3,1,1},{"b",6,7,2,2}}};
+    EXPECT_TRUE(viewer::move_graph_card(layout,"a",100,50,50));
+    EXPECT_DOUBLE_EQ(layout.nodes[0].center_x,4);
+    EXPECT_DOUBLE_EQ(layout.nodes[0].center_y,2);
+    EXPECT_DOUBLE_EQ(layout.nodes[1].center_x,6);
+    EXPECT_DOUBLE_EQ(layout.nodes[1].center_y,7);
+    EXPECT_DOUBLE_EQ(layout.nodes[0].width,1);
+    EXPECT_FALSE(viewer::move_graph_card(layout,"missing",1,2,50));
+    EXPECT_FALSE(viewer::move_graph_card(layout,"a",1,2,0));
+    EXPECT_TRUE(viewer::move_graph_card(layout,"a",-250,-100,50));
+    EXPECT_DOUBLE_EQ(layout.nodes[0].center_x,-1);
+    EXPECT_DOUBLE_EQ(layout.nodes[0].center_y,4);
+}
