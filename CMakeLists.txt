@@ -20,6 +20,11 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=libc\\+\\+")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>)
+  add_link_options(-fexperimental-library)
+endif()
+
 include(cmake/ProjectOptions.cmake)  # <-- Add here, once
 
 option(PEELF_BUILD_VIEWER "Build the GUI viewer application" ON)
