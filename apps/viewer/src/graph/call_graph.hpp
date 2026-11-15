@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -121,11 +122,17 @@ public:
                                         std::span<const std::string> arguments) const override;
 };
 
+using GraphByteReader = std::function<std::vector<std::uint8_t>(std::uint64_t offset, std::size_t size)>;
+
 [[nodiscard]] std::string to_dot(const CallGraph& graph);
 [[nodiscard]] CallGraph build_entry_call_graph(const peelf::IBinaryImage& image);
 [[nodiscard]] CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolIndex& symbol_index);
 [[nodiscard]] CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                                                        std::span<const std::uint8_t> image_bytes,
+                                                       const SymbolIndex& symbol_index,
+                                                       const SymbolRecord& root);
+[[nodiscard]] CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
+                                                       const GraphByteReader& read_bytes,
                                                        const SymbolIndex& symbol_index,
                                                        const SymbolRecord& root);
 [[nodiscard]] CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_bytes,

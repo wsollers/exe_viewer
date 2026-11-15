@@ -51,27 +51,29 @@ namespace viewer {
         void render_disassembly_panel();
 
         void on_file_loaded();
+        void on_process_attached();
         void load_debug_symbols(const std::filesystem::path& path);
 
         ImVec4 get_mnemonic_color(const std::string &mnemonic) const;
 
         void disassemble_section(const std::string &section_name, std::size_t max_size);
 
-        // Disassemble a window of raw bytes starting at a file offset (used by the
-        // Hex view's click-to-disassemble). Format-agnostic.
-        void disassemble_at_offset(std::size_t file_offset);
-        void disassemble_at_offset(std::size_t file_offset, std::uint64_t display_address);
+        // Disassemble a window of raw bytes starting at a file/window offset (used by
+        // Hex view, Symbols, MemMap, and Structure navigation). Format-agnostic.
+        void disassemble_at_offset(std::uint64_t file_offset);
+        void disassemble_at_offset(std::uint64_t file_offset, std::uint64_t display_address);
+        void refresh_disassembly();
 
 
     private:
         BinaryModel& model_;
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
-        SymbolIndex symbol_index_;
         ViewerSelection current_selection_;
         std::optional<ViewerSelection> last_navigation_selection_;
 
         FilePanel       file_panel_;
+        MemoryMapPanel  memory_map_panel_;
         StructureNavigatorPanel structure_panel_;
         SelectionDetailsPanel details_panel_;
         SectionsPanel   sections_panel_;
@@ -95,6 +97,21 @@ namespace viewer {
         bool reset_dock_layout_ = false;
         bool show_disassembly_panel_ = true;
         bool show_call_graph_panel_ = false;
+
+        // Live process attach modal state
+        bool open_attach_modal_next_frame_ = false;
+        std::vector<peelf::ProcessInfo> cached_process_list_;
+        char process_filter_buf_[128] = {};
+        char manual_pid_buf_[32] = {};
+        bool process_accessible_only_ = false;
+        std::optional<peelf::ProcessId> selected_attach_pid_;
+        std::string attach_error_message_;
+
+        // Current disassembly cursor for live refresh after staging/committing patches
+        std::optional<std::uint64_t> last_disasm_offset_;
+        std::uint64_t last_disasm_address_ = 0;
+        std::string disasm_status_;
+
         CallGraphSample call_graph_sample_ = CallGraphSample::LoadedImage;
         std::optional<VulkanManager::Texture> call_graph_texture_;
         std::optional<CallGraph> current_call_graph_;
@@ -110,6 +127,10 @@ namespace viewer {
 
         void render_main_menu();
         void render_dockspace();
+        void render_attach_process_modal();
+        void open_attach_process_modal();
+        void refresh_process_list();
+        void sync_live_process_view(bool navigate_to_entry);
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);
         void queue_call_graph_sample(CallGraphSample sample);

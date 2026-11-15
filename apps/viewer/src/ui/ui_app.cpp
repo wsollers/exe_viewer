@@ -4,17 +4,24 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <limits>
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
+
+#include <peelf/process.hpp>
 
 #include "graph/call_graph.hpp"
 #include "logger.hpp"
@@ -46,7 +53,32 @@ namespace {
 [[nodiscard]] bool same_selection(const ViewerSelection& lhs, const ViewerSelection& rhs) {
     return lhs.kind == rhs.kind &&
            lhs.object_index == rhs.object_index &&
+           lhs.file_offset == rhs.file_offset &&
+           lhs.virtual_address == rhs.virtual_address &&
            lhs.label == rhs.label;
+}
+
+[[nodiscard]] std::size_t clamp_to_size_t(std::uint64_t value) noexcept {
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return static_cast<std::size_t>(value);
+}
+
+[[nodiscard]] bool icontains_filter(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return true;
+    }
+    const auto it = std::search(
+        haystack.begin(),
+        haystack.end(),
+        needle.begin(),
+        needle.end(),
+        [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        });
+    return it != haystack.end();
 }
 
 struct BmpImage {
@@ -256,6 +288,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     : model_(model)
     , vulkan_(vulkan)
     , file_panel_(model)
+    , memory_map_panel_(model, current_selection_)
     , structure_panel_(structure_tree_, current_selection_)
     , details_panel_(current_selection_)
     , sections_panel_(model)
@@ -271,61 +304,155 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , pe_exports_panel_(model)
 {
     hex_panel_.set_byte_activated_callback([this](std::size_t off) {
+        const std::optional<std::uint64_t> va = model_.offset_to_virtual_address(off);
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::None,
+            .label = va ? std::format("VA 0x{:X}", *va) : std::format("Offset 0x{:X}", off),
+            .file_offset = off,
+            .virtual_address = va,
+            .size = 1,
+            .preferred_view = PreferredView::Hex,
+        };
+        last_navigation_selection_ = current_selection_;
         disassemble_at_offset(off);
     });
+    hex_panel_.set_bytes_patched_callback([this](std::size_t) {
+        refresh_disassembly();
+    });
+
+    auto on_refresh_map = [this]() {
+        auto res = model_.refresh_process_map();
+        if (!res) {
+            Log().error("Failed to refresh process memory map: {}", res.error().message);
+            return;
+        }
+        sync_live_process_view(false);
+        Log().info("Refreshed process memory map ({} regions, {} modules)",
+                   model_.memory_regions().size(),
+                   model_.process_modules().size());
+    };
+    auto on_detach_proc = [this]() {
+        model_.detach_process();
+        on_file_loaded();
+        Log().info("Detached from live process");
+    };
+
+    file_panel_.set_attach_requested_callback([this]() { open_attach_process_modal(); });
+    file_panel_.set_refresh_requested_callback(on_refresh_map);
+    file_panel_.set_detach_requested_callback(on_detach_proc);
+
+    memory_map_panel_.set_attach_requested_callback([this]() {
+        open_attach_process_modal();
+    });
+    memory_map_panel_.set_refresh_requested_callback(on_refresh_map);
+    memory_map_panel_.set_detach_requested_callback(on_detach_proc);
+    memory_map_panel_.set_module_selected_callback([this](std::size_t module_index) {
+        auto res = model_.select_process_module(module_index);
+        if (!res) {
+            Log().error("Failed to select module: {}", res.error().message);
+            return;
+        }
+        sync_live_process_view(true);
+    });
+    memory_map_panel_.set_region_activated_callback([this](std::size_t region_index, bool prefer_module_context) {
+        if (region_index >= model_.memory_regions().size()) {
+            return;
+        }
+        const peelf::MemoryRegion reg_copy = model_.memory_regions()[region_index];
+        auto res = model_.select_memory_region(region_index, prefer_module_context);
+        if (!res) {
+            Log().error("Failed to select memory region: {}", res.error().message);
+            return;
+        }
+        sync_live_process_view(false);
+        const std::uint64_t offset = model_.virtual_address_to_offset(reg_copy.start_address).value_or(0u);
+        current_selection_ = selection_from_memory_region(reg_copy, static_cast<std::uint64_t>(region_index), offset);
+        hex_panel_.navigate_to_range(clamp_to_size_t(offset),
+                                     clamp_to_size_t(std::min<std::uint64_t>(reg_copy.size(), 16u)));
+        if (reg_copy.protection.executable) {
+            disassemble_at_offset(offset, reg_copy.start_address);
+        }
+        last_navigation_selection_ = current_selection_;
+    });
+
+    patch_set_panel_.set_patch_activated_callback([this](const ViewerSelection& sel) {
+        std::optional<std::uint64_t> off = sel.file_offset;
+        if (!off && sel.virtual_address) {
+            if (model_.is_live_process() && !model_.virtual_address_to_offset(*sel.virtual_address)) {
+                if (model_.navigate_to_virtual_address(*sel.virtual_address)) {
+                    sync_live_process_view(false);
+                }
+            }
+            off = model_.virtual_address_to_offset(*sel.virtual_address);
+        }
+        if (off) {
+            const std::uint64_t sz = sel.size != 0 ? sel.size : 1u;
+            hex_panel_.navigate_to_range(clamp_to_size_t(*off), clamp_to_size_t(sz));
+            disassemble_at_offset(*off, sel.virtual_address.value_or(*off));
+        }
+        last_navigation_selection_ = sel;
+    });
+    patch_set_panel_.set_patch_mutated_callback([this]() {
+        refresh_disassembly();
+    });
+    shellcode_panel_.set_patch_changed_callback([this]() {
+        refresh_disassembly();
+    });
+
     sections_panel_.set_section_activated_callback(
         [this](const peelf::Section& section, std::uint64_t object_index) {
+            const std::optional<std::uint64_t> nav_offset =
+                model_.is_live_process()
+                    ? model_.virtual_address_to_offset(section.virtual_address)
+                    : std::optional<std::uint64_t>(section.file_offset);
+            if (!nav_offset) {
+                Log().warn("Section '{}' at 0x{:X} is outside the active window",
+                           section.name,
+                           section.virtual_address);
+                return;
+            }
             const std::uint64_t range_size = section.file_size != 0 ? section.file_size : section.virtual_size;
             current_selection_ = ViewerSelection{
                 .kind = SelectionKind::Section,
                 .label = section.name,
-                .file_offset = section.file_offset,
+                .file_offset = *nav_offset,
                 .virtual_address = section.virtual_address,
                 .size = std::max(section.file_size, section.virtual_size),
                 .object_index = object_index,
                 .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex
             };
-            hex_panel_.navigate_to_range(static_cast<std::size_t>(section.file_offset),
-                                         static_cast<std::size_t>(range_size));
+            hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset),
+                                         clamp_to_size_t(std::max<std::uint64_t>(range_size, 1u)));
             if (section.executable) {
-                disassemble_at_offset(static_cast<std::size_t>(section.file_offset), section.virtual_address);
+                disassemble_at_offset(*nav_offset, section.virtual_address);
             }
             last_navigation_selection_ = current_selection_;
         });
-    symbols_panel_.set_symbol_activated_callback([this](const peelf::Symbol& symbol, std::uint64_t object_index) {
-        const peelf::IBinaryImage* img = model_.image();
-        if (img == nullptr) {
+    symbols_panel_.set_symbol_record_activated_callback([this](const SymbolRecord& record, std::uint64_t object_index) {
+        std::optional<std::uint64_t> nav_offset = record.file_offset;
+        if (record.virtual_address) {
+            const auto model_off = model_.virtual_address_to_offset(*record.virtual_address);
+            if (model_off) {
+                nav_offset = model_off;
+            } else if (model_.is_live_process() && model_.navigate_to_virtual_address(*record.virtual_address)) {
+                sync_live_process_view(false);
+                nav_offset = model_.virtual_address_to_offset(*record.virtual_address);
+            }
+        }
+        if (!nav_offset) {
+            Log().warn("Symbol '{}' at 0x{:X} does not map to readable bytes",
+                       record.name.empty() ? "<unnamed>" : record.name,
+                       record.virtual_address.value_or(0u));
             return;
         }
 
-        const auto file_offset = img->virtual_address_to_file_offset(symbol.virtual_address);
-        if (!file_offset) {
-            Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
-                       symbol.name.empty() ? "<unnamed>" : symbol.name,
-                       symbol.virtual_address);
-            return;
+        const std::uint64_t highlight_size = record.size != 0 ? record.size : 1u;
+        current_selection_ = selection_from_symbol_record(record, object_index);
+        current_selection_.file_offset = *nav_offset;
+        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(highlight_size));
+        if (current_selection_.preferred_view == PreferredView::Disassembly) {
+            disassemble_at_offset(*nav_offset, record.virtual_address.value_or(*nav_offset));
         }
-        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
-            symbol.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            Log().warn("Symbol '{}' range is too large for this platform",
-                       symbol.name.empty() ? "<unnamed>" : symbol.name);
-            return;
-        }
-
-        const std::size_t highlight_size = symbol.size != 0
-            ? static_cast<std::size_t>(symbol.size)
-            : std::size_t{1};
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::Symbol,
-            .label = symbol.name.empty() ? "<unnamed>" : symbol.name,
-            .file_offset = *file_offset,
-            .virtual_address = symbol.virtual_address,
-            .size = symbol.size,
-            .object_index = object_index,
-            .preferred_view = PreferredView::Disassembly
-        };
-        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
-        disassemble_at_offset(static_cast<std::size_t>(*file_offset), symbol.virtual_address);
         last_navigation_selection_ = current_selection_;
     });
     imports_panel_.set_import_activated_callback([this](const peelf::ImportEntry& entry, std::uint64_t object_index) {
@@ -334,22 +461,20 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             return;
         }
 
-        const auto file_offset = img->virtual_address_to_file_offset(entry.address);
-        if (!file_offset) {
-            Log().warn("Import '{}!{}' at 0x{:X} does not map to file bytes",
+        std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(entry.address);
+        if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(entry.address)) {
+            sync_live_process_view(false);
+            nav_offset = model_.virtual_address_to_offset(entry.address);
+        }
+        if (!nav_offset) {
+            Log().warn("Import '{}!{}' at 0x{:X} does not map to bytes",
                        entry.library,
                        entry.name.empty() ? "<ordinal-or-library>" : entry.name,
                        entry.address);
             return;
         }
-        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            Log().warn("Import '{}!{}' address is too large for this platform",
-                       entry.library,
-                       entry.name.empty() ? "<ordinal-or-library>" : entry.name);
-            return;
-        }
 
-        const std::size_t pointer_size = img->is_64bit() ? 8u : 4u;
+        const std::uint64_t pointer_size = img->is_64bit() ? 8u : 4u;
         std::string label = entry.library;
         if (!entry.name.empty()) {
             label += "!";
@@ -358,13 +483,13 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         current_selection_ = ViewerSelection{
             .kind = SelectionKind::Import,
             .label = std::move(label),
-            .file_offset = *file_offset,
+            .file_offset = *nav_offset,
             .virtual_address = entry.address,
             .size = pointer_size,
             .object_index = object_index,
             .preferred_view = PreferredView::Hex
         };
-        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), pointer_size);
+        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(pointer_size));
         last_navigation_selection_ = current_selection_;
     });
     exports_panel_.set_export_activated_callback([this](const peelf::ExportEntry& entry, std::uint64_t object_index) {
@@ -373,30 +498,29 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             return;
         }
 
-        const auto file_offset = img->virtual_address_to_file_offset(entry.virtual_address);
-        if (!file_offset) {
-            Log().warn("Export '{}' at 0x{:X} does not map to file bytes",
+        std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(entry.virtual_address);
+        if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(entry.virtual_address)) {
+            sync_live_process_view(false);
+            nav_offset = model_.virtual_address_to_offset(entry.virtual_address);
+        }
+        if (!nav_offset) {
+            Log().warn("Export '{}' at 0x{:X} does not map to bytes",
                        entry.name.empty() ? "<unnamed>" : entry.name,
                        entry.virtual_address);
-            return;
-        }
-        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            Log().warn("Export '{}' address is too large for this platform",
-                       entry.name.empty() ? "<unnamed>" : entry.name);
             return;
         }
 
         current_selection_ = ViewerSelection{
             .kind = SelectionKind::Export,
             .label = entry.name.empty() ? "<unnamed>" : entry.name,
-            .file_offset = *file_offset,
+            .file_offset = *nav_offset,
             .virtual_address = entry.virtual_address,
             .size = 1,
             .object_index = object_index,
             .preferred_view = PreferredView::Disassembly
         };
-        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), 1);
-        disassemble_at_offset(static_cast<std::size_t>(*file_offset), entry.virtual_address);
+        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), 1);
+        disassemble_at_offset(*nav_offset, entry.virtual_address);
         last_navigation_selection_ = current_selection_;
     });
 }
@@ -411,8 +535,10 @@ UiApp::~UiApp() {
 void UiApp::render() {
     render_main_menu();
     render_dockspace();
+    render_attach_process_modal();
 
     file_panel_.draw();
+    memory_map_panel_.draw();
     structure_panel_.draw();
     apply_structure_selection_navigation();
     details_panel_.draw();
@@ -446,11 +572,66 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) {
             if (on_open_file_) { on_open_file_(); }
         }
-        if (ImGui::MenuItem("Open Debug Symbols...")) {
+        if (ImGui::MenuItem("Attach to Process...", "Ctrl+P")) {
+            open_attach_process_modal();
+        }
+        if (ImGui::MenuItem("Refresh Process Memory Map", "F5", false, model_.is_live_process())) {
+            auto res = model_.refresh_process_map();
+            if (res) {
+                sync_live_process_view(false);
+                Log().info("Refreshed process memory map");
+            } else {
+                Log().error("Refresh failed: {}", res.error().message);
+            }
+        }
+        if (ImGui::MenuItem("Detach from Process", nullptr, false, model_.is_live_process())) {
+            model_.detach_process();
+            on_file_loaded();
+            Log().info("Detached from live process");
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Open Debug Symbols...", nullptr, false, model_.image() != nullptr)) {
             if (on_open_debug_symbols_) { on_open_debug_symbols_(); }
         }
-        if (ImGui::MenuItem("Save Patched As...")) {
+        if (ImGui::MenuItem("Save Patched As...",
+                            nullptr,
+                            false,
+                            !model_.is_live_process() && model_.editable_image() != nullptr)) {
             if (on_save_patched_as_) { on_save_patched_as_(); }
+        }
+        if (ImGui::MenuItem("Commit Patches to Process",
+                            nullptr,
+                            false,
+                            model_.is_live_process() && !model_.staged_live_patches().empty())) {
+            auto res = model_.commit_patches_to_process(
+                peelf::MemoryWriteOptions{.allow_protection_override = true});
+            if (res) {
+                Log().info("Committed {} staged patch range(s) to live process RAM", *res);
+                refresh_disassembly();
+            } else {
+                Log().error("Commit to RAM failed: {}", res.error().message);
+            }
+        }
+        if (ImGui::MenuItem("Discard Staged Patches",
+                            nullptr,
+                            false,
+                            model_.is_live_process() && !model_.staged_live_patches().empty())) {
+            model_.discard_staged_patches();
+            refresh_disassembly();
+            Log().info("Discarded staged live patches");
+        }
+        if (ImGui::MenuItem("Revert Committed RAM Patches",
+                            nullptr,
+                            false,
+                            model_.is_live_process() && !model_.committed_live_patches().empty())) {
+            auto res = model_.revert_committed_patches(
+                peelf::MemoryWriteOptions{.allow_protection_override = true});
+            if (res) {
+                Log().info("Reverted {} committed patch range(s) in process RAM", *res);
+                refresh_disassembly();
+            } else {
+                Log().error("Revert committed RAM patches failed: {}", res.error().message);
+            }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -470,6 +651,12 @@ void UiApp::render_main_menu() {
             bool v = file_panel_.visible();
             if (ImGui::MenuItem(file_panel_.name().c_str(), nullptr, &v))
                 file_panel_.set_visible(v);
+        }
+
+        {
+            bool v = memory_map_panel_.visible();
+            if (ImGui::MenuItem(memory_map_panel_.name().c_str(), nullptr, &v))
+                memory_map_panel_.set_visible(v);
         }
 
         {
@@ -597,15 +784,185 @@ void UiApp::render_dockspace() {
     ImGui::End();
 }
 
+void UiApp::open_attach_process_modal() {
+    attach_error_message_.clear();
+    refresh_process_list();
+    open_attach_modal_next_frame_ = true;
+}
+
+void UiApp::refresh_process_list() {
+    auto listed = model_.list_processes();
+    if (!listed) {
+        attach_error_message_ = "Failed to enumerate processes: " + listed.error().message;
+        cached_process_list_.clear();
+        return;
+    }
+    cached_process_list_ = std::move(*listed);
+}
+
+void UiApp::render_attach_process_modal() {
+    if (open_attach_modal_next_frame_) {
+        ImGui::OpenPopup("Attach to Process");
+        open_attach_modal_next_frame_ = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(860.0f, 540.0f), ImGuiCond_FirstUseEver);
+    bool modal_open = true;
+    if (!ImGui::BeginPopupModal("Attach to Process", &modal_open)) {
+        return;
+    }
+
+    auto try_attach_pid = [this](peelf::ProcessId pid) {
+        auto attached = model_.attach_process(pid);
+        if (!attached) {
+            attach_error_message_ = std::format("Attach to PID {} failed: {}", pid, attached.error().message);
+            Log().error("{}", attach_error_message_);
+            return;
+        }
+        attach_error_message_.clear();
+        on_process_attached();
+        ImGui::CloseCurrentPopup();
+    };
+
+    ImGui::SetNextItemWidth(320.0f);
+    ImGui::InputTextWithHint("##ProcSearch",
+                             "Filter by PID, name, path, or command line...",
+                             process_filter_buf_,
+                             sizeof(process_filter_buf_));
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh")) {
+        refresh_process_list();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Attach Self")) {
+        try_attach_pid(peelf::current_process_id());
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Accessible only", &process_accessible_only_);
+
+    ImGui::SetNextItemWidth(140.0f);
+    ImGui::InputTextWithHint("##ManualPid", "PID...", manual_pid_buf_, sizeof(manual_pid_buf_), ImGuiInputTextFlags_CharsDecimal);
+    ImGui::SameLine();
+    if (ImGui::Button("Attach PID")) {
+        char* end = nullptr;
+        const unsigned long long parsed = std::strtoull(manual_pid_buf_, &end, 10);
+        if (end != manual_pid_buf_ && parsed > 0 &&
+            parsed <= static_cast<unsigned long long>(std::numeric_limits<peelf::ProcessId>::max())) {
+            try_attach_pid(static_cast<peelf::ProcessId>(parsed));
+        } else {
+            attach_error_message_ = "Enter a valid positive numeric PID.";
+        }
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%zu processes enumerated)", cached_process_list_.size());
+
+    if (!attach_error_message_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", attach_error_message_.c_str());
+    }
+
+    ImGui::Separator();
+
+    const std::string_view filter(process_filter_buf_);
+    const float footer_height = ImGui::GetFrameHeightWithSpacing() + 8.0f;
+    if (ImGui::BeginTable("AttachProcessTable",
+                          6,
+                          ImGuiTableFlags_Borders |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_Resizable |
+                              ImGuiTableFlags_ScrollY,
+                          ImVec2(0.0f, -footer_height))) {
+        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 76.0f);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 165.0f);
+        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("User", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+        ImGui::TableSetupColumn("Executable / Command Line", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        for (const peelf::ProcessInfo& proc : cached_process_list_) {
+            const bool is_accessible = proc.access == peelf::ProcessAccessStatus::Accessible ||
+                                       proc.access == peelf::ProcessAccessStatus::ReadOnly;
+            if (process_accessible_only_ && !is_accessible) {
+                continue;
+            }
+            const std::string exe_path_str = proc.executable_path.string();
+            std::array<char, 32> pid_str{};
+            std::snprintf(pid_str.data(), pid_str.size(), "%" PRIu32, proc.pid);
+            if (!filter.empty() &&
+                !icontains_filter(pid_str.data(), filter) &&
+                !icontains_filter(proc.name, filter) &&
+                !icontains_filter(exe_path_str, filter) &&
+                !icontains_filter(proc.command_line, filter)) {
+                continue;
+            }
+
+            const bool is_sel = selected_attach_pid_ && *selected_attach_pid_ == proc.pid;
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::PushID(static_cast<int>(proc.pid & 0x7FFFFFFFu));
+            if (ImGui::Selectable(pid_str.data(),
+                                  is_sel,
+                                  ImGuiSelectableFlags_SpanAllColumns |
+                                      ImGuiSelectableFlags_AllowDoubleClick)) {
+                selected_attach_pid_ = proc.pid;
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    try_attach_pid(proc.pid);
+                }
+            }
+            ImGui::PopID();
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(proc.name.empty() ? "<unknown>" : proc.name.c_str());
+
+            ImGui::TableNextColumn();
+            const std::string_view arch = peelf::to_string(proc.architecture);
+            ImGui::TextUnformatted(arch.data(), arch.data() + arch.size());
+
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(proc.user.empty() ? "-" : proc.user.c_str());
+
+            ImGui::TableNextColumn();
+            const std::string_view access_label = peelf::to_string(proc.access);
+            ImGui::TextColored(is_accessible ? ImVec4(0.40f, 0.90f, 0.55f, 1.0f)
+                                             : ImVec4(0.70f, 0.55f, 0.55f, 1.0f),
+                               "%.*s",
+                               static_cast<int>(access_label.size()),
+                               access_label.data());
+
+            ImGui::TableNextColumn();
+            const std::string& detail = !exe_path_str.empty() ? exe_path_str : proc.command_line;
+            if (!detail.empty()) {
+                ImGui::TextUnformatted(detail.c_str());
+            } else {
+                ImGui::TextDisabled("-");
+            }
+        }
+
+        ImGui::EndTable();
+    }
+
+    ImGui::BeginDisabled(!selected_attach_pid_.has_value());
+    if (ImGui::Button("Attach", ImVec2(110.0f, 0.0f)) && selected_attach_pid_) {
+        try_attach_pid(*selected_attach_pid_);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(110.0f, 0.0f))) {
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
 void UiApp::load_call_graph_sample(CallGraphSample sample) {
     pending_call_graph_request_.reset();
     if (sample == CallGraphSample::LoadedImage) {
         const peelf::IBinaryImage* image = model_.image();
         if (image == nullptr) {
-            call_graph_status_ = "No image loaded. Open a PE/ELF file or choose a sample graph.";
+            call_graph_status_ = "No image loaded. Open a PE/ELF file or select a live module.";
             return;
         }
-        load_call_graph_from_graph(build_entry_call_graph(*image, symbol_index_), graph_bmp_name(sample));
+        load_call_graph_from_graph(build_entry_call_graph(*image, model_.symbol_index()), graph_bmp_name(sample));
         call_graph_sample_ = sample;
         return;
     }
@@ -643,10 +1000,23 @@ void UiApp::process_deferred_gpu_work() {
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         if (img != nullptr) {
+            const GraphByteReader reader = [this](std::uint64_t offset, std::size_t length)
+                -> std::vector<std::uint8_t> {
+                auto sample = model_.read_window_sample(offset, length);
+                if (!sample || sample->bytes.empty()) {
+                    return {};
+                }
+                std::size_t readable_prefix = 0;
+                while (readable_prefix < sample->valid.size() && sample->valid[readable_prefix] != 0) {
+                    ++readable_prefix;
+                }
+                sample->bytes.resize(readable_prefix);
+                return std::move(sample->bytes);
+            };
             load_call_graph_from_graph(
                 build_symbol_fanout_call_graph(*img,
-                                               std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
-                                               symbol_index_,
+                                               reader,
+                                               model_.symbol_index(),
                                                root),
                 "loaded_symbol_fanout_call_graph.bmp");
             call_graph_status_ = "Loaded fan-out from " + root.name;
@@ -721,37 +1091,47 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
     }
 
     current_selection_ = selection_from_call_graph_node(node, *img);
-    const std::optional<std::uint64_t> file_offset = current_selection_.file_offset;
+    std::optional<std::uint64_t> nav_offset = current_selection_.file_offset;
+    if (current_selection_.virtual_address) {
+        if (const auto model_off = model_.virtual_address_to_offset(*current_selection_.virtual_address)) {
+            nav_offset = model_off;
+            current_selection_.file_offset = model_off;
+        }
+    }
 
-    if (file_offset && *file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        const std::size_t size = current_selection_.size != 0 &&
-                                         current_selection_.size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
-                                     ? static_cast<std::size_t>(current_selection_.size)
-                                     : std::size_t{1};
-        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), size);
+    if (nav_offset) {
+        const std::uint64_t size = current_selection_.size != 0 ? current_selection_.size : 1u;
+        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(size));
         const std::uint64_t display_address = current_selection_.virtual_address
             ? *current_selection_.virtual_address
-            : *file_offset;
-        disassemble_at_offset(static_cast<std::size_t>(*file_offset), display_address);
+            : *nav_offset;
+        disassemble_at_offset(*nav_offset, display_address);
     }
     last_navigation_selection_ = current_selection_;
 
+    const SymbolIndex& sym_idx = model_.symbol_index();
     const SymbolRecord* record = nullptr;
     if (node.symbol && !node.symbol->name.empty()) {
-        record = symbol_index_.find_by_name(node.symbol->name);
+        record = sym_idx.find_by_name(node.symbol->name);
     }
     if (!node.label.empty()) {
         if (record == nullptr) {
-            record = symbol_index_.find_by_name(node.label);
+            record = sym_idx.find_by_name(node.label);
         }
     }
     if (record == nullptr && node.bytes.start.virtual_address) {
-        record = symbol_index_.find_containing_address(*node.bytes.start.virtual_address);
+        record = sym_idx.find_containing_address(*node.bytes.start.virtual_address);
     }
-    if (record != nullptr && record->virtual_address && record->file_offset) {
-        pending_call_graph_root_ = *record;
-        pending_call_graph_delay_frames_ = 1;
-        call_graph_status_ = "Queued fan-out from " + record->name;
+    if (record != nullptr && record->virtual_address) {
+        SymbolRecord resolved = *record;
+        if (!resolved.file_offset) {
+            resolved.file_offset = model_.virtual_address_to_offset(*resolved.virtual_address);
+        }
+        if (resolved.file_offset) {
+            pending_call_graph_root_ = std::move(resolved);
+            pending_call_graph_delay_frames_ = 1;
+            call_graph_status_ = "Queued fan-out from " + record->name;
+        }
     }
 }
 
@@ -921,6 +1301,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.42f, nullptr, &main_id);
 
     ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(memory_map_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
@@ -944,39 +1325,79 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     void UiApp::render_disassembly_panel() {
     ImGui::Begin("Disassembly");
 
-
     if (!file_loaded_ || !disasm_.is_initialized()) {
-        ImGui::Text("No file loaded or disassembler not initialized");
+        ImGui::TextDisabled("No file or live process loaded, or disassembler not initialized.");
         ImGui::End();
         return;
     }
 
-    // Simple table view
-    if (ImGui::BeginTable("DisasmTable", 4,
+    if (!disasm_status_.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.30f, 1.0f), "%s", disasm_status_.c_str());
+    }
+
+    // Table view with live symbol resolution and patch-state tinting
+    if (ImGui::BeginTable("DisasmTable", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 132.0f);
+        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, 150.0f);
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 180.0f);
-        ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 84.0f);
         ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
+        const SymbolIndex& sym_idx = model_.symbol_index();
         for (const auto &inst: current_instructions_) {
             ImGui::TableNextRow();
 
             // Address
             ImGui::TableNextColumn();
-            ImGui::Text("%016llX", inst.address);
+            ImGui::Text("0x%016" PRIX64, inst.address);
 
-            // Bytes
+            // Symbol label (exact match or containing symbol + delta)
             ImGui::TableNextColumn();
+            if (const SymbolRecord* exact = sym_idx.find_exact_address(inst.address)) {
+                ImGui::TextColored(ImVec4(0.55f, 0.88f, 1.0f, 1.0f), "%s:", exact->name.c_str());
+            } else if (const SymbolRecord* containing = sym_idx.find_containing_address(inst.address)) {
+                if (containing->virtual_address && inst.address > *containing->virtual_address) {
+                    ImGui::TextDisabled("%s+0x%" PRIX64,
+                                        containing->name.c_str(),
+                                        inst.address - *containing->virtual_address);
+                } else {
+                    ImGui::TextDisabled("%s", containing->name.c_str());
+                }
+            } else {
+                ImGui::TextDisabled("-");
+            }
+
+            // Bytes (highlight if any instruction byte is staged or committed)
+            ImGui::TableNextColumn();
+            BytePatchState inst_patch_state = BytePatchState::Unchanged;
+            if (const auto base_off = model_.virtual_address_to_offset(inst.address)) {
+                for (std::size_t bi = 0; bi < inst.bytes.size(); ++bi) {
+                    const BytePatchState st = model_.byte_patch_state_at_offset(*base_off + bi);
+                    if (st == BytePatchState::Staged) {
+                        inst_patch_state = BytePatchState::Staged;
+                        break;
+                    }
+                    if (st == BytePatchState::Committed) {
+                        inst_patch_state = BytePatchState::Committed;
+                    }
+                }
+            }
             std::string bytes_str;
             for (std::uint8_t b: inst.bytes) {
                 char buf[4];
-                snprintf(buf, sizeof(buf), "%02X ", b);
+                std::snprintf(buf, sizeof(buf), "%02X ", b);
                 bytes_str += buf;
             }
-            ImGui::TextDisabled("%s", bytes_str.c_str());
+            if (inst_patch_state == BytePatchState::Staged) {
+                ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.25f, 1.0f), "%s", bytes_str.c_str());
+            } else if (inst_patch_state == BytePatchState::Committed) {
+                ImGui::TextColored(ImVec4(0.35f, 0.92f, 0.55f, 1.0f), "%s", bytes_str.c_str());
+            } else {
+                ImGui::TextDisabled("%s", bytes_str.c_str());
+            }
 
             // Mnemonic (color-coded)
             ImGui::TableNextColumn();
@@ -993,15 +1414,97 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     ImGui::End();
 }
-    // Called after a file (PE or ELF) is loaded into the model.
+
+    void UiApp::sync_live_process_view(bool navigate_to_entry) {
+        if (!model_.is_live_process() || model_.process_session() == nullptr) {
+            return;
+        }
+
+        const peelf::IProcessSession* sess = model_.process_session();
+        structure_tree_ = build_live_process_structure_tree(
+            sess->info(),
+            model_.process_modules(),
+            model_.memory_regions(),
+            model_.image(),
+            model_.active_module_index());
+
+        pending_call_graph_root_.reset();
+        pending_call_graph_delay_frames_ = 0;
+        pending_call_graph_request_.reset();
+        if (call_graph_texture_) {
+            vulkan_.destroy_texture(*call_graph_texture_);
+            call_graph_texture_.reset();
+        }
+
+        const peelf::Architecture target_arch = model_.architecture() != peelf::Architecture::Unknown
+            ? model_.architecture()
+            : sess->info().architecture;
+        if (const std::optional<viewer::Architecture> arch = disassembler_architecture(target_arch)) {
+            file_loaded_ = disasm_.init(*arch, disassembler_endianness(model_.endianness()));
+        } else {
+            file_loaded_ = false;
+        }
+
+        if (const PeModel* pe = model_.pe()) {
+            pe_model_ = *pe;
+        } else {
+            pe_model_ = {};
+        }
+
+        if (navigate_to_entry) {
+            current_instructions_.clear();
+            disasm_status_.clear();
+            if (structure_tree_) {
+                current_selection_ = structure_tree_->selection;
+            }
+            const peelf::IBinaryImage* img = model_.image();
+            if (img != nullptr && img->entry_point() != 0) {
+                if (const auto entry_off = model_.virtual_address_to_offset(img->entry_point())) {
+                    hex_panel_.navigate_to_range(clamp_to_size_t(*entry_off), 1);
+                    disassemble_at_offset(*entry_off, img->entry_point());
+                } else {
+                    hex_panel_.navigate_to_range(0, 1);
+                    disassemble_at_offset(0, model_.view_base_address());
+                }
+            } else if (model_.view_size() > 0) {
+                hex_panel_.navigate_to_range(0, 1);
+                disassemble_at_offset(0, model_.view_base_address());
+            }
+            last_navigation_selection_ = current_selection_;
+            call_graph_sample_ = CallGraphSample::LoadedImage;
+            call_graph_status_ = "Attached to live module. Click Loaded Image or Reload to render the call graph.";
+        }
+    }
+
+    void UiApp::on_process_attached() {
+        if (!model_.is_live_process() || model_.process_session() == nullptr) {
+            return;
+        }
+        sync_live_process_view(true);
+        Log().info("Attached to PID {} ({}): {} regions, {} modules, {} symbols",
+                   model_.process_session()->pid(),
+                   model_.process_session()->info().name,
+                   model_.memory_regions().size(),
+                   model_.process_modules().size(),
+                   model_.symbol_index().size());
+    }
+
+    // Called after a file (PE or ELF) is loaded into the model, or after detaching.
     void UiApp::on_file_loaded() {
+        if (model_.is_live_process()) {
+            on_process_attached();
+            return;
+        }
+
         const peelf::IBinaryImage* img = model_.image();
         if (!img) {
             file_loaded_ = false;
             structure_tree_.reset();
-            symbol_index_ = {};
             current_selection_ = {};
             last_navigation_selection_.reset();
+            last_disasm_offset_.reset();
+            current_instructions_.clear();
+            disasm_status_.clear();
             pending_call_graph_root_.reset();
             pending_call_graph_delay_frames_ = 0;
             pending_call_graph_request_.reset();
@@ -1009,7 +1512,6 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
 
         structure_tree_ = build_structure_tree(*img);
-        symbol_index_ = SymbolIndex::build(*img);
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         pending_call_graph_request_.reset();
@@ -1026,7 +1528,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
         current_selection_ = structure_tree_->selection;
         last_navigation_selection_.reset();
-        Log().info("Loaded {} symbol records", symbol_index_.size());
+        Log().info("Loaded {} symbol records", model_.symbol_index().size());
 
         // Map the unified architecture onto the disassembler's enum.
         const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());
@@ -1045,20 +1547,22 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
         file_loaded_ = true;
         current_instructions_.clear();
+        disasm_status_.clear();
 
         if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
-            hex_panel_.navigate_to_range(static_cast<std::size_t>(*entry_offset), 1);
+            hex_panel_.navigate_to_range(clamp_to_size_t(*entry_offset), 1);
             last_navigation_selection_ = current_selection_;
         }
 
-        // PE keeps its entry-point disassembly via the legacy PeModel. ELF
-        // entry-point disassembly via the unified image is future work (P4);
-        // for now, click a byte in the Hex view to disassemble at that offset.
         if (const PeModel* pe = model_.pe()) {
             pe_model_ = *pe;
             disassemble_entry_point(4096);
+            if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
+                last_disasm_offset_ = *entry_offset;
+                last_disasm_address_ = img->entry_point();
+            }
         } else if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
-            disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
+            disassemble_at_offset(*entry_offset, img->entry_point());
         }
 
         call_graph_sample_ = CallGraphSample::LoadedImage;
@@ -1084,11 +1588,11 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             return;
         }
 
-        symbol_index_.add_debug_symbols(*img, std::span<const DebugSymbol>(result.symbols.data(), result.symbols.size()));
+        model_.add_debug_symbols(std::span<const DebugSymbol>(result.symbols.data(), result.symbols.size()));
         Log().info("Loaded {} debug symbols from {}; symbol index now has {} records",
                    result.symbols.size(),
                    path.string(),
-                   symbol_index_.size());
+                   model_.symbol_index().size());
 
         call_graph_status_ = "Debug symbols loaded. Use Reload to rebuild the call graph.";
         pending_call_graph_request_.reset();
@@ -1103,7 +1607,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     void UiApp::apply_structure_selection_navigation() {
         if (current_selection_.kind == SelectionKind::None ||
-            current_selection_.kind == SelectionKind::Group) {
+            current_selection_.kind == SelectionKind::Group ||
+            current_selection_.kind == SelectionKind::Process) {
             return;
         }
         if (last_navigation_selection_ &&
@@ -1111,38 +1616,62 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             return;
         }
 
-        const peelf::IBinaryImage* img = model_.image();
-        if (img == nullptr) {
-            return;
-        }
-
-        std::optional<std::uint64_t> file_offset = current_selection_.file_offset;
-        if (!file_offset && current_selection_.virtual_address) {
-            file_offset = img->virtual_address_to_file_offset(*current_selection_.virtual_address);
-        }
-
-        if (!file_offset) {
-            last_navigation_selection_ = current_selection_;
-            return;
-        }
-        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
-            current_selection_.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            Log().warn("Selection '{}' range is too large for this platform", current_selection_.label);
+        if (current_selection_.kind == SelectionKind::ProcessModule && model_.is_live_process()) {
+            const auto mod_idx = static_cast<std::size_t>(current_selection_.object_index);
+            if (model_.active_module_index() != mod_idx && mod_idx < model_.process_modules().size()) {
+                const ViewerSelection saved_sel = current_selection_;
+                if (model_.select_process_module(mod_idx)) {
+                    sync_live_process_view(true);
+                    current_selection_ = saved_sel;
+                }
+            }
             last_navigation_selection_ = current_selection_;
             return;
         }
 
-        const std::size_t offset = static_cast<std::size_t>(*file_offset);
-        const std::size_t size = current_selection_.size != 0
-            ? static_cast<std::size_t>(current_selection_.size)
-            : std::size_t{1};
-        hex_panel_.navigate_to_range(offset, size);
+        if (current_selection_.kind == SelectionKind::MemoryRegion && model_.is_live_process()) {
+            const auto reg_idx = static_cast<std::size_t>(current_selection_.object_index);
+            if (reg_idx < model_.memory_regions().size()) {
+                const peelf::MemoryRegion reg_copy = model_.memory_regions()[reg_idx];
+                const ViewerSelection saved_sel = current_selection_;
+                if (model_.select_memory_region(reg_idx, true)) {
+                    sync_live_process_view(false);
+                    current_selection_ = saved_sel;
+                    const std::uint64_t off = model_.virtual_address_to_offset(reg_copy.start_address).value_or(0u);
+                    current_selection_.file_offset = off;
+                    hex_panel_.navigate_to_range(clamp_to_size_t(off),
+                                                 clamp_to_size_t(std::min<std::uint64_t>(reg_copy.size(), 16u)));
+                    if (reg_copy.protection.executable) {
+                        disassemble_at_offset(off, reg_copy.start_address);
+                    }
+                }
+            }
+            last_navigation_selection_ = current_selection_;
+            return;
+        }
+
+        std::optional<std::uint64_t> nav_offset = current_selection_.file_offset;
+        if (model_.is_live_process() && current_selection_.virtual_address) {
+            if (const auto live_off = model_.virtual_address_to_offset(*current_selection_.virtual_address)) {
+                nav_offset = live_off;
+            }
+        } else if (!nav_offset && current_selection_.virtual_address) {
+            nav_offset = model_.virtual_address_to_offset(*current_selection_.virtual_address);
+        }
+
+        if (!nav_offset) {
+            last_navigation_selection_ = current_selection_;
+            return;
+        }
+
+        const std::uint64_t size = current_selection_.size != 0 ? current_selection_.size : 1u;
+        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(size));
 
         if (current_selection_.preferred_view == PreferredView::Disassembly) {
             const std::uint64_t display_address = current_selection_.virtual_address
                 ? *current_selection_.virtual_address
-                : *file_offset;
-            disassemble_at_offset(offset, display_address);
+                : *nav_offset;
+            disassemble_at_offset(*nav_offset, display_address);
         }
 
         last_navigation_selection_ = current_selection_;
@@ -1228,32 +1757,45 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
     }
 
-    void UiApp::disassemble_at_offset(std::size_t file_offset) {
-        std::uint64_t display_address = file_offset;
-        if (const peelf::IBinaryImage* img = model_.image()) {
-            if (const auto va = img->file_offset_to_virtual_address(file_offset)) {
-                display_address = *va;
-            }
-        }
+    void UiApp::disassemble_at_offset(std::uint64_t file_offset) {
+        const std::uint64_t display_address =
+            model_.offset_to_virtual_address(file_offset).value_or(file_offset);
         disassemble_at_offset(file_offset, display_address);
     }
 
-    void UiApp::disassemble_at_offset(std::size_t file_offset, std::uint64_t display_address) {
+    void UiApp::disassemble_at_offset(std::uint64_t file_offset, std::uint64_t display_address) {
         if (!file_loaded_ || !disasm_.is_initialized()) {
             return;
         }
-        const auto& bytes = model_.bytes();
-        if (file_offset >= bytes.size()) {
+        const std::uint64_t total_size = model_.view_size();
+        if (file_offset >= total_size) {
             return;
         }
+        last_disasm_offset_ = file_offset;
+        last_disasm_address_ = display_address;
+
         constexpr std::size_t kWindow = 256;
-        const std::size_t avail = bytes.size() - file_offset;
-        const std::size_t size = std::min(kWindow, avail);
-        auto effective = model_.read_effective_bytes(file_offset, size);
-        if (effective) {
-            current_instructions_ = disasm_.disassemble(effective->data(), effective->size(), display_address);
-        } else {
-            current_instructions_ = disasm_.disassemble(bytes.data() + file_offset, size, display_address);
+        const auto sample = model_.read_window_sample(file_offset, kWindow);
+        std::size_t readable_len = 0;
+        if (sample) {
+            while (readable_len < sample->valid.size() && sample->valid[readable_len] != 0) {
+                ++readable_len;
+            }
+        }
+        if (readable_len == 0) {
+            current_instructions_.clear();
+            disasm_status_ = std::format(
+                "Memory at 0x{:X} is unreadable (guard page or unmapped region).",
+                display_address);
+            return;
+        }
+        disasm_status_.clear();
+        current_instructions_ = disasm_.disassemble(sample->bytes.data(), readable_len, display_address);
+    }
+
+    void UiApp::refresh_disassembly() {
+        if (last_disasm_offset_) {
+            disassemble_at_offset(*last_disasm_offset_, last_disasm_address_);
         }
     }
 

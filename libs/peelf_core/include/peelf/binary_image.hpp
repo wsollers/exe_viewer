@@ -393,4 +393,21 @@ public:
 // Parse bytes into a concrete PE/ELF image behind the IBinaryImage interface.
 [[nodiscard]] Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> bytes);
 
+// Parse an on-disk PE/ELF file and rebase all virtual addresses and mapped section offsets
+// to a live runtime load base (`live_base`), so window offset `off` maps to `live_base + off`.
+[[nodiscard]] Result<std::unique_ptr<IBinaryImage>> parse_rebased_image(
+    std::span<const std::uint8_t> file_bytes,
+    std::uint64_t live_base);
+
+// Parse an already memory-mapped PE/ELF image snapshot read from `[live_base, live_base + size)`.
+[[nodiscard]] Result<std::unique_ptr<IBinaryImage>> parse_mapped_image(
+    std::span<const std::uint8_t> mapped_bytes,
+    std::uint64_t live_base);
+
+// Normalize an in-memory mapped PE snapshot so file-layout parsers (such as PeParser/PeImage)
+// can inspect headers, sections, exports, and imports directly at their mapped RVA offsets.
+[[nodiscard]] std::vector<std::uint8_t> normalize_mapped_pe_for_file_parsers(
+    std::span<const std::uint8_t> mapped_bytes,
+    std::uint64_t live_base);
+
 } // namespace peelf

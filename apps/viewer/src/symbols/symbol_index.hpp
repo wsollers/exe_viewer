@@ -58,5 +58,6 @@ private:
 };
 
 [[nodiscard]] std::string import_symbol_name(const peelf::ImportEntry& entry);
+[[nodiscard]] const char* to_string(SymbolSource source) noexcept;
 
 } // namespace viewer

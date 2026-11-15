@@ -10,11 +10,13 @@ boundaries we are adding for assembler/decompiler/live-process work.
 flowchart LR
     user["User"]
     app["peelf_viewer<br/>Application"]
-    ui["UiApp<br/>Dear ImGui panels"]
-    model["BinaryModel<br/>loaded file bytes + parsed image"]
-    core["peelf_core<br/>PE / ELF parsers"]
+    ui["UiApp<br/>Dear ImGui panels + MemMap + Attach Modal"]
+    model["BinaryModel<br/>static file OR live process session"]
+    core["peelf_core<br/>PE / ELF parsers + live rebasing"]
+    proc["IProcessBackend / IProcessSession<br/>Linux /proc + process_vm_* · Win32 Toolhelp + VirtualQueryEx"]
+    patches["PagedBinaryImage / LiveMemoryPatchSpace<br/>stage-first overlay + explicit Commit/Revert RAM"]
     disasm["Capstone wrapper<br/>Disassembler"]
-    symbols["SymbolIndex<br/>parser symbols + debug symbols"]
+    symbols["SymbolIndex<br/>PE/ELF symbols + GOT/PLT + rebased PDB"]
     graph["CallGraph model<br/>entry / fan-out / CFG work"]
     graphviz["Graphviz dot<br/>external renderer"]
     vulkan["VulkanManager<br/>textures + ImGui backend"]
@@ -23,6 +25,8 @@ flowchart LR
     app --> ui
     app --> model
     model --> core
+    model --> proc
+    model --> patches
     ui --> model
     ui --> disasm
     ui --> symbols
@@ -56,28 +60,61 @@ sequenceDiagram
     Ui->>Ui: navigate Hex/Disassembly to entry point
 ```
 
+## Live Process Attach, MemMap & Stage-to-RAM Flow
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant Ui as UiApp / Panels
+    participant Model as BinaryModel
+    participant Proc as IProcessBackend / Session
+    participant Core as peelf_core (Live Rebasing)
+    participant Patch as LiveMemoryPatchSpace
+
+    User->>Ui: File > Attach to Process...
+    Ui->>Model: list_processes() / attach_process(pid)
+    Model->>Proc: open_process(pid) + memory_regions() + modules()
+    Model->>Core: load_live_module_image(main_module)
+    Note over Core: Combines live RAM at runtime ASLR base<br/>with on-disk PE/ELF (.symtab/.strtab, directories)<br/>rebased by (live_base - static_base)
+    Core-->>Model: Rebased IBinaryImage + SymbolIndex
+    Ui->>Ui: Populate Memory Map, Structure, Symbols, Hex & Disassembly
+    User->>Ui: Edit byte in Hex View or Stage Shellcode
+    Ui->>Patch: stage_patch(session, va, bytes)
+    Note over Patch: Overlay only — live process RAM untouched;<br/>visible immediately in Hex, Disasm & Patch Set
+    User->>Ui: Click "Commit to RAM"
+    Ui->>Patch: commit_to_process(session, options)
+    Patch->>Proc: Snapshot original RAM + write_memory (COW / VirtualProtectEx fallback)
+    User->>Ui: Click "Revert RAM"
+    Ui->>Patch: revert_committed(session)
+    Patch->>Proc: Restore snapshotted original RAM bytes
+```
+
 ## Panel Navigation Model
 
 ```mermaid
 flowchart TD
-    structure["Structure tree"]
+    structure["Structure tree<br/>File OR Process / Modules / Memory Map"]
+    memmap["Memory Map panel<br/>VMMap regions + module selector"]
     sections["Sections panel"]
     imports["Imports panel"]
     exports["Exports panel"]
-    symbolsPanel["Symbols panel"]
+    symbolsPanel["Symbols panel<br/>source + VA + offset"]
+    patchPanel["Patch Set panel<br/>staged + committed RAM"]
     graphPanel["Call Graph panel"]
 
-    selection["ViewerSelection<br/>kind, label, file offset, VA, size, preferred view"]
+    selection["ViewerSelection<br/>kind, label, window offset, VA, size, preferred view"]
 
     details["Details panel"]
-    hex["Hex View<br/>scroll + highlight byte range"]
-    disasmPanel["Disassembly panel<br/>decode from mapped offset"]
+    hex["Hex View<br/>VA/offset + inline edit + ?? unmapped + patch highlights"]
+    disasmPanel["Disassembly panel<br/>symbol labels + staged/committed tint"]
 
     structure --> selection
+    memmap --> selection
     sections --> selection
     imports --> selection
     exports --> selection
     symbolsPanel --> selection
+    patchPanel --> selection
     graphPanel --> selection
 
     selection --> details

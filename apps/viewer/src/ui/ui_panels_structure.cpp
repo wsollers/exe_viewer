@@ -35,6 +35,9 @@ namespace {
         case SelectionKind::Group:          return "Group";
         case SelectionKind::CallGraphNode:  return "Call Graph Node";
         case SelectionKind::Patch:          return "Patch";
+        case SelectionKind::Process:        return "Process";
+        case SelectionKind::ProcessModule:  return "Process Module";
+        case SelectionKind::MemoryRegion:   return "Memory Region";
     }
     return "Unknown";
 }

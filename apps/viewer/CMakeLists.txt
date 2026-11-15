@@ -31,6 +31,7 @@ add_executable(peelf_viewer
         src/ui/ui_app.hpp
         src/ui/ui_app.cpp
         src/ui/ui_panels_file.cpp
+        src/ui/ui_panels_memmap.cpp
         src/ui/ui_panels_pe_headers.cpp
         src/ui/ui_panels_pe_imports.cpp
         src/ui/ui_panels_pe_exports.cpp

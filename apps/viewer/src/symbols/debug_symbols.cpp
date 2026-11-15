@@ -46,7 +46,11 @@ namespace {
            bytes.starts_with("Microsoft C/C++ program database");
 }
 
-[[nodiscard]] std::uint64_t estimate_pe_image_base(const peelf::IBinaryImage& image) noexcept {
+[[maybe_unused]] [[nodiscard]] std::uint64_t resolve_pe_image_base(
+    const peelf::IBinaryImage& image) noexcept {
+    if (image.image_base() != 0) {
+        return image.image_base();
+    }
     if (image.format() != peelf::Format::PE || image.sections().empty()) {
         return 0;
     }
@@ -311,18 +315,21 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     if (!has_pdb_extension(pdb_path)) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::UnsupportedFormat,
+            .symbols = {},
             .diagnostic = "Only PDB debug symbol files are supported by this loader",
         };
     }
     if (!std::filesystem::exists(pdb_path)) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::FileNotFound,
+            .symbols = {},
             .diagnostic = pdb_path.string(),
         };
     }
     if (!has_native_pdb_signature(pdb_path)) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::UnsupportedFormat,
+            .symbols = {},
             .diagnostic = "File does not have a recognized native PDB/MSF signature",
         };
     }
@@ -333,6 +340,7 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     if (FAILED(init_result) && init_result != RPC_E_CHANGED_MODE) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
+            .symbols = {},
             .diagnostic = "CoInitializeEx failed",
         };
     }
@@ -359,6 +367,7 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
         cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendUnavailable,
+            .symbols = {},
             .diagnostic = "DIA source is unavailable: " + source_diagnostic,
         };
     }
@@ -369,6 +378,7 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
         cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
+            .symbols = {},
             .diagnostic = "DIA could not load the PDB",
         };
     }
@@ -378,6 +388,7 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
         cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
+            .symbols = {},
             .diagnostic = "DIA could not open a PDB session",
         };
     }
@@ -387,11 +398,12 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
         cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
+            .symbols = {},
             .diagnostic = "DIA could not read the PDB global scope",
         };
     }
 
-    const std::uint64_t image_base = estimate_pe_image_base(image);
+    const std::uint64_t image_base = resolve_pe_image_base(image);
     DebugSymbolLoadResult result;
     add_dia_children(*global.get(), SymTagFunction, image_base, true, result.symbols);
     add_dia_children(*global.get(), SymTagPublicSymbol, image_base, false, result.symbols);
@@ -410,9 +422,23 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     (void)image;
     return DebugSymbolLoadResult{
         .status = DebugSymbolLoadStatus::BackendUnavailable,
+        .symbols = {},
         .diagnostic = "PDB loading requires the Windows DIA SDK backend",
     };
 #endif
+}
+
+std::vector<DebugSymbol> rebase_debug_symbols(std::span<const DebugSymbol> symbols,
+                                              std::uint64_t image_base) {
+    std::vector<DebugSymbol> rebased;
+    rebased.reserve(symbols.size());
+    for (DebugSymbol sym : symbols) {
+        if (sym.relative_virtual_address != 0) {
+            sym.virtual_address = image_base + sym.relative_virtual_address;
+        }
+        rebased.push_back(std::move(sym));
+    }
+    return rebased;
 }
 
 } // namespace viewer
