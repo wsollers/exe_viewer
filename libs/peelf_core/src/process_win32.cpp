@@ -507,8 +507,8 @@ public:
                                           Endianness::Little,
                                           info_.is_64bit ? AddressWidth::Bits64
                                                          : AddressWidth::Bits32);
-                    const auto stack_base = rd.read_ptr(info_.is_64bit ? 0x08u : 0x04u);
-                    const auto stack_limit = rd.read_ptr(info_.is_64bit ? 0x10u : 0x08u);
+                    const auto stack_base = rd.read_pointer(info_.is_64bit ? 0x08u : 0x04u);
+                    const auto stack_limit = rd.read_pointer(info_.is_64bit ? 0x10u : 0x08u);
                     if (stack_base && stack_limit && *stack_base > *stack_limit) {
                         thread_stacks.push_back(WinStackRange{*stack_limit, *stack_base, ti.tid});
                     }
@@ -529,7 +529,7 @@ public:
                                       Endianness::Little,
                                       info_.is_64bit ? AddressWidth::Bits64 : AddressWidth::Bits32);
                 const std::uint32_t num_heaps = rd.read_u32(0).value_or(0);
-                const std::uint64_t heaps_va = rd.read_ptr(info_.is_64bit ? 8u : 4u).value_or(0);
+                const std::uint64_t heaps_va = rd.read_pointer(info_.is_64bit ? 8u : 4u).value_or(0);
                 const std::uint32_t capped = std::min<std::uint32_t>(num_heaps, 256u);
                 const std::size_t ptr_sz = info_.is_64bit ? 8u : 4u;
                 if (capped > 0 && heaps_va != 0) {
@@ -540,7 +540,7 @@ public:
                                                info_.is_64bit ? AddressWidth::Bits64
                                                               : AddressWidth::Bits32);
                         for (std::uint32_t i = 0; i < capped; ++i) {
-                            if (const auto hbase = prd.read_ptr(i * ptr_sz); hbase && *hbase != 0) {
+                            if (const auto hbase = prd.read_pointer(i * ptr_sz); hbase && *hbase != 0) {
                                 heap_bases.emplace(*hbase, i);
                             }
                         }
@@ -874,6 +874,33 @@ public:
                 if (const auto teb = query_win32_thread_teb(th.get(), info_.is_64bit)) {
                     ti.teb_address = *teb;
                     ti.tls_base = *teb;
+                }
+                if (const auto nt_query_thread = get_nt_query_thread()) {
+                    constexpr ULONG kThreadQuerySetWin32StartAddress = 9u;
+                    ULONG_PTR start_va = 0;
+                    ULONG ret_len = 0;
+                    if (nt_query_thread(th.get(),
+                                        kThreadQuerySetWin32StartAddress,
+                                        &start_va,
+                                        sizeof(start_va),
+                                        &ret_len) >= 0 &&
+                        start_va != 0) {
+                        ti.start_address = static_cast<std::uint64_t>(start_va);
+                    }
+                }
+                FILETIME ft_create{};
+                FILETIME ft_exit{};
+                FILETIME ft_kernel{};
+                FILETIME ft_user{};
+                if (::GetThreadTimes(th.get(), &ft_create, &ft_exit, &ft_kernel, &ft_user) != FALSE) {
+                    const std::uint64_t k100 =
+                        (static_cast<std::uint64_t>(ft_kernel.dwHighDateTime) << 32u) |
+                        static_cast<std::uint64_t>(ft_kernel.dwLowDateTime);
+                    const std::uint64_t u100 =
+                        (static_cast<std::uint64_t>(ft_user.dwHighDateTime) << 32u) |
+                        static_cast<std::uint64_t>(ft_user.dwLowDateTime);
+                    ti.kernel_time_ns = k100 * 100ULL;
+                    ti.user_time_ns = u100 * 100ULL;
                 }
                 ti.status = SubsystemStatus::available("Win32 Thread", "thread handle accessible");
             } else {

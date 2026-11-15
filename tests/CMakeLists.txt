@@ -55,6 +55,7 @@ add_executable(peelf_tests
   demangle_dwarf_test.cpp
   structure_interpreter_test.cpp
   vmmap_explorer_test.cpp
+  process_internals_test.cpp
   analysis_project_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp

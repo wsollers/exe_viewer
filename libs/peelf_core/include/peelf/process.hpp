@@ -86,10 +86,14 @@ struct ThreadInfo {
     bool is_suspended{false};
     std::optional<std::uint64_t> instruction_pointer{};
     std::optional<std::uint64_t> stack_pointer{};
+    std::optional<std::uint64_t> start_address{};
     std::optional<std::uint64_t> tls_base{};
     std::optional<std::uint64_t> teb_address{};
     std::optional<std::int64_t> syscall_number{};
     std::string wait_channel{};
+    std::optional<std::uint64_t> user_time_ns{};
+    std::optional<std::uint64_t> kernel_time_ns{};
+    std::optional<double> cpu_percent{};
     SubsystemStatus status{};
 };
 

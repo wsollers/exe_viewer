@@ -327,6 +327,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , references_panel_(reference_index_, annotations_, symbol_index_, current_selection_)
     , strings_panel_(model, strings_index_, reference_index_, annotations_, current_selection_)
     , struct_view_panel_(model, current_selection_)
+    , process_internals_panel_(model)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -335,6 +336,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     references_panel_.set_visible(false);
     strings_panel_.set_visible(false);
     struct_view_panel_.set_visible(false);
+    process_internals_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
 #ifdef _WIN32
@@ -934,6 +936,7 @@ void UiApp::render() {
     references_panel_.draw();
     strings_panel_.draw();
     struct_view_panel_.draw();
+    process_internals_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
@@ -1267,6 +1270,13 @@ void UiApp::render_main_menu() {
             handlers_panel_.set_visible(true);
             activate_panel(handlers_panel_.name().c_str());
         }
+        if (ImGui::MenuItem("Process Internals (Handles / Sockets / Security)",
+                            nullptr,
+                            false,
+                            model_.is_live_process())) {
+            process_internals_panel_.set_visible(true);
+            activate_panel(process_internals_panel_.name().c_str());
+        }
         if (ImGui::MenuItem("References & Notes", "X", false, model_.has_file())) open_references();
         if (ImGui::MenuItem("Decompile selection", "F5", false, model_.has_file())) request_decompile();
         if (ImGui::MenuItem("Structure")) structure_panel_.set_visible(true);
@@ -1375,7 +1385,8 @@ void UiApp::render_main_menu() {
                                static_cast<UiPanel*>(&thread_locals_panel_),
                                static_cast<UiPanel*>(&memory_search_panel_),
                                static_cast<UiPanel*>(&runtime_flags_panel_),
-                               static_cast<UiPanel*>(&handlers_panel_)}) {
+                               static_cast<UiPanel*>(&handlers_panel_),
+                               static_cast<UiPanel*>(&process_internals_panel_)}) {
             bool v = extra->visible();
             if (ImGui::MenuItem(extra->name().c_str(), nullptr, &v)) {
                 extra->set_visible(v);
@@ -2351,6 +2362,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(references_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(strings_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(struct_view_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(process_internals_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);

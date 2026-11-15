@@ -8,6 +8,7 @@
 
 #include "peelf/endian_reader.hpp"
 #include "peelf/process.hpp"
+#include "peelf/process_internals.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1265,6 +1266,32 @@ public:
             std::filesystem::path("/proc") / std::to_string(info_.pid) / "task";
         const bool is_self_proc = (info_.pid == current_process_id());
         const ThreadId self_tid = is_self_proc ? current_thread_id() : 0u;
+        const long clk_tck_raw = ::sysconf(_SC_CLK_TCK);
+        const std::uint64_t clk_tck = clk_tck_raw > 0 ? static_cast<std::uint64_t>(clk_tck_raw) : 100u;
+
+        std::optional<std::uint64_t> auxv_entry{};
+        {
+            std::ifstream aux_ifs(std::filesystem::path("/proc") / std::to_string(info_.pid) / "auxv",
+                                  std::ios::in | std::ios::binary);
+            if (aux_ifs.is_open()) {
+                std::vector<std::uint8_t> aux_bytes((std::istreambuf_iterator<char>(aux_ifs)),
+                                                    std::istreambuf_iterator<char>());
+                const TargetLayout tl = target_layout();
+                const std::size_t word_sz = (tl.address_width == AddressWidth::Bits64) ? 8u : 4u;
+                const EndianReader rd(aux_bytes, tl.endianness, tl.address_width);
+                for (std::size_t off = 0; off + 2 * word_sz <= aux_bytes.size(); off += 2 * word_sz) {
+                    const auto tag = rd.read_pointer(off);
+                    const auto val = rd.read_pointer(off + word_sz);
+                    if (!tag.has_value() || !val.has_value() || *tag == 0) {
+                        break;
+                    }
+                    if (*tag == 9u && *val != 0) {  // AT_ENTRY
+                        auxv_entry = *val;
+                        break;
+                    }
+                }
+            }
+        }
 
         std::vector<ThreadInfo> out;
         out.reserve(tids.size());
@@ -1279,13 +1306,19 @@ public:
             }
             ti.name = std::move(comm);
 
-            const ProcTaskStatInfo stat_info = parse_proc_task_stat(read_text_file(tdir / "stat"));
-            if (stat_info.valid) {
-                ti.state = decode_proc_stat_state(stat_info.state_char);
-                ti.is_suspended = (stat_info.state_char == 'T' || stat_info.state_char == 't' ||
+            const LinuxTaskStatSample stat_sample =
+                parse_linux_task_stat_sample(read_text_file(tdir / "stat"));
+            if (stat_sample.valid) {
+                ti.state = decode_proc_stat_state(stat_sample.state_char);
+                ti.is_suspended = (stat_sample.state_char == 'T' || stat_sample.state_char == 't' ||
                                    stopped_threads_.contains(tid) || suspended_);
-                ti.stack_pointer = stat_info.kstkesp;
-                ti.instruction_pointer = stat_info.kstkeip;
+                ti.stack_pointer = stat_sample.kstkesp;
+                ti.instruction_pointer = stat_sample.kstkeip;
+                ti.user_time_ns = (stat_sample.utime_ticks * 1'000'000'000ULL) / clk_tck;
+                ti.kernel_time_ns = (stat_sample.stime_ticks * 1'000'000'000ULL) / clk_tck;
+            }
+            if (static_cast<ProcessId>(tid) == info_.pid && auxv_entry.has_value()) {
+                ti.start_address = auxv_entry;
             }
 
             std::string wchan = read_text_file(tdir / "wchan");
@@ -1346,7 +1379,7 @@ public:
             if (ti.instruction_pointer.has_value() && ti.stack_pointer.has_value()) {
                 ti.status = SubsystemStatus::available(
                     "/proc/<pid>/task", "thread state and instruction/stack pointers available");
-            } else if (stat_info.valid) {
+            } else if (stat_sample.valid) {
                 ti.status = SubsystemStatus::partial(
                     "/proc/<pid>/task",
                     "thread state available; pause process or enable ptrace for exact live registers");

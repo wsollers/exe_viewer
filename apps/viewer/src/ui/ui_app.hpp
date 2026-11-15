@@ -15,6 +15,7 @@
 #include "ui_panels_references.hpp"
 #include "ui_panels_strings.hpp"
 #include "ui_panels_struct_view.hpp"
+#include "ui_panels_process_internals.hpp"
 #include "decompile/decompiler.hpp"
 #include <future>
 #include "disasm/disassembler.hpp"
@@ -162,6 +163,7 @@ namespace viewer {
         ReferencesPanel references_panel_;
         StringsPanel    strings_panel_;
         StructureViewPanel struct_view_panel_;
+        ProcessInternalsPanel process_internals_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;

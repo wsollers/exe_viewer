@@ -104,17 +104,20 @@ void ThreadsAndStackPanel::draw_contents() {
     const peelf::TargetLayout layout = model_.target_layout();
 
     if (ImGui::BeginTable("ThreadListTable",
-                          5,
+                          8,
                           ImGuiTableFlags_Borders |
                               ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_Resizable |
                               ImGuiTableFlags_ScrollY,
-                          ImVec2(0.0f, 135.0f))) {
-        ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.40f);
-        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 86.0f);
-        ImGui::TableSetupColumn("TLS / TEB", ImGuiTableColumnFlags_WidthFixed, 135.0f);
-        ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthFixed, 78.0f);
+                          ImVec2(0.0f, 145.0f))) {
+        ImGui::TableSetupColumn("TID", ImGuiTableColumnFlags_WidthFixed, 68.0f);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+        ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthFixed, 82.0f);
+        ImGui::TableSetupColumn("CPU %", ImGuiTableColumnFlags_WidthFixed, 66.0f);
+        ImGui::TableSetupColumn("Start Address", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+        ImGui::TableSetupColumn("Wait / wchan", ImGuiTableColumnFlags_WidthStretch, 0.26f);
+        ImGui::TableSetupColumn("TLS / TEB", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Control", ImGuiTableColumnFlags_WidthFixed, 76.0f);
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
@@ -137,6 +140,41 @@ void ThreadsAndStackPanel::draw_contents() {
             ImGui::TableNextColumn();
             const std::string_view st_label = peelf::to_string(th.state);
             ImGui::TextUnformatted(st_label.data(), st_label.data() + st_label.size());
+
+            ImGui::TableNextColumn();
+            if (th.cpu_percent.has_value()) {
+                ImGui::Text("%.1f%%", *th.cpu_percent);
+            } else {
+                ImGui::TextDisabled("-");
+            }
+            if (ImGui::IsItemHovered() && (th.user_time_ns.has_value() || th.kernel_time_ns.has_value())) {
+                const double user_ms = static_cast<double>(th.user_time_ns.value_or(0)) / 1.0e6;
+                const double kern_ms = static_cast<double>(th.kernel_time_ns.value_or(0)) / 1.0e6;
+                ImGui::SetTooltip("User: %.2f ms | Kernel: %.2f ms", user_ms, kern_ms);
+            }
+
+            ImGui::TableNextColumn();
+            if (th.start_address.has_value() && *th.start_address != 0) {
+                const std::string start_hex = format_ptr_width(*th.start_address, layout.address_width);
+                const std::string sym = model_.resolve_address_symbol(*th.start_address);
+                const std::string label = sym.empty() ? start_hex : (sym + " (" + start_hex + ")");
+                if (ImGui::SmallButton(label.c_str())) {
+                    if (on_address_activated_) {
+                        on_address_activated_(*th.start_address, PreferredView::Disassembly, false);
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("-");
+            }
+
+            ImGui::TableNextColumn();
+            if (!th.wait_channel.empty()) {
+                ImGui::TextUnformatted(th.wait_channel.c_str());
+            } else if (th.syscall_number.has_value() && *th.syscall_number >= 0) {
+                ImGui::Text("syscall #%" PRId64, *th.syscall_number);
+            } else {
+                ImGui::TextDisabled("-");
+            }
 
             ImGui::TableNextColumn();
             const std::optional<std::uint64_t> tls_or_teb =

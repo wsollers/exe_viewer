@@ -10,10 +10,10 @@ boundaries we are adding for assembler/decompiler/live-process work.
 flowchart LR
     user["User"]
     app["peelf_viewer<br/>Application"]
-    ui["UiApp<br/>Dear ImGui panels + MemMap + Threads/Stack/TLS + Search + Runtime/Flags + Handlers"]
+    ui["UiApp<br/>Dear ImGui panels + VMMap + Structure View + Process Internals + Threads/Stack/TLS + Search + Runtime/Flags + Handlers"]
     model["BinaryModel<br/>static file (editable) OR strictly read-only live process"]
-    core["peelf_core<br/>C++23 EndianReader + PE/ELF parsers + live rebasing + forgiving subsystems"]
-    proc["IProcessBackend / IProcessSession<br/>read-only attach + cmdline resolution + pause/resume + thread contexts"]
+    core["peelf_core<br/>C++23 EndianReader + PE/ELF/DWARF parsers + live rebasing + smaps/internals subsystems"]
+    proc["IProcessBackend / IProcessSession<br/>read-only attach + smaps/WorkingSet + handles/sockets/security + thread CPU/contexts"]
     patches["PagedBinaryImage<br/>staged edits + Save Patched As (static files only)"]
     disasm["Capstone wrapper<br/>Disassembler + FunctionIndex"]
     decomp["IDecompiler<br/>StructuredPseudoC + RetDec + Ghidra"]

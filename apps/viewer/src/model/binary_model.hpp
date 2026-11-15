@@ -24,6 +24,7 @@
 #include <peelf/memory_search.hpp>
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
+#include <peelf/process_internals.hpp>
 #include <peelf/runtime_structures.hpp>
 #include <peelf/stack_tls.hpp>
 
@@ -197,6 +198,13 @@ namespace viewer {
         }
         [[nodiscard]] const peelf::HandlersReport& handlers_report() const noexcept { return handlers_report_; }
 
+        // Read-only lazy/manual Process Explorer & System Informer user-mode telemetry.
+        void refresh_process_internals();
+        [[nodiscard]] bool has_process_internals() const noexcept { return process_internals_loaded_; }
+        [[nodiscard]] const peelf::ProcessInternalsSnapshot& process_internals() const noexcept {
+            return process_internals_;
+        }
+
         // Unified window addressing:
         // - Static file: view_base_address() == 0, view_size() == file size, offset == file offset.
         // - Live process: view_base_address() == module/region start VA, offset == VA - view_base_address().
@@ -297,6 +305,9 @@ namespace viewer {
         peelf::ProcessEnvironmentSnapshot process_env_;
         peelf::ThreadEnvironmentSnapshot thread_env_;
         peelf::HandlersReport handlers_report_;
+        peelf::ProcessInternalsSnapshot process_internals_{};
+        bool process_internals_loaded_{false};
+        peelf::ThreadCpuTracker thread_cpu_tracker_{};
 
         mutable std::string last_diagnostic_;
         mutable std::string cached_content_sha256_;

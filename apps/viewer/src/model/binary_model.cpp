@@ -114,6 +114,9 @@ std::filesystem::path utf8_path(std::string_view text) {
         process_env_ = {};
         thread_env_ = {};
         handlers_report_ = {};
+        process_internals_ = {};
+        process_internals_loaded_ = false;
+        thread_cpu_tracker_.reset();
         last_diagnostic_.clear();
     }
 
@@ -1542,6 +1545,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         }
 
         threads_ = std::move(*listed);
+        thread_cpu_tracker_.update(threads_);
         threads_status_ = peelf::SubsystemStatus::available(
             "process",
             std::to_string(threads_.size()) + " thread(s) discovered");
@@ -1768,6 +1772,22 @@ std::filesystem::path utf8_path(std::string_view text) {
             modules_,
             ctx_ptr,
             sym_fn);
+    }
+
+    void BinaryModel::refresh_process_internals() {
+        if (!is_live_process() || session_ == nullptr) {
+            process_internals_ = {};
+            process_internals_.handles.status = peelf::SubsystemStatus::unavailable(
+                "process", "Not attached to a live process");
+            process_internals_.sockets.status = peelf::SubsystemStatus::unavailable(
+                "process", "Not attached to a live process");
+            process_internals_.security.status = peelf::SubsystemStatus::unavailable(
+                "process", "Not attached to a live process");
+            process_internals_loaded_ = false;
+            return;
+        }
+        process_internals_ = peelf::inspect_process_internals(*session_);
+        process_internals_loaded_ = true;
     }
 
 } // namespace viewer

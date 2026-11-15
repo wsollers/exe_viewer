@@ -11,6 +11,9 @@ add_library(peelf_core
   src/process_common.cpp
   src/process_linux.cpp
   src/process_win32.cpp
+  src/process_internals_common.cpp
+  src/process_internals_linux.cpp
+  src/process_internals_win32.cpp
   src/stack_tls.cpp
   src/memory_search.cpp
   src/runtime_structures.cpp
@@ -27,6 +30,7 @@ add_library(peelf_core
   include/peelf/dwarf.hpp
   include/peelf/patching.hpp
   include/peelf/process.hpp
+  include/peelf/process_internals.hpp
   include/peelf/stack_tls.hpp
   include/peelf/memory_search.hpp
   include/peelf/runtime_structures.hpp
@@ -64,4 +68,8 @@ target_compile_definitions(peelf_core PUBLIC
 
 if(MSVC)
   target_compile_definitions(peelf_core PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+if(WIN32)
+  target_link_libraries(peelf_core PRIVATE ws2_32 advapi32)
 endif()

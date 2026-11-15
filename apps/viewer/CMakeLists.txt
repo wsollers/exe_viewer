@@ -64,6 +64,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_strings.cpp
         src/ui/ui_panels_struct_view.hpp
         src/ui/ui_panels_struct_view.cpp
+        src/ui/ui_panels_process_internals.hpp
+        src/ui/ui_panels_process_internals.cpp
         src/analysis/function_index.hpp
         src/analysis/function_index.cpp
         src/analysis/reference_index.cpp
