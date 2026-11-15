@@ -7,9 +7,10 @@
 
 namespace viewer {
 
-SymbolsPanel::SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection)
-    : UiPanel("Symbols")
+SymbolsPanel::SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, const BinaryModel& model)
+    : UiPanel("Functions & Names")
     , index_(index)
+    , model_(model)
     , selection_(selection)
 {
     filter_buf_[0] = '\0';
@@ -21,7 +22,9 @@ void SymbolsPanel::draw_contents() {
         return;
     }
 
-    ImGui::InputTextWithHint("Filter", "Any part of a name...", filter_buf_, sizeof(filter_buf_));
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##Filter", "Search functions or names...", filter_buf_, sizeof(filter_buf_));
+    ImGui::Checkbox("Functions only", &functions_only_);
     const std::string filter = filter_buf_;
     const bool has_filter = !filter.empty();
     const auto records = index_.records();
@@ -34,21 +37,20 @@ void SymbolsPanel::draw_contents() {
     if (!selected_index) last_scrolled_selected_.reset();
 
     ImGui::Separator();
-    if (ImGui::BeginTable("SymbolsTable", 6,
+    if (ImGui::BeginTable("SymbolsTable", 3,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX)) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 300.0f);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 14);
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-        ImGui::TableSetupColumn("External", ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("Dynamic", ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
         std::vector<std::size_t> matches;
         std::optional<int> selected_row;
         for (std::size_t i = 0; i < records.size(); ++i)
-            if (!has_filter || symbol_name_matches(records[i].name, filter)) {
+            if ((!has_filter || symbol_name_matches(records[i].name, filter)) &&
+                (!functions_only_ || (model_.image() && symbol_has_code(*model_.image(), records[i])))) {
                 if (selected_index == i) selected_row = static_cast<int>(matches.size());
                 matches.push_back(i);
             }
@@ -81,11 +83,6 @@ void SymbolsPanel::draw_contents() {
             else ImGui::TextDisabled("Unmapped");
             ImGui::TableNextColumn();
             ImGui::Text("0x%llX", static_cast<unsigned long long>(symbol.size));
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(symbol.external ? "Yes" : "No");
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(symbol.dynamic ? "Yes" : "No");
-            ImGui::TableNextColumn();
             const char* source = "Embedded";
             switch (symbol.source) {
                 case SymbolSource::DebugSymbol: source = "PDB"; break;
@@ -94,7 +91,7 @@ void SymbolsPanel::draw_contents() {
                 case SymbolSource::EntryPoint: source = "Entry point"; break;
                 case SymbolSource::ImageSymbol: break;
             }
-            ImGui::TextUnformatted(source);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Source: %s", source);
         }
         }
 

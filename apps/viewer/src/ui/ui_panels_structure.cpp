@@ -126,15 +126,14 @@ void SelectionDetailsPanel::draw_contents() {
         return;
     }
 
-    ImGui::Text("Kind: %s", selection_kind_name(selection_.kind));
-    ImGui::Text("Label: %s", selection_.label.c_str());
-    ImGui::Text("Preferred view: %s", preferred_view_name(selection_.preferred_view));
+    ImGui::TextWrapped("%s", selection_.label.c_str());
+    ImGui::TextDisabled("%s", selection_kind_name(selection_.kind));
     ImGui::Separator();
-
-    draw_optional_hex_value("File offset", selection_.file_offset);
-    draw_optional_hex_value("Virtual address", selection_.virtual_address);
-    ImGui::Text("Size: 0x%016" PRIX64, selection_.size);
-    ImGui::Text("Object index: %" PRIu64, selection_.object_index);
+    if (ImGui::CollapsingHeader("Location", ImGuiTreeNodeFlags_DefaultOpen)) {
+        draw_optional_hex_value("File offset", selection_.file_offset);
+        draw_optional_hex_value("Virtual address", selection_.virtual_address);
+        ImGui::Text("Size: %" PRIu64 " bytes", selection_.size);
+    }
 }
 
 } // namespace viewer

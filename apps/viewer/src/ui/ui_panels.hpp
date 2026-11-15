@@ -137,7 +137,7 @@ namespace viewer {
 
     class SymbolsPanel : public UiPanel {
     public:
-        SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection);
+        SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, const BinaryModel& model);
         void set_symbol_activated_callback(
             std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> cb) {
             on_symbol_activated_ = std::move(cb);
@@ -146,6 +146,8 @@ namespace viewer {
         void draw_contents() override;
     private:
         const SymbolIndex& index_;
+        const BinaryModel& model_;
+        bool functions_only_ = true;
         const ViewerSelection& selection_;
         char filter_buf_[128] = {};
         std::optional<std::uint64_t> last_scrolled_selected_;

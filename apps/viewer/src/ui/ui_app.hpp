@@ -68,6 +68,10 @@ namespace viewer {
     private:
         ImFont* code_font_ = nullptr; // Owned by the ImGui font atlas.
         bool show_about_ = false;
+        std::uint64_t jump_address_ = 0;
+        bool focus_graph_ = false;
+        bool focus_workspace_ = true;
+        bool focus_listing_ = false;
         BinaryModel& model_;
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;

@@ -24,6 +24,14 @@
 namespace viewer {
 namespace {
 
+void activate_panel(const char* name) {
+    if (auto* window = ImGui::FindWindowByName(name)) {
+        if (window->DockNode && window->DockNode->TabBar)
+            window->DockNode->TabBar->NextSelectedTabId = window->TabId;
+        ImGui::FocusWindow(window);
+    }
+}
+
 [[nodiscard]] std::optional<viewer::Architecture> disassembler_architecture(peelf::Architecture arch) {
     switch (arch) {
         case peelf::Architecture::X86:       return viewer::Architecture::X86_32;
@@ -265,7 +273,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , shellcode_panel_(model, current_selection_)
     , imports_panel_(model)
     , exports_panel_(model)
-    , symbols_panel_(symbol_index_, current_selection_)
+    , symbols_panel_(symbol_index_, current_selection_, model)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -303,6 +311,9 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             last_navigation_selection_ = current_selection_;
         });
     symbols_panel_.set_symbol_activated_callback([this](const SymbolRecord& symbol, std::uint64_t object_index) {
+        focus_listing_ = true;
+        activate_panel(details_panel_.name().c_str());
+        activate_panel("Disassembly");
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr) {
             return;
@@ -447,7 +458,25 @@ void UiApp::render() {
         if (ImGui::Button("Open binary") && on_open_file_) on_open_file_();
         ImGui::SameLine();
         ImGui::BeginDisabled(!model_.has_file());
-        if (ImGui::Button("Symbols")) symbols_panel_.set_visible(true);
+        if (ImGui::Button("Functions")) { symbols_panel_.set_visible(true); activate_panel(symbols_panel_.name().c_str()); }
+        ImGui::SameLine();
+        if (ImGui::Button("Listing")) { show_disassembly_panel_ = true; activate_panel("Disassembly"); }
+        ImGui::SameLine();
+        if (ImGui::Button("Graph")) { show_call_graph_panel_ = true; focus_graph_ = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Entry")) disassemble_entry_point(512);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
+        ImGui::InputScalar("##JumpVA", ImGuiDataType_U64, &jump_address_, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to virtual address (hexadecimal)");
+        ImGui::SameLine();
+        if (ImGui::Button("Jump") && model_.image()) {
+            if (const auto offset = model_.image()->virtual_address_to_file_offset(jump_address_)) {
+                disassemble_at_offset(static_cast<std::size_t>(*offset), jump_address_);
+                hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), 1);
+                activate_panel("Disassembly");
+            } else Log().warn("Address 0x{:X} is not backed by file bytes", jump_address_);
+        }
         ImGui::SameLine();
         if (ImGui::Button("Patches")) patch_set_panel_.set_visible(true);
         ImGui::SameLine();
@@ -457,6 +486,33 @@ void UiApp::render() {
         ImGui::TextDisabled("%s", model_.has_file()
             ? std::filesystem::path(model_.file_info().path).filename().string().c_str()
             : "Ready to inspect");
+    }
+    ImGui::End();
+    if (ImGui::BeginViewportSideBar("##section-map", viewport, ImGuiDir_Up,
+            ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2,
+            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled("SEGMENTS");
+        if (const auto* image = model_.image()) {
+            for (const auto& section : image->sections()) {
+                if (section.file_size == 0) continue;
+                ImGui::SameLine();
+                ImGui::PushID(static_cast<int>(section.file_offset));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(section.executable ? ImGuiCol_HeaderActive : ImGuiCol_FrameBg));
+                if (ImGui::Button(section.name.c_str())) {
+                    hex_panel_.navigate_to_range(static_cast<std::size_t>(section.file_offset), 1);
+                    if (section.executable) disassemble_at_offset(static_cast<std::size_t>(section.file_offset), section.virtual_address);
+                    current_selection_ = ViewerSelection{.kind = SelectionKind::Section, .label = section.name,
+                        .file_offset = section.file_offset, .virtual_address = section.virtual_address,
+                        .size = section.file_size, .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex};
+                }
+                ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("VA 0x%llX | %llu file bytes%s",
+                    static_cast<unsigned long long>(section.virtual_address), static_cast<unsigned long long>(section.file_size),
+                    section.executable ? " | executable" : "");
+                ImGui::PopID();
+            }
+        } else { ImGui::SameLine(); ImGui::TextDisabled("Open an image to navigate its sections"); }
     }
     ImGui::End();
     render_dockspace();
@@ -486,9 +542,17 @@ void UiApp::render() {
     }
     if (show_call_graph_panel_) {
         render_call_graph_panel();
+        if (focus_graph_) { activate_panel("Call Graph"); focus_graph_ = false; }
     }
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
+    if (focus_listing_) { activate_panel("Disassembly"); focus_listing_ = false; }
+    if (focus_workspace_) {
+        activate_panel(symbols_panel_.name().c_str());
+        activate_panel(details_panel_.name().c_str());
+        activate_panel("Disassembly");
+        focus_workspace_ = false;
+    }
 }
 
 void UiApp::render_main_menu() {
@@ -699,7 +763,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("MainDockSpace");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV2");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
@@ -882,14 +946,6 @@ void UiApp::render_call_graph_panel() {
         queue_call_graph_sample(CallGraphSample::LoadedImage);
     }
     ImGui::SameLine();
-    if (ImGui::Button("PE x64 sample")) {
-        queue_call_graph_sample(CallGraphSample::PeStartup);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Linux ELF sample")) {
-        queue_call_graph_sample(CallGraphSample::ElfStartup);
-    }
-    ImGui::SameLine();
     if (ImGui::Button("Reload")) {
         queue_call_graph_sample(call_graph_sample_);
     }
@@ -897,6 +953,7 @@ void UiApp::render_call_graph_panel() {
     if (!call_graph_status_.empty()) {
         ImGui::TextUnformatted(call_graph_status_.c_str());
     }
+    if (!current_call_graph_) ImGui::TextWrapped("Select a function in Functions & Names to explore its calls, or build the loaded-image graph.");
 
     ImGui::InputTextWithHint("Find node", "Any part of a function name...", graph_search_, sizeof(graph_search_));
     if (current_call_graph_ && ImGui::CollapsingHeader("Callers / Callees (current graph)")) {
@@ -953,7 +1010,9 @@ void UiApp::render_call_graph_panel() {
         constexpr float kGraphPadding = 32.0f;
         const ImVec2 padded_canvas_size(std::max(1.0f, canvas_size.x - kGraphPadding * 2.0f),
                                         std::max(1.0f, canvas_size.y - kGraphPadding * 2.0f));
-        const float scale = std::min(padded_canvas_size.x / graph_width, padded_canvas_size.y / graph_height);
+        const float scale = std::min({padded_canvas_size.x / graph_width,
+                                     padded_canvas_size.y / graph_height,
+                                     ImGui::GetFontSize() * 6.0f});
         const ImVec2 draw_size(std::max(1.0f, graph_width * scale), std::max(1.0f, graph_height * scale));
         const ImVec2 graph_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f,
                                canvas_pos.y + (canvas_size.y - draw_size.y) * 0.5f);
@@ -1066,22 +1125,23 @@ void UiApp::render_call_graph_panel() {
 }
 
 void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size) {
+    focus_workspace_ = true;
     ImGui::DockBuilderRemoveNode(dockspace_id);
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspace_id, dockspace_size);
 
     ImGuiID main_id = dockspace_id;
     const bool compact = dockspace_size.x < ImGui::GetFontSize() * 100.0f;
-    const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, compact ? 0.28f : 0.22f, nullptr, &main_id);
-    const ImGuiID right_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.24f, nullptr, &main_id);
-    const ImGuiID bottom_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.14f, nullptr, &main_id);
-    const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.54f, nullptr, &main_id);
+    const ImGuiID bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.12f, nullptr, &main_id);
+    const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, compact ? 0.25f : 0.19f, nullptr, &main_id);
+    const ImGuiID right_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.25f, nullptr, &main_id);
+    const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.26f, nullptr, &main_id);
 
     ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
 
     ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
@@ -1090,9 +1150,12 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(pe_imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(pe_exports_panel_.name().c_str(), right_id);
 
-    ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), main_id);
-    ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), main_id);
-    ImGui::DockBuilderDockWindow("Disassembly", center_bottom_id);
+    ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), center_bottom_id);
+    ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
+    ImGui::DockBuilderDockWindow("Disassembly", main_id);
+    ImGui::DockBuilderDockWindow("Call Graph", main_id);
+    if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(symbols_panel_.name().c_str());
+    if (auto* node = ImGui::DockBuilderGetNode(right_id)) node->SelectedTabId = ImHashStr(details_panel_.name().c_str());
     ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
 
     ImGui::DockBuilderFinish(dockspace_id);
@@ -1526,7 +1589,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     ImVec4 UiApp::get_mnemonic_color(const std::string& mnemonic) const {
     if (mnemonic.empty()) {
-        return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);  // White
+        return ImGui::GetStyleColorVec4(ImGuiCol_Text);
     }
 
     // Branch/control flow - Blue
@@ -1536,7 +1599,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         mnemonic == "syscall" || mnemonic == "sysret" ||
         mnemonic == "b" || mnemonic == "bl" || mnemonic == "bx" || mnemonic == "blx" ||
         mnemonic == "cbz" || mnemonic == "cbnz") {
-        return ImVec4(0.4f, 0.8f, 1.0f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
     }
 
     // SIMD/Vector - Green
@@ -1548,26 +1611,26 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         mnemonic.find("divp") == 0 || mnemonic.find("xmm") != std::string::npos ||
         mnemonic.find("ymm") != std::string::npos ||
         mnemonic.find("zmm") != std::string::npos) {
-        return ImVec4(0.5f, 1.0f, 0.5f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_PlotLines);
     }
 
     // NOP/padding - Gray
     if (mnemonic == "nop" || mnemonic == "int3" || mnemonic == "ud2") {
-        return ImVec4(0.5f, 0.5f, 0.5f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
     }
 
     // Data movement - Light yellow
     if (mnemonic.find("mov") == 0 || mnemonic == "lea" ||
         mnemonic == "push" || mnemonic == "pop" ||
         mnemonic == "xchg" || mnemonic == "ldr" || mnemonic == "str") {
-        return ImVec4(1.0f, 1.0f, 0.7f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_Text);
     }
 
     // Arithmetic - Orange
     if (mnemonic == "add" || mnemonic == "sub" || mnemonic == "mul" ||
         mnemonic == "div" || mnemonic == "inc" || mnemonic == "dec" ||
         mnemonic == "imul" || mnemonic == "idiv" || mnemonic == "neg") {
-        return ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_PlotHistogram);
     }
 
     // Logic/bitwise - Purple
@@ -1575,16 +1638,16 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         mnemonic == "not" || mnemonic == "shl" || mnemonic == "shr" ||
         mnemonic == "sar" || mnemonic == "rol" || mnemonic == "ror" ||
         mnemonic == "test" || mnemonic == "cmp") {
-        return ImVec4(0.8f, 0.6f, 1.0f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
     }
 
     // Compare/test - Cyan
     if (mnemonic == "cmp" || mnemonic == "test" ||
         mnemonic.find("cmp") == 0 || mnemonic.find("test") == 0) {
-        return ImVec4(0.4f, 1.0f, 1.0f, 1.0f);
+        return ImGui::GetStyleColorVec4(ImGuiCol_PlotLines);
     }
 
     // Default - White
-    return ImVec4(1.0f, 1.0f, 1.0f, 1.0f);
+    return ImGui::GetStyleColorVec4(ImGuiCol_Text);
 }
 } // namespace viewer

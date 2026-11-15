@@ -51,9 +51,9 @@ namespace viewer {
 
             ImVec4 color;
             switch (e.level) {
-                case LogLevel::Info:    color = ImVec4(0.8f, 0.8f, 0.8f, 1); break;
-                case LogLevel::Warning: color = ImVec4(1.0f, 0.8f, 0.2f, 1); break;
-                case LogLevel::Error:   color = ImVec4(1.0f, 0.3f, 0.3f, 1); break;
+                case LogLevel::Info:    color = ImGui::GetStyleColorVec4(ImGuiCol_Text); break;
+                case LogLevel::Warning: color = ImGui::GetStyleColorVec4(ImGuiCol_PlotHistogram); break;
+                case LogLevel::Error:   color = ImGui::GetStyleColorVec4(ImGuiCol_PlotHistogramHovered); break;
             }
 
             ImGui::PushStyleColor(ImGuiCol_Text, color);
