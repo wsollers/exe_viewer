@@ -226,7 +226,8 @@ are available and point to decoded instructions; other table forms remain
 unresolved. Applied byte edits refresh the active graph.
 
 Double-click a graph instruction or listing address to follow a direct target.
-Use **Back/Forward** or `Alt+Left` / `Alt+Right` to retrace navigation, `Space` to
+Use **Back/Forward**, `Backspace` / `Shift+Backspace`, or `Alt+Left` / `Alt+Right`
+to retrace navigation, `Space` to
 switch between graph and listing, arrow keys to select code, and `Enter` to
 follow a selected direct target. These shortcuts do not interfere with text
 entry. Graph instructions and the listing show resolved symbol names.

@@ -609,8 +609,10 @@ void UiApp::rebuild_references() {
 void UiApp::render_main_menu() {
     if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_X, ImGuiInputFlags_RouteGlobal)) open_references();
     if (!ImGui::GetIO().WantTextInput) {
-        if (ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_LeftArrow, ImGuiInputFlags_RouteAlways)) navigate_history(false);
-        if (ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_RightArrow, ImGuiInputFlags_RouteAlways)) navigate_history(true);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_LeftArrow) ||
+            ImGui::IsKeyChordPressed(ImGuiKey_Backspace)) navigate_history(false);
+        if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_RightArrow) ||
+            ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_Backspace)) navigate_history(true);
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal) && on_open_file_) on_open_file_();
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal) && model_.has_file() && on_save_patched_as_) on_save_patched_as_();
