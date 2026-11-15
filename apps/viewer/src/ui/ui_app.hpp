@@ -10,6 +10,7 @@
 
 #include "model/binary_model.hpp"
 #include "ui_panels.hpp"
+#include "ui_panels_references.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
 #include "symbols/symbol_index.hpp"
@@ -54,6 +55,7 @@ namespace viewer {
 
         void on_file_loaded();
         void load_debug_symbols(const std::filesystem::path& path);
+        void navigate_to_address(std::uint64_t address, PreferredView view = PreferredView::Disassembly);
 
         ImVec4 get_mnemonic_color(const std::string &mnemonic) const;
 
@@ -76,8 +78,19 @@ namespace viewer {
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
         SymbolIndex symbol_index_;
+        ReferenceIndex reference_index_;
+        AnnotationStore annotations_;
+        bool references_dirty_ = true;
+        bool focus_references_ = false;
+        std::uint64_t reference_revision_ = 0;
+        std::uint64_t annotation_revision_ = 0;
+        bool reference_thumb_mode_ = false;
         ViewerSelection current_selection_;
         std::optional<ViewerSelection> last_navigation_selection_;
+        NavigationHistory navigation_history_;
+        void navigate_history(bool forward);
+        void switch_analysis_view(bool graph);
+        [[nodiscard]] std::optional<SymbolRecord> navigation_graph_root(std::uint64_t address) const;
 
         FilePanel       file_panel_;
         StructureNavigatorPanel structure_panel_;
@@ -89,6 +102,7 @@ namespace viewer {
         ImportsPanel    imports_panel_;
         ExportsPanel    exports_panel_;
         SymbolsPanel    symbols_panel_;
+        ReferencesPanel references_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;
@@ -116,6 +130,7 @@ namespace viewer {
         float graph_zoom_ = 1.0f;
         ImVec2 graph_pan_{};
         bool fit_graph_ = false;
+        bool center_graph_selection_ = false;
         std::uint64_t graph_revision_ = 0;
         std::uint8_t pending_call_graph_delay_frames_ = 0;
         std::optional<PendingCallGraphRequest> pending_call_graph_request_;
@@ -134,6 +149,8 @@ namespace viewer {
 
 
         void render_main_menu();
+        void rebuild_references();
+        void open_references();
         void render_dockspace();
         void render_call_graph_panel();
         void load_call_graph_sample(CallGraphSample sample);

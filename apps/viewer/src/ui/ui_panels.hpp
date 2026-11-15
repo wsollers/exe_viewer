@@ -138,6 +138,9 @@ namespace viewer {
     class SymbolsPanel : public UiPanel {
     public:
         SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, const BinaryModel& model);
+        void set_display_name_resolver(std::function<std::string(const SymbolRecord&)> resolver) {
+            display_name_resolver_ = std::move(resolver);
+        }
         void set_symbol_activated_callback(
             std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> cb) {
             on_symbol_activated_ = std::move(cb);
@@ -151,6 +154,7 @@ namespace viewer {
         const ViewerSelection& selection_;
         char filter_buf_[128] = {};
         std::optional<std::uint64_t> last_scrolled_selected_;
+        std::function<std::string(const SymbolRecord&)> display_name_resolver_;
         std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> on_symbol_activated_;
     };
 

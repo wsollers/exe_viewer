@@ -45,6 +45,7 @@ namespace {
         case PreferredView::Details:     return "Details";
         case PreferredView::Hex:         return "Hex";
         case PreferredView::Disassembly: return "Disassembly";
+        case PreferredView::Graph:       return "Flow Graph";
     }
     return "Details";
 }

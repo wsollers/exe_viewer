@@ -55,6 +55,8 @@ void activate_panel(const char* name) {
 [[nodiscard]] bool same_selection(const ViewerSelection& lhs, const ViewerSelection& rhs) {
     return lhs.kind == rhs.kind &&
            lhs.object_index == rhs.object_index &&
+           lhs.virtual_address == rhs.virtual_address && lhs.file_offset == rhs.file_offset &&
+           lhs.size == rhs.size && lhs.preferred_view == rhs.preferred_view &&
            lhs.label == rhs.label;
 }
 
@@ -279,11 +281,21 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , imports_panel_(model)
     , exports_panel_(model)
     , symbols_panel_(symbol_index_, current_selection_, model)
+    , references_panel_(reference_index_, annotations_, symbol_index_, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
     , pe_exports_panel_(model)
 {
+    references_panel_.set_visible(false);
+    references_panel_.set_navigate_callback([this](std::uint64_t address) {
+        navigate_to_address(address, PreferredView::Disassembly);
+    });
+    references_panel_.set_rebuild_callback([this] { references_dirty_ = true; });
+    symbols_panel_.set_display_name_resolver([this](const SymbolRecord& symbol) {
+        const auto* annotation = symbol.virtual_address ? annotations_.find(*symbol.virtual_address) : nullptr;
+        return annotation && !annotation->name.empty() ? annotation->name : symbol.name;
+    });
     hex_panel_.set_byte_activated_callback([this](std::size_t off, std::size_t size) {
         current_selection_ = ViewerSelection{
             .kind = SelectionKind::ByteRange,
@@ -359,10 +371,11 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             .virtual_address = symbol.virtual_address,
             .size = symbol.size,
             .object_index = object_index,
-            .preferred_view = symbol_has_code(*img, symbol) ? PreferredView::Disassembly : PreferredView::Hex
+            .preferred_view = symbol_has_code(*img, symbol) ? PreferredView::Graph : PreferredView::Hex
         };
         hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
         if (symbol_has_code(*img, symbol)) {
+            current_selection_.graph_root = symbol;
             disassemble_at_offset(static_cast<std::size_t>(*file_offset), *symbol.virtual_address);
             pending_call_graph_root_ = symbol;
             pending_call_graph_delay_frames_ = 1;
@@ -465,23 +478,29 @@ void UiApp::render() {
         ImGui::BeginDisabled(!model_.has_file());
         if (ImGui::Button("Functions")) { symbols_panel_.set_visible(true); activate_panel(symbols_panel_.name().c_str()); }
         ImGui::SameLine();
-        if (ImGui::Button("Listing")) { show_disassembly_panel_ = true; activate_panel("Disassembly"); }
+        ImGui::BeginDisabled(!navigation_history_.can_back());
+        if (ImGui::Button("Back")) navigate_history(false);
+        ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Graph")) { show_call_graph_panel_ = true; focus_graph_ = true; }
+        ImGui::BeginDisabled(!navigation_history_.can_forward());
+        if (ImGui::Button("Forward")) navigate_history(true);
+        ImGui::EndDisabled();
         ImGui::SameLine();
-        if (ImGui::Button("Entry")) disassemble_entry_point(512);
+        if (ImGui::Button("Listing")) switch_analysis_view(false);
+        ImGui::SameLine();
+        if (ImGui::Button("Graph")) switch_analysis_view(true);
+        ImGui::SameLine();
+        if (ImGui::Button("Entry") && model_.image()) navigate_to_address(model_.image()->entry_point());
         ImGui::SameLine();
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
         ImGui::InputScalar("##JumpVA", ImGuiDataType_U64, &jump_address_, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to virtual address (hexadecimal)");
         ImGui::SameLine();
         if (ImGui::Button("Jump") && model_.image()) {
-            if (const auto offset = model_.image()->virtual_address_to_file_offset(jump_address_)) {
-                disassemble_at_offset(static_cast<std::size_t>(*offset), jump_address_);
-                hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), 1);
-                activate_panel("Disassembly");
-            } else Log().warn("Address 0x{:X} is not backed by file bytes", jump_address_);
+            navigate_to_address(jump_address_);
         }
+        ImGui::SameLine();
+        if (ImGui::Button("References")) open_references();
         ImGui::SameLine();
         if (ImGui::Button("Patches")) patch_set_panel_.set_visible(true);
         ImGui::SameLine();
@@ -535,6 +554,11 @@ void UiApp::render() {
     imports_panel_.draw();
     exports_panel_.draw();
     symbols_panel_.draw();
+    references_panel_.draw();
+    if (focus_references_) {
+        activate_panel(references_panel_.name().c_str());
+        focus_references_ = false;
+    }
     pe_headers_panel_.draw();
     pe_imports_panel_.draw();
     pe_exports_panel_.draw();
@@ -552,6 +576,7 @@ void UiApp::render() {
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
     if (focus_listing_) { activate_panel("Disassembly"); focus_listing_ = false; }
+    navigation_history_.visit(current_selection_);
     if (focus_workspace_) {
         activate_panel(symbols_panel_.name().c_str());
         activate_panel(details_panel_.name().c_str());
@@ -560,7 +585,33 @@ void UiApp::render() {
     }
 }
 
+void UiApp::open_references() {
+    references_panel_.set_visible(true);
+    focus_references_ = true;
+}
+
+void UiApp::rebuild_references() {
+    const auto* image = model_.image();
+    if (!image) return;
+    if (model_.changed_intervals().empty()) {
+        reference_index_ = ReferenceIndex::build(*image, model_.bytes(), thumb_mode_);
+    } else if (const auto bytes = model_.read_effective_bytes(0, model_.bytes().size())) {
+        reference_index_ = ReferenceIndex::build(*image, *bytes, thumb_mode_);
+    } else {
+        reference_index_ = {};
+        Log().warn("Unable to read patched bytes for reference analysis");
+    }
+    reference_revision_ = model_.edit_revision();
+    reference_thumb_mode_ = thumb_mode_;
+    references_dirty_ = false;
+}
+
 void UiApp::render_main_menu() {
+    if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_X, ImGuiInputFlags_RouteGlobal)) open_references();
+    if (!ImGui::GetIO().WantTextInput) {
+        if (ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_LeftArrow, ImGuiInputFlags_RouteAlways)) navigate_history(false);
+        if (ImGui::Shortcut(ImGuiMod_Alt | ImGuiKey_RightArrow, ImGuiInputFlags_RouteAlways)) navigate_history(true);
+    }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal) && on_open_file_) on_open_file_();
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal) && model_.has_file() && on_save_patched_as_) on_save_patched_as_();
     if (!ImGui::BeginMainMenuBar())
@@ -597,14 +648,15 @@ void UiApp::render_main_menu() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Navigate")) {
+        if (ImGui::MenuItem("Back", "Alt+Left", false, navigation_history_.can_back())) navigate_history(false);
+        if (ImGui::MenuItem("Forward", "Alt+Right", false, navigation_history_.can_forward())) navigate_history(true);
+        ImGui::Separator();
         if (ImGui::MenuItem("Entry point", nullptr, false, model_.image() != nullptr)) {
             const auto* image = model_.image();
-            if (const auto offset = image->virtual_address_to_file_offset(image->entry_point())) {
-                hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), 1);
-                disassemble_at_offset(static_cast<std::size_t>(*offset), image->entry_point());
-            }
+            navigate_to_address(image->entry_point());
         }
         if (ImGui::MenuItem("Symbols")) symbols_panel_.set_visible(true);
+        if (ImGui::MenuItem("References & Notes", "X", false, model_.has_file())) open_references();
         if (ImGui::MenuItem("Structure")) structure_panel_.set_visible(true);
         ImGui::EndMenu();
     }
@@ -768,7 +820,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV3");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV4");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
@@ -809,6 +861,13 @@ void UiApp::queue_call_graph_sample(CallGraphSample sample) {
 }
 
 void UiApp::process_deferred_gpu_work() {
+    if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
+        references_dirty_ = true;
+    if (references_panel_.visible() && references_dirty_ && model_.image()) rebuild_references();
+    if (annotation_revision_ != annotations_.revision()) {
+        annotation_revision_ = annotations_.revision();
+        if (active_graph_root_) pending_call_graph_root_ = active_graph_root_;
+    }
     if (active_graph_root_ && graph_revision_ != model_.edit_revision()) {
         pending_call_graph_root_ = active_graph_root_;
         graph_revision_ = model_.edit_revision();
@@ -837,17 +896,17 @@ void UiApp::process_deferred_gpu_work() {
             graph_pan_ = {};
             graph_zoom_ = 1.0f;
             if (function_cfg_ && root.file_offset && root.virtual_address && *root.file_offset < model_.bytes().size()) {
-                const auto offset = static_cast<std::size_t>(*root.file_offset);
-                auto size = std::min<std::size_t>(root.size ? static_cast<std::size_t>(std::min<std::uint64_t>(root.size, 16384)) : 256,
-                                                  model_.bytes().size() - offset);
-                if (root.size == 0) for (const auto& candidate : symbol_index_.records())
-                    if (candidate.file_offset && *candidate.file_offset > offset && symbol_has_code(*img, candidate))
-                        size = std::min(size, static_cast<std::size_t>(*candidate.file_offset - offset));
+                const auto extent = discover_function_extent(*img, symbol_index_, root, model_.bytes().size());
+                if (!extent) { call_graph_status_ = "No executable extent available for " + root.name; return; }
+                const auto offset = static_cast<std::size_t>(extent->file_offset);
+                const auto size = static_cast<std::size_t>(extent->size);
                 if (const auto bytes = model_.read_effective_bytes(offset, size)) {
                     load_call_graph_from_graph(build_function_cfg_call_graph(*bytes, *root.virtual_address,
-                        img->architecture(), img->endianness(), offset, root.name, thumb_mode_), "function_cfg");
-                    if (current_call_graph_) call_graph_status_ = root.name + std::format("  |  {} bytes", size) +
-                        (root.size == size ? "  |  Function control flow" : "  |  Bounded code preview");
+                        img->architecture(), img->endianness(), offset, root.name, thumb_mode_,
+                        extent->source == FunctionExtentSource::ExecutableRegion ||
+                        extent->source == FunctionExtentSource::NextSymbol), "function_cfg");
+                    if (current_call_graph_) call_graph_status_ = root.name + std::format("  |  {} bytes  |  {}{}", size,
+                        function_extent_source_name(extent->source), extent->truncated ? " (limited)" : "");
                 }
             } else {
                 load_call_graph_from_graph(build_symbol_fanout_call_graph(*img, model_.bytes(), symbol_index_, root), "function_calls");
@@ -858,6 +917,30 @@ void UiApp::process_deferred_gpu_work() {
 }
 
 void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name) {
+    for (auto& node : graph.nodes) {
+        if (node.bytes.start.virtual_address) {
+            if (const auto* note = annotations_.find(*node.bytes.start.virtual_address); note && !note->name.empty())
+                node.label = note->name;
+        }
+        for (auto& instruction : node.instructions) {
+            if (const auto* note = annotations_.find(instruction.address); note && !note->comment.empty())
+                instruction.operands += " ; " + note->comment.substr(0, 160);
+            if (instruction.branch_target) {
+                if (const auto* note = annotations_.find(*instruction.branch_target); note && !note->name.empty())
+                    instruction.operands += " ; " + note->name;
+            }
+        }
+    }
+    // Add symbol annotations before layout so node widths include the names.
+    for (auto& node : graph.nodes) for (auto& instruction : node.instructions) {
+        if (!instruction.branch_target) continue;
+        if (const auto* target = symbol_index_.find_containing_address(*instruction.branch_target);
+            target && target->virtual_address) {
+            const auto delta = *instruction.branch_target - *target->virtual_address;
+            instruction.operands += delta ? std::format(" ; {}+0x{:X}", target->name, delta)
+                                          : " ; " + target->name;
+        }
+    }
     current_call_graph_.reset();
     current_call_graph_layout_.reset();
     const std::filesystem::path plain_path = std::filesystem::temp_directory_path() / (output_name.string() + ".plain");
@@ -888,6 +971,7 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
 
     loaded_call_graph_bmp_ = plain_path;
     current_call_graph_ = std::move(graph);
+    center_graph_selection_ = current_selection_.virtual_address.has_value();
     call_graph_status_ = "Loaded graph layout from current image";
 }
 
@@ -925,7 +1009,10 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
         return;
     }
 
+    navigation_history_.visit(current_selection_);
     current_selection_ = selection_from_call_graph_node(node, *img);
+    current_selection_.preferred_view = PreferredView::Graph;
+    current_selection_.graph_root = active_graph_root_;
     const std::optional<std::uint64_t> file_offset = current_selection_.file_offset;
 
     if (file_offset && *file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
@@ -955,6 +1042,7 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
         record = symbol_index_.find_containing_address(*node.bytes.start.virtual_address);
     }
     if (record != nullptr && record->virtual_address && record->file_offset) {
+        current_selection_.graph_root = *record;
         pending_call_graph_root_ = *record;
         pending_call_graph_delay_frames_ = 1;
         call_graph_status_ = "Queued fan-out from " + record->name;
@@ -966,6 +1054,29 @@ void UiApp::render_call_graph_panel() {
     if (!ImGui::Begin("Flow Graph", &show_call_graph_panel_)) {
         ImGui::End();
         return;
+    }
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Space)) switch_analysis_view(false);
+        if (current_call_graph_ && !current_call_graph_->nodes.empty()) {
+            std::vector<const CallGraphNode*> nodes;
+            for (const auto& node : current_call_graph_->nodes)
+                if (node.bytes.start.virtual_address && node.bytes.start.file_offset) nodes.push_back(&node);
+            auto selected = std::ranges::find_if(nodes, [this](const auto* node) {
+                return current_selection_.virtual_address && *current_selection_.virtual_address >= *node->bytes.start.virtual_address &&
+                    *current_selection_.virtual_address - *node->bytes.start.virtual_address < std::max<std::uint64_t>(1, node->bytes.size);
+            });
+            if (!nodes.empty() && (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_UpArrow))) {
+                auto index = selected == nodes.end() ? std::ptrdiff_t{0} : selected - nodes.begin();
+                if (selected != nodes.end()) index += ImGui::IsKeyPressed(ImGuiKey_UpArrow) ? -1 : 1;
+                index = std::clamp(index, std::ptrdiff_t{0}, static_cast<std::ptrdiff_t>(nodes.size() - 1));
+                activate_call_graph_node(*nodes[static_cast<std::size_t>(index)]);
+                center_graph_selection_ = true;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Enter) && selected != nodes.end()) {
+                const auto target = std::ranges::find_if((*selected)->instructions, [](const auto& i) { return i.branch_target.has_value(); });
+                if (target != (*selected)->instructions.end()) navigate_to_address(*target->branch_target, PreferredView::Graph);
+            }
+        }
     }
 
     if (ImGui::RadioButton("Control flow", function_cfg_)) {
@@ -1069,6 +1180,22 @@ void UiApp::render_call_graph_panel() {
         }
         const float scale = native_scale * graph_zoom_;
         const ImVec2 draw_size(std::max(1.0f, graph_width * scale), std::max(1.0f, graph_height * scale));
+        if (center_graph_selection_) {
+            for (const auto& node : current_call_graph_->nodes) {
+                if (!node.bytes.start.virtual_address || !current_selection_.virtual_address) continue;
+                const auto start = *node.bytes.start.virtual_address;
+                const auto address = *current_selection_.virtual_address;
+                if (address < start || address - start >= std::max<std::uint64_t>(1, node.bytes.size)) continue;
+                const auto layout = std::ranges::find_if(current_call_graph_layout_->nodes,
+                    [&](const auto& item) { return item.node_id == node.id; });
+                if (layout != current_call_graph_layout_->nodes.end()) {
+                    graph_pan_.x = draw_size.x * 0.5f - static_cast<float>(layout->center_x - bounds.min_x) * scale;
+                    graph_pan_.y = canvas_size.y * 0.5f - kGraphPadding - static_cast<float>(bounds.max_y - layout->center_y) * scale;
+                }
+                break;
+            }
+            center_graph_selection_ = false;
+        }
         const ImVec2 graph_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f + graph_pan_.x,
                                canvas_pos.y + kGraphPadding + graph_pan_.y);
 
@@ -1114,6 +1241,11 @@ void UiApp::render_call_graph_panel() {
             const peelf::IBinaryImage* img = model_.image();
             if (graph_node != current_call_graph_->nodes.end() && img != nullptr) {
                 selected = same_selection(current_selection_, selection_from_call_graph_node(*graph_node, *img));
+                if (current_selection_.virtual_address && graph_node->bytes.start.virtual_address) {
+                    const auto address = *current_selection_.virtual_address;
+                    const auto start = *graph_node->bytes.start.virtual_address;
+                    selected = address >= start && address - start < std::max<std::uint64_t>(graph_node->bytes.size, 1);
+                }
             }
             const ImVec2 top_left = to_screen(layout_node.center_x - layout_node.width * 0.5,
                                               layout_node.center_y + layout_node.height * 0.5);
@@ -1142,7 +1274,18 @@ void UiApp::render_call_graph_panel() {
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
             if (const CallGraphNode* node =
                     hit_test_call_graph_node(graph_pos, scale, bounds.min_x, bounds.max_y, ImGui::GetIO().MousePos)) {
-                activate_call_graph_node(*node);
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && !node->instructions.empty()) {
+                    const auto layout = std::ranges::find_if(current_call_graph_layout_->nodes,
+                        [&](const auto& item) { return item.node_id == node->id; });
+                    if (layout != current_call_graph_layout_->nodes.end()) {
+                        const float top = to_screen(layout->center_x, layout->center_y + layout->height * 0.5).y + 5;
+                        const auto row = static_cast<int>((ImGui::GetIO().MousePos.y - top) / std::max(3.0f, scale / 7.2f)) - 1;
+                        if (row >= 0 && static_cast<std::size_t>(row) < node->instructions.size()) {
+                            const auto target = node->instructions[static_cast<std::size_t>(row)].branch_target;
+                            if (target) navigate_to_address(*target, PreferredView::Graph);
+                        }
+                    }
+                } else activate_call_graph_node(*node);
             }
         }
     } else if (call_graph_texture_) {
@@ -1211,6 +1354,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
 
     ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(references_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(pe_headers_panel_.name().c_str(), right_id);
@@ -1235,6 +1379,30 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             disassemble_at_offset(disassembly_location_->file_offset, disassembly_location_->address);
     }
     ImGui::Begin("Disassembly");
+    std::optional<std::uint64_t> follow_target;
+    std::optional<int> scroll_to_row;
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Space)) switch_analysis_view(true);
+        const auto selected = std::ranges::find_if(current_instructions_, [this](const auto& instruction) {
+            return current_selection_.virtual_address == instruction.address;
+        });
+        if (selected != current_instructions_.end() && ImGui::IsKeyPressed(ImGuiKey_Enter)) follow_target = selected->branch_target;
+        if (!current_instructions_.empty() && (ImGui::IsKeyPressed(ImGuiKey_DownArrow) || ImGui::IsKeyPressed(ImGuiKey_UpArrow))) {
+            auto index = selected == current_instructions_.end() ? std::ptrdiff_t{0} : selected - current_instructions_.begin();
+            if (selected != current_instructions_.end()) index += ImGui::IsKeyPressed(ImGuiKey_UpArrow) ? -1 : 1;
+            index = std::clamp(index, std::ptrdiff_t{0}, static_cast<std::ptrdiff_t>(current_instructions_.size() - 1));
+            const auto& instruction = current_instructions_[static_cast<std::size_t>(index)];
+            if (const auto offset = model_.image()->virtual_address_to_file_offset(instruction.address)) {
+                const auto root = navigation_graph_root(instruction.address);
+                current_selection_ = {.kind = SelectionKind::ByteRange, .label = instruction.to_string(),
+                    .file_offset = *offset, .virtual_address = instruction.address, .size = instruction.bytes.size(),
+                    .preferred_view = PreferredView::Disassembly, .graph_root = root};
+                scroll_to_row = static_cast<int>(index);
+                last_navigation_selection_ = current_selection_;
+                hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), instruction.bytes.size());
+            }
+        }
+    }
 
 
     if (!file_loaded_ || !disasm_.is_initialized()) {
@@ -1245,6 +1413,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     if (disasm_.architecture() == Architecture::ARM32 && ImGui::Checkbox("Thumb mode", &thumb_mode_)) {
         if (disasm_.set_thumb_mode(thumb_mode_)) {
+            pending_call_graph_root_ = active_graph_root_;
             if (disassembly_location_)
                 disassemble_at_offset(disassembly_location_->file_offset, disassembly_location_->address);
         } else {
@@ -1260,12 +1429,13 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 180.0f);
         ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 22.0f);
-        ImGui::TableSetupColumn("Symbol", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 28.0f);
+        ImGui::TableSetupColumn("Symbol / annotation", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 28.0f);
         ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(current_instructions_.size()));
+        if (scroll_to_row) clipper.IncludeItemByIndex(*scroll_to_row);
         while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const auto& inst = current_instructions_[static_cast<std::size_t>(row)];
@@ -1274,8 +1444,11 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             // Address
             ImGui::TableNextColumn();
             ImGui::PushID(row);
-            if (ImGui::Selectable(std::format("{:016X}", inst.address).c_str())) {
+            if (ImGui::Selectable(std::format("{:016X}", inst.address).c_str(),
+                current_selection_.virtual_address == inst.address, ImGuiSelectableFlags_AllowDoubleClick)) {
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) follow_target = inst.branch_target;
                 if (const auto offset = model_.image()->virtual_address_to_file_offset(inst.address)) {
+                    const auto root = navigation_graph_root(inst.address);
                     hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), inst.bytes.size());
                     current_selection_ = ViewerSelection{
                         .kind = SelectionKind::ByteRange,
@@ -1283,7 +1456,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                         .file_offset = *offset,
                         .virtual_address = inst.address,
                         .size = inst.bytes.size(),
-                        .preferred_view = PreferredView::Hex
+                        .preferred_view = PreferredView::Disassembly,
+                        .graph_root = root
                     };
                     last_navigation_selection_ = current_selection_;
                 }
@@ -1291,6 +1465,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             ImGui::PopID();
 
             // Bytes
+            if (scroll_to_row && row == *scroll_to_row) ImGui::SetScrollHereY();
             ImGui::TableNextColumn();
             std::string bytes_str;
             for (std::uint8_t b: inst.bytes) {
@@ -1318,6 +1493,9 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                 }
             }
             ImGui::TableNextColumn();
+            if (const auto* note = annotations_.find(inst.address); note && (!note->name.empty() || !note->comment.empty())) {
+                ImGui::TextUnformatted((note->name + (note->comment.empty() ? "" : " ; " + note->comment)).c_str());
+            } else
             if (const auto* symbol = symbol_index_.find_containing_address(inst.address); symbol && symbol->virtual_address) {
                 const auto offset = inst.address - *symbol->virtual_address;
                 const auto label = offset == 0 ? symbol->name : std::format("{}+0x{:X}", symbol->name, offset);
@@ -1330,9 +1508,14 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                           }
 
     ImGui::End();
+    if (follow_target) navigate_to_address(*follow_target);
 }
     // Called after a file (PE or ELF) is loaded into the model.
     void UiApp::on_file_loaded() {
+        annotations_.clear();
+        reference_index_ = {};
+        references_dirty_ = true;
+        navigation_history_.clear();
         disassembly_location_.reset();
         thumb_mode_ = false;
         const peelf::IBinaryImage* img = model_.image();
@@ -1447,6 +1630,88 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
     }
 
+
+std::optional<SymbolRecord> UiApp::navigation_graph_root(std::uint64_t address) const {
+    if (current_selection_.virtual_address == address && current_selection_.graph_root)
+        return current_selection_.graph_root;
+    if (active_graph_root_ && current_call_graph_ && current_call_graph_->id == "function_cfg") {
+        for (const auto& node : current_call_graph_->nodes) {
+            if (node.kind != CallGraphNodeKind::BasicBlock || !node.bytes.start.virtual_address) continue;
+            const auto start = *node.bytes.start.virtual_address;
+            if (address >= start && address - start < node.bytes.size) return active_graph_root_;
+        }
+    }
+    if (const auto* image = model_.image()) {
+        if (const auto* symbol = symbol_index_.find_containing_address(address); symbol && symbol_has_code(*image, *symbol))
+            return *symbol;
+    }
+    return std::nullopt;
+}
+
+void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
+    const auto* image = model_.image();
+    if (!image) return;
+    const auto offset = image->virtual_address_to_file_offset(address);
+    if (!offset || *offset >= model_.bytes().size()) {
+        Log().warn("Address 0x{:X} is not backed by file bytes", address);
+        return;
+    }
+    navigation_history_.visit(current_selection_);
+    const auto* symbol = symbol_index_.find_containing_address(address);
+    auto root = navigation_graph_root(address);
+    if (!root) root = SymbolRecord{.name = std::format("loc_{:X}", address), .virtual_address = address, .file_offset = *offset};
+    current_selection_ = {.kind = SelectionKind::ByteRange,
+        .label = symbol ? symbol->name : std::format("loc_{:X}", address),
+        .file_offset = *offset, .virtual_address = address, .size = 1, .preferred_view = view, .graph_root = root};
+    hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), 1);
+    disassemble_at_offset(static_cast<std::size_t>(*offset), address);
+    last_navigation_selection_ = current_selection_;
+    if (view == PreferredView::Graph) {
+        if (!active_graph_root_ || active_graph_root_->virtual_address != root->virtual_address) {
+            pending_call_graph_root_ = *root;
+            pending_call_graph_delay_frames_ = 0;
+        }
+        show_call_graph_panel_ = true;
+        focus_graph_ = true;
+        center_graph_selection_ = true;
+    } else if (view == PreferredView::Hex) {
+        hex_panel_.set_visible(true);
+        activate_panel("Hex View");
+    } else {
+        show_disassembly_panel_ = true;
+        focus_listing_ = true;
+    }
+    navigation_history_.visit(current_selection_);
+}
+
+void UiApp::navigate_history(bool forward) {
+    navigation_history_.visit(current_selection_);
+    const auto destination = forward ? navigation_history_.forward() : navigation_history_.back();
+    if (!destination) return;
+    // Set the destination first so the common navigation path preserves the cursor.
+    current_selection_ = *destination;
+    if (destination->virtual_address) {
+        navigate_to_address(*destination->virtual_address, destination->preferred_view);
+        current_selection_ = *destination;
+        last_navigation_selection_ = current_selection_;
+        if (destination->file_offset) hex_panel_.navigate_to_range(static_cast<std::size_t>(*destination->file_offset),
+            static_cast<std::size_t>(std::max<std::uint64_t>(1, destination->size)));
+    }
+    else { last_navigation_selection_.reset(); apply_structure_selection_navigation(); }
+}
+
+void UiApp::switch_analysis_view(bool graph) {
+    auto selection = current_selection_;
+    if (current_selection_.virtual_address) {
+        navigate_to_address(*current_selection_.virtual_address, graph ? PreferredView::Graph : PreferredView::Disassembly);
+        selection.graph_root = current_selection_.graph_root;
+        selection.preferred_view = graph ? PreferredView::Graph : PreferredView::Disassembly;
+        current_selection_ = std::move(selection);
+        last_navigation_selection_ = current_selection_;
+        if (current_selection_.file_offset) hex_panel_.navigate_to_range(static_cast<std::size_t>(*current_selection_.file_offset),
+            static_cast<std::size_t>(std::max<std::uint64_t>(1, current_selection_.size)));
+    }
+}
 
     void UiApp::apply_structure_selection_navigation() {
         if (current_selection_.kind == SelectionKind::None ||

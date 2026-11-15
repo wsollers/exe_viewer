@@ -49,7 +49,8 @@ void SymbolsPanel::draw_contents() {
         std::vector<std::size_t> matches;
         std::optional<int> selected_row;
         for (std::size_t i = 0; i < records.size(); ++i)
-            if ((!has_filter || symbol_name_matches(records[i].name, filter)) &&
+            if ((!has_filter || symbol_name_matches(records[i].name, filter) ||
+                 (display_name_resolver_ && symbol_name_matches(display_name_resolver_(records[i]), filter))) &&
                 (!functions_only_ || (model_.image() && symbol_has_code(*model_.image(), records[i])))) {
                 if (selected_index == i) selected_row = static_cast<int>(matches.size());
                 matches.push_back(i);
@@ -66,13 +67,16 @@ void SymbolsPanel::draw_contents() {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::PushID(static_cast<int>(row_id));
-            const char* display_name = symbol.name.empty() ? "<unnamed>" : symbol.name.c_str();
+            const std::string resolved_name = display_name_resolver_ ? display_name_resolver_(symbol) : symbol.name;
+            const char* display_name = resolved_name.empty() ? "<unnamed>" : resolved_name.c_str();
             const bool selected = selection_.label == symbol.name && selection_.virtual_address == symbol.virtual_address;
             if (ImGui::Selectable(display_name, selected, ImGuiSelectableFlags_SpanAllColumns)) {
                 if (on_symbol_activated_) {
                     on_symbol_activated_(symbol, row_id);
                 }
             }
+            if (ImGui::IsItemHovered() && resolved_name != symbol.name)
+                ImGui::SetTooltip("Original symbol: %s", symbol.name.c_str());
             if (selected && last_scrolled_selected_ != row_id) {
                 ImGui::SetScrollHereY(0.5f);
                 last_scrolled_selected_ = row_id;

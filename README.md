@@ -218,8 +218,31 @@ function to view instruction-bearing basic blocks and directed branch edges.
 Use the mouse wheel to zoom, middle-drag to pan, **Fit** for an overview, and
 **100%** for readable code. Clicking a block synchronizes the byte selection and
 disassembly. **Calls** switches to function relationships. Graph layout requires
-Graphviz. Previews use symbol sizes when available (up to 16 KiB); unknown sizes
-use a bounded 256-byte window. Applied byte edits refresh the active graph.
+Graphviz. Function bounds use symbol sizes or x64 PE runtime metadata, then the
+next known function or executable region, capped at 16 KiB. The graph reports
+which boundary source was used. Unknown indirect branches remain explicitly
+unresolved. Guarded absolute x86 jump tables are recovered only when all entries
+are available and point to decoded instructions; other table forms remain
+unresolved. Applied byte edits refresh the active graph.
+
+Double-click a graph instruction or listing address to follow a direct target.
+Use **Back/Forward** or `Alt+Left` / `Alt+Right` to retrace navigation, `Space` to
+switch between graph and listing, arrow keys to select code, and `Enter` to
+follow a selected direct target. These shortcuts do not interfere with text
+entry. Graph instructions and the listing show resolved symbol names.
+
+Open **References** from the toolbar or press `X` for **References & Notes**.
+Filter incoming/outgoing references for the selection, or search addresses,
+symbols, referenced ASCII strings, user names, and comments. Source and target
+addresses navigate independently. Reference analysis scans up to 4 MiB of
+executable section bytes, reports partial coverage, and refreshes on patch or
+Thumb-mode changes while the panel is open. This is a conservative static scan:
+address constants are distinguished from memory references, and
+register-dependent targets are not guessed.
+
+Names and comments are currently session-only and cleared on loading a binary.
+They appear in the function list, graph, and listing; original symbols remain
+searchable. Project persistence is a separate planned feature.
 
 ## Notes
 
