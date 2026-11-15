@@ -308,12 +308,13 @@ namespace viewer {
         }
 
         nfdchar_t *out_path = nullptr;
-        nfdfilteritem_t filters[2] = {
-            {"Executables", "exe,dll,so,elf"},
+        nfdfilteritem_t filters[3] = {
+            {"Executables & Crash Dumps", "exe,dll,so,elf,dmp,mdmp,core"},
+            {"Crash Dumps (.dmp, .core)", "dmp,mdmp,core"},
             {"All Files", "*"}
         };
 
-        nfdresult_t result = NFD_OpenDialog(&out_path, filters, 2, nullptr);
+        nfdresult_t result = NFD_OpenDialog(&out_path, filters, 3, nullptr);
 
         if (result == NFD_OKAY) {
             std::string path(out_path);
@@ -361,6 +362,23 @@ namespace viewer {
     void Application::analysis_file_dialog(int action) {
         if (!nfd_initialized_) return;
         nfdchar_t* path = nullptr;
+        if (action == 4) {
+            nfdfilteritem_t filters[2] = {
+                {"Crash Dumps (.dmp, .mdmp, .core)", "dmp,mdmp,core"},
+                {"All Files", "*"},
+            };
+            if (NFD_OpenDialog(&path, filters, 2, nullptr) == NFD_OKAY) {
+                std::string selected(path);
+                NFD_FreePath(path);
+                if (model_.load_file(selected)) {
+                    Log().info("Loaded crash dump: {}", selected);
+                    ui_->on_file_loaded();
+                } else {
+                    Log().error("Failed to open crash dump '{}': {}", selected, model_.last_diagnostic());
+                }
+            }
+            return;
+        }
         if (action == 3) {
             nfdfilteritem_t filters[2] = {
                 {"Executables", "exe,dll,so,elf,bin,sys"},

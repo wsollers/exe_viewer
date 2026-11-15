@@ -2,6 +2,7 @@
 
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
+#include <peelf/crash_dump.hpp>
 #include <peelf/dependency_tree.hpp>
 #include <peelf/error.hpp>
 #include <peelf/forgiving.hpp>
@@ -160,6 +161,7 @@ struct HeadlessAnalysisReport {
     std::string sha256{};
     std::uint64_t file_size{0};
     std::unique_ptr<IBinaryImage> image{};
+    std::unique_ptr<ICrashDumpSession> crash_dump{};
     DependencyGraph dependencies{};
     SecurityAuditReport security{};
     bool strings_included{false};

@@ -18,6 +18,7 @@
 #include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_image.hpp>
+#include <peelf/crash_dump.hpp>
 #include <peelf/endian_reader.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/handlers.hpp>
@@ -100,6 +101,10 @@ namespace viewer {
         [[nodiscard]] bool is_live_process() const noexcept {
             return source_kind_ == BinarySourceKind::LiveProcess && session_ != nullptr;
         }
+        [[nodiscard]] bool is_crash_dump() const noexcept {
+            return is_live_process() && session_->is_crash_dump();
+        }
+        [[nodiscard]] const peelf::CrashDumpSummary* crash_dump_summary() const noexcept;
         [[nodiscard]] bool is_read_only() const noexcept { return is_live_process(); }
         [[nodiscard]] BinarySourceKind source_kind() const noexcept { return source_kind_; }
         [[nodiscard]] LiveViewTargetKind live_target_kind() const noexcept { return live_target_kind_; }

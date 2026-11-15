@@ -1,4 +1,5 @@
 #include "peelf/process_internals.hpp"
+#include "peelf/crash_dump.hpp"
 
 #if defined(__linux__)
 
@@ -44,6 +45,17 @@ constexpr std::size_t kMaxEnumeratedFds = 4096;
 }  // namespace
 
 ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
+    if (session.is_crash_dump()) {
+        if (const auto* dump = dynamic_cast<const ICrashDumpSession*>(&session)) {
+            return dump->crash_internals();
+        }
+        ProcessInternalsSnapshot snap{};
+        snap.handles.status = SubsystemStatus::unavailable("crash_dump", "No handle stream in crash dump");
+        snap.sockets.status = SubsystemStatus::unavailable("crash_dump", "Live sockets not captured in crash dump");
+        snap.security.status = SubsystemStatus::unavailable("crash_dump", "Live token/seccomp not captured in crash dump");
+        return snap;
+    }
+
     ProcessInternalsSnapshot snap{};
     const ProcessId pid = session.pid();
     const std::string proc_root = "/proc/" + std::to_string(pid);

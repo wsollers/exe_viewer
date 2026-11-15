@@ -1493,6 +1493,73 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         return make_error(std::format("Failed while reading '{}'", options.binary_path.string()));
     }
 
+    HeadlessAnalysisReport report;
+    report.binary_path = options.binary_path;
+    report.sha256 = sha256_hex(raw_bytes);
+    report.file_size = raw_bytes.size();
+
+    // Crash dump support (`WU-14`): Windows `"MDMP"` .dmp and Linux ELF `ET_CORE`
+    // must be checked before `parse_image`, since `ET_CORE` starts with `\x7FELF`.
+    if (is_crash_dump_bytes(raw_bytes)) {
+        auto opened = open_crash_dump_bytes(std::move(raw_bytes), options.binary_path);
+        if (!opened.has_value()) {
+            return std::unexpected(opened.error());
+        }
+        report.crash_dump = std::move(*opened);
+
+        // Opportunistically hydrate the faulting or main module image when mapped/backed.
+        const auto regs = report.crash_dump->memory_regions();
+        const auto mods = report.crash_dump->modules();
+        if (regs.has_value() && mods.has_value() && !mods->empty()) {
+            std::size_t chosen_idx = 0u;
+            const auto& csum = report.crash_dump->crash_summary();
+            const std::uint64_t fault_ip =
+                (csum.exception.has_value() && csum.exception->instruction_pointer.has_value())
+                    ? *csum.exception->instruction_pointer
+                    : 0u;
+            bool matched = false;
+            if (fault_ip != 0u) {
+                for (std::size_t i = 0u; i < mods->size(); ++i) {
+                    if (fault_ip >= (*mods)[i].base_address &&
+                        fault_ip < (*mods)[i].base_address + std::max<std::uint64_t>((*mods)[i].size, 1u)) {
+                        chosen_idx = i;
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if (!matched) {
+                for (std::size_t i = 0u; i < mods->size(); ++i) {
+                    if ((*mods)[i].is_main_module) {
+                        chosen_idx = i;
+                        break;
+                    }
+                }
+            }
+            if (auto loaded_mod = load_live_module_image(*report.crash_dump, (*mods)[chosen_idx], *regs)) {
+                report.image = std::move(*loaded_mod);
+            }
+        }
+
+        const ProcessInternalsSnapshot internals = report.crash_dump->crash_internals();
+        const ProcessSecurityProfile* sec_ptr =
+            internals.security.has_value() ? &(*internals.security.value) : nullptr;
+        if (report.image != nullptr) {
+            DependencyResolveOptions dep_opts;
+            dep_opts.root_path = options.binary_path;
+            dep_opts.search_roots = options.search_roots;
+            report.dependencies = build_dependency_graph(*report.image, dep_opts);
+            report.security = audit_security(*report.image, {}, report.crash_dump.get(), sec_ptr);
+        } else {
+            report.security = audit_live_process_security(*report.crash_dump, sec_ptr);
+        }
+
+        if (options.compare_path.has_value()) {
+            return make_error("--compare is not supported when the primary input is a crash dump");
+        }
+        return report;
+    }
+
     auto parsed = parse_image(raw_bytes);
     if (!parsed.has_value()) {
         return make_error(std::format("Failed to parse '{}': {}",
@@ -1500,10 +1567,6 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
                                       parsed.error().message));
     }
 
-    HeadlessAnalysisReport report;
-    report.binary_path = options.binary_path;
-    report.sha256 = sha256_hex(raw_bytes);
-    report.file_size = raw_bytes.size();
     report.image = std::move(*parsed);
 
     DependencyResolveOptions dep_opts;
@@ -1534,7 +1597,8 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
 }
 
 std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
-    const IBinaryImage& img = *report.image;
+    const IBinaryImage* img = report.image.get();
+    ICrashDumpSession* dump = report.crash_dump.get();
     std::string out;
     out.reserve(16384u);
 
@@ -1546,23 +1610,45 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
     out += "{\n";
     out += "  \"schema_version\": 1,\n";
 
-    // Binary identity
+    // Binary / dump identity
     out += "  \"binary\": {\n";
     out += "    "; key("path"); append_json_escaped(out, report.binary_path.generic_string()); out += ",\n";
     out += "    "; key("sha256"); append_json_escaped(out, report.sha256); out += ",\n";
     out += std::format("    \"size\": {},\n", report.file_size);
-    out += "    "; key("format"); append_json_escaped(out, to_string(img.format())); out += ",\n";
-    out += "    "; key("kind"); append_json_escaped(out, to_string(img.kind())); out += ",\n";
-    out += "    "; key("arch"); append_json_escaped(out, to_string(img.architecture())); out += ",\n";
-    out += std::format("    \"bits\": {},\n", img.is_64bit() ? 64 : 32);
-    out += "    "; key("endianness"); append_json_escaped(out, to_string(img.endianness())); out += ",\n";
-    out += std::format("    \"entry_point\": {},\n", img.entry_point());
-    out += std::format("    \"image_base\": {}\n", img.image_base());
+    if (dump != nullptr) {
+        const CrashDumpSummary& cs = dump->crash_summary();
+        const std::string_view fmt_str =
+            cs.kind == CrashDumpKind::WindowsMinidump ? "Minidump" : "ELF";
+        out += "    "; key("format"); append_json_escaped(out, fmt_str); out += ",\n";
+        out += "    "; key("kind"); append_json_escaped(out, "CrashDump"); out += ",\n";
+        out += "    "; key("arch"); append_json_escaped(out, to_string(cs.layout.architecture)); out += ",\n";
+        out += std::format("    \"bits\": {},\n", cs.layout.address_width == AddressWidth::Bits64 ? 64 : 32);
+        out += "    "; key("endianness"); append_json_escaped(out, to_string(cs.layout.endianness)); out += ",\n";
+        const std::uint64_t ep = img != nullptr
+            ? img->entry_point()
+            : (cs.exception.has_value() ? cs.exception->instruction_pointer.value_or(0u) : 0u);
+        const std::uint64_t ib = img != nullptr ? img->image_base() : 0u;
+        out += std::format("    \"entry_point\": {},\n", ep);
+        out += std::format("    \"image_base\": {}\n", ib);
+    } else {
+        out += "    "; key("format"); append_json_escaped(out, to_string(img->format())); out += ",\n";
+        out += "    "; key("kind"); append_json_escaped(out, to_string(img->kind())); out += ",\n";
+        out += "    "; key("arch"); append_json_escaped(out, to_string(img->architecture())); out += ",\n";
+        out += std::format("    \"bits\": {},\n", img->is_64bit() ? 64 : 32);
+        out += "    "; key("endianness"); append_json_escaped(out, to_string(img->endianness())); out += ",\n";
+        out += std::format("    \"entry_point\": {},\n", img->entry_point());
+        out += std::format("    \"image_base\": {}\n", img->image_base());
+    }
     out += "  },\n";
+
+    static const std::vector<Section> kEmptySecs{};
+    static const std::vector<ImportEntry> kEmptyImps{};
+    static const std::vector<ExportEntry> kEmptyExps{};
+    static const std::vector<Symbol> kEmptySyms{};
 
     // Sections
     out += "  \"sections\": [";
-    const auto& secs = img.sections();
+    const auto& secs = img != nullptr ? img->sections() : kEmptySecs;
     for (std::size_t i = 0; i < secs.size(); ++i) {
         const Section& s = secs[i];
         out += (i == 0u) ? "\n" : ",\n";
@@ -1583,7 +1669,7 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
 
     // Imports
     out += "  \"imports\": [";
-    const auto& imps = img.imports();
+    const auto& imps = img != nullptr ? img->imports() : kEmptyImps;
     for (std::size_t i = 0; i < imps.size(); ++i) {
         const ImportEntry& imp = imps[i];
         out += (i == 0u) ? "\n" : ",\n";
@@ -1601,7 +1687,7 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
 
     // Exports
     out += "  \"exports\": [";
-    const auto& exps = img.exports();
+    const auto& exps = img != nullptr ? img->exports() : kEmptyExps;
     for (std::size_t i = 0; i < exps.size(); ++i) {
         const ExportEntry& exp = exps[i];
         out += (i == 0u) ? "\n" : ",\n";
@@ -1641,7 +1727,7 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
 
     // Symbols with demangled names (`WU-05`)
     out += "  \"symbols\": [";
-    const auto& syms = img.symbols();
+    const auto& syms = img != nullptr ? img->symbols() : kEmptySyms;
     for (std::size_t i = 0; i < syms.size(); ++i) {
         const Symbol& s = syms[i];
         const DemangleResult dem = demangle_symbol(s.name);
@@ -1659,6 +1745,105 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
     }
     if (!syms.empty()) out += "\n  ";
     out += "],\n";
+
+    // Offline Crash Dump Summary (`WU-14`)
+    if (dump != nullptr) {
+        const CrashDumpSummary& cs = dump->crash_summary();
+        out += "  \"crash_dump\": {\n";
+        out += "    "; key("kind"); append_json_escaped(out, to_string(cs.kind)); out += ",\n";
+        out += "    "; key("os_summary"); append_json_escaped(out, cs.os_summary); out += ",\n";
+        out += "    "; key("cpu_summary"); append_json_escaped(out, cs.cpu_summary); out += ",\n";
+        out += std::format("    \"pid\": {},\n", cs.pid);
+        out += std::format("    \"parent_pid\": {},\n", cs.parent_pid);
+        out += "    "; key("process_name"); append_json_escaped(out, cs.process_name); out += ",\n";
+        out += "    "; key("command_line"); append_json_escaped(out, cs.command_line); out += ",\n";
+
+        out += "    \"exception\": ";
+        if (cs.exception.has_value()) {
+            const CrashExceptionInfo& ex = *cs.exception;
+            out += "{\n";
+            out += std::format("      \"thread_id\": {},\n",
+                               ex.thread_id.has_value() ? std::to_string(*ex.thread_id) : "null");
+            out += std::format("      \"code\": {},\n", ex.fault_code);
+            out += "      "; key("name"); append_json_escaped(out, ex.fault_name); out += ",\n";
+            out += std::format("      \"fault_address\": {},\n",
+                               ex.fault_address.has_value() ? std::to_string(*ex.fault_address) : "null");
+            out += std::format("      \"instruction_pointer\": {},\n",
+                               ex.instruction_pointer.has_value() ? std::to_string(*ex.instruction_pointer) : "null");
+            out += "      "; key("access_operation"); append_json_escaped(out, ex.access_operation); out += ",\n";
+            out += "      "; key("description"); append_json_escaped(out, ex.description); out += "\n";
+            out += "    },\n";
+        } else {
+            out += "null,\n";
+        }
+
+        const auto mods = dump->modules();
+        out += "    \"modules\": [";
+        if (mods.has_value()) {
+            for (std::size_t i = 0; i < mods->size(); ++i) {
+                const ModuleInfo& m = (*mods)[i];
+                out += (i == 0u) ? "\n" : ",\n";
+                out += "      { ";
+                key("name"); append_json_escaped(out, m.name); out += ", ";
+                key("path"); append_json_escaped(out, m.path.generic_string());
+                out += std::format(", \"base_address\": {}, \"size\": {}, \"entry_point\": {}, \"is_main_module\": {} }}",
+                                   m.base_address,
+                                   m.size,
+                                   m.entry_point,
+                                   m.is_main_module ? "true" : "false");
+            }
+            if (!mods->empty()) out += "\n    ";
+        }
+        out += "],\n";
+
+        const auto ths = dump->threads();
+        out += "    \"threads\": [";
+        if (ths.has_value()) {
+            for (std::size_t i = 0; i < ths->size(); ++i) {
+                const ThreadInfo& th = (*ths)[i];
+                const ThreadContext ctx = dump->thread_context(th.tid);
+                out += (i == 0u) ? "\n" : ",\n";
+                out += "      { ";
+                out += std::format("\"tid\": {}, ", th.tid);
+                key("name"); append_json_escaped(out, th.name); out += ", ";
+                key("state"); append_json_escaped(out, to_string(th.state));
+                out += std::format(", \"instruction_pointer\": {}, \"stack_pointer\": {}, \"frame_pointer\": {}, \"tls_base\": {}, \"registers\": [",
+                                   ctx.instruction_pointer,
+                                   ctx.stack_pointer,
+                                   ctx.frame_pointer,
+                                   th.tls_base.value_or(0u));
+                for (std::size_t r = 0; r < ctx.registers.size(); ++r) {
+                    const RegisterValue& rv = ctx.registers[r];
+                    if (r > 0u) out += ", ";
+                    out += "{ ";
+                    key("name"); append_json_escaped(out, rv.name);
+                    out += std::format(", \"value\": {} }}", rv.value_u64);
+                }
+                out += "] }";
+            }
+            if (!ths->empty()) out += "\n    ";
+        }
+        out += "],\n";
+
+        const auto regs = dump->memory_regions();
+        out += "    \"memory_regions\": [";
+        if (regs.has_value()) {
+            for (std::size_t i = 0; i < regs->size(); ++i) {
+                const MemoryRegion& reg = (*regs)[i];
+                out += (i == 0u) ? "\n" : ",\n";
+                out += std::format("      {{ \"start_address\": {}, \"end_address\": {}, \"size\": {}, ",
+                                   reg.start_address,
+                                   reg.end_address,
+                                   reg.size());
+                key("protection"); append_json_escaped(out, format_protection(reg.protection)); out += ", ";
+                key("kind"); append_json_escaped(out, to_string(reg.kind)); out += ", ";
+                key("pathname"); append_json_escaped(out, reg.pathname);
+                out += std::format(", \"file_offset\": {} }}", reg.file_offset);
+            }
+            if (!regs->empty()) out += "\n    ";
+        }
+        out += "]\n  },\n";
+    }
 
     // Security Audit (`WU-13`)
     out += "  \"security_audit\": {\n";
@@ -1969,11 +2154,22 @@ std::optional<int> try_run_headless_or_help_cli(
     bool has_positional_binary = false;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
-        const std::string_view a = args[i];
-        if (a == "--headless") {
+        const std::string_view raw_arg = args[i];
+        if (raw_arg == "--headless") {
             continue;
         }
+        std::string_view a = raw_arg;
+        std::optional<std::string_view> inline_val;
+        if (raw_arg.starts_with("--")) {
+            if (const std::size_t eq = raw_arg.find('='); eq != std::string_view::npos) {
+                a = raw_arg.substr(0u, eq);
+                inline_val = raw_arg.substr(eq + 1u);
+            }
+        }
         auto require_next = [&](std::string_view flag) -> std::optional<std::string_view> {
+            if (inline_val.has_value()) {
+                return *inline_val;
+            }
             if (i + 1u >= args.size()) {
                 stderr_stream << "Error: missing value after " << flag << "\n";
                 return std::nullopt;

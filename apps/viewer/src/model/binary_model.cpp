@@ -357,6 +357,29 @@ std::filesystem::path utf8_path(std::string_view text) {
             return false;
         }
 
+        // Offline crash dumps (`WU-14`: Windows `"MDMP"` .dmp and Linux ELF `ET_CORE`)
+        // must be detected BEFORE `peelf::parse_image`, since `ET_CORE` begins with `\x7FELF`.
+        if (peelf::is_crash_dump_bytes(bytes_)) {
+            auto opened_dump = peelf::open_crash_dump_bytes(std::move(bytes_), utf8_path(path));
+            if (!opened_dump.has_value()) {
+                const std::string err = opened_dump.error().message;
+                reset_all();
+                last_diagnostic_ = err;
+                return false;
+            }
+            auto attached = attach_session(std::move(*opened_dump));
+            if (!attached.has_value()) {
+                const std::string err = attached.error().message;
+                reset_all();
+                last_diagnostic_ = err;
+                return false;
+            }
+            if (file_info_.path.empty() || file_info_.path.starts_with("[")) {
+                file_info_.path = path;
+            }
+            return true;
+        }
+
         if (auto parsed = peelf::parse_image(bytes_)) {
             image_ = std::move(*parsed);
             architecture_ = image_->architecture();
@@ -456,8 +479,33 @@ std::filesystem::path utf8_path(std::string_view text) {
 
         auto map_res = refresh_process_map();
         (void)refresh_threads();
+        if (const peelf::CrashDumpSummary* dump = crash_dump_summary(); dump != nullptr) {
+            if (dump->exception.has_value()) {
+                if (dump->exception->thread_id.has_value() && *dump->exception->thread_id != 0u) {
+                    for (const peelf::ThreadInfo& th : threads_) {
+                        if (th.tid == *dump->exception->thread_id) {
+                            select_thread(th.tid);
+                            break;
+                        }
+                    }
+                }
+                if (dump->exception->instruction_pointer.has_value() &&
+                    *dump->exception->instruction_pointer != 0u) {
+                    (void)navigate_to_virtual_address(*dump->exception->instruction_pointer);
+                }
+            }
+            refresh_process_internals();
+        }
         refresh_runtime_and_handlers();
         return map_res;
+    }
+
+    const peelf::CrashDumpSummary* BinaryModel::crash_dump_summary() const noexcept {
+        if (!is_crash_dump()) {
+            return nullptr;
+        }
+        const auto* dump = dynamic_cast<const peelf::ICrashDumpSession*>(session_.get());
+        return dump != nullptr ? &dump->crash_summary() : nullptr;
     }
 
     void BinaryModel::detach_process() {
@@ -648,12 +696,20 @@ std::filesystem::path utf8_path(std::string_view text) {
 
             const std::string display_path = !mod.path.empty() ? mod.path.string() : mod.name;
             file_info_.path = display_path;
-            file_info_.format_str = std::string(peelf::to_string(image_->format())) + " (Live Read-Only)";
+            file_info_.format_str = std::string(peelf::to_string(image_->format())) +
+                                    (is_crash_dump() ? " (Crash Dump)" : " (Live Read-Only)");
             file_info_.arch_str = std::string(peelf::to_string(image_->architecture()));
             file_info_.size_bytes = live_window_size_;
             file_info_.entry_point = image_->entry_point();
             file_info_.flags.clear();
-            file_info_.flags.push_back("Live PID " + std::to_string(session_->pid()) + " (Read-Only)");
+            if (const auto* dump = crash_dump_summary(); dump != nullptr) {
+                file_info_.flags.push_back("[CRASH DUMP] " + std::string(peelf::to_string(dump->kind)));
+                if (dump->exception.has_value() && !dump->exception->description.empty()) {
+                    file_info_.flags.push_back(dump->exception->description);
+                }
+            } else {
+                file_info_.flags.push_back("Live PID " + std::to_string(session_->pid()) + " (Read-Only)");
+            }
             file_info_.flags.push_back("Base " + format_hex_addr(mod.base_address));
             file_info_.flags.push_back(std::string(peelf::to_string(image_->kind())));
             file_info_.flags.push_back(image_->is_64bit() ? "64-bit" : "32-bit");
@@ -793,19 +849,23 @@ std::filesystem::path utf8_path(std::string_view text) {
         const std::string region_name = !reg.pathname.empty()
             ? reg.pathname
             : ("[" + std::string(peelf::to_string(reg.kind)) + "]");
+        const char* mode_tag = is_crash_dump() ? "Crash Dump" : "Live RAM";
         file_info_.path = region_name;
         file_info_.format_str = image_
-            ? (std::string(peelf::to_string(image_->format())) + " Region (Live RAM)")
-            : "Memory Region (Live RAM)";
+            ? (std::string(peelf::to_string(image_->format())) + " Region (" + mode_tag + ")")
+            : (std::string("Memory Region (") + mode_tag + ")");
         file_info_.arch_str = std::string(peelf::to_string(architecture_));
         file_info_.size_bytes = reg.size();
         file_info_.entry_point = image_ ? image_->entry_point() : reg.start_address;
         file_info_.flags = {
-            "Live PID " + std::to_string(session_->pid()),
+            (is_crash_dump() ? "[CRASH DUMP] PID " : "Live PID ") + std::to_string(session_->pid()),
             "Range " + format_hex_addr(reg.start_address) + " - " + format_hex_addr(reg.end_address),
             "Perms " + peelf::format_protection(reg.protection),
             "Kind " + std::string(peelf::to_string(reg.kind)),
         };
+        if (const auto* dump = crash_dump_summary(); dump != nullptr && dump->exception.has_value()) {
+            file_info_.flags.push_back(dump->exception->description);
+        }
 
         std::uint32_t flags = 0;
         if (reg.protection.readable)   flags |= 0x4u;

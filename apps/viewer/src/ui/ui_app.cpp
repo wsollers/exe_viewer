@@ -1522,6 +1522,9 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) {
             if (on_open_file_) { on_open_file_(); }
         }
+        if (ImGui::MenuItem("Open Crash Dump...", nullptr, false, static_cast<bool>(on_analysis_file_))) {
+            on_analysis_file_(4);
+        }
         if (ImGui::BeginMenu("Recent Binaries")) {
             std::optional<std::filesystem::path> selected;
             for (const auto& path : recent_binaries_.paths()) {
@@ -1570,14 +1573,17 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem(model_.is_process_suspended() ? "Resume Process" : "Pause Process",
                             nullptr,
                             false,
-                            model_.is_live_process())) {
+                            model_.is_live_process() && !model_.is_crash_dump())) {
             const auto st = model_.is_process_suspended() ? model_.resume_process() : model_.suspend_process();
             Log().info("{}", st.detail);
         }
-        if (ImGui::MenuItem("Detach from Process", nullptr, false, model_.is_live_process())) {
+        if (ImGui::MenuItem(model_.is_crash_dump() ? "Close Crash Dump" : "Detach from Process",
+                            nullptr,
+                            false,
+                            model_.is_live_process())) {
             model_.detach_process();
             on_file_loaded();
-            Log().info("Detached from live process");
+            Log().info("{}", model_.is_crash_dump() ? "Closed crash dump" : "Detached from live process");
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Open Debug Symbols...", nullptr, false, model_.image() != nullptr)) {
@@ -3006,10 +3012,19 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                 current_selection_ = structure_tree_->selection;
             }
             const peelf::IBinaryImage* img = model_.image();
-            if (img != nullptr && img->entry_point() != 0) {
-                if (const auto entry_off = model_.virtual_address_to_offset(img->entry_point())) {
+            std::uint64_t target_va = 0u;
+            if (const auto* dump = model_.crash_dump_summary();
+                dump != nullptr && dump->exception.has_value() &&
+                dump->exception->instruction_pointer.has_value() &&
+                *dump->exception->instruction_pointer != 0u) {
+                target_va = *dump->exception->instruction_pointer;
+            } else if (img != nullptr && img->entry_point() != 0u) {
+                target_va = img->entry_point();
+            }
+            if (target_va != 0u) {
+                if (const auto entry_off = model_.virtual_address_to_offset(target_va)) {
                     hex_panel_.navigate_to_range(clamp_to_size_t(*entry_off), 1);
-                    disassemble_at_offset(*entry_off, img->entry_point());
+                    disassemble_at_offset(*entry_off, target_va);
                 } else {
                     hex_panel_.navigate_to_range(0, 1);
                     disassemble_at_offset(0, model_.view_base_address());
@@ -3020,7 +3035,9 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             }
             last_navigation_selection_ = current_selection_;
             call_graph_sample_ = CallGraphSample::LoadedImage;
-            call_graph_status_ = "Attached to live module. Click Loaded Image or Reload to render the call graph.";
+            call_graph_status_ = model_.is_crash_dump()
+                ? "Opened crash dump. Click Loaded Image or Reload to render the call graph."
+                : "Attached to live module. Click Loaded Image or Reload to render the call graph.";
         }
     }
 

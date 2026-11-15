@@ -365,6 +365,7 @@ public:
     [[nodiscard]] ProcessId pid() const noexcept { return info().pid; }
     [[nodiscard]] virtual bool is_alive() const noexcept = 0;
     [[nodiscard]] virtual bool is_read_only() const noexcept { return true; }
+    [[nodiscard]] virtual bool is_crash_dump() const noexcept { return false; }
     [[nodiscard]] virtual TargetLayout target_layout() const noexcept {
         return TargetLayout::from_arch(info().architecture, info().is_64bit, info().endianness);
     }

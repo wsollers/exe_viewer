@@ -78,21 +78,47 @@ void ThreadsAndStackPanel::draw_contents() {
         return;
     }
 
-    const bool proc_paused = model_.is_process_suspended();
-    if (ImGui::Button(proc_paused ? "Resume Process" : "Pause Process")) {
-        const peelf::SubsystemStatus st = proc_paused ? model_.resume_process() : model_.suspend_process();
-        status_note_ = st.detail;
+    if (const peelf::CrashDumpSummary* dump = model_.crash_dump_summary(); dump != nullptr) {
+        ImGui::TextColored(ImVec4(1.0f, 0.48f, 0.34f, 1.0f),
+                           "[CRASH DUMP] %s",
+                           std::string(peelf::to_string(dump->kind)).c_str());
+        if (dump->exception.has_value()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.28f, 1.0f),
+                               "| %s",
+                               dump->exception->description.c_str());
+            if (dump->exception->instruction_pointer.has_value() &&
+                *dump->exception->instruction_pointer != 0u &&
+                on_address_activated_) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Jump to Faulting IP")) {
+                    on_address_activated_(*dump->exception->instruction_pointer,
+                                          PreferredView::Disassembly,
+                                          false);
+                }
+            }
+        }
+        if (ImGui::Button("Refresh Threads & Context")) {
+            (void)model_.refresh_threads();
+            model_.refresh_selected_thread_inspection();
+        }
+    } else {
+        const bool proc_paused = model_.is_process_suspended();
+        if (ImGui::Button(proc_paused ? "Resume Process" : "Pause Process")) {
+            const peelf::SubsystemStatus st = proc_paused ? model_.resume_process() : model_.suspend_process();
+            status_note_ = st.detail;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Refresh Threads & Context")) {
+            (void)model_.refresh_threads();
+            model_.refresh_selected_thread_inspection();
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(proc_paused ? ImVec4(1.0f, 0.80f, 0.25f, 1.0f)
+                                       : ImVec4(0.40f, 0.92f, 0.56f, 1.0f),
+                           "%s",
+                           proc_paused ? "[PROCESS PAUSED]" : "[PROCESS RUNNING]");
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh Threads & Context")) {
-        (void)model_.refresh_threads();
-        model_.refresh_selected_thread_inspection();
-    }
-    ImGui::SameLine();
-    ImGui::TextColored(proc_paused ? ImVec4(1.0f, 0.80f, 0.25f, 1.0f)
-                                   : ImVec4(0.40f, 0.92f, 0.56f, 1.0f),
-                       "%s",
-                       proc_paused ? "[PROCESS PAUSED]" : "[PROCESS RUNNING]");
 
     draw_status_banner("Threads", model_.threads_status());
     if (!status_note_.empty()) {

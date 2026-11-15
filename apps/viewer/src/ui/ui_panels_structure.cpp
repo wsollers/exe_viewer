@@ -126,6 +126,20 @@ SelectionDetailsPanel::SelectionDetailsPanel(const ViewerSelection& selection, c
 {}
 
 void SelectionDetailsPanel::draw_contents() {
+    if (model_ != nullptr && model_->is_crash_dump()) {
+        if (const peelf::CrashDumpSummary* dump = model_->crash_dump_summary(); dump != nullptr) {
+            ImGui::TextColored(ImVec4(1.0f, 0.48f, 0.34f, 1.0f),
+                               "[CRASH DUMP] %s",
+                               std::string(peelf::to_string(dump->kind)).c_str());
+            if (dump->exception.has_value()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.80f, 0.28f, 1.0f),
+                                   "%s",
+                                   dump->exception->description.c_str());
+            }
+            ImGui::Separator();
+        }
+    }
+
     if (selection_.kind == SelectionKind::None) {
         ImGui::TextUnformatted("No selection.");
         return;

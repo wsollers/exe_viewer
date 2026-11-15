@@ -23,6 +23,8 @@ add_library(peelf_core
   src/runtime_structures.cpp
   src/handlers.cpp
   src/security_audit.cpp
+  src/crash_dump_minidump.cpp
+  src/crash_dump_elf_core.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
@@ -45,6 +47,7 @@ add_library(peelf_core
   include/peelf/runtime_structures.hpp
   include/peelf/handlers.hpp
   include/peelf/security_audit.hpp
+  include/peelf/crash_dump.hpp
   include/mapping/file_mapping.hpp
   src/mapping/map_errors.cpp
   src/mapping/file_mapping_posix.cpp

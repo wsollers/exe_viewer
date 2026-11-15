@@ -22,34 +22,57 @@ namespace viewer {
 
         if (model_.is_live_process()) {
             if (const peelf::IProcessSession* sess = model_.process_session()) {
-                const bool paused = model_.is_process_suspended();
-                ImGui::TextColored(paused ? ImVec4(1.0f, 0.78f, 0.25f, 1.0f)
-                                          : ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
-                                   "%s LIVE PROCESS: %s (PID %llu) [Read-Only]",
-                                   paused ? "[PAUSED]" : "[RUNNING]",
-                                   sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
-                                   static_cast<unsigned long long>(sess->pid()));
-                if (ImGui::SmallButton(paused ? "Resume Process" : "Pause Process")) {
-                    if (on_pause_toggle_) {
-                        on_pause_toggle_();
+                if (const peelf::CrashDumpSummary* dump = model_.crash_dump_summary(); dump != nullptr) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.50f, 0.36f, 1.0f),
+                                       "[CRASH DUMP] %s (PID %llu) — %s",
+                                       sess->info().name.empty() ? "<dump>" : sess->info().name.c_str(),
+                                       static_cast<unsigned long long>(sess->pid()),
+                                       std::string(peelf::to_string(dump->kind)).c_str());
+                    if (dump->exception.has_value()) {
+                        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f),
+                                           "Fault: %s",
+                                           dump->exception->description.c_str());
                     }
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Refresh Map")) {
-                    if (on_refresh_requested_) {
-                        on_refresh_requested_();
+                    if (!dump->os_summary.empty() || !dump->cpu_summary.empty()) {
+                        ImGui::TextDisabled("%s | %s",
+                                            dump->os_summary.c_str(),
+                                            dump->cpu_summary.c_str());
                     }
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Switch Process...")) {
-                    if (on_attach_requested_) {
-                        on_attach_requested_();
+                    if (ImGui::SmallButton("Close Dump")) {
+                        if (on_detach_requested_) {
+                            on_detach_requested_();
+                        }
                     }
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Detach")) {
-                    if (on_detach_requested_) {
-                        on_detach_requested_();
+                } else {
+                    const bool paused = model_.is_process_suspended();
+                    ImGui::TextColored(paused ? ImVec4(1.0f, 0.78f, 0.25f, 1.0f)
+                                              : ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
+                                       "%s LIVE PROCESS: %s (PID %llu) [Read-Only]",
+                                       paused ? "[PAUSED]" : "[RUNNING]",
+                                       sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
+                                       static_cast<unsigned long long>(sess->pid()));
+                    if (ImGui::SmallButton(paused ? "Resume Process" : "Pause Process")) {
+                        if (on_pause_toggle_) {
+                            on_pause_toggle_();
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Refresh Map")) {
+                        if (on_refresh_requested_) {
+                            on_refresh_requested_();
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Switch Process...")) {
+                        if (on_attach_requested_) {
+                            on_attach_requested_();
+                        }
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Detach")) {
+                        if (on_detach_requested_) {
+                            on_detach_requested_();
+                        }
                     }
                 }
                 if (model_.resolved_executable_path()) {
