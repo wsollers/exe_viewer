@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <string>
 
 namespace viewer {
@@ -17,6 +18,10 @@ SymbolsPanel::SymbolsPanel(const SymbolIndex& index, const ViewerSelection& sele
 }
 
 void SymbolsPanel::draw_contents() {
+    if (library_filter_file_ != model_.file_info().path) {
+        library_filter_file_ = model_.file_info().path;
+        library_filter_.clear();
+    }
     if (index_.empty()) {
         ImGui::TextUnformatted("No symbols.");
         return;
@@ -24,6 +29,16 @@ void SymbolsPanel::draw_contents() {
 
     ImGui::SetNextItemWidth(-1);
     ImGui::InputTextWithHint("##Filter", "Search functions or names...", filter_buf_, sizeof(filter_buf_));
+    const auto libraries = index_.libraries();
+    if (!library_filter_.empty() && std::ranges::find(libraries,library_filter_) == libraries.end()) library_filter_.clear();
+    ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Library").x - ImGui::GetStyle().ItemInnerSpacing.x);
+    if (ImGui::BeginCombo("Library", library_filter_.c_str())) {
+        if (ImGui::Selectable("##AllLibraries", library_filter_.empty())) library_filter_.clear();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("All libraries (no filtering)");
+        for (const auto& library : libraries)
+            if (ImGui::Selectable(library.c_str(), library_filter_ == library)) library_filter_ = library;
+        ImGui::EndCombo();
+    }
     ImGui::Checkbox("Functions only", &functions_only_);
     const std::string filter = filter_buf_;
     const bool has_filter = !filter.empty();
@@ -51,7 +66,9 @@ void SymbolsPanel::draw_contents() {
         for (std::size_t i = 0; i < records.size(); ++i)
             if ((!has_filter || symbol_name_matches(records[i].name, filter) ||
                  (display_name_resolver_ && symbol_name_matches(display_name_resolver_(records[i]), filter))) &&
-                (!functions_only_ || (model_.image() && symbol_has_code(*model_.image(), records[i])))) {
+                (library_filter_.empty() || records[i].library == library_filter_) &&
+                (!functions_only_ || records[i].source == SymbolSource::Import ||
+                 (model_.image() && symbol_has_code(*model_.image(), records[i])))) {
                 if (selected_index == i) selected_row = static_cast<int>(matches.size());
                 matches.push_back(i);
             }

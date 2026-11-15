@@ -25,6 +25,7 @@ struct DebugSymbol {
     std::uint64_t virtual_address = 0;
     std::uint64_t size = 0;
     bool function = false;
+    std::string library;
 };
 
 struct SymbolRecord {
@@ -38,6 +39,7 @@ struct SymbolRecord {
     bool external = false;
     // Known PDB classification; other symbol formats use executable section membership.
     std::optional<bool> function;
+    std::string library;
 };
 
 class SymbolIndex {
@@ -48,6 +50,7 @@ public:
     [[nodiscard]] std::span<const SymbolRecord> records() const noexcept { return records_; }
     [[nodiscard]] bool empty() const noexcept { return records_.empty(); }
     [[nodiscard]] std::size_t size() const noexcept { return records_.size(); }
+    [[nodiscard]] std::vector<std::string> libraries() const;
 
     [[nodiscard]] const SymbolRecord* find_by_name(std::string_view name) const noexcept;
     [[nodiscard]] const SymbolRecord* find_containing_address(std::uint64_t virtual_address) const noexcept;

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -460,6 +461,27 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     add_dia_children(*global.get(), SymTagPublicSymbol, image_base, false, result.symbols);
     add_dia_children(*global.get(), SymTagData, image_base, false, result.symbols);
     add_dia_types(*global.get(), result.types);
+    std::map<std::uint64_t,std::string> libraries_by_address;
+    ComPtr<IDiaEnumSymbols> compilands;
+    if (SUCCEEDED(global->findChildren(SymTagCompiland,nullptr,nsNone,compilands.put())) && compilands) {
+        ComPtr<IDiaSymbol> compiland; ULONG fetched=0;
+        while (SUCCEEDED(compilands->Next(1,compiland.put(),&fetched)) && fetched==1) {
+            Bstr library_name;
+            if (FAILED(compiland->get_libraryName(library_name.put())) || !library_name.get()) continue;
+            const auto library=to_utf8(library_name.get());
+            auto extension=std::filesystem::path(library).extension().string();
+            std::ranges::transform(extension,extension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+            if (extension!=".lib" && extension!=".a") continue;
+            std::vector<DebugSymbol> members;
+            add_dia_children(*compiland.get(),SymTagFunction,image_base,true,members);
+            add_dia_children(*compiland.get(),SymTagData,image_base,false,members);
+            for (const auto& member : members) libraries_by_address.try_emplace(member.virtual_address,library);
+        }
+    }
+
+    compilands.reset(); // Release DIA objects before cleanup_com unloads the provider DLL.
+    for (auto& symbol : result.symbols)
+        if (const auto it=libraries_by_address.find(symbol.virtual_address); it!=libraries_by_address.end()) symbol.library=it->second;
 
     std::ranges::sort(result.symbols, {}, &DebugSymbol::name);
     result.symbols.erase(std::ranges::unique(result.symbols, [](const DebugSymbol& lhs, const DebugSymbol& rhs) {

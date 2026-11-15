@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -201,5 +202,38 @@ TEST(DebugSymbols, ConfiguredDiaBackendLoadsBuildPdb) {
     EXPECT_FALSE(result.symbols.empty());
 #else
     GTEST_SKIP() << "DIA backend was not configured for this build";
+#endif
+}
+
+TEST(SymbolIndex, RetainsLibraryMetadataAndListsDistinctLibraries) {
+    const auto image=parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image,nullptr);
+    auto index=viewer::SymbolIndex::build(*image);
+    const auto address=image->entry_point();
+    const std::array symbols{
+        viewer::DebugSymbol{.name="library_function_a",.virtual_address=address,.size=4,.function=true,.library="alpha.lib"},
+        viewer::DebugSymbol{.name="library_function_b",.virtual_address=address+4,.size=4,.function=true,.library="alpha.lib"},
+        viewer::DebugSymbol{.name="library_function_c",.virtual_address=address+8,.size=4,.function=true,.library="beta.lib"}};
+    index.add_debug_symbols(*image,symbols);
+    ASSERT_NE(index.find_by_name("library_function_a"),nullptr);
+    EXPECT_EQ(index.find_by_name("library_function_a")->library,"alpha.lib");
+    const auto libraries=index.libraries();
+    EXPECT_EQ(std::ranges::count(libraries,"alpha.lib"),1);
+    EXPECT_EQ(std::ranges::count(libraries,"beta.lib"),1);
+    EXPECT_EQ(std::ranges::count(libraries,""),0);
+    for (const auto& symbol:index.records()) if(symbol.source==viewer::SymbolSource::Import)
+        EXPECT_EQ(symbol.library,image->imports()[symbol.source_index].library);
+}
+
+TEST(DebugSymbols, ReadsStaticLibraryProvenanceFromFixturePdb) {
+#if defined(_WIN32) && defined(PEELF_HAS_DIA)
+    std::ifstream file(PEELF_CALLGRAPH_FIXTURE_EXE,std::ios::binary);
+    const std::vector<std::uint8_t> bytes{std::istreambuf_iterator<char>(file),{}};
+    auto image=peelf::parse_image(bytes); ASSERT_TRUE(image);
+    const auto pdb=viewer::load_pdb_debug_symbols(PEELF_CALLGRAPH_FIXTURE_PDB,**image);
+    ASSERT_EQ(pdb.status,viewer::DebugSymbolLoadStatus::Loaded)<<pdb.diagnostic;
+    EXPECT_TRUE(std::ranges::any_of(pdb.symbols,[](const auto& s){return s.function && !s.library.empty();}));
+#else
+    GTEST_SKIP()<<"DIA unavailable";
 #endif
 }

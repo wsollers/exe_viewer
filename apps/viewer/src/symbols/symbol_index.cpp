@@ -209,6 +209,7 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
             .size = image.is_64bit() ? 8u : 4u,
             .dynamic = true,
             .external = true,
+            .library = import.library,
         });
     }
 
@@ -233,8 +234,17 @@ void SymbolIndex::add_debug_symbols(const peelf::IBinaryImage& image, std::span<
             .dynamic = false,
             .external = symbol.virtual_address == 0,
             .function = symbol.function,
+            .library = symbol.library,
         });
     }
+}
+
+std::vector<std::string> SymbolIndex::libraries() const {
+    std::vector<std::string> result;
+    for (const auto& record : records_) if (!record.library.empty()) result.push_back(record.library);
+    std::ranges::sort(result);
+    result.erase(std::ranges::unique(result).begin(), result.end());
+    return result;
 }
 
 const SymbolRecord* SymbolIndex::find_by_name(std::string_view name) const noexcept {

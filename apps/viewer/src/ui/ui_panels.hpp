@@ -161,6 +161,8 @@ namespace viewer {
         const SymbolIndex& index_;
         const BinaryModel& model_;
         bool functions_only_ = true;
+        std::string library_filter_;
+        std::string library_filter_file_;
         const ViewerSelection& selection_;
         char filter_buf_[128] = {};
         std::optional<std::uint64_t> last_scrolled_selected_;
