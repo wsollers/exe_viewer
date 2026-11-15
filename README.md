@@ -9,6 +9,28 @@ A cross-platform executable & shared-library viewer:
 
 For architecture diagrams and data-flow notes, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Screenshots
+
+Captured from the running Windows Debug build while inspecting `peelf_viewer.exe`
+with its PDB symbols loaded. Click an image to view it at full resolution.
+
+**Control-flow graph** — function search, draggable basic-block cards, branch
+connections, and the linked hex view.
+
+![Control-flow graph with symbol search and hex bytes](docs/screenshots/flow-graph.png)
+
+**Disassembly and hex** — addresses, instruction bytes, operands, and symbol
+annotations alongside the byte editor.
+
+![Symbol-annotated disassembly and hex editor](docs/screenshots/disassembly-hex.png)
+
+**Ghidra decompiler** — function output with address-to-code mapping beside the
+disassembly and hex views.
+
+![Ghidra decompiler with address and code columns](docs/screenshots/ghidra-decompiler.png)
+
+Original captures are stored in [`docs/screenshots`](docs/screenshots).
+
 ## Toolchains
 
 ### UI resources and headless startup
