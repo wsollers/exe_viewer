@@ -137,6 +137,11 @@ add_dependencies(peelf_tests peelf_callgraph_fixture)
 
 # Register every TEST() with CTest so `ctest` discovers and runs them.
 gtest_discover_tests(peelf_tests)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME Decompiler.PythonBridge
+    COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/bn_bridge_test.py)
+endif()
 if(TARGET peelf_viewer)
   add_test(NAME Startup.Headless COMMAND peelf_viewer --headless)
   add_test(NAME Startup.Help COMMAND peelf_viewer --help)
