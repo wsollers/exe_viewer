@@ -358,6 +358,31 @@ void add_elf_metadata(const peelf::IBinaryImage& image, StructureNode& root) {
 
 } // namespace
 
+void NavigationHistory::visit(const ViewerSelection& selection) {
+    if (!selection.virtual_address && !selection.file_offset) return;
+    if (!entries_.empty()) {
+        const auto& current = entries_[cursor_];
+        if (current.virtual_address == selection.virtual_address && current.file_offset == selection.file_offset) {
+            entries_[cursor_] = selection;
+            return;
+        }
+        entries_.resize(cursor_ + 1);
+    }
+    if (entries_.size() == 256) entries_.erase(entries_.begin());
+    entries_.push_back(selection);
+    cursor_ = entries_.size() - 1;
+}
+
+std::optional<ViewerSelection> NavigationHistory::back() {
+    if (!can_back()) return std::nullopt;
+    return entries_[--cursor_];
+}
+
+std::optional<ViewerSelection> NavigationHistory::forward() {
+    if (!can_forward()) return std::nullopt;
+    return entries_[++cursor_];
+}
+
 StructureNode build_structure_tree(const peelf::IBinaryImage& image) {
     StructureNode root{
         .selection = ViewerSelection{

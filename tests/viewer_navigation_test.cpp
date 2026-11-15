@@ -14,6 +14,74 @@
 #include "navigation/viewer_navigation.hpp"
 #include <peelf/binary_image.hpp>
 
+TEST(NavigationHistory, BackForwardAndBranchingPreserveSelections) {
+    viewer::NavigationHistory history;
+    viewer::ViewerSelection a{.label="a", .file_offset=10, .virtual_address=0x1000, .size=4,
+        .preferred_view=viewer::PreferredView::Graph};
+    auto b = a; b.virtual_address=0x2000; b.file_offset=20;
+    auto c = a; c.virtual_address=0x3000; c.file_offset=30;
+    EXPECT_FALSE(history.back());
+    history.visit(a); history.visit(b); history.visit(b);
+    ASSERT_TRUE(history.can_back());
+    const auto previous = history.back();
+    ASSERT_TRUE(previous);
+    EXPECT_EQ(previous->virtual_address,a.virtual_address);
+    EXPECT_EQ(previous->size,4);
+    EXPECT_EQ(previous->preferred_view,viewer::PreferredView::Graph);
+    EXPECT_FALSE(history.can_back());
+    ASSERT_TRUE(history.forward());
+    ASSERT_TRUE(history.back());
+    history.visit(c);
+    EXPECT_FALSE(history.can_forward());
+    EXPECT_EQ(history.back()->virtual_address,a.virtual_address);
+    history.clear();
+    EXPECT_FALSE(history.can_back()); EXPECT_FALSE(history.can_forward());
+}
+
+TEST(NavigationHistory, ViewChangesUpdateCurrentEntryAndHistoryIsBounded) {
+    viewer::NavigationHistory history;
+    viewer::ViewerSelection selection{.file_offset=0, .virtual_address=0, .preferred_view=viewer::PreferredView::Graph};
+    history.visit(selection);
+    selection.preferred_view=viewer::PreferredView::Disassembly;
+    history.visit(selection);
+    EXPECT_FALSE(history.can_back());
+    for (std::uint64_t i=1; i<300; ++i) {
+        selection.file_offset=i; selection.virtual_address=i;
+        history.visit(selection);
+    }
+    int count=0;
+    while (history.back()) ++count;
+    EXPECT_EQ(count,255);
+    history.clear();
+    history.visit({});
+    EXPECT_FALSE(history.forward()); EXPECT_FALSE(history.back());
+}
+
+TEST(NavigationHistory, RetainsUnsymbolizedGraphOriginAcrossViewsAndOtherFunctions) {
+    viewer::NavigationHistory history;
+    viewer::ViewerSelection block{.file_offset=0x40, .virtual_address=0x1040,
+        .preferred_view=viewer::PreferredView::Graph,
+        .graph_root=viewer::SymbolRecord{.name="sub_1000", .virtual_address=0x1000, .file_offset=0, .size=0}};
+    history.visit(block);
+    block.preferred_view=viewer::PreferredView::Disassembly;
+    history.visit(block);
+    auto callee=block;
+    callee.virtual_address=0x2040;
+    callee.file_offset=0x1040;
+    callee.graph_root=viewer::SymbolRecord{.name="sub_2000", .virtual_address=0x2000, .file_offset=0x1000};
+    history.visit(callee);
+    const auto restored=history.back();
+    ASSERT_TRUE(restored);
+    ASSERT_TRUE(restored->graph_root);
+    EXPECT_EQ(restored->virtual_address,0x1040);
+    EXPECT_EQ(restored->graph_root->virtual_address,0x1000);
+    EXPECT_EQ(restored->preferred_view,viewer::PreferredView::Disassembly);
+    const auto next=history.forward();
+    ASSERT_TRUE(next);
+    ASSERT_TRUE(next->graph_root);
+    EXPECT_EQ(next->graph_root->virtual_address,0x2000);
+}
+
 namespace {
 
 [[nodiscard]] std::vector<std::uint8_t> read_fixture(const std::string& name) {

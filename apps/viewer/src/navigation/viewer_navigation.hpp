@@ -7,13 +7,15 @@
 
 #include <peelf/binary_image.hpp>
 #include <peelf/patching.hpp>
+#include "symbols/symbol_index.hpp"
 
 namespace viewer {
 
 enum class PreferredView : std::uint8_t {
     Details,
     Hex,
-    Disassembly
+    Disassembly,
+    Graph
 };
 
 enum class SelectionKind : std::uint8_t {
@@ -53,6 +55,23 @@ struct ViewerSelection {
     std::uint64_t size = 0;
     std::uint64_t object_index = 0;
     PreferredView preferred_view = PreferredView::Details;
+    // Keep the analysis origin independently of the selected interior instruction.
+    std::optional<SymbolRecord> graph_root;
+};
+
+// Headless navigation state. Revisiting the current address does not add noise;
+// navigating after Back drops the abandoned forward branch.
+class NavigationHistory {
+public:
+    void visit(const ViewerSelection& selection);
+    [[nodiscard]] std::optional<ViewerSelection> back();
+    [[nodiscard]] std::optional<ViewerSelection> forward();
+    [[nodiscard]] bool can_back() const noexcept { return !entries_.empty() && cursor_ > 0; }
+    [[nodiscard]] bool can_forward() const noexcept { return cursor_ + 1 < entries_.size(); }
+    void clear() noexcept { entries_.clear(); cursor_ = 0; }
+private:
+    std::vector<ViewerSelection> entries_;
+    std::size_t cursor_ = 0;
 };
 
 struct StructureNode {
