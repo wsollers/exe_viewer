@@ -5,6 +5,8 @@
 #include <format>
 #include <thread>
 #include <atomic>
+#include <charconv>
+#include <cerrno>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -16,7 +18,7 @@
 
 namespace viewer {
 DecompiledUnit AnnotatedCodeDecompiler::decompile(const DecompileRequest& request, std::stop_token stop) const {
-    DecompiledUnit unit{DecompileStatus::Ready,"Annotated code (not decompiled)","Instruction semantics are not lifted to C. Select Binary Ninja for decompiled HLIL."};
+    DecompiledUnit unit{DecompileStatus::Ready,"Annotated code (not decompiled)","Instruction semantics are not lifted to C. Select Ghidra or Binary Ninja for decompilation."};
     for (const auto& node : request.fallback_graph.nodes) {
         if (stop.stop_requested()) { unit.status=DecompileStatus::Cancelled; unit.lines.clear(); return unit; }
         if (node.instructions.empty()) continue;
@@ -33,19 +35,29 @@ DecompiledUnit parse_decompiler_output(std::string_view text) {
     DecompiledUnit unit; unit.provider="Binary Ninja HLIL";
     if (text.size()>4*1024*1024) { unit.diagnostic="Backend output exceeds 4 MiB"; return unit; }
     std::istringstream in{std::string(text)}; std::string magic,status; int version;
-    if (!(in>>magic>>version>>status>>std::quoted(unit.diagnostic)) || magic!="PEELF_DECOMPILE" || version!=1) { unit.diagnostic="Malformed backend response"; return unit; }
+    if (!(in>>magic>>version>>status>>std::quoted(unit.diagnostic)) || magic!="PEELF_DECOMPILE" || (version!=1 && version!=2)) { unit.diagnostic="Malformed backend response"; return unit; }
     if (status=="unavailable") unit.status=DecompileStatus::Unavailable;
     else if (status=="unsupported") unit.status=DecompileStatus::Unsupported;
     else if (status=="no_function") unit.status=DecompileStatus::NoFunction;
     else if (status=="failed") unit.status=DecompileStatus::Failed;
     else if (status=="ready") unit.status=DecompileStatus::Ready;
+    else if (status=="timeout") unit.status=DecompileStatus::Timeout;
     else { unit.diagnostic="Unknown backend status"; return unit; }
     std::size_t count;
     if (!(in>>count) || count>100000) { unit.status=DecompileStatus::Failed; unit.diagnostic="Invalid backend line count"; return unit; }
     for (std::size_t i=0;i<count;++i) {
-        std::uint64_t address; std::string line;
+        std::string address, line;
         if (!(in>>address>>std::quoted(line))) { unit.status=DecompileStatus::Failed; unit.diagnostic="Truncated backend lines"; unit.lines.clear(); return unit; }
-        unit.lines.push_back({address,std::move(line)});
+        std::optional<std::uint64_t> mapped;
+        if (address != "-" || version != 2) {
+            std::uint64_t value{};
+            const auto [end, error] = std::from_chars(address.data(), address.data()+address.size(), value);
+            if (error != std::errc{} || end != address.data()+address.size()) {
+                unit.status=DecompileStatus::Failed; unit.diagnostic="Invalid backend address"; unit.lines.clear(); return unit;
+            }
+            mapped = value;
+        }
+        unit.lines.push_back({mapped,std::move(line)});
     }
     in>>std::ws;
     if (!in.eof() || (unit.status==DecompileStatus::Ready && unit.lines.empty())) { unit.status=DecompileStatus::Failed; unit.diagnostic="Invalid backend response"; unit.lines.clear(); }
@@ -63,28 +75,43 @@ BackendProcessResult BackendRunner::run(const std::filesystem::path& executable,
     auto command=quote(executable.wstring());
     for(const auto& arg:arguments) { command+=L' '; command+=quote(std::filesystem::path(arg).wstring()); }
     STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION process{};
-    if(!CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&process)) return {};
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) return {};
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) { CloseHandle(job); return {}; }
+    if(!CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW | CREATE_SUSPENDED,nullptr,nullptr,&startup,&process)) { CloseHandle(job); return {}; }
+    if (!AssignProcessToJobObject(job, process.hProcess) || ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+        TerminateProcess(process.hProcess, 1); CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job); return {};
+    }
     CloseHandle(process.hThread);
     auto deadline=std::chrono::steady_clock::now()+timeout; BackendProcessResult result;
     while(WaitForSingleObject(process.hProcess,25)==WAIT_TIMEOUT) {
         if(stop.stop_requested() || std::chrono::steady_clock::now()>=deadline) {
             result.cancelled=stop.stop_requested(); result.timed_out=!result.cancelled;
-            TerminateProcess(process.hProcess,1); WaitForSingleObject(process.hProcess,5000); CloseHandle(process.hProcess); return result;
+            TerminateJobObject(job,1); WaitForSingleObject(process.hProcess,5000); CloseHandle(process.hProcess); CloseHandle(job); return result;
         }
     }
-    DWORD exit=1; GetExitCodeProcess(process.hProcess,&exit); CloseHandle(process.hProcess); result.exit_code=static_cast<int>(exit); return result;
+    DWORD exit=1; GetExitCodeProcess(process.hProcess,&exit); CloseHandle(process.hProcess); CloseHandle(job); result.exit_code=static_cast<int>(exit); return result;
 #else
     std::vector<std::string> owned{executable.string()}; owned.insert(owned.end(),arguments.begin(),arguments.end());
     std::vector<char*> argv; for(auto& s:owned) argv.push_back(s.data()); argv.push_back(nullptr);
     const auto pid=fork(); if(pid<0) return {};
-    if(pid==0) { execvp(argv[0],argv.data()); _exit(127); }
+    if(pid==0) { setpgid(0,0); execvp(argv[0],argv.data()); _exit(127); }
+    setpgid(pid,pid);
     auto deadline=std::chrono::steady_clock::now()+timeout; int status=0;
-    while(waitpid(pid,&status,WNOHANG)==0) {
+    for (;;) {
+        const auto waited = waitpid(pid,&status,WNOHANG);
+        if (waited == pid) break;
+        if (waited < 0 && errno != EINTR) { kill(-pid,SIGKILL); return {}; }
         if(stop.stop_requested() || std::chrono::steady_clock::now()>=deadline) {
-            kill(pid,SIGKILL); waitpid(pid,&status,0); return {-1,!stop.stop_requested(),stop.stop_requested()};
+            kill(-pid,SIGKILL);
+            while (waitpid(pid,&status,0) < 0 && errno == EINTR) {}
+            return {-1,!stop.stop_requested(),stop.stop_requested()};
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
+    kill(-pid,SIGKILL);
     return {WIFEXITED(status)?WEXITSTATUS(status):-1};
 #endif
 }

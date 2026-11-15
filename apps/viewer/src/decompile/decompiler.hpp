@@ -16,6 +16,7 @@ struct DecompileRequest {
     peelf::Architecture architecture = peelf::Architecture::Unknown;
     std::vector<std::uint8_t> image_bytes;
     CallGraph fallback_graph;
+    bool thumb = false;
 };
 class IDecompiler {
 public:
@@ -48,4 +49,25 @@ private:
     const IBackendRunner& runner_;
 };
 [[nodiscard]] DecompiledUnit parse_decompiler_output(std::string_view);
+enum class DecompilerProvider { Ghidra, BinaryNinja, AnnotatedCode };
+struct DecompilerSettings {
+    DecompilerProvider provider = DecompilerProvider::Ghidra;
+    std::filesystem::path ghidra_home;
+    std::filesystem::path java = "java";
+    std::filesystem::path python = "python";
+    int timeout_seconds = 180;
+};
+[[nodiscard]] DecompilerSettings discover_decompilers(const std::filesystem::path& executable_directory);
+[[nodiscard]] peelf::Result<DecompilerSettings> read_decompiler_settings(const std::filesystem::path&);
+[[nodiscard]] peelf::Result<void> save_decompiler_settings(const std::filesystem::path&, const DecompilerSettings&);
+class GhidraDecompiler final : public IDecompiler {
+public:
+    GhidraDecompiler(DecompilerSettings settings, std::filesystem::path scripts, const IBackendRunner& runner)
+        : settings_(std::move(settings)), scripts_(std::move(scripts)), runner_(runner) {}
+    [[nodiscard]] DecompiledUnit decompile(const DecompileRequest&, std::stop_token = {}) const override;
+private:
+    DecompilerSettings settings_;
+    std::filesystem::path scripts_;
+    const IBackendRunner& runner_;
+};
 }

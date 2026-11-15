@@ -63,6 +63,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/patch_preview.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/project.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/ghidra_decompiler.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/binary_model.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/pe_parser.cpp
@@ -134,6 +135,10 @@ if(TARGET peelf_gui AND MSVC)
   )
 endif()
 add_dependencies(peelf_tests peelf_callgraph_fixture)
+add_executable(peelf_backend_fixture backend_process_fixture.cpp)
+target_compile_features(peelf_backend_fixture PRIVATE cxx_std_23)
+add_dependencies(peelf_tests peelf_backend_fixture)
+target_compile_definitions(peelf_tests PRIVATE PEELF_BACKEND_FIXTURE="$<TARGET_FILE:peelf_backend_fixture>")
 
 # Register every TEST() with CTest so `ctest` discovers and runs them.
 gtest_discover_tests(peelf_tests)

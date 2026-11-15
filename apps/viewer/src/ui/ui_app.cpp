@@ -289,6 +289,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , pe_exports_panel_(model)
 {
     references_panel_.set_visible(false);
+    initialize_decompiler();
     patch_set_panel_.set_analysis_context(&symbol_index_, &thumb_mode_);
     references_panel_.set_navigate_callback([this](std::uint64_t address) {
         navigate_to_address(address, PreferredView::Disassembly);

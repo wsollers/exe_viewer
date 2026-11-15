@@ -77,7 +77,14 @@ namespace viewer {
         ImFont* code_font_ = nullptr; // Owned by the ImGui font atlas.
         bool show_decompiler_ = false;
         bool focus_decompiler_ = false;
-        bool binary_ninja_ = false;
+        int decompiler_provider_ = 0;
+        char ghidra_home_[2048] = "";
+        char decompiler_java_[2048] = "java";
+        int decompiler_timeout_ = 180;
+        bool decompiler_thumb_ = false;
+        std::filesystem::path decompiler_directory_;
+        std::string decompiler_settings_status_;
+        void initialize_decompiler();
         char decompiler_python_[1024] = "python";
         DecompiledUnit decompiled_;
         std::future<DecompiledUnit> decompile_job_;

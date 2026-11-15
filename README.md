@@ -254,14 +254,50 @@ control-flow edges before applying them. Editing invalidates older previews.
 **File > Export Patch Report** writes offsets, mapped addresses, and original and
 replacement bytes. Exporting a patched binary remains a separate action.
 
-Press **F5** on a function to open the Decompiler panel. Its built-in view is
-explicitly labeled annotated code, not decompiled C. Enable **Binary Ninja HLIL**
-and supply a Python interpreter with your local Binary Ninja API installed for
-real HLIL output. See the [Binary Ninja API cookbook](https://docs.binary.ninja/dev/cookbook.html).
-The optional bridge runs on an effective-byte snapshot in a separate process,
-with cancellation and a 60-second deadline. CPU and HLIL availability depend on
-the installed backend. Click an address-bearing result line to return to assembly;
-HLIL address mappings are approximate. Byte edits mark the result stale.
+Press **F5** on a selected function to open the Decompiler panel. **Ghidra is the
+default provider**, producing actual C output with clickable mapped lines.
+Unmapped declarations and braces remain unlinked; decompiler line mappings are
+approximate. Byte edits and ARM/Thumb changes mark existing output stale.
+
+### Installing and configuring Ghidra
+
+Use a local, extracted [official Ghidra release](https://github.com/NationalSecurityAgency/ghidra/releases)
+and the JDK required by that release. This integration is tested with **Ghidra 12.2
+and JDK 25**. Ghidra is a runtime dependency, not linked into the C++ application
+or downloaded automatically at startup. No Docker daemon or Ghidra GUI is needed.
+
+In **Decompiler > Backend settings**, set the Ghidra root folder and Java
+executable, then **Save settings**. Settings persist in `decompiler.ini` next to
+the viewer executable; save failures are shown in the panel. On first startup,
+`GHIDRA_INSTALL_DIR` and `JAVA_HOME` supply defaults. Discovery also checks `tools`
+and `out/tools` folders along the executable's parent directories, so a development
+installation can live in the ignored `out/tools/ghidra_12.2_PUBLIC` folder.
+
+The viewer launches Java directly, imports an effective-byte snapshot into a
+temporary Ghidra project, and exports the selected function through the bundled
+`resources/PeelfDecompile.java` script. It never executes the analyzed binary.
+Cancellation and deadlines terminate the analyzer process tree; temporary projects
+and snapshots are removed afterward. The default overall deadline is 180 seconds
+(configurable from 10 to 3600); per-function decompilation has a 60-second limit.
+Each request currently reanalyzes a fresh snapshot. Ghidra's normal user cache and
+script compilation cache may persist outside that temporary project.
+
+**Binary Ninja HLIL** remains optional in the provider selector. It requires a
+Python interpreter with the Binary Ninja API and a **Commercial-or-higher** license
+for headless operation; Personal cannot use this adapter. See the
+[Binary Ninja API cookbook](https://docs.binary.ninja/dev/cookbook.html).
+The third provider, **Annotated assembly**, is explicitly not decompiled C.
+
+Ghidra integration tests are opt-in: set `GHIDRA_INSTALL_DIR` and `JAVA_HOME`, then
+run `ctest --test-dir out/build/msvc-debug -C Debug -R GhidraIntegration --output-on-failure`.
+They cover all ten supported CPU families plus PE32/PE32+ and effective-byte
+replacement. Without Ghidra, those tests skip while unit and process-runner tests
+still run. Processor variants unsupported by the installed Ghidra remain backend
+errors, rather than silently falling back to an unrelated decoder.
+
+Docker is an optional future deployment adapter for server workloads. The desktop
+provider intentionally uses the local installation, avoiding volume mapping and
+container startup overhead.
 
 ## Notes
 
