@@ -154,6 +154,17 @@ bool symbol_has_code(const peelf::IBinaryImage& image, const SymbolRecord& symbo
     return executable_section_containing(image, *symbol.virtual_address) != nullptr;
 }
 
+const char* to_string(SymbolSource source) noexcept {
+    switch (source) {
+        case SymbolSource::EntryPoint:  return "entry";
+        case SymbolSource::ImageSymbol: return "symbol";
+        case SymbolSource::Import:      return "import";
+        case SymbolSource::Export:      return "export";
+        case SymbolSource::DebugSymbol: return "pdb";
+    }
+    return "symbol";
+}
+
 SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
     SymbolIndex index;
     index.records_.reserve(1u + image.symbols().size() + image.imports().size() + image.exports().size());
@@ -211,6 +222,43 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
             .external = true,
             .library = import.library,
         });
+    }
+
+    if (image.format() == peelf::Format::ELF && !image.elf_relocations().empty()) {
+        std::vector<const peelf::ElfSymbol*> dynsyms;
+        for (const peelf::ElfSymbol& es : image.elf_symbols()) {
+            if (es.dynamic) {
+                dynsyms.push_back(&es);
+            }
+        }
+        if (!dynsyms.empty()) {
+            const std::uint64_t slot_size = image.is_64bit() ? 8u : 4u;
+            for (std::uint64_t rel_idx = 0; rel_idx < image.elf_relocations().size(); ++rel_idx) {
+                const peelf::ElfRelocation& rel =
+                    image.elf_relocations()[static_cast<std::size_t>(rel_idx)];
+                if (rel.offset == 0 || rel.symbol_index == 0 ||
+                    rel.symbol_index >= dynsyms.size()) {
+                    continue;
+                }
+                const peelf::ElfSymbol& sym = *dynsyms[static_cast<std::size_t>(rel.symbol_index)];
+                if (sym.name.empty()) {
+                    continue;
+                }
+                if (index.find_exact_address(rel.offset) != nullptr) {
+                    continue;
+                }
+                add_record(index.records_, SymbolRecord{
+                    .name = sym.name,
+                    .source = SymbolSource::Import,
+                    .source_index = image.imports().size() + rel_idx,
+                    .virtual_address = rel.offset,
+                    .file_offset = image.virtual_address_to_file_offset(rel.offset),
+                    .size = slot_size,
+                    .dynamic = true,
+                    .external = true,
+                });
+            }
+        }
     }
 
     return index;

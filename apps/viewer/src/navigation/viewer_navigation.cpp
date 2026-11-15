@@ -15,8 +15,13 @@ namespace {
         .selection = ViewerSelection{
             .kind = SelectionKind::Group,
             .label = std::move(label),
+            .file_offset = std::nullopt,
+            .virtual_address = std::nullopt,
+            .size = 0,
+            .object_index = 0,
             .preferred_view = PreferredView::Details
-        }
+        },
+        .children = {}
     };
 }
 
@@ -28,9 +33,13 @@ namespace {
         .selection = ViewerSelection{
             .kind = kind,
             .label = std::move(label),
+            .file_offset = std::nullopt,
+            .virtual_address = std::nullopt,
+            .size = 0,
             .object_index = object_index,
             .preferred_view = preferred_view
-        }
+        },
+        .children = {}
     };
 }
 
@@ -388,9 +397,13 @@ StructureNode build_structure_tree(const peelf::IBinaryImage& image) {
         .selection = ViewerSelection{
             .kind = SelectionKind::Image,
             .label = std::string(peelf::to_string(image.format())) + " Image",
+            .file_offset = std::nullopt,
             .virtual_address = image.entry_point(),
+            .size = 0,
+            .object_index = 0,
             .preferred_view = PreferredView::Details
-        }
+        },
+        .children = {}
     };
 
     add_headers(image, root);
@@ -401,6 +414,76 @@ StructureNode build_structure_tree(const peelf::IBinaryImage& image) {
     add_symbols(image, root);
     add_pe_metadata(image, root);
     add_elf_metadata(image, root);
+
+    return root;
+}
+
+StructureNode build_live_process_structure_tree(
+    const peelf::ProcessInfo& process,
+    std::span<const peelf::ModuleInfo> modules,
+    std::span<const peelf::MemoryRegion> regions,
+    const peelf::IBinaryImage* active_image,
+    std::optional<std::size_t> active_module_index) {
+    std::string proc_label = "Process " +
+        (process.name.empty() ? std::to_string(process.pid) : process.name) +
+        " (PID " + std::to_string(process.pid) + ")";
+
+    StructureNode root{
+        .selection = ViewerSelection{
+            .kind = SelectionKind::Process,
+            .label = std::move(proc_label),
+            .file_offset = std::nullopt,
+            .virtual_address = active_image ? std::optional<std::uint64_t>(active_image->entry_point())
+                                            : std::nullopt,
+            .size = 0,
+            .object_index = process.pid,
+            .preferred_view = PreferredView::Details
+        },
+        .children = {}
+    };
+
+    StructureNode modules_group = group_node("Modules (" + std::to_string(modules.size()) + ")");
+    for (std::size_t i = 0; i < modules.size(); ++i) {
+        const peelf::ModuleInfo& mod = modules[i];
+        std::string label = mod.name.empty() ? mod.path.string() : mod.name;
+        if (label.empty()) {
+            label = "module_0x" + hex64(mod.base_address);
+        }
+        if (active_module_index && *active_module_index == i) {
+            label += " [active]";
+        }
+        label += " @ 0x" + hex64(mod.base_address);
+        StructureNode mod_node = selectable_node(
+            SelectionKind::ProcessModule,
+            std::move(label),
+            static_cast<std::uint64_t>(i),
+            PreferredView::Details);
+        mod_node.selection.virtual_address = mod.base_address;
+        mod_node.selection.size = mod.size;
+        modules_group.children.push_back(std::move(mod_node));
+    }
+    root.children.push_back(std::move(modules_group));
+
+    StructureNode memmap_group = group_node("Memory Map (" + std::to_string(regions.size()) + ")");
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        const peelf::MemoryRegion& reg = regions[i];
+        StructureNode reg_node{
+            .selection = selection_from_memory_region(reg, static_cast<std::uint64_t>(i)),
+            .children = {}
+        };
+        memmap_group.children.push_back(std::move(reg_node));
+    }
+    root.children.push_back(std::move(memmap_group));
+
+    if (active_image != nullptr) {
+        StructureNode image_tree = build_structure_tree(*active_image);
+        if (active_module_index && *active_module_index < modules.size() &&
+            !modules[*active_module_index].name.empty()) {
+            image_tree.selection.label =
+                modules[*active_module_index].name + " (" + image_tree.selection.label + ")";
+        }
+        root.children.push_back(std::move(image_tree));
+    }
 
     return root;
 }
@@ -446,6 +529,64 @@ ViewerSelection selection_from_patch_interval(const peelf::PatchInterval& patch,
     };
 }
 
+ViewerSelection selection_from_live_patch_interval(const peelf::PatchInterval& patch,
+                                                   std::uint64_t patch_index,
+                                                   std::optional<std::uint64_t> window_offset,
+                                                   std::string_view prefix) {
+    std::string label(prefix);
+    if (!label.empty()) {
+        label += ' ';
+    }
+    label += "RAM Patch 0x" + hex64(patch.offset);
+    return ViewerSelection{
+        .kind = SelectionKind::Patch,
+        .label = std::move(label),
+        .file_offset = window_offset,
+        .virtual_address = patch.offset,
+        .size = static_cast<std::uint64_t>(patch.patched.size()),
+        .object_index = patch_index,
+        .preferred_view = PreferredView::Hex
+    };
+}
+
+ViewerSelection selection_from_memory_region(const peelf::MemoryRegion& region,
+                                             std::uint64_t region_index,
+                                             std::optional<std::uint64_t> window_offset) {
+    std::string label = "0x" + hex64(region.start_address) + " " +
+                        peelf::format_protection(region.protection);
+    if (!region.pathname.empty()) {
+        label += " " + region.pathname;
+    } else {
+        label += " (" + std::string(peelf::to_string(region.kind)) + ")";
+    }
+    return ViewerSelection{
+        .kind = SelectionKind::MemoryRegion,
+        .label = std::move(label),
+        .file_offset = window_offset,
+        .virtual_address = region.start_address,
+        .size = region.size(),
+        .object_index = region_index,
+        .preferred_view = region.protection.executable ? PreferredView::Disassembly : PreferredView::Hex
+    };
+}
+
+ViewerSelection selection_from_symbol_record(const SymbolRecord& record,
+                                             std::uint64_t record_index) {
+    PreferredView view = PreferredView::Details;
+    if (record.file_offset) {
+        view = record.source == SymbolSource::Import ? PreferredView::Hex : PreferredView::Disassembly;
+    }
+    return ViewerSelection{
+        .kind = SelectionKind::Symbol,
+        .label = record.name.empty() ? "<unnamed>" : record.name,
+        .file_offset = record.file_offset,
+        .virtual_address = record.virtual_address,
+        .size = record.size != 0 ? record.size : 1u,
+        .object_index = record_index,
+        .preferred_view = view
+    };
+}
+
 std::optional<std::uint64_t> selected_symbol_index(const ViewerSelection& selection,
                                                    const peelf::IBinaryImage& image) {
     if (selection.kind != SelectionKind::Symbol && selection.kind != SelectionKind::CallGraphNode) {
@@ -464,6 +605,32 @@ std::optional<std::uint64_t> selected_symbol_index(const ViewerSelection& select
     }
     if (selection.virtual_address && *selection.virtual_address == symbol.virtual_address) {
         return selection.object_index;
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint64_t> selected_symbol_record_index(const ViewerSelection& selection,
+                                                          const SymbolIndex& symbol_index) {
+    const auto records = symbol_index.records();
+    if (selection.kind != SelectionKind::Symbol && selection.kind != SelectionKind::CallGraphNode &&
+        selection.kind != SelectionKind::Export && selection.kind != SelectionKind::Import) {
+        return std::nullopt;
+    }
+    if (selection.kind == SelectionKind::Symbol && selection.object_index < records.size()) {
+        const SymbolRecord& rec = records[static_cast<std::size_t>(selection.object_index)];
+        if (rec.name == selection.label ||
+            (selection.virtual_address && rec.virtual_address == selection.virtual_address)) {
+            return selection.object_index;
+        }
+    }
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        const SymbolRecord& rec = records[i];
+        if (!selection.label.empty() && rec.name == selection.label) {
+            return static_cast<std::uint64_t>(i);
+        }
+        if (selection.virtual_address && rec.virtual_address == selection.virtual_address) {
+            return static_cast<std::uint64_t>(i);
+        }
     }
     return std::nullopt;
 }

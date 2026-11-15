@@ -11,12 +11,43 @@ namespace viewer {
 
     void FilePanel::draw_contents() {
         if (!model_.has_file()) {
-            ImGui::TextUnformatted("Start an inspection");
+            ImGui::TextUnformatted("No file or live process loaded.");
             ImGui::Separator();
-            ImGui::TextWrapped("Open a PE or ELF binary using File > Open or Ctrl+O.");
-            ImGui::Spacing();
-            ImGui::TextDisabled("Inspect  /  Navigate  /  Patch  /  Export");
+            ImGui::TextWrapped("Open a PE/ELF file from disk or attach to a running process to inspect memory and symbols.");
+            if (on_attach_requested_ && ImGui::Button("Attach to Process...")) {
+                on_attach_requested_();
+            }
             return;
+        }
+
+        if (model_.is_live_process()) {
+            if (const peelf::IProcessSession* sess = model_.process_session()) {
+                ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
+                                   "LIVE PROCESS: %s (PID %llu)",
+                                   sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
+                                   static_cast<unsigned long long>(sess->pid()));
+                if (ImGui::SmallButton("Refresh Map")) {
+                    if (on_refresh_requested_) {
+                        on_refresh_requested_();
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Switch Process...")) {
+                    if (on_attach_requested_) {
+                        on_attach_requested_();
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Detach")) {
+                    if (on_detach_requested_) {
+                        on_detach_requested_();
+                    }
+                }
+                ImGui::Text("Staged RAM patches: %zu | Committed: %zu",
+                            model_.staged_live_patches().size(),
+                            model_.committed_live_patches().size());
+                ImGui::Separator();
+            }
         }
 
         const auto& info = model_.file_info();
@@ -37,6 +68,7 @@ namespace viewer {
                 row("Format", info.format_str);
                 row("Architecture", info.arch_str);
                 row("Size", std::format("{} bytes", info.size_bytes));
+                row("Window base", std::format("0x{:X}", model_.view_base_address()));
                 row("Entry point", std::format("0x{:X}", info.entry_point));
                 ImGui::EndTable();
             }

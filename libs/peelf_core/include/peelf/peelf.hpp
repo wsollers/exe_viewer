@@ -10,6 +10,9 @@
 #include <source_location>
 
 #include <peelf/error.hpp>
+#include <peelf/binary_image.hpp>
+#include <peelf/process.hpp>
+#include <peelf/patching.hpp>
 
 #include <pe/pe_definitions.h>
 #include <elf/elf_definitions.h>

@@ -34,6 +34,9 @@ struct DebugSymbolLoadResult {
 [[nodiscard]] DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_path,
                                                            const peelf::IBinaryImage& image);
 
+[[nodiscard]] std::vector<DebugSymbol> rebase_debug_symbols(std::span<const DebugSymbol> symbols,
+                                                            std::uint64_t image_base);
+
 [[nodiscard]] const char* to_string(DebugSymbolLoadStatus status) noexcept;
 
 } // namespace viewer

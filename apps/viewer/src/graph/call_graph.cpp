@@ -514,7 +514,7 @@ namespace {
 }
 
 [[nodiscard]] const SymbolRecord* resolve_call_target_symbol(const peelf::IBinaryImage& image,
-                                                             std::span<const std::uint8_t> image_bytes,
+                                                             const GraphByteReader& read_bytes,
                                                              Disassembler& disassembler,
                                                              const SymbolIndex& symbol_index,
                                                              std::uint64_t target,
@@ -528,12 +528,12 @@ namespace {
     }
 
     if (const std::optional<std::uint64_t> target_file_offset = image.virtual_address_to_file_offset(target)) {
-        const std::size_t start = static_cast<std::size_t>(*target_file_offset);
-        if (start < image_bytes.size()) {
-            constexpr std::size_t max_thunk_bytes = 16;
-            const std::size_t bytes_to_read = std::min(max_thunk_bytes, image_bytes.size() - start);
+        constexpr std::size_t max_thunk_bytes = 16;
+        const std::vector<std::uint8_t> thunk_bytes =
+            read_bytes ? read_bytes(*target_file_offset, max_thunk_bytes) : std::vector<std::uint8_t>{};
+        if (!thunk_bytes.empty()) {
             const std::vector<Instruction> thunk =
-                disassembler.disassemble_count(image_bytes.data() + start, bytes_to_read, target, 2);
+                disassembler.disassemble_count(thunk_bytes.data(), thunk_bytes.size(), target, 2);
             if (!thunk.empty() && is_indirect_branch_instruction(thunk.front())) {
                 if (const std::optional<std::uint64_t> indirect_address =
                         parse_x86_rip_relative_memory_target(thunk.front())) {
@@ -547,7 +547,7 @@ namespace {
                     if (*branch_target != target) {
                         if (const SymbolRecord* chained =
                                 resolve_call_target_symbol(image,
-                                                           image_bytes,
+                                                           read_bytes,
                                                            disassembler,
                                                            symbol_index,
                                                            *branch_target,
@@ -965,11 +965,30 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                                          std::span<const std::uint8_t> image_bytes,
                                          const SymbolIndex& symbol_index,
                                          const SymbolRecord& root) {
+    const GraphByteReader reader = [image_bytes](std::uint64_t offset,
+                                                 std::size_t size) -> std::vector<std::uint8_t> {
+        if (offset >= static_cast<std::uint64_t>(image_bytes.size()) || size == 0) {
+            return {};
+        }
+        const auto start = static_cast<std::size_t>(offset);
+        const std::size_t avail = std::min(size, image_bytes.size() - start);
+        return std::vector<std::uint8_t>(image_bytes.begin() + static_cast<std::ptrdiff_t>(start),
+                                         image_bytes.begin() + static_cast<std::ptrdiff_t>(start + avail));
+    };
+    return build_symbol_fanout_call_graph(image, reader, symbol_index, root);
+}
+
+CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
+                                         const GraphByteReader& read_bytes,
+                                         const SymbolIndex& symbol_index,
+                                         const SymbolRecord& root) {
     CallGraph graph{
         .id = "symbol_fanout_call_graph",
         .label = root.name + " fan-out",
         .architecture = image.architecture(),
         .endianness = image.endianness(),
+        .nodes = {},
+        .edges = {},
     };
 
     graph.nodes.push_back(node_from_record(root, "root"));
@@ -977,19 +996,19 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
     constexpr std::size_t max_function_scan = 4096;
     bool resolved_any_call = false;
 
-    if (root.file_offset && root.virtual_address) {
+    if (root.file_offset && root.virtual_address && read_bytes) {
         const std::optional<Architecture> arch = disassembler_architecture(image.architecture());
         if (arch) {
             Disassembler disassembler;
             if (disassembler.init(*arch, disassembler_endianness(image.endianness()))) {
                 const std::uint64_t requested_size = root.size != 0 ? root.size : max_function_scan;
-                const std::size_t start = static_cast<std::size_t>(*root.file_offset);
                 const std::size_t bytes_to_read = static_cast<std::size_t>(
                     std::min<std::uint64_t>(requested_size, max_function_scan));
+                const std::vector<std::uint8_t> fn_bytes = read_bytes(*root.file_offset, bytes_to_read);
 
-                if (start <= image_bytes.size() && bytes_to_read <= image_bytes.size() - start) {
-                    const auto instructions = disassembler.disassemble(image_bytes.data() + start,
-                                                                        bytes_to_read,
+                if (!fn_bytes.empty()) {
+                    const auto instructions = disassembler.disassemble(fn_bytes.data(),
+                                                                        fn_bytes.size(),
                                                                         *root.virtual_address);
                     std::uint64_t call_index = 0;
                     const Instruction* previous_instruction = nullptr;
@@ -1011,7 +1030,7 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                         }
 
                         const SymbolRecord* callee =
-                            resolve_call_target_symbol(image, image_bytes, disassembler, symbol_index, *target);
+                            resolve_call_target_symbol(image, read_bytes, disassembler, symbol_index, *target);
                         const std::string callee_id = "callee_" + std::to_string(call_index++);
                         if (callee != nullptr && callee->name != root.name) {
                             graph.nodes.push_back(node_from_call_target(image, *callee, *target, callee_id));
@@ -1028,9 +1047,14 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                                 .label = "call target\n" + format_hex(*target),
                                 .kind = CallGraphNodeKind::Unknown,
                                 .bytes = GraphByteRange{
-                                    .start = GraphAddress{.virtual_address = *target},
+                                    .start = GraphAddress{
+                                        .virtual_address = *target,
+                                        .relative_virtual_address = std::nullopt,
+                                        .file_offset = std::nullopt,
+                                    },
                                     .size = 1,
                                 },
+                                .symbol = std::nullopt,
                             });
                             graph.edges.push_back(CallGraphEdge{
                                 .from_node_id = "root",
@@ -1052,6 +1076,8 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
             .id = "no_calls",
             .label = "No direct call targets resolved\nsymbols/disassembly may be missing",
             .kind = CallGraphNodeKind::Unknown,
+            .bytes = {},
+            .symbol = std::nullopt,
         });
         graph.edges.push_back(CallGraphEdge{
             .from_node_id = "root",

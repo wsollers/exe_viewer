@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 
+#include <cinttypes>
 #include <cstdint>
 #include <algorithm>
 #include <string>
@@ -51,6 +52,9 @@ void SymbolsPanel::draw_contents() {
         }
     if (!selected_index) last_scrolled_selected_.reset();
 
+    ImGui::TextDisabled("%zu unified symbol record%s",
+                        records.size(),
+                        records.size() == 1 ? "" : "s");
     ImGui::Separator();
     if (ImGui::BeginTable("SymbolsTable", 3,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
@@ -99,6 +103,7 @@ void SymbolsPanel::draw_contents() {
                 last_scrolled_selected_ = row_id;
             }
             ImGui::PopID();
+
             ImGui::TableNextColumn();
             if (symbol.virtual_address) ImGui::Text("0x%llX", static_cast<unsigned long long>(*symbol.virtual_address));
             else ImGui::TextDisabled("Unmapped");

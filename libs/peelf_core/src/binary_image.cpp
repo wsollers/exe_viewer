@@ -150,9 +150,27 @@ public:
             if (section.file_size == 0) {
                 continue;
             }
+            if (format_ == Format::ELF && !section.readable && !section.writable &&
+                !section.executable && section.virtual_address == 0) {
+                continue;
+            }
             if (file_offset >= section.file_offset && file_offset - section.file_offset < section.file_size) {
                 return checked_add_u64(section.virtual_address, file_offset - section.file_offset);
             }
+        }
+        if (format_ == Format::ELF) {
+            for (const Segment& segment : segments_) {
+                if (segment.type != 1 || segment.file_size == 0) {  // PT_LOAD
+                    continue;
+                }
+                if (file_offset >= segment.file_offset &&
+                    file_offset - segment.file_offset < segment.file_size) {
+                    return checked_add_u64(segment.virtual_address, file_offset - segment.file_offset);
+                }
+            }
+        }
+        if (is_live_mapped_ && file_offset < mapped_span_size_) {
+            return checked_add_u64(image_base_, file_offset);
         }
         return std::nullopt;
     }
@@ -160,6 +178,10 @@ public:
     [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
         std::uint64_t virtual_address) const noexcept override {
         for (const Section& section : sections_) {
+            if (format_ == Format::ELF && !section.readable && !section.writable &&
+                !section.executable && section.virtual_address == 0) {
+                continue;
+            }
             const std::uint64_t mapped_size = section.virtual_size != 0 ? section.virtual_size : section.file_size;
             if (mapped_size == 0) {
                 continue;
@@ -173,6 +195,30 @@ public:
                 return checked_add_u64(section.file_offset, delta);
             }
         }
+        if (format_ == Format::ELF) {
+            for (const Segment& segment : segments_) {
+                if (segment.type != 1) {  // PT_LOAD
+                    continue;
+                }
+                const std::uint64_t mapped_size =
+                    segment.virtual_size != 0 ? segment.virtual_size : segment.file_size;
+                if (mapped_size == 0) {
+                    continue;
+                }
+                if (virtual_address >= segment.virtual_address &&
+                    virtual_address - segment.virtual_address < mapped_size) {
+                    const std::uint64_t delta = virtual_address - segment.virtual_address;
+                    if (delta >= segment.file_size) {
+                        return std::nullopt;
+                    }
+                    return checked_add_u64(segment.file_offset, delta);
+                }
+            }
+        }
+        if (is_live_mapped_ && virtual_address >= image_base_ &&
+            (virtual_address - image_base_) < mapped_span_size_) {
+            return virtual_address - image_base_;
+        }
         return std::nullopt;
     }
 
@@ -182,6 +228,8 @@ protected:
     Architecture arch_   = Architecture::Unknown;
     Endianness   endian_ = Endianness::Little;
     bool         is_64_  = false;
+    bool         is_live_mapped_ = false;
+    std::uint64_t mapped_span_size_ = 0;
     std::uint64_t image_base_ = 0;
     std::uint64_t entry_ = 0;
     std::vector<Section> sections_;
@@ -222,6 +270,9 @@ public:
         return interpreter_;
     }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
+    static Result<std::unique_ptr<IBinaryImage>> parse_mapped(std::span<const std::uint8_t> mapped_bytes,
+                                                              std::uint64_t live_base);
+    void rebase_to_live_base(std::uint64_t live_base);
 
 private:
     ElfHeader elf_header_;
@@ -269,6 +320,7 @@ public:
         return clr_header_ ? &*clr_header_ : nullptr;
     }
     static Result<std::unique_ptr<IBinaryImage>> parse(std::span<const std::uint8_t> b);
+    void rebase_to_live_base(std::uint64_t live_base);
 
 private:
     std::vector<PeBaseRelocationBlock> base_relocations_;
@@ -1646,6 +1698,31 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     // Sections (P2-1), best-effort: identity above is already valid.
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
                        img->program_headers_, img->segments_, img->interpreter_, img->notes_);
+
+    // Determine static link-time load base from PT_LOAD segments (0 for PIE/ET_DYN, e.g. 0x400000 for ET_EXEC).
+    bool found_zero_off_load = false;
+    std::uint64_t min_load_base = 0;
+    bool any_load = false;
+    for (const ElfProgramHeader& ph : img->program_headers_) {
+        if (ph.type != 1) {  // PT_LOAD
+            continue;
+        }
+        if (ph.offset == 0) {
+            img->image_base_ = ph.virtual_address;
+            found_zero_off_load = true;
+            break;
+        }
+        const std::uint64_t candidate =
+            ph.virtual_address >= ph.offset ? (ph.virtual_address - ph.offset) : ph.virtual_address;
+        if (!any_load || candidate < min_load_base) {
+            min_load_base = candidate;
+            any_load = true;
+        }
+    }
+    if (!found_zero_off_load && any_load) {
+        img->image_base_ = min_load_base;
+    }
+
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
@@ -1991,6 +2068,705 @@ Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> 
         case Format::ELF: return ElfImage::parse(bytes);
         case Format::PE:  return PeImage::parse(bytes);
         default:          return make_error("Unknown or unsupported binary format");
+    }
+}
+
+namespace {
+
+void wr16_endian(std::vector<std::uint8_t>& b, std::size_t off, std::uint16_t v, bool big) noexcept {
+    if (big) {
+        b[off + 0] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+        b[off + 1] = static_cast<std::uint8_t>(v & 0xFFu);
+    } else {
+        b[off + 0] = static_cast<std::uint8_t>(v & 0xFFu);
+        b[off + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFFu);
+    }
+}
+
+void wr32_endian(std::vector<std::uint8_t>& b, std::size_t off, std::uint32_t v, bool big) noexcept {
+    for (std::size_t i = 0; i < 4; ++i) {
+        const std::size_t idx = big ? (off + 3 - i) : (off + i);
+        b[idx] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu);
+    }
+}
+
+void wr64_endian(std::vector<std::uint8_t>& b, std::size_t off, std::uint64_t v, bool big) noexcept {
+    for (std::size_t i = 0; i < 8; ++i) {
+        const std::size_t idx = big ? (off + 7 - i) : (off + i);
+        b[idx] = static_cast<std::uint8_t>((v >> (8 * i)) & 0xFFu);
+    }
+}
+
+[[nodiscard]] std::optional<std::size_t> normalize_dynamic_ptr_to_offset(
+    std::uint64_t raw_ptr,
+    std::uint64_t live_base,
+    std::uint64_t static_base,
+    std::size_t mapped_size) noexcept {
+    if (raw_ptr == 0) {
+        return std::nullopt;
+    }
+    if (live_base != 0 && raw_ptr >= live_base &&
+        (raw_ptr - live_base) < static_cast<std::uint64_t>(mapped_size)) {
+        return static_cast<std::size_t>(raw_ptr - live_base);
+    }
+    if (raw_ptr >= static_base &&
+        (raw_ptr - static_base) < static_cast<std::uint64_t>(mapped_size)) {
+        return static_cast<std::size_t>(raw_ptr - static_base);
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::uint32_t count_gnu_hash_dynsyms(std::span<const std::uint8_t> b,
+                                                   std::size_t hash_off,
+                                                   bool is64,
+                                                   bool big) noexcept {
+    if (!fits_range(hash_off, 16, static_cast<std::uint64_t>(b.size()))) {
+        return 0;
+    }
+    const std::uint32_t nbuckets = rd32(b, hash_off + 0, big);
+    const std::uint32_t symoffset = rd32(b, hash_off + 4, big);
+    const std::uint32_t bloom_size = rd32(b, hash_off + 8, big);
+    const std::size_t word_sz = is64 ? 8u : 4u;
+    const std::uint64_t buckets_off64 =
+        static_cast<std::uint64_t>(hash_off) + 16ull +
+        static_cast<std::uint64_t>(bloom_size) * static_cast<std::uint64_t>(word_sz);
+    const std::uint64_t buckets_bytes = static_cast<std::uint64_t>(nbuckets) * 4ull;
+    if (nbuckets == 0 || !fits_range(buckets_off64, buckets_bytes, static_cast<std::uint64_t>(b.size()))) {
+        return symoffset;
+    }
+
+    const auto buckets_off = static_cast<std::size_t>(buckets_off64);
+    std::uint32_t max_sym = 0;
+    for (std::uint32_t i = 0; i < nbuckets; ++i) {
+        const std::uint32_t bucket = rd32(b, buckets_off + static_cast<std::size_t>(i) * 4u, big);
+        if (bucket > max_sym) {
+            max_sym = bucket;
+        }
+    }
+    if (max_sym < symoffset) {
+        return symoffset;
+    }
+
+    const std::uint64_t chains_off64 = buckets_off64 + buckets_bytes;
+    std::uint32_t idx = max_sym;
+    constexpr std::uint32_t kMaxChainWalk = 1u << 20;
+    for (std::uint32_t step = 0; step < kMaxChainWalk; ++step) {
+        const std::uint64_t entry_off =
+            chains_off64 + static_cast<std::uint64_t>(idx - symoffset) * 4ull;
+        if (!fits_range(entry_off, 4, static_cast<std::uint64_t>(b.size()))) {
+            break;
+        }
+        const std::uint32_t chain_val = rd32(b, static_cast<std::size_t>(entry_off), big);
+        ++idx;
+        if ((chain_val & 1u) != 0) {
+            break;
+        }
+    }
+    return idx;
+}
+
+}  // namespace
+
+void ElfImage::rebase_to_live_base(std::uint64_t live_base) {
+    const std::uint64_t static_base = image_base_;
+    const std::uint64_t bias = live_base - static_base;
+
+    image_base_ = live_base;
+    is_live_mapped_ = true;
+    if (entry_ != 0) {
+        entry_ += bias;
+        elf_header_.entry = entry_;
+    }
+
+    std::uint64_t max_end = 4096;
+
+    for (ElfProgramHeader& ph : program_headers_) {
+        if (ph.type == 1 || ph.virtual_address != 0) {
+            ph.virtual_address += bias;
+            if (ph.physical_address != 0) {
+                ph.physical_address += bias;
+            }
+            if (ph.virtual_address >= live_base) {
+                ph.offset = ph.virtual_address - live_base;
+            }
+            ph.file_size = std::max(ph.memory_size, ph.file_size);
+        }
+    }
+
+    for (Segment& seg : segments_) {
+        if (seg.type == 1 || seg.virtual_address != 0) {
+            seg.virtual_address += bias;
+            if (seg.virtual_address >= live_base) {
+                seg.file_offset = seg.virtual_address - live_base;
+            }
+            seg.file_size = std::max(seg.virtual_size, seg.file_size);
+            if (seg.type == 1 && seg.virtual_address >= live_base) {
+                max_end = std::max(max_end, (seg.virtual_address - live_base) + seg.file_size);
+            }
+        }
+    }
+
+    for (std::size_t i = 0; i < sections_.size(); ++i) {
+        Section& sec = sections_[i];
+        const bool is_alloc = (i < section_headers_.size())
+                                  ? ((section_headers_[i].flags & 0x2ull) != 0)
+                                  : (sec.readable || sec.writable || sec.executable);
+        if (is_alloc) {
+            sec.virtual_address += bias;
+            if (sec.virtual_address >= live_base) {
+                sec.file_offset = sec.virtual_address - live_base;
+            }
+            sec.file_size = std::max(sec.virtual_size, sec.file_size);
+            if (sec.virtual_address >= live_base) {
+                max_end = std::max(max_end, (sec.virtual_address - live_base) + sec.file_size);
+            }
+            if (i < section_headers_.size()) {
+                section_headers_[i].address = sec.virtual_address;
+                section_headers_[i].offset = sec.file_offset;
+            }
+        } else {
+            sec.virtual_address = 0;
+            sec.file_offset = 0;
+            sec.file_size = 0;
+        }
+    }
+
+    // If section headers were stripped/unmapped in RAM, synthesize navigable sections from PT_LOAD.
+    if (sections_.empty()) {
+        std::size_t load_index = 0;
+        for (const Segment& seg : segments_) {
+            if (seg.type != 1 || seg.file_size == 0) {
+                continue;
+            }
+            Section sec;
+            if (seg.executable) {
+                sec.name = load_index == 0 ? ".text" : (".load_rx_" + std::to_string(load_index));
+            } else if (seg.writable) {
+                sec.name = ".data_rw_" + std::to_string(load_index);
+            } else {
+                sec.name = load_index == 0 ? ".rodata_hdr" : (".rodata_" + std::to_string(load_index));
+            }
+            sec.virtual_address = seg.virtual_address;
+            sec.virtual_size = seg.virtual_size != 0 ? seg.virtual_size : seg.file_size;
+            sec.file_offset = seg.file_offset;
+            sec.file_size = seg.file_size;
+            sec.readable = seg.readable;
+            sec.writable = seg.writable;
+            sec.executable = seg.executable;
+            sections_.push_back(std::move(sec));
+            ++load_index;
+        }
+    }
+
+    mapped_span_size_ = max_end;
+
+    for (Symbol& sym : symbols_) {
+        const bool defined_in_section = sym.section_index != 0 && sym.section_index < 0xFF00u;
+        const bool undef_with_plt_stub = sym.section_index == 0 && sym.virtual_address != 0;
+        if (defined_in_section || undef_with_plt_stub) {
+            sym.virtual_address += bias;
+        }
+    }
+
+    for (ElfSymbol& esym : elf_symbols_) {
+        const bool defined_in_section = esym.section_index != 0 && esym.section_index < 0xFF00u;
+        const bool undef_with_plt_stub = esym.section_index == 0 && esym.value != 0;
+        if (defined_in_section || undef_with_plt_stub) {
+            esym.value += bias;
+        }
+    }
+
+    for (ImportEntry& imp : imports_) {
+        if (imp.address != 0) {
+            imp.address += bias;
+        }
+    }
+
+    for (ExportEntry& exp : exports_) {
+        if (exp.virtual_address != 0) {
+            exp.virtual_address += bias;
+        }
+    }
+
+    for (ElfRelocation& rel : relocations_) {
+        if (rel.offset != 0) {
+            rel.offset += bias;
+        }
+    }
+}
+
+Result<std::unique_ptr<IBinaryImage>> ElfImage::parse_mapped(
+    std::span<const std::uint8_t> mapped_bytes,
+    std::uint64_t live_base) {
+    if (mapped_bytes.size() < 0x34) {
+        return make_error("ELF mapped image too small");
+    }
+    const std::uint8_t ei_class = mapped_bytes[4];
+    const std::uint8_t ei_data = mapped_bytes[5];
+    if ((ei_class != 1 && ei_class != 2) || (ei_data != 1 && ei_data != 2)) {
+        return make_error("ELF mapped image has invalid ident");
+    }
+    const bool is64 = (ei_class == 2);
+    const bool big = (ei_data == 2);
+    if (mapped_bytes.size() < (is64 ? 0x40u : 0x34u)) {
+        return make_error("ELF mapped image truncated header");
+    }
+
+    std::vector<std::uint8_t> norm(mapped_bytes.begin(), mapped_bytes.end());
+
+    const std::uint64_t e_phoff =
+        is64 ? rd64(norm, 0x20, big) : static_cast<std::uint64_t>(rd32(norm, 0x1C, big));
+    const std::uint16_t e_phentsize = rd16(norm, is64 ? 0x36 : 0x2A, big);
+    const std::uint16_t e_phnum = rd16(norm, is64 ? 0x38 : 0x2C, big);
+
+    std::uint64_t static_base = 0;
+    bool found_zero_load = false;
+    bool any_load = false;
+    const std::size_t min_phent = is64 ? 0x38u : 0x20u;
+    if (e_phentsize >= min_phent &&
+        fits_range(e_phoff,
+                   static_cast<std::uint64_t>(e_phentsize) * static_cast<std::uint64_t>(e_phnum),
+                   static_cast<std::uint64_t>(norm.size()))) {
+        for (std::uint16_t i = 0; i < e_phnum; ++i) {
+            const std::size_t ph =
+                static_cast<std::size_t>(e_phoff) + static_cast<std::size_t>(i) * e_phentsize;
+            const std::uint32_t p_type = rd32(norm, ph + 0, big);
+            if (p_type != 1) {
+                continue;
+            }
+            const std::uint64_t p_offset =
+                is64 ? rd64(norm, ph + 8, big) : static_cast<std::uint64_t>(rd32(norm, ph + 4, big));
+            const std::uint64_t p_vaddr =
+                is64 ? rd64(norm, ph + 16, big) : static_cast<std::uint64_t>(rd32(norm, ph + 8, big));
+            if (p_offset == 0) {
+                static_base = p_vaddr;
+                found_zero_load = true;
+                break;
+            }
+            const std::uint64_t cand = p_vaddr >= p_offset ? (p_vaddr - p_offset) : p_vaddr;
+            if (!any_load || cand < static_base) {
+                static_base = cand;
+                any_load = true;
+            }
+        }
+
+        // If a prelinked in-memory image (e.g. some vDSOs) already uses live_base as p_vaddr,
+        // static_base equals live_base and (p_vaddr - static_base) still gives exact buffer offsets!
+        (void)found_zero_load;
+
+        for (std::uint16_t i = 0; i < e_phnum; ++i) {
+            const std::size_t ph =
+                static_cast<std::size_t>(e_phoff) + static_cast<std::size_t>(i) * e_phentsize;
+            const std::uint32_t p_type = rd32(norm, ph + 0, big);
+            if (p_type == 0) {
+                continue;
+            }
+            const std::uint64_t p_vaddr =
+                is64 ? rd64(norm, ph + 16, big) : static_cast<std::uint64_t>(rd32(norm, ph + 8, big));
+            const std::uint64_t p_memsz =
+                is64 ? rd64(norm, ph + 40, big)
+                     : static_cast<std::uint64_t>(rd32(norm, ph + 20, big));
+            if (p_vaddr >= static_base &&
+                (p_vaddr - static_base) < static_cast<std::uint64_t>(norm.size())) {
+                const std::uint64_t new_off = p_vaddr - static_base;
+                const std::uint64_t avail = static_cast<std::uint64_t>(norm.size()) - new_off;
+                const std::uint64_t new_filesz = std::min(p_memsz, avail);
+                if (is64) {
+                    wr64_endian(norm, ph + 8, new_off, big);
+                    wr64_endian(norm, ph + 32, new_filesz, big);
+                } else {
+                    wr32_endian(norm, ph + 4, static_cast<std::uint32_t>(new_off), big);
+                    wr32_endian(norm, ph + 16, static_cast<std::uint32_t>(new_filesz), big);
+                }
+            }
+        }
+    }
+
+    // Validate whether section headers are genuinely present in mapped memory (e.g. [vdso]).
+    const std::uint64_t e_shoff =
+        is64 ? rd64(norm, 0x28, big) : static_cast<std::uint64_t>(rd32(norm, 0x20, big));
+    const std::uint16_t e_shentsize = rd16(norm, is64 ? 0x3A : 0x2E, big);
+    const std::uint16_t e_shnum = rd16(norm, is64 ? 0x3C : 0x30, big);
+    const std::uint16_t e_shstrndx = rd16(norm, is64 ? 0x3E : 0x32, big);
+    const std::size_t min_shent = is64 ? 0x40u : 0x28u;
+    bool sh_valid = false;
+    if (e_shoff != 0 && e_shentsize >= min_shent && e_shnum > 0 && e_shstrndx < e_shnum &&
+        fits_range(e_shoff,
+                   static_cast<std::uint64_t>(e_shentsize) * static_cast<std::uint64_t>(e_shnum),
+                   static_cast<std::uint64_t>(norm.size()))) {
+        // First section header must be SHT_NULL (type == 0) and shstrtab must be SHT_STRTAB (type == 3).
+        const std::uint32_t sh0_type = rd32(norm, static_cast<std::size_t>(e_shoff) + 4, big);
+        const std::size_t str_sh =
+            static_cast<std::size_t>(e_shoff) + static_cast<std::size_t>(e_shstrndx) * e_shentsize;
+        const std::uint32_t str_type = rd32(norm, str_sh + 4, big);
+        const std::uint64_t str_off =
+            is64 ? rd64(norm, str_sh + 24, big) : static_cast<std::uint64_t>(rd32(norm, str_sh + 16, big));
+        const std::uint64_t str_sz =
+            is64 ? rd64(norm, str_sh + 32, big) : static_cast<std::uint64_t>(rd32(norm, str_sh + 20, big));
+        sh_valid = (sh0_type == 0 && str_type == 3 && str_sz > 0 &&
+                    fits_range(str_off, str_sz, static_cast<std::uint64_t>(norm.size())));
+    }
+    if (!sh_valid) {
+        if (is64) {
+            wr64_endian(norm, 0x28, 0, big);
+            wr16_endian(norm, 0x3C, 0, big);
+            wr16_endian(norm, 0x3E, 0, big);
+        } else {
+            wr32_endian(norm, 0x20, 0, big);
+            wr16_endian(norm, 0x30, 0, big);
+            wr16_endian(norm, 0x32, 0, big);
+        }
+    }
+
+    auto parsed = ElfImage::parse(norm);
+    if (!parsed) {
+        return parsed;
+    }
+
+    auto* elf = static_cast<ElfImage*>(parsed->get());
+
+    // Recover dynamic entries, DT_NEEDED imports, and .dynsym symbols directly from PT_DYNAMIC
+    // when section headers were absent in memory.
+    if (elf->dynamic_entries_.empty()) {
+        for (const ElfProgramHeader& ph : elf->program_headers_) {
+            if (ph.type != 2 || ph.file_size == 0 ||
+                !fits_range(ph.offset, ph.file_size, static_cast<std::uint64_t>(norm.size()))) {
+                continue;
+            }
+            const std::size_t dyn_ent_sz = is64 ? 16u : 8u;
+            const std::size_t count = static_cast<std::size_t>(ph.file_size) / dyn_ent_sz;
+            std::optional<std::size_t> strtab_off;
+            std::uint64_t strtab_sz = 0;
+            std::optional<std::size_t> symtab_off;
+            std::uint64_t syment_sz = is64 ? 24u : 16u;
+            std::optional<std::size_t> sysv_hash_off;
+            std::optional<std::size_t> gnu_hash_off;
+
+            for (std::size_t i = 0; i < count; ++i) {
+                const std::size_t off = static_cast<std::size_t>(ph.offset) + i * dyn_ent_sz;
+                const std::int64_t tag =
+                    is64 ? static_cast<std::int64_t>(rd64(norm, off, big))
+                         : static_cast<std::int64_t>(static_cast<std::int32_t>(rd32(norm, off, big)));
+                const std::uint64_t val =
+                    is64 ? rd64(norm, off + 8, big)
+                         : static_cast<std::uint64_t>(rd32(norm, off + 4, big));
+                ElfDynamicEntry de;
+                de.tag = static_cast<std::uint64_t>(tag);
+                de.value = val;
+                elf->dynamic_entries_.push_back(de);
+                if (tag == 0) {
+                    break;
+                }
+                if (tag == 5) {  // DT_STRTAB
+                    strtab_off = normalize_dynamic_ptr_to_offset(
+                        val, live_base, static_base, norm.size());
+                } else if (tag == 10) {  // DT_STRSZ
+                    strtab_sz = val;
+                } else if (tag == 6) {  // DT_SYMTAB
+                    symtab_off = normalize_dynamic_ptr_to_offset(
+                        val, live_base, static_base, norm.size());
+                } else if (tag == 11 && val != 0) {  // DT_SYMENT
+                    syment_sz = val;
+                } else if (tag == 4) {  // DT_HASH
+                    sysv_hash_off = normalize_dynamic_ptr_to_offset(
+                        val, live_base, static_base, norm.size());
+                } else if (tag == 0x6ffffef5ll) {  // DT_GNU_HASH
+                    gnu_hash_off = normalize_dynamic_ptr_to_offset(
+                        val, live_base, static_base, norm.size());
+                }
+            }
+
+            if (strtab_off && *strtab_off < norm.size()) {
+                const std::size_t max_str =
+                    strtab_sz != 0
+                        ? static_cast<std::size_t>(std::min<std::uint64_t>(
+                              strtab_sz, static_cast<std::uint64_t>(norm.size() - *strtab_off)))
+                        : (norm.size() - *strtab_off);
+                const auto read_dynstr = [&](std::uint32_t name_off) -> std::string {
+                    if (name_off >= max_str) {
+                        return {};
+                    }
+                    return read_c_string(
+                        std::span<const std::uint8_t>(norm.data() + *strtab_off, max_str),
+                        name_off);
+                };
+
+                for (ElfDynamicEntry& de : elf->dynamic_entries_) {
+                    if (de.tag == 1) {  // DT_NEEDED
+                        de.needed_library = read_dynstr(static_cast<std::uint32_t>(de.value));
+                        if (!de.needed_library.empty()) {
+                            ImportEntry imp;
+                            imp.library = de.needed_library;
+                            elf->imports_.push_back(std::move(imp));
+                        }
+                    }
+                }
+
+                if (symtab_off && elf->symbols_.empty() && syment_sz >= (is64 ? 24u : 16u)) {
+                    std::uint32_t sym_count = 0;
+                    if (sysv_hash_off &&
+                        fits_range(*sysv_hash_off, 8, static_cast<std::uint64_t>(norm.size()))) {
+                        sym_count = rd32(norm, *sysv_hash_off + 4, big);
+                    } else if (gnu_hash_off) {
+                        sym_count = count_gnu_hash_dynsyms(norm, *gnu_hash_off, is64, big);
+                    } else if (*strtab_off > *symtab_off) {
+                        sym_count = static_cast<std::uint32_t>(
+                            (*strtab_off - *symtab_off) / static_cast<std::size_t>(syment_sz));
+                    }
+
+                    constexpr std::uint32_t kMaxSyms = 262144u;
+                    sym_count = std::min(sym_count, kMaxSyms);
+                    for (std::uint32_t idx = 1; idx < sym_count; ++idx) {
+                        const std::uint64_t ent_off64 =
+                            static_cast<std::uint64_t>(*symtab_off) +
+                            static_cast<std::uint64_t>(idx) * syment_sz;
+                        if (!fits_range(ent_off64, syment_sz, static_cast<std::uint64_t>(norm.size()))) {
+                            break;
+                        }
+                        const auto ent = static_cast<std::size_t>(ent_off64);
+                        std::uint32_t st_name = 0;
+                        std::uint8_t st_info = 0;
+                        std::uint8_t st_other = 0;
+                        std::uint16_t st_shndx = 0;
+                        std::uint64_t st_value = 0;
+                        std::uint64_t st_size = 0;
+                        if (is64) {
+                            st_name = rd32(norm, ent + 0, big);
+                            st_info = norm[ent + 4];
+                            st_other = norm[ent + 5];
+                            st_shndx = rd16(norm, ent + 6, big);
+                            st_value = rd64(norm, ent + 8, big);
+                            st_size = rd64(norm, ent + 16, big);
+                        } else {
+                            st_name = rd32(norm, ent + 0, big);
+                            st_value = rd32(norm, ent + 4, big);
+                            st_size = rd32(norm, ent + 8, big);
+                            st_info = norm[ent + 12];
+                            st_other = norm[ent + 13];
+                            st_shndx = rd16(norm, ent + 14, big);
+                        }
+
+                        ElfSymbol es;
+                        es.name_offset = st_name;
+                        es.name = read_dynstr(st_name);
+                        es.value = st_value;
+                        es.size = st_size;
+                        es.binding = static_cast<std::uint8_t>(st_info >> 4);
+                        es.type = static_cast<std::uint8_t>(st_info & 0x0Fu);
+                        es.visibility = static_cast<std::uint8_t>(st_other & 0x03u);
+                        es.other = st_other;
+                        es.section_index = st_shndx;
+                        es.dynamic = true;
+
+                        Symbol s;
+                        s.name = es.name;
+                        s.virtual_address = st_value;
+                        s.size = st_size;
+                        s.binding = es.binding;
+                        s.type = es.type;
+                        s.section_index = st_shndx;
+                        s.dynamic = true;
+
+                        elf->elf_symbols_.push_back(std::move(es));
+                        elf->symbols_.push_back(std::move(s));
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    elf->rebase_to_live_base(live_base);
+    return parsed;
+}
+
+void PeImage::rebase_to_live_base(std::uint64_t live_base) {
+    const std::uint64_t static_base = image_base_;
+    const std::uint64_t bias = live_base - static_base;
+    const std::uint64_t entry_rva = entry_ >= static_base ? (entry_ - static_base) : 0;
+
+    image_base_ = live_base;
+    entry_ = live_base + entry_rva;
+    is_live_mapped_ = true;
+
+    std::uint64_t max_end = 4096;
+    for (Section& sec : sections_) {
+        const std::uint64_t rva =
+            sec.virtual_address >= static_base ? (sec.virtual_address - static_base) : 0;
+        sec.virtual_address = live_base + rva;
+        sec.file_offset = rva;
+        sec.file_size = std::max(sec.virtual_size, sec.file_size);
+        max_end = std::max(max_end, sec.file_offset + sec.file_size);
+    }
+    mapped_span_size_ = max_end;
+
+    for (Symbol& sym : symbols_) {
+        if (sym.virtual_address >= static_base && sym.section_index != 0) {
+            sym.virtual_address += bias;
+        }
+    }
+
+    for (ImportEntry& imp : imports_) {
+        if (imp.address != 0) {
+            imp.address += bias;
+        }
+    }
+
+    for (ExportEntry& exp : exports_) {
+        if (exp.virtual_address != 0) {
+            exp.virtual_address += bias;
+        }
+    }
+
+    for (PeDebugDirectory& dbg : debug_directories_) {
+        if (dbg.address_of_raw_data != 0) {
+            dbg.pointer_to_raw_data = dbg.address_of_raw_data;
+        }
+    }
+
+    if (tls_directory_) {
+        auto rebase_opt_va = [&](std::uint64_t& va) {
+            if (va >= static_base && (va - static_base) < mapped_span_size_) {
+                va += bias;
+            }
+        };
+        rebase_opt_va(tls_directory_->raw_data_start_va);
+        rebase_opt_va(tls_directory_->raw_data_end_va);
+        rebase_opt_va(tls_directory_->address_of_index);
+        rebase_opt_va(tls_directory_->address_of_callbacks);
+        for (std::uint64_t& cb : tls_directory_->callbacks) {
+            rebase_opt_va(cb);
+        }
+    }
+
+    if (load_config_directory_) {
+        load_config_directory_->file_offset = load_config_directory_->rva;
+        auto rebase_opt_va = [&](std::uint64_t& va) {
+            if (va >= static_base && (va - static_base) < mapped_span_size_) {
+                va += bias;
+            }
+        };
+        rebase_opt_va(load_config_directory_->security_cookie);
+        rebase_opt_va(load_config_directory_->se_handler_table);
+        rebase_opt_va(load_config_directory_->guard_cf_check_function_pointer);
+        rebase_opt_va(load_config_directory_->guard_cf_dispatch_function_pointer);
+        rebase_opt_va(load_config_directory_->guard_cf_function_table);
+    }
+
+    for (PeRuntimeFunction& rf : runtime_functions_) {
+        rf.file_offset = rf.begin_address_rva;
+    }
+
+    if (resource_directory_) {
+        resource_directory_->file_offset = resource_directory_->rva;
+    }
+
+    for (PeResourceDataEntry& rde : resource_data_entries_) {
+        rde.data_file_offset = rde.data_rva;
+    }
+
+    if (clr_header_) {
+        clr_header_->file_offset = clr_header_->rva;
+    }
+}
+
+std::vector<std::uint8_t> normalize_mapped_pe_for_file_parsers(
+    std::span<const std::uint8_t> mapped_bytes,
+    std::uint64_t live_base) {
+    std::vector<std::uint8_t> out(mapped_bytes.begin(), mapped_bytes.end());
+    if (out.size() < 0x40 || out[0] != 'M' || out[1] != 'Z') {
+        return out;
+    }
+    const std::uint32_t e_lfanew = rd32(out, 0x3C, false);
+    if (!fits_range(e_lfanew, 24, static_cast<std::uint64_t>(out.size()))) {
+        return out;
+    }
+    if (out[e_lfanew] != 'P' || out[e_lfanew + 1] != 'E' ||
+        out[e_lfanew + 2] != 0 || out[e_lfanew + 3] != 0) {
+        return out;
+    }
+
+    const std::size_t coff = static_cast<std::size_t>(e_lfanew) + 4;
+    const std::uint16_t num_sections = rd16(out, coff + 2, false);
+    const std::uint16_t size_of_opt = rd16(out, coff + 16, false);
+    const std::size_t opt = coff + 20;
+    if (size_of_opt < 32 || !fits_range(opt, size_of_opt, static_cast<std::uint64_t>(out.size()))) {
+        return out;
+    }
+
+    const std::uint16_t magic = rd16(out, opt, false);
+    const bool is64 = (magic == 0x20b);
+    if (is64 && size_of_opt >= 32) {
+        wr64_endian(out, opt + 24, live_base, false);
+    } else if (magic == 0x10b && size_of_opt >= 32) {
+        wr32_endian(out, opt + 28, static_cast<std::uint32_t>(live_base), false);
+    }
+
+    // Clear Certificate Table directory entry (index 4) since overlay certs are not mapped in RAM.
+    const std::size_t cert_dir_off = opt + (is64 ? 0x70u : 0x60u) + 4u * 8u;
+    if (size_of_opt >= ((is64 ? 0x70u : 0x60u) + 5u * 8u) &&
+        fits_range(cert_dir_off, 8, static_cast<std::uint64_t>(out.size()))) {
+        wr32_endian(out, cert_dir_off + 0, 0, false);
+        wr32_endian(out, cert_dir_off + 4, 0, false);
+    }
+
+    const std::size_t sect_table = opt + size_of_opt;
+    for (std::uint16_t i = 0; i < num_sections; ++i) {
+        const std::uint64_t hdr64 =
+            static_cast<std::uint64_t>(sect_table) + static_cast<std::uint64_t>(i) * 0x28ull;
+        if (!fits_range(hdr64, 0x28, static_cast<std::uint64_t>(out.size()))) {
+            break;
+        }
+        const auto hdr = static_cast<std::size_t>(hdr64);
+        const std::uint32_t vsize = rd32(out, hdr + 8, false);
+        const std::uint32_t vaddr = rd32(out, hdr + 12, false);
+        const std::uint32_t rawsize = rd32(out, hdr + 16, false);
+        const std::uint32_t span = std::max(vsize, rawsize);
+        const std::uint32_t clamped_size =
+            vaddr < out.size()
+                ? static_cast<std::uint32_t>(
+                      std::min<std::uint64_t>(span, static_cast<std::uint64_t>(out.size()) - vaddr))
+                : 0u;
+        wr32_endian(out, hdr + 16, clamped_size, false);
+        wr32_endian(out, hdr + 20, vaddr, false);
+    }
+
+    return out;
+}
+
+Result<std::unique_ptr<IBinaryImage>> parse_rebased_image(
+    std::span<const std::uint8_t> file_bytes,
+    std::uint64_t live_base) {
+    auto parsed = parse_image(file_bytes);
+    if (!parsed) {
+        return parsed;
+    }
+    if ((*parsed)->format() == Format::ELF) {
+        static_cast<ElfImage*>(parsed->get())->rebase_to_live_base(live_base);
+    } else if ((*parsed)->format() == Format::PE) {
+        static_cast<PeImage*>(parsed->get())->rebase_to_live_base(live_base);
+    }
+    return parsed;
+}
+
+Result<std::unique_ptr<IBinaryImage>> parse_mapped_image(
+    std::span<const std::uint8_t> mapped_bytes,
+    std::uint64_t live_base) {
+    switch (detect_format(mapped_bytes)) {
+        case Format::ELF:
+            return ElfImage::parse_mapped(mapped_bytes, live_base);
+        case Format::PE: {
+            const std::vector<std::uint8_t> norm =
+                normalize_mapped_pe_for_file_parsers(mapped_bytes, live_base);
+            auto parsed = PeImage::parse(norm);
+            if (!parsed) {
+                return parsed;
+            }
+            static_cast<PeImage*>(parsed->get())->rebase_to_live_base(live_base);
+            return parsed;
+        }
+        default:
+            return make_error("Unknown or unsupported mapped binary format");
     }
 }
 

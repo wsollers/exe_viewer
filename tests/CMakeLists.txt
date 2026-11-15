@@ -57,6 +57,8 @@ add_executable(peelf_tests
   assembler_dependency_test.cpp
   patching_test.cpp
   binary_model_patch_test.cpp
+  process_memmap_test.cpp
+  live_process_self_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp

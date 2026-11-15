@@ -1,6 +1,7 @@
 #pragma once
 
 #include "peelf/error.hpp"
+#include "peelf/process.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,10 +24,17 @@ struct PatchInterval {
     }
 };
 
+struct PatchSpanSnapshot {
+    std::uint64_t offset{};
+    std::vector<std::uint8_t> before;
+    std::vector<std::uint8_t> after;
+};
+
 struct PatchEdit {
     std::uint64_t offset{};
     std::vector<std::uint8_t> before;
     std::vector<std::uint8_t> after;
+    std::vector<PatchSpanSnapshot> spans;
     std::string label;
 };
 
@@ -107,6 +115,89 @@ private:
     std::uint64_t page_size_{default_page_size};
     mutable std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> page_cache_;
     std::map<std::uint64_t, PatchInterval> patches_;
+    std::vector<PatchEdit> undo_stack_;
+    std::vector<PatchEdit> redo_stack_;
+};
+
+enum class LiveByteState : std::uint8_t {
+    Unmodified = 0,
+    Staged = 1,
+    Committed = 2,
+};
+
+struct CommittedPatchInterval {
+    std::uint64_t address{};
+    std::vector<std::uint8_t> original;
+    std::vector<std::uint8_t> committed;
+
+    [[nodiscard]] std::uint64_t end_address() const noexcept {
+        return address + static_cast<std::uint64_t>(committed.size());
+    }
+};
+
+class LiveMemoryPatchSpace {
+public:
+    LiveMemoryPatchSpace() = default;
+
+    void clear() noexcept;
+    void clear_staged() noexcept;
+
+    [[nodiscard]] bool has_staged_patches() const noexcept { return !staged_.empty(); }
+    [[nodiscard]] bool has_committed_patches() const noexcept { return !committed_.empty(); }
+    [[nodiscard]] bool can_undo() const noexcept { return !undo_stack_.empty(); }
+    [[nodiscard]] bool can_redo() const noexcept { return !redo_stack_.empty(); }
+
+    [[nodiscard]] std::vector<PatchInterval> staged_intervals() const;
+    [[nodiscard]] std::vector<PatchInterval> staged_intervals(std::uint64_t address,
+                                                              std::uint64_t size) const;
+    [[nodiscard]] std::vector<CommittedPatchInterval> committed_intervals() const;
+
+    [[nodiscard]] Result<void> stage_patch(IProcessSession& session,
+                                           std::uint64_t address,
+                                           std::span<const std::uint8_t> bytes,
+                                           std::string label);
+    [[nodiscard]] Result<void> stage_writes(IProcessSession& session,
+                                            std::span<const PendingPatchWrite> writes,
+                                            std::string label);
+
+    [[nodiscard]] Result<void> undo(IProcessSession& session);
+    [[nodiscard]] Result<void> redo(IProcessSession& session);
+
+    [[nodiscard]] Result<std::vector<std::uint8_t>> read_effective(IProcessSession& session,
+                                                                   std::uint64_t address,
+                                                                   std::size_t size) const;
+
+    void apply_overlay(std::uint64_t address,
+                       MemorySample& sample,
+                       std::vector<LiveByteState>* out_states = nullptr) const;
+
+    [[nodiscard]] Result<std::size_t> commit_to_process(IProcessSession& session,
+                                                        MemoryWriteOptions options = {});
+
+    [[nodiscard]] Result<std::size_t> revert_committed(IProcessSession& session,
+                                                       MemoryWriteOptions options = {});
+    [[nodiscard]] Result<void> revert_committed_interval(IProcessSession& session,
+                                                         std::uint64_t address,
+                                                         std::uint64_t size,
+                                                         MemoryWriteOptions options = {});
+
+private:
+    [[nodiscard]] Result<std::vector<std::uint8_t>> read_live_baseline(IProcessSession& session,
+                                                                       std::uint64_t address,
+                                                                       std::size_t size) const;
+    [[nodiscard]] Result<void> record_original_ram_if_missing(IProcessSession& session,
+                                                              std::uint64_t address,
+                                                              std::size_t size);
+    [[nodiscard]] Result<void> apply_staged_replacement_no_history(
+        IProcessSession& session,
+        std::uint64_t address,
+        std::span<const std::uint8_t> bytes);
+    void rebuild_committed_interval_for_range(std::uint64_t address,
+                                              std::span<const std::uint8_t> written_bytes);
+
+    std::map<std::uint64_t, std::uint8_t> original_ram_;
+    std::map<std::uint64_t, PatchInterval> staged_;
+    std::map<std::uint64_t, CommittedPatchInterval> committed_;
     std::vector<PatchEdit> undo_stack_;
     std::vector<PatchEdit> redo_stack_;
 };

@@ -10,6 +10,7 @@
 #include "disasm/disassembler.hpp"
 #include "model/binary_model.hpp"
 #include "navigation/viewer_navigation.hpp"
+#include "symbols/symbol_index.hpp"
 #include "ui_panel.hpp"
 #include "symbols/symbol_index.hpp"
 #include "analysis/patch_preview.hpp"
@@ -26,10 +27,45 @@ namespace viewer {
     class FilePanel : public UiPanel {
     public:
         explicit FilePanel(BinaryModel& model);
+        void set_attach_requested_callback(std::function<void()> cb) { on_attach_requested_ = std::move(cb); }
+        void set_refresh_requested_callback(std::function<void()> cb) { on_refresh_requested_ = std::move(cb); }
+        void set_detach_requested_callback(std::function<void()> cb) { on_detach_requested_ = std::move(cb); }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
+        std::function<void()> on_attach_requested_;
+        std::function<void()> on_refresh_requested_;
+        std::function<void()> on_detach_requested_;
+    };
+
+    class MemoryMapPanel : public UiPanel {
+    public:
+        MemoryMapPanel(BinaryModel& model, ViewerSelection& selection);
+        void set_attach_requested_callback(std::function<void()> cb) { on_attach_requested_ = std::move(cb); }
+        void set_refresh_requested_callback(std::function<void()> cb) { on_refresh_requested_ = std::move(cb); }
+        void set_detach_requested_callback(std::function<void()> cb) { on_detach_requested_ = std::move(cb); }
+        void set_module_selected_callback(std::function<void(std::size_t)> cb) {
+            on_module_selected_ = std::move(cb);
+        }
+        void set_region_activated_callback(
+            std::function<void(std::size_t region_index, bool prefer_module_context)> cb) {
+            on_region_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        ViewerSelection& selection_;
+        char filter_buf_[128] = {};
+        bool filter_exec_only_ = false;
+        bool filter_writable_only_ = false;
+        bool filter_modules_only_ = false;
+        std::function<void()> on_attach_requested_;
+        std::function<void()> on_refresh_requested_;
+        std::function<void()> on_detach_requested_;
+        std::function<void(std::size_t)> on_module_selected_;
+        std::function<void(std::size_t, bool)> on_region_activated_;
     };
 
     class StructureNavigatorPanel : public UiPanel {
@@ -73,6 +109,7 @@ namespace viewer {
         explicit HexViewPanel(BinaryModel& model);
         // Invoked with the file offset of the byte the user clicks.
         void set_byte_activated_callback(std::function<void(std::size_t, std::size_t)> cb) { on_byte_activated_ = std::move(cb); }
+        void set_bytes_patched_callback(std::function<void(std::size_t)> cb) { on_bytes_patched_ = std::move(cb); }
         void navigate_to_range(std::size_t file_offset, std::size_t size);
         void navigate_to_ranges(std::span<const ByteRange> ranges);
         void clear_selection() noexcept;
@@ -90,22 +127,29 @@ namespace viewer {
         char edit_bytes_[4096] = {};
         std::string edit_status_;
         std::function<void(std::size_t, std::size_t)> on_byte_activated_;
+        char quick_patch_buf_[256] = {};
+        std::string quick_patch_status_;
+        std::size_t quick_patch_offset_ = 0;
+        std::function<void(std::size_t)> on_bytes_patched_;
     };
 
     class ShellcodeScratchPanel : public UiPanel {
     public:
         ShellcodeScratchPanel(BinaryModel& model, const ViewerSelection& selection);
+        void set_patch_changed_callback(std::function<void()> cb) { on_patch_changed_ = std::move(cb); }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         const ViewerSelection& selection_;
         bool assembly_mode_ = false;
+        bool override_protection_ = true;
         char input_buf_[32768] = {};
         std::vector<std::uint8_t> output_bytes_;
         std::string hex_view_;
         std::string diagnostic_;
         bool last_assembly_mode_ = false;
+        std::function<void()> on_patch_changed_;
 
         void rebuild_output();
         void draw_hex_output() const;
@@ -118,6 +162,12 @@ namespace viewer {
         PatchSetPanel(BinaryModel& model, ViewerSelection& selection);
         void set_analysis_context(const SymbolIndex* symbols, const bool* thumb) { symbols_ = symbols; thumb_ = thumb; }
         void reset_preview() { preview_.reset(); replacement_[0] = 0; status_.clear(); }
+        void set_patch_activated_callback(std::function<void(const ViewerSelection&)> cb) {
+            on_patch_activated_ = std::move(cb);
+        }
+        void set_patch_mutated_callback(std::function<void()> cb) {
+            on_patch_mutated_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
@@ -128,6 +178,10 @@ namespace viewer {
         const bool* thumb_ = nullptr;
         char replacement_[4096]{};
         std::optional<PatchPreview> preview_;
+        bool override_protection_ = true;
+        std::string status_message_;
+        std::function<void(const ViewerSelection&)> on_patch_activated_;
+        std::function<void()> on_patch_mutated_;
     };
 
     class DisassemblyPanel : public UiPanel {

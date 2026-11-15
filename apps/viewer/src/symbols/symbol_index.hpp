@@ -75,5 +75,6 @@ private:
     }
     return false;
 }
+[[nodiscard]] const char* to_string(SymbolSource source) noexcept;
 
 } // namespace viewer
