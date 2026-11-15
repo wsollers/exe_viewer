@@ -1064,13 +1064,72 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
     return graph;
 }
 
+std::string_view function_extent_source_name(FunctionExtentSource source) noexcept {
+    switch (source) {
+        case FunctionExtentSource::Symbol: return "Symbol extent";
+        case FunctionExtentSource::RuntimeMetadata: return "Runtime function extent";
+        case FunctionExtentSource::NextSymbol: return "Bounded by next function";
+        case FunctionExtentSource::ExecutableRegion: return "Executable region preview";
+    }
+    return "Unknown extent";
+}
+
+std::optional<FunctionExtent> discover_function_extent(const peelf::IBinaryImage& image,
+    const SymbolIndex& symbols, const SymbolRecord& root, std::uint64_t image_size, std::uint64_t max_bytes) {
+    if (!root.virtual_address || max_bytes == 0) return std::nullopt;
+    const auto mapped = image.virtual_address_to_file_offset(*root.virtual_address);
+    if (!mapped || *mapped >= image_size || (root.file_offset && *root.file_offset != *mapped)) return std::nullopt;
+    const auto address = *root.virtual_address;
+    std::uint64_t region_size = 0;
+    const auto consider_region = [&](const auto& region) {
+        if (!region.executable || *mapped < region.file_offset) return;
+        const auto delta = *mapped - region.file_offset;
+        if (delta >= region.file_size) return;
+        const auto size = std::min(region.file_size - delta, image_size - *mapped);
+        if (region_size == 0 || size < region_size) region_size = size;
+    };
+    for (const auto& section : image.sections()) consider_region(section);
+    if (region_size == 0) for (const auto& segment : image.segments()) consider_region(segment);
+    if (region_size == 0) return std::nullopt;
+    FunctionExtent result{*mapped, address, region_size, FunctionExtentSource::ExecutableRegion, false};
+    if (root.size != 0 && root.source != SymbolSource::EntryPoint) {
+        result.size = root.size;
+        result.source = FunctionExtentSource::Symbol;
+    } else if (image.format() == peelf::Format::PE && image.architecture() == peelf::Architecture::X86_64 &&
+               address >= image.image_base()) {
+        const auto rva = address - image.image_base();
+        for (const auto& runtime : image.pe_runtime_functions()) {
+            if (runtime.begin_address_rva <= rva && runtime.end_address_rva > rva) {
+                result.size = runtime.end_address_rva - rva;
+                result.source = FunctionExtentSource::RuntimeMetadata;
+                break;
+            }
+        }
+    }
+    if (result.source == FunctionExtentSource::ExecutableRegion) {
+        for (const auto& symbol : symbols.records()) {
+            if (!symbol.virtual_address || *symbol.virtual_address <= address || !symbol_has_code(image, symbol)) continue;
+            const auto distance = *symbol.virtual_address - address;
+            if (distance < result.size) {
+                result.size = distance;
+                result.source = FunctionExtentSource::NextSymbol;
+            }
+        }
+    }
+    const auto bounded = std::min({result.size, region_size, max_bytes});
+    result.truncated = bounded < result.size;
+    result.size = bounded;
+    return result;
+}
+
 CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_bytes,
                                         std::uint64_t virtual_address,
                                         peelf::Architecture architecture,
                                         peelf::Endianness endianness,
                                         std::optional<std::uint64_t> file_offset,
                                         std::string label,
-                                        bool thumb_mode) {
+                                        bool thumb_mode,
+                                        bool reachable_only) {
     CallGraph graph{
         .id = "function_cfg",
         .label = std::move(label),
@@ -1082,6 +1141,8 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
     if (!arch || function_bytes.empty()) {
         return graph;
     }
+    if (function_bytes.size() > std::numeric_limits<std::uint64_t>::max() - virtual_address) return graph;
+    if (file_offset && function_bytes.size() > std::numeric_limits<std::uint64_t>::max() - *file_offset) return graph;
 
     Disassembler disassembler;
     if (!disassembler.init(*arch, disassembler_endianness(endianness))) {
@@ -1103,23 +1164,61 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
     const std::uint64_t function_end =
         virtual_address + static_cast<std::uint64_t>(function_bytes.size());
     std::set<std::uint64_t> leaders{instructions.front().address};
+    const auto conditional = [](const Instruction& i) { return i.flow == InstructionFlow::ConditionalBranch; };
+    const auto branch = [](const Instruction& i) { return i.flow == InstructionFlow::Branch; };
+    const auto returns = [](const Instruction& i) {
+        return i.flow == InstructionFlow::Return || i.flow == InstructionFlow::ConditionalReturn;
+    };
+    const auto terminates = [&](const Instruction& i) { return conditional(i) || branch(i) || returns(i); };
+    // Recover only the proven, locally guarded absolute-pointer dispatch pattern:
+    // cmp index, max; ja default; jmp [index * pointer_size + table].
+    // Relative tables, register transformations and tables outside this mapping stay unresolved.
+    std::map<std::size_t, std::vector<std::uint64_t>> jump_tables;
+    for (std::size_t i = 2; i < instructions.size(); ++i) {
+        const auto& dispatch = instructions[i];
+        const auto& guard = instructions[i - 1];
+        const auto& compare = instructions[i - 2];
+        if (!dispatch.jump_table || !compare.compare_bound || *compare.compare_bound >= 256 ||
+            guard.mnemonic != "ja" || !guard.branch_target || *guard.branch_target == dispatch.address ||
+            compare.compare_register != dispatch.jump_table->index_register) continue;
+        if (std::ranges::any_of(instructions, [&](const Instruction& instruction) {
+            return instruction.branch_target == dispatch.address;
+        })) continue; // A direct entry could bypass the bounds check.
+        const auto& table = *dispatch.jump_table;
+        const auto count = *compare.compare_bound + 1;
+        if (table.address < virtual_address) continue;
+        const auto offset = table.address - virtual_address;
+        if (offset > function_bytes.size() || count > (function_bytes.size() - offset) / table.entry_size) continue;
+        std::vector<std::uint64_t> targets;
+        for (std::uint64_t entry = 0; entry < count; ++entry) {
+            std::uint64_t destination = 0;
+            for (std::uint8_t byte = 0; byte < table.entry_size; ++byte)
+                destination |= static_cast<std::uint64_t>(function_bytes[offset + entry * table.entry_size + byte]) << (byte * 8);
+            if (!instruction_by_address.contains(destination)) { targets.clear(); break; }
+            targets.push_back(destination);
+        }
+        if (!targets.empty()) {
+            for (const auto target : targets) leaders.insert(target);
+            jump_tables.emplace(i, std::move(targets));
+        }
+    }
 
     for (std::size_t index = 0; index < instructions.size(); ++index) {
         const Instruction& instruction = instructions[index];
-        const std::uint64_t next_address =
-            instruction.address + static_cast<std::uint64_t>(instruction.bytes.size());
-        const std::optional<std::uint64_t> target = parse_direct_call_target(instruction);
+        const auto after = index + (instruction.delay_slot ? 2u : 1u);
+        const std::uint64_t next_address = after < instructions.size() ? instructions[after].address : function_end;
+        const std::optional<std::uint64_t> target = instruction.branch_target;
         const bool target_in_function = target && *target >= virtual_address && *target < function_end &&
                                         instruction_by_address.contains(*target);
 
-        if (is_conditional_branch_instruction(instruction)) {
+        if (conditional(instruction)) {
             if (target_in_function) {
                 leaders.insert(*target);
             }
             if (index + 1u < instructions.size()) {
                 leaders.insert(next_address);
             }
-        } else if (is_unconditional_branch_instruction(instruction)) {
+        } else if (branch(instruction) || returns(instruction)) {
             if (target_in_function) {
                 leaders.insert(*target);
             }
@@ -1146,9 +1245,8 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
         ++index;
         while (index < instructions.size() && !leaders.contains(instructions[index].address)) {
             const Instruction& previous = instructions[index - 1u];
-            if (is_conditional_branch_instruction(previous) ||
-                is_unconditional_branch_instruction(previous) ||
-                is_return_instruction(previous)) {
+            if (terminates(previous)) {
+                if (previous.delay_slot && index < instructions.size()) ++index;
                 break;
             }
             ++index;
@@ -1189,7 +1287,7 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
         auto& node = graph.nodes.back();
         for (std::size_t i = block.first_instruction; i < block.first_instruction + block.instruction_count; ++i) {
             const auto& instruction = instructions[i];
-            node.instructions.push_back({instruction.address, instruction.mnemonic, instruction.operands});
+            node.instructions.push_back({instruction.address, instruction.mnemonic, instruction.operands, instruction.branch_target});
         }
     }
 
@@ -1201,22 +1299,46 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
 
     for (std::size_t block_index = 0; block_index < blocks.size(); ++block_index) {
         const Block& block = blocks[block_index];
-        const Instruction& last = instructions[block.first_instruction + block.instruction_count - 1u];
-        const std::uint64_t next_address = last.address + static_cast<std::uint64_t>(last.bytes.size());
-        const auto target = parse_direct_call_target(last);
+        const auto last_index = block.first_instruction + block.instruction_count - 1u;
+        const auto control_index = block.instruction_count > 1 && instructions[last_index - 1].delay_slot &&
+            terminates(instructions[last_index - 1]) ? last_index - 1 : last_index;
+        const Instruction& last = instructions[control_index];
+        const std::uint64_t next_address = block.end;
+        const auto target = last.branch_target;
         const bool target_in_function = target && block_by_start.contains(*target);
 
-        if (is_return_instruction(last)) {
+        const auto unresolved = [&](CallGraphEdgeKind kind, std::string reason) {
+            const auto id = "external_" + block.id;
+            const auto known_target = kind == CallGraphEdgeKind::Unknown ? std::nullopt : target;
+            graph.nodes.push_back(CallGraphNode{.id = id,
+                .label = known_target ? format_hex(*known_target) + " (outside analyzed blocks)" : std::move(reason),
+                .kind = known_target ? CallGraphNodeKind::External : CallGraphNodeKind::Unknown,
+                .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = known_target}}});
+            graph.edges.push_back({block.id, id, kind, known_target ? "external" : "unresolved"});
+        };
+
+        if (last.annulled_delay_slot) {
+            unresolved(CallGraphEdgeKind::Unknown, "Unresolved branch-likely (annulled delay slot)");
+            continue;
+        }
+        if (last.delay_slot && control_index == last_index && terminates(last)) {
+            unresolved(CallGraphEdgeKind::Unknown, "Missing delay slot");
+            continue;
+        }
+
+        if (returns(last)) {
             graph.edges.push_back(CallGraphEdge{
                 .from_node_id = block.id,
                 .to_node_id = "return",
                 .kind = CallGraphEdgeKind::Return,
                 .label = "return",
             });
+            if (last.flow == InstructionFlow::ConditionalReturn && block_by_start.contains(next_address))
+                graph.edges.push_back({block.id, block_by_start.at(next_address), CallGraphEdgeKind::Fallthrough, "not returned"});
             continue;
         }
 
-        if (is_conditional_branch_instruction(last)) {
+        if (conditional(last)) {
             if (target_in_function) {
                 graph.edges.push_back(CallGraphEdge{
                     .from_node_id = block.id,
@@ -1224,6 +1346,8 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
                     .kind = CallGraphEdgeKind::ConditionalBranch,
                     .label = "taken",
                 });
+            } else {
+                unresolved(CallGraphEdgeKind::ConditionalBranch, "Unresolved conditional branch");
             }
             if (block_by_start.contains(next_address)) {
                 graph.edges.push_back(CallGraphEdge{
@@ -1236,14 +1360,21 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
             continue;
         }
 
-        if (is_unconditional_branch_instruction(last)) {
-            if (target_in_function) {
+        if (branch(last)) {
+            if (const auto table = jump_tables.find(control_index); table != jump_tables.end()) {
+                for (std::size_t case_index = 0; case_index < table->second.size(); ++case_index) {
+                    graph.edges.push_back({block.id, block_by_start.at(table->second[case_index]),
+                        CallGraphEdgeKind::UnconditionalBranch, "case " + std::to_string(case_index)});
+                }
+            } else if (target_in_function) {
                 graph.edges.push_back(CallGraphEdge{
                     .from_node_id = block.id,
                     .to_node_id = block_by_start[*target],
                     .kind = CallGraphEdgeKind::UnconditionalBranch,
                     .label = "branch",
                 });
+            } else {
+                unresolved(CallGraphEdgeKind::UnconditionalBranch, "Unresolved indirect branch / jump table");
             }
             continue;
         }
@@ -1258,6 +1389,20 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
         }
     }
 
+    if (reachable_only) {
+        std::set<std::string> reachable{"bb_0"};
+        std::vector<std::string> pending{"bb_0"};
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+            for (const auto& edge : graph.edges) {
+                if (edge.from_node_id == pending[i] && reachable.insert(edge.to_node_id).second)
+                    pending.push_back(edge.to_node_id);
+            }
+        }
+        std::erase_if(graph.nodes, [&](const auto& node) { return !reachable.contains(node.id); });
+        std::erase_if(graph.edges, [&](const auto& edge) {
+            return !reachable.contains(edge.from_node_id) || !reachable.contains(edge.to_node_id);
+        });
+    }
     return graph;
 }
 

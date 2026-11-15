@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <optional>
 
@@ -28,6 +29,14 @@ enum class Endianness {
     Big
 };
 
+enum class InstructionFlow : std::uint8_t { Normal, Call, ConditionalBranch, Branch, Return, ConditionalReturn };
+
+struct AbsoluteJumpTableOperand {
+    std::uint64_t address = 0;
+    std::uint32_t index_register = 0;
+    std::uint8_t entry_size = 0;
+};
+
 struct Instruction {
     std::uint64_t address;
     std::vector<std::uint8_t> bytes;
@@ -35,6 +44,12 @@ struct Instruction {
     std::string operands;
     std::string comment;
     std::optional<std::uint64_t> branch_target;
+    InstructionFlow flow = InstructionFlow::Normal;
+    bool delay_slot = false;
+    bool annulled_delay_slot = false;
+    std::optional<AbsoluteJumpTableOperand> jump_table;
+    std::optional<std::uint64_t> compare_bound;
+    std::uint32_t compare_register = 0;
 
     std::string to_string() const {
         return mnemonic + (operands.empty() ? "" : " " + operands);
@@ -167,6 +182,13 @@ public:
                 inst.mnemonic = insn[i].mnemonic;
                 inst.operands = insn[i].op_str;
                 inst.branch_target = direct_target(insn[i]);
+                inst.flow = instruction_flow(insn[i]);
+                inst.delay_slot = (arch_ == Architecture::MIPS32 || arch_ == Architecture::MIPS64) &&
+                    inst.flow != InstructionFlow::Normal;
+                annotate_jump_table(insn[i], inst);
+                inst.annulled_delay_slot = inst.delay_slot &&
+                    (inst.mnemonic == "beql" || inst.mnemonic == "bnel" || inst.mnemonic == "blezl" ||
+                     inst.mnemonic == "bgtzl" || inst.mnemonic == "bltzl" || inst.mnemonic == "bgezl");
                 result.push_back(std::move(inst));
             }
             cs_free(insn, count);
@@ -192,6 +214,13 @@ public:
                 inst.mnemonic = insn[i].mnemonic;
                 inst.operands = insn[i].op_str;
                 inst.branch_target = direct_target(insn[i]);
+                inst.flow = instruction_flow(insn[i]);
+                inst.delay_slot = (arch_ == Architecture::MIPS32 || arch_ == Architecture::MIPS64) &&
+                    inst.flow != InstructionFlow::Normal;
+                annotate_jump_table(insn[i], inst);
+                inst.annulled_delay_slot = inst.delay_slot &&
+                    (inst.mnemonic == "beql" || inst.mnemonic == "bnel" || inst.mnemonic == "blezl" ||
+                     inst.mnemonic == "bgtzl" || inst.mnemonic == "bltzl" || inst.mnemonic == "bgezl");
                 result.push_back(std::move(inst));
             }
             cs_free(insn, actual);
@@ -264,9 +293,87 @@ public:
     }
 
 private:
+    void annotate_jump_table(const cs_insn& insn, Instruction& result) const {
+        if (!insn.detail || (arch_ != Architecture::X86_32 && arch_ != Architecture::X86_64)) return;
+        const auto& detail = insn.detail->x86;
+        if (insn.id == X86_INS_CMP && detail.op_count == 2 && detail.operands[0].type == X86_OP_REG &&
+            detail.operands[1].type == X86_OP_IMM && detail.operands[1].imm >= 0) {
+            result.compare_register = detail.operands[0].reg;
+            result.compare_bound = static_cast<std::uint64_t>(detail.operands[1].imm);
+        }
+        if (insn.id != X86_INS_JMP || detail.op_count != 1 || detail.operands[0].type != X86_OP_MEM) return;
+        const auto& operand = detail.operands[0];
+        const auto& memory = operand.mem;
+        if (memory.base != X86_REG_INVALID || memory.index == X86_REG_INVALID || memory.segment != X86_REG_INVALID ||
+            memory.disp < 0 || memory.scale != operand.size || (operand.size != 4 && operand.size != 8)) return;
+        result.jump_table = AbsoluteJumpTableOperand{static_cast<std::uint64_t>(memory.disp),
+            static_cast<std::uint32_t>(memory.index), operand.size};
+    }
+    [[nodiscard]] InstructionFlow instruction_flow(const cs_insn& insn) const {
+        if (!insn.detail) return InstructionFlow::Normal;
+        const auto group = [&insn](std::uint8_t value) {
+            for (std::uint8_t i = 0; i < insn.detail->groups_count; ++i)
+                if (insn.detail->groups[i] == value) return true;
+            return false;
+        };
+        const std::string_view m = insn.mnemonic;
+        const std::string_view operands = insn.op_str;
+        const bool conditional_arm = arch_ == Architecture::ARM32 && insn.detail->arm.cc != ARM_CC_AL &&
+            insn.detail->arm.cc != ARM_CC_INVALID;
+        const auto return_flow = conditional_arm ? InstructionFlow::ConditionalReturn : InstructionFlow::Return;
+        if (group(CS_GRP_RET) || group(CS_GRP_IRET)) return return_flow;
+        if (arch_ == Architecture::ARM32) {
+            if ((insn.id == ARM_INS_BX && operands == "lr") ||
+                ((insn.id == ARM_INS_POP || insn.id == ARM_INS_LDM) && operands.find("pc") != operands.npos))
+                return return_flow;
+        }
+        if ((arch_ == Architecture::MIPS32 || arch_ == Architecture::MIPS64) &&
+            m == "jr" && (operands == "$ra" || operands == "$31")) return InstructionFlow::Return;
+        if ((arch_ == Architecture::MIPS32 || arch_ == Architecture::MIPS64) &&
+            (insn.id == MIPS_INS_JAL || insn.id == MIPS_INS_JALR || insn.id == MIPS_INS_BAL || insn.id == MIPS_INS_JALX))
+            return InstructionFlow::Call;
+        if ((arch_ == Architecture::PowerPC32 || arch_ == Architecture::PowerPC64) && m == "blr")
+            return InstructionFlow::Return;
+        if ((arch_ == Architecture::RISCV32 || arch_ == Architecture::RISCV64) &&
+            (m == "ret" || (m == "jr" && operands == "ra"))) return InstructionFlow::Return;
+        if (arch_ == Architecture::RISCV32 || arch_ == Architecture::RISCV64) {
+            const auto& detail = insn.detail->riscv;
+            if (m == "j" || m == "jr" || m == "c.j" || m == "c.jr" ||
+                ((insn.id == RISCV_INS_JAL || insn.id == RISCV_INS_JALR) && detail.op_count > 1 &&
+                 detail.operands[0].type == RISCV_OP_REG && detail.operands[0].reg == RISCV_REG_X0))
+                return InstructionFlow::Branch;
+        }
+        if ((arch_ == Architecture::PowerPC32 || arch_ == Architecture::PowerPC64) &&
+            (insn.id == PPC_INS_BL || insn.id == PPC_INS_BLA || insn.id == PPC_INS_BCTRL || insn.id == PPC_INS_BLRL ||
+             insn.id == PPC_INS_BCL || insn.id == PPC_INS_BCLA || insn.id == PPC_INS_BCCTRL || insn.id == PPC_INS_BCLRL))
+            return InstructionFlow::Call;
+        if (group(CS_GRP_CALL)) return InstructionFlow::Call;
+        if (!group(CS_GRP_JUMP)) return InstructionFlow::Normal;
+        switch (arch_) {
+            case Architecture::X86_32: case Architecture::X86_64:
+                return insn.id == X86_INS_JMP || insn.id == X86_INS_LJMP ? InstructionFlow::Branch : InstructionFlow::ConditionalBranch;
+            case Architecture::ARM32:
+                if (insn.id == ARM_INS_CBZ || insn.id == ARM_INS_CBNZ) return InstructionFlow::ConditionalBranch;
+                return insn.detail->arm.cc == ARM_CC_AL || insn.detail->arm.cc == ARM_CC_INVALID ?
+                    InstructionFlow::Branch : InstructionFlow::ConditionalBranch;
+            case Architecture::ARM64:
+                return (insn.id == ARM64_INS_B && (insn.detail->arm64.cc == ARM64_CC_AL || insn.detail->arm64.cc == ARM64_CC_INVALID)) ||
+                    insn.id == ARM64_INS_BR ? InstructionFlow::Branch : InstructionFlow::ConditionalBranch;
+            case Architecture::MIPS32: case Architecture::MIPS64:
+                return m == "j" || m == "jr" || m == "b" ? InstructionFlow::Branch : InstructionFlow::ConditionalBranch;
+            case Architecture::PowerPC32: case Architecture::PowerPC64:
+                return m == "b" || m == "ba" || m == "bctr" ? InstructionFlow::Branch : InstructionFlow::ConditionalBranch;
+            case Architecture::RISCV32: case Architecture::RISCV64:
+                return m == "j" || m == "jr" || m == "jal" || m == "jalr" || m == "c.j" || m == "c.jr" ?
+                    InstructionFlow::Branch : InstructionFlow::ConditionalBranch;
+        }
+        return InstructionFlow::Normal;
+    }
     [[nodiscard]] std::optional<std::uint64_t> direct_target(const cs_insn& instruction) const {
         if (!instruction.detail) return std::nullopt;
-        bool branch = false;
+        const auto flow = instruction_flow(instruction);
+        bool branch = flow == InstructionFlow::Call || flow == InstructionFlow::Branch ||
+            flow == InstructionFlow::ConditionalBranch;
         for (std::uint8_t i = 0; i < instruction.detail->groups_count; ++i)
             branch |= instruction.detail->groups[i] == CS_GRP_CALL || instruction.detail->groups[i] == CS_GRP_JUMP;
         if (!branch) return std::nullopt;

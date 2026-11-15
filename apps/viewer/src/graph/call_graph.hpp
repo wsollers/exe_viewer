@@ -54,7 +54,24 @@ struct GraphInstruction {
     std::uint64_t address = 0;
     std::string mnemonic;
     std::string operands;
+    std::optional<std::uint64_t> branch_target;
 };
+
+enum class FunctionExtentSource : std::uint8_t { Symbol, RuntimeMetadata, NextSymbol, ExecutableRegion };
+
+struct FunctionExtent {
+    std::uint64_t file_offset = 0;
+    std::uint64_t virtual_address = 0;
+    std::uint64_t size = 0;
+    FunctionExtentSource source = FunctionExtentSource::ExecutableRegion;
+    bool truncated = false;
+};
+
+// Bounds are always limited to mapped executable bytes and the supplied file size.
+[[nodiscard]] std::optional<FunctionExtent> discover_function_extent(
+    const peelf::IBinaryImage& image, const SymbolIndex& symbols, const SymbolRecord& root,
+    std::uint64_t image_size, std::uint64_t max_bytes = 16384);
+[[nodiscard]] std::string_view function_extent_source_name(FunctionExtentSource source) noexcept;
 
 struct CallGraphNode {
     std::string id;
@@ -156,7 +173,8 @@ public:
                                                       peelf::Endianness endianness,
                                                       std::optional<std::uint64_t> file_offset = std::nullopt,
                                                       std::string label = "function",
-                                                      bool thumb_mode = false);
+                                                      bool thumb_mode = false,
+                                                      bool reachable_only = false);
 [[nodiscard]] std::string_view graphviz_format_name(GraphRenderFormat format) noexcept;
 [[nodiscard]] std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain);
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,

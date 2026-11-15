@@ -663,6 +663,167 @@ TEST(CallGraph, ThumbCfgCarriesInstructionBodies) {
     EXPECT_TRUE(has_edge(graph, "bb_0", "return", viewer::CallGraphEdgeKind::Return));
 }
 
+TEST(FunctionAnalysis, ExtentUsesSymbolAndRejectsUnmappedOrMismatchedOffsets) {
+    const auto bytes = read_fixture("known-win-x64.exe");
+    const auto image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+    auto symbols = viewer::SymbolIndex::build(*image);
+    viewer::SymbolRecord root{.name="test", .virtual_address=image->entry_point(),
+        .file_offset=image->virtual_address_to_file_offset(image->entry_point()), .size=32};
+    ASSERT_TRUE(root.file_offset);
+    auto extent = viewer::discover_function_extent(*image, symbols, root, bytes.size());
+    ASSERT_TRUE(extent);
+    EXPECT_EQ(extent->size, 32u);
+    EXPECT_EQ(extent->source, viewer::FunctionExtentSource::Symbol);
+    EXPECT_FALSE(extent->truncated);
+    extent = viewer::discover_function_extent(*image, symbols, root, bytes.size(), 8);
+    ASSERT_TRUE(extent);
+    EXPECT_EQ(extent->size, 8u);
+    EXPECT_TRUE(extent->truncated);
+    EXPECT_FALSE(viewer::discover_function_extent(*image, symbols, root, *root.file_offset));
+    ++*root.file_offset;
+    EXPECT_FALSE(viewer::discover_function_extent(*image, symbols, root, bytes.size()));
+}
+
+TEST(FunctionAnalysis, SizedFunctionIsNotCutAtOverlappingSymbol) {
+    const auto bytes = read_fixture("known-win-x64.exe");
+    const auto image = parse_fixture("known-win-x64.exe");
+    ASSERT_NE(image, nullptr);
+    auto symbols = viewer::SymbolIndex::build(*image);
+    const std::array debug{viewer::DebugSymbol{.name="overlapping", .virtual_address=image->entry_point()+4,
+        .size=4, .function=true}};
+    symbols.add_debug_symbols(*image, debug);
+    viewer::SymbolRecord root{.name="test", .virtual_address=image->entry_point(), .size=32};
+    auto extent = viewer::discover_function_extent(*image, symbols, root, bytes.size());
+    ASSERT_TRUE(extent);
+    EXPECT_EQ(extent->size, 32u);
+    root.size = 0;
+    extent = viewer::discover_function_extent(*image, symbols, root, bytes.size());
+    ASSERT_TRUE(extent);
+    // A runtime table, if present, is stronger evidence than an interior symbol.
+    if (extent->source != viewer::FunctionExtentSource::RuntimeMetadata) {
+        EXPECT_EQ(extent->size, 4u);
+        EXPECT_EQ(extent->source, viewer::FunctionExtentSource::NextSymbol);
+    }
+}
+
+TEST(FunctionAnalysis, RuntimeMetadataProvidesExtentWithoutSymbols) {
+    const auto bytes = read_file(PEELF_CALLGRAPH_FIXTURE_EXE);
+    const auto image = parse_file(PEELF_CALLGRAPH_FIXTURE_EXE);
+    ASSERT_NE(image, nullptr);
+    if (image->format() != peelf::Format::PE || image->architecture() != peelf::Architecture::X86_64) GTEST_SKIP();
+    ASSERT_FALSE(image->pe_runtime_functions().empty());
+    const auto runtime = image->pe_runtime_functions().front();
+    viewer::SymbolRecord root{.name="stripped", .virtual_address=image->image_base()+runtime.begin_address_rva};
+    const auto extent = viewer::discover_function_extent(*image, viewer::SymbolIndex{}, root, bytes.size());
+    ASSERT_TRUE(extent);
+    EXPECT_EQ(extent->source, viewer::FunctionExtentSource::RuntimeMetadata);
+    EXPECT_EQ(extent->size, runtime.end_address_rva-runtime.begin_address_rva);
+}
+
+TEST(CallGraph, IndirectBranchesAreExplicitAndDoNotFallThrough) {
+    const std::array<std::uint8_t, 3> bytes{0xFF,0xE0,0xC3}; // jmp rax; ret
+    const auto graph = viewer::build_function_cfg_call_graph(bytes, 0x1000,
+        peelf::Architecture::X86_64, peelf::Endianness::Little);
+    ASSERT_NE(find_node(graph, "external_bb_0"), nullptr);
+    EXPECT_TRUE(has_edge(graph,"bb_0","external_bb_0",viewer::CallGraphEdgeKind::UnconditionalBranch));
+    EXPECT_FALSE(has_edge(graph,"bb_0","bb_1",viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_FALSE(find_node(graph,"bb_0")->instructions.front().branch_target);
+}
+
+TEST(CallGraph, Arm64IndirectCallIsNotPowerPcReturn) {
+    const std::array<std::uint8_t,8> bytes{0x00,0x00,0x3F,0xD6,0xC0,0x03,0x5F,0xD6}; // blr x0; ret
+    const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::ARM64,peelf::Endianness::Little);
+    const auto* block = find_node(graph,"bb_0");
+    ASSERT_NE(block,nullptr);
+    EXPECT_EQ(block->instruction_count,2u);
+    EXPECT_TRUE(has_edge(graph,"bb_0","return",viewer::CallGraphEdgeKind::Return));
+}
+
+TEST(CallGraph, Arm64ConditionalBranchUsesFinalImmediate) {
+    const std::array<std::uint8_t,12> bytes{0x40,0x00,0x00,0x36,0xC0,0x03,0x5F,0xD6,0xC0,0x03,0x5F,0xD6}; // tbz w0,#0,+8
+    const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::ARM64,peelf::Endianness::Little);
+    EXPECT_TRUE(has_edge(graph,"bb_0","bb_2",viewer::CallGraphEdgeKind::ConditionalBranch));
+    ASSERT_NE(find_node(graph,"bb_0"),nullptr);
+    EXPECT_EQ(find_node(graph,"bb_0")->instructions.front().branch_target,0x1008u);
+}
+
+TEST(CallGraph, ArmConditionalReturnPreservesFallthrough) {
+    const std::array<std::uint8_t,8> bytes{0x1E,0xFF,0x2F,0x11,0x1E,0xFF,0x2F,0xE1}; // bxne lr; bx lr
+    const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::ARM,peelf::Endianness::Little);
+    EXPECT_TRUE(has_edge(graph,"bb_0","return",viewer::CallGraphEdgeKind::Return));
+    EXPECT_TRUE(has_edge(graph,"bb_0","bb_1",viewer::CallGraphEdgeKind::Fallthrough));
+}
+
+TEST(CallGraph, MipsReturnIncludesItsDelaySlot) {
+    const std::array<std::uint8_t,8> bytes{0x03,0xE0,0x00,0x08,0x24,0x02,0x00,0x01}; // jr ra; addiu v0,zero,1
+    const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::MIPS32,peelf::Endianness::Big);
+    ASSERT_NE(find_node(graph,"bb_0"),nullptr);
+    EXPECT_EQ(find_node(graph,"bb_0")->instruction_count,2u);
+    EXPECT_TRUE(has_edge(graph,"bb_0","return",viewer::CallGraphEdgeKind::Return));
+}
+
+TEST(CallGraph, MipsRegisterJumpIsNotAReturn) {
+    const std::array<std::uint8_t,8> bytes{0x01,0x00,0x00,0x08,0,0,0,0}; // jr t0; nop
+    const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::MIPS32,peelf::Endianness::Big);
+    EXPECT_FALSE(has_edge(graph,"bb_0","return",viewer::CallGraphEdgeKind::Return));
+    EXPECT_TRUE(has_edge(graph,"bb_0","external_bb_0",viewer::CallGraphEdgeKind::UnconditionalBranch));
+}
+
+TEST(CallGraph, RiscVZeroDestinationJumpDoesNotFallThrough) {
+    const std::array<std::uint8_t,12> bytes{0x6F,0x00,0x80,0x00,0x67,0x80,0x00,0x00,0x67,0x80,0x00,0x00};
+    for (const auto arch : {peelf::Architecture::RISCV32,peelf::Architecture::RISCV64}) {
+        const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,arch,peelf::Endianness::Little);
+        EXPECT_TRUE(has_edge(graph,"bb_0","bb_2",viewer::CallGraphEdgeKind::UnconditionalBranch));
+        EXPECT_FALSE(has_edge(graph,"bb_0","bb_1",viewer::CallGraphEdgeKind::Fallthrough));
+    }
+}
+
+TEST(CallGraph, ReachablePreviewExcludesDeadBlocksButPreservesExplicitFullExtent) {
+    const std::array<std::uint8_t,4> bytes{0xEB,0x01,0xC3,0xC3};
+    const auto preview = viewer::build_function_cfg_call_graph(bytes,0x1000,peelf::Architecture::X86_64,
+        peelf::Endianness::Little,std::nullopt,"preview",false,true);
+    EXPECT_EQ(find_node(preview,"bb_1"),nullptr);
+    EXPECT_NE(find_node(preview,"bb_2"),nullptr);
+    EXPECT_TRUE(has_edge(preview,"bb_0","bb_2",viewer::CallGraphEdgeKind::UnconditionalBranch));
+    const auto full = viewer::build_function_cfg_call_graph(bytes,0x1000,peelf::Architecture::X86_64,
+        peelf::Endianness::Little);
+    EXPECT_NE(find_node(full,"bb_1"),nullptr);
+}
+
+TEST(CallGraph, MipsBranchLikelyExposesUnsupportedAnnulSemantics) {
+    const std::array<std::uint8_t,12> bytes{0x50,0x00,0x00,0x01,0,0,0,0,0,0,0,0}; // beql zero,zero,+1; slots
+    const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::MIPS32,peelf::Endianness::Big);
+    const auto* unresolved = find_node(graph,"external_bb_0");
+    ASSERT_NE(unresolved,nullptr);
+    EXPECT_NE(unresolved->label.find("annulled"),std::string::npos);
+    EXPECT_TRUE(has_edge(graph,"bb_0","external_bb_0",viewer::CallGraphEdgeKind::Unknown));
+}
+
+TEST(CallGraph, GuardedAbsoluteJumpTableRecoversCasesAndRejectsInvalidPointers) {
+    std::vector<std::uint8_t> bytes{
+        0x83,0xF8,0x01, // cmp eax,1
+        0x77,0x09, // ja 0x100E
+        0xFF,0x24,0x85,0x10,0x10,0x00,0x00, // jmp [eax*4+0x1010]
+        0xC3,0xC3,0xC3,0x90, // two cases, default, alignment
+        0x0C,0x10,0x00,0x00,0x0D,0x10,0x00,0x00};
+    auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::X86,peelf::Endianness::Little);
+    EXPECT_TRUE(std::ranges::any_of(graph.edges,[](const auto& edge){return edge.label=="case 0";}));
+    EXPECT_TRUE(std::ranges::any_of(graph.edges,[](const auto& edge){return edge.label=="case 1";}));
+    bytes[16] = 0xFF; // out-of-range destination: never invent a case edge
+    graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
+        peelf::Architecture::X86,peelf::Endianness::Little);
+    EXPECT_FALSE(std::ranges::any_of(graph.edges,[](const auto& edge){return edge.label.starts_with("case ");}));
+    EXPECT_NE(find_node(graph,"external_bb_1"),nullptr);
+}
+
 TEST(CallGraph, BuildsFunctionCfgWithUnconditionalBranch) {
     const std::array<std::uint8_t, 8> bytes{
         0xEB, 0x05,                   // jmp 0x3007
