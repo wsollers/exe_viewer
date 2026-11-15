@@ -233,3 +233,27 @@ TEST(Decompiler, PdbStructuresAndRealSymbolAwareFunction) {
     EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return !line.ranges.empty();}));
     EXPECT_TRUE(std::ranges::any_of(result.types,[](const auto& t){return t.name.find("DecompilerPacket")!=std::string::npos;}));
 }
+
+TEST(Decompiler, ViewerPdbSymbolCollisionsDoNotAbortDecompilation) {
+#ifndef PEELF_VIEWER_DEBUG_EXE
+    GTEST_SKIP()<<"Viewer build unavailable";
+#else
+    auto settings=discover_decompilers({});
+    if(settings.ghidra_home.empty()) GTEST_SKIP()<<"Set GHIDRA_INSTALL_DIR for real backend integration";
+    const auto directory=std::filesystem::path(PEELF_VIEWER_DEBUG_EXE).parent_path();
+    BinaryModel model; ASSERT_TRUE(model.load_file((directory/"peelf_viewer.exe").string()));
+    const auto pdb=load_pdb_debug_symbols(directory/"peelf_viewer.pdb",*model.image());
+    ASSERT_EQ(pdb.status,DebugSymbolLoadStatus::Loaded)<<pdb.diagnostic;
+    auto index=SymbolIndex::build(*model.image()); index.add_debug_symbols(*model.image(),pdb.symbols);
+    auto target=std::ranges::find_if(index.records(),[](const auto& symbol){return symbol.name=="capture_current_context" && symbol.size>0;});
+    ASSERT_NE(target,index.records().end()); ASSERT_TRUE(target->virtual_address);
+    DecompileRequest request; request.address=*target->virtual_address; request.function_size=target->size;
+    request.architecture=model.image()->architecture(); request.image_bytes.assign(model.bytes().begin(),model.bytes().end());
+    request.symbols.assign(index.records().begin(),index.records().end()); request.types=pdb.types;
+    BackendRunner runner;
+    const auto scripts=std::filesystem::path(PEELF_TEST_FIXTURES_DIR).parent_path().parent_path()/"apps/viewer/resources";
+    const auto result=GhidraDecompiler(settings,scripts,runner).decompile(request);
+    ASSERT_EQ(result.status,DecompileStatus::Ready)<<result.diagnostic;
+    EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return line.address.has_value();}));
+#endif
+}

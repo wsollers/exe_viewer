@@ -15,6 +15,23 @@ public class PeelfDecompile extends HeadlessScript {
     private record NamedSymbol(Address address, long size, boolean function, String name) {}
     private List<NamedSymbol> symbols = new ArrayList<>();
     private long functionSize = 0;
+    private void applySymbol(NamedSymbol symbol) throws Exception {
+        String name=symbol.name().replaceAll("\\s", "_");
+        var function=getFunctionAt(symbol.address());
+        try {
+            if (function!=null && symbol.function()) {
+                if (!function.getName().equals(name)) function.setName(name,SourceType.USER_DEFINED);
+            } else {
+                // The loader, PDB analyzer, or prepare pass may already own this label.
+                for (var existing : currentProgram.getSymbolTable().getSymbols(symbol.address()))
+                    if (existing.getName().equals(name)) return;
+                createLabel(symbol.address(),name,true,SourceType.USER_DEFINED);
+            }
+        } catch (ghidra.util.exception.DuplicateNameException | ghidra.util.exception.InvalidInputException ignored) {
+            // Names are best-effort annotations. Preserve the existing symbol and
+            // function body when an alias conflicts; never fail decompilation for it.
+        }
+    }
     private String decode(String value) {
         return value.equals("-") ? "" : new String(HexFormat.of().parseHex(value), StandardCharsets.UTF_8);
     }
@@ -44,22 +61,18 @@ public class PeelfDecompile extends HeadlessScript {
                     else if (display.equals("uint32_t") && length==4) data=UnsignedIntegerDataType.dataType;
                     else if (display.equals("float") && length==4) data=FloatDataType.dataType;
                     else if (display.equals("double") && length==8) data=DoubleDataType.dataType;
-                    if (type instanceof Structure structure) structure.replaceAtOffset(offset,data,length,field,display);
-                    else ((Union)type).add(data,length,field,display);
+                    try {
+                        if (type instanceof Structure structure) structure.replaceAtOffset(offset,data,length,field,display);
+                        else ((Union)type).add(data,length,field,display);
+                    } catch (IllegalArgumentException ignored) {
+                        // Flattened PDB anonymous unions can have overlapping members.
+                        // Retain the representable layout instead of aborting analysis.
+                    }
                 }
                 if (prepare) currentProgram.getDataTypeManager().addDataType(type,DataTypeConflictHandler.KEEP_HANDLER);
             }
         }
-        for (var symbol : symbols) {
-            var function=getFunctionAt(symbol.address());
-            String name=symbol.name().replaceAll("\\s", "_");
-            try {
-                if (function!=null && symbol.function()) function.setName(name,SourceType.USER_DEFINED);
-                else createLabel(symbol.address(),name,true,SourceType.USER_DEFINED);
-            } catch (ghidra.util.exception.InvalidInputException ignored) {
-                // A name that cannot be represented must not discard an otherwise valid function.
-            }
-        }
+        for (var symbol : symbols) applySymbol(symbol);
     }
     private String exportTypes() {
         var records=new ArrayList<String>();
@@ -127,8 +140,9 @@ public class PeelfDecompile extends HeadlessScript {
                 disassemble(address);
                 function=getFunctionAt(address);
                 String name=symbols.stream().filter(s->s.address().equals(address) && s.function()).map(s->s.name().replaceAll("\\s","_")).findFirst().orElse(null);
-                if (function==null) function=manager.createFunction(name,address,body,SourceType.USER_DEFINED);
-                else { function.setBody(body); if(name!=null) function.setName(name,SourceType.USER_DEFINED); }
+                if (function==null) function=manager.createFunction(null,address,body,SourceType.USER_DEFINED);
+                else function.setBody(body);
+                if (name!=null) applySymbol(new NamedSymbol(address,functionSize,true,name));
             }
             if (function == null && currentProgram.getMemory().contains(address)) {
                 disassemble(address);
