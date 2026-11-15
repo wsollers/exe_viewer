@@ -92,6 +92,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         auto_loaded_debug_keys_.clear();
         active_debug_types_.clear();
         active_source_lines_.clear();
+        applied_structures_.clear();
         session_.reset();
         resolved_exe_path_.reset();
         regions_.clear();
@@ -987,6 +988,33 @@ std::filesystem::path utf8_path(std::string_view text) {
             return nullptr;
         }
         return &candidate;
+    }
+
+    void BinaryModel::add_applied_structure(AppliedStructureBinding binding) {
+        if (binding.type_name.empty()) {
+            return;
+        }
+        if (binding.count == 0) {
+            binding.count = 1;
+        }
+        for (AppliedStructureBinding& existing : applied_structures_) {
+            if (existing.address == binding.address &&
+                existing.is_file_offset == binding.is_file_offset &&
+                existing.type_name == binding.type_name) {
+                existing.count = binding.count;
+                if (!binding.label.empty()) {
+                    existing.label = std::move(binding.label);
+                }
+                return;
+            }
+        }
+        applied_structures_.push_back(std::move(binding));
+    }
+
+    void BinaryModel::remove_applied_structure(std::size_t index) {
+        if (index < applied_structures_.size()) {
+            applied_structures_.erase(applied_structures_.begin() + static_cast<std::ptrdiff_t>(index));
+        }
     }
 
     std::uint64_t BinaryModel::view_base_address() const noexcept {

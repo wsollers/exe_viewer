@@ -114,6 +114,15 @@ void HexViewPanel::draw_contents() {
             ImGui::SetClipboardText(text.c_str());
         } else edit_status_ = selected.error().message;
     }
+    if (on_apply_structure_) {
+        ImGui::SameLine();
+        if (ImGui::Button("Apply Structure...")) {
+            const std::uint64_t addr = is_live
+                ? (base_va + static_cast<std::uint64_t>(selected_offset_))
+                : static_cast<std::uint64_t>(selected_offset_);
+            on_apply_structure_(addr, !is_live);
+        }
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("0x%llX | %zu bytes", static_cast<unsigned long long>(selected_offset_), highlighted_size_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shift-click a byte to extend the selection.");
@@ -210,7 +219,7 @@ void HexViewPanel::draw_contents() {
                         ImGui::OpenPopup("HexQuickPatchPopup");
                     }
                 }
-                if (!is_live && ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     selected_offset_ = i;
                     highlighted_offset_ = i;
                     highlighted_size_ = 1;
@@ -264,35 +273,43 @@ void HexViewPanel::draw_contents() {
 
     if (ImGui::BeginPopup("HexQuickPatchPopup")) {
         const std::uint64_t display_addr = is_live ? (base_va + quick_patch_offset_) : quick_patch_offset_;
-        ImGui::Text("Stage hex bytes at %s 0x%" PRIX64,
-                    is_live ? "VA" : "offset",
-                    display_addr);
-        ImGui::InputTextWithHint("##QuickHexBytes", "e.g. 90 90 or C3", quick_patch_buf_, sizeof(quick_patch_buf_));
-        if (ImGui::Button("Stage Patch")) {
-            const ShellcodeParseResult parsed = parse_hex_shellcode(quick_patch_buf_);
-            if (!parsed.success || parsed.bytes.empty()) {
-                quick_patch_status_ = parsed.diagnostic;
-            } else {
-                auto res = model_.apply_patch_bytes(quick_patch_offset_, parsed.bytes, "hex view inline patch");
-                if (res) {
-                    if (on_bytes_patched_) {
-                        on_bytes_patched_(quick_patch_offset_);
-                    }
-                    ImGui::CloseCurrentPopup();
-                } else {
-                    quick_patch_status_ = res.error().message;
-                }
+        if (on_apply_structure_) {
+            const std::string apply_lbl = std::format(
+                "Apply Structure at {} 0x{:X}...", is_live ? "VA" : "offset", display_addr);
+            if (ImGui::MenuItem(apply_lbl.c_str())) {
+                on_apply_structure_(display_addr, !is_live);
+                ImGui::CloseCurrentPopup();
+            }
+            if (!is_live) {
+                ImGui::Separator();
             }
         }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel")) {
-            ImGui::CloseCurrentPopup();
-        }
-        if (is_live) {
-            ImGui::TextDisabled("Staged edits apply to live RAM when you click 'Commit to RAM'.");
-        }
-        if (!quick_patch_status_.empty()) {
-            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", quick_patch_status_.c_str());
+        if (!is_live) {
+            ImGui::Text("Stage hex bytes at offset 0x%" PRIX64, display_addr);
+            ImGui::InputTextWithHint("##QuickHexBytes", "e.g. 90 90 or C3", quick_patch_buf_, sizeof(quick_patch_buf_));
+            if (ImGui::Button("Stage Patch")) {
+                const ShellcodeParseResult parsed = parse_hex_shellcode(quick_patch_buf_);
+                if (!parsed.success || parsed.bytes.empty()) {
+                    quick_patch_status_ = parsed.diagnostic;
+                } else {
+                    auto res = model_.apply_patch_bytes(quick_patch_offset_, parsed.bytes, "hex view inline patch");
+                    if (res) {
+                        if (on_bytes_patched_) {
+                            on_bytes_patched_(quick_patch_offset_);
+                        }
+                        ImGui::CloseCurrentPopup();
+                    } else {
+                        quick_patch_status_ = res.error().message;
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            if (!quick_patch_status_.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", quick_patch_status_.c_str());
+            }
         }
         ImGui::EndPopup();
     }

@@ -143,6 +143,12 @@ namespace viewer {
         [[nodiscard]] std::span<const SourceLineMapping> source_lines() const noexcept { return active_source_lines_; }
         [[nodiscard]] const SourceLineMapping* find_source_line(std::uint64_t virtual_address,
                                                                 std::uint64_t max_distance = 64) const noexcept;
+        [[nodiscard]] std::span<const AppliedStructureBinding> applied_structures() const noexcept {
+            return applied_structures_;
+        }
+        void add_applied_structure(AppliedStructureBinding binding);
+        void remove_applied_structure(std::size_t index);
+        void clear_applied_structures() noexcept { applied_structures_.clear(); }
         [[nodiscard]] bool demangle_symbols() const noexcept { return demangle_symbols_; }
         void set_demangle_symbols(bool enabled) noexcept { demangle_symbols_ = enabled; }
         void set_analysis_thumb_mode(bool thumb_mode);
@@ -259,6 +265,7 @@ namespace viewer {
         std::set<std::string> auto_loaded_debug_keys_;
         std::vector<DataTypeRecord> active_debug_types_;
         std::vector<SourceLineMapping> active_source_lines_;
+        std::vector<AppliedStructureBinding> applied_structures_;
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
         std::unique_ptr<peelf::IProcessSession> session_;

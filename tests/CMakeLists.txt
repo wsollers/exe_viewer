@@ -53,6 +53,7 @@ add_executable(peelf_tests
   reference_index_test.cpp
   strings_index_test.cpp
   demangle_dwarf_test.cpp
+  structure_interpreter_test.cpp
   analysis_project_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp
@@ -70,6 +71,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/reference_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/strings_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/structure_interpreter.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/patch_preview.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/project.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler.cpp

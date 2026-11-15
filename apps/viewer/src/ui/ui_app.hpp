@@ -14,6 +14,7 @@
 #include "ui_panels.hpp"
 #include "ui_panels_references.hpp"
 #include "ui_panels_strings.hpp"
+#include "ui_panels_struct_view.hpp"
 #include "decompile/decompiler.hpp"
 #include <future>
 #include "disasm/disassembler.hpp"
@@ -129,6 +130,7 @@ namespace viewer {
         bool strings_dirty_ = true;
         bool focus_references_ = false;
         bool focus_strings_ = false;
+        bool focus_struct_view_ = false;
         std::uint64_t reference_revision_ = 0;
         std::uint64_t strings_revision_ = 0;
         std::uint64_t annotation_revision_ = 0;
@@ -159,6 +161,7 @@ namespace viewer {
         HandlersPanel   handlers_panel_;
         ReferencesPanel references_panel_;
         StringsPanel    strings_panel_;
+        StructureViewPanel struct_view_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;
@@ -233,6 +236,9 @@ namespace viewer {
         void open_references();
         void rebuild_strings();
         void open_strings();
+        void open_structure_view(std::string_view type_name = {},
+                                 std::optional<std::uint64_t> address = std::nullopt,
+                                 bool is_file_offset = false);
         void render_dockspace();
         void render_attach_process_modal();
         void open_attach_process_modal();

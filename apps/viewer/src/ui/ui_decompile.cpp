@@ -397,11 +397,29 @@ void UiApp::render_data_types() {
     ImGui::InputTextWithHint("##type_search","Search structures, members, types, or data symbols...",data_type_filter_,sizeof(data_type_filter_));
     if (ImGui::BeginTabBar("data_views")) {
         if (ImGui::BeginTabItem("Structures")) {
+            if (ImGui::SmallButton("Open Structure View...")) {
+                open_structure_view();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(Built-in PE/ELF/Win32/Linux runtime schemas + loaded debug types)");
             if (debug_types_.empty() && decompiled_.types.empty())
-                ImGui::TextWrapped("No structure definitions loaded. Load a PDB with type information or decompile an image containing debug types. Symbol names alone do not describe member layouts.");
+                ImGui::TextWrapped("No PDB/DWARF/Ghidra types loaded; built-in PE/ELF/runtime schemas remain available in Structure View.");
             auto draw=[&](const DataTypeRecord& type) {
                 if (!type_matches(type,data_type_filter_)) return;
                 ImGui::PushID(type.name.c_str());
+                if (ImGui::SmallButton("Apply")) {
+                    if (current_selection_.virtual_address) {
+                        open_structure_view(type.name, *current_selection_.virtual_address, false);
+                    } else if (current_selection_.file_offset) {
+                        open_structure_view(type.name, *current_selection_.file_offset, true);
+                    } else {
+                        open_structure_view(type.name);
+                    }
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Apply %s at current selection in Structure View", type.name.c_str());
+                }
+                ImGui::SameLine();
                 const auto label=std::format("{} {} ({} bytes)",type.is_union ? "union" : "struct",type.name,type.size);
                 if (ImGui::TreeNodeEx("##type",ImGuiTreeNodeFlags_SpanAvailWidth,"%s",label.c_str())) {
                     if (ImGui::BeginTable("members",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_Resizable)) {

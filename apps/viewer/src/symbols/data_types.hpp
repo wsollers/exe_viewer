@@ -12,6 +12,16 @@ struct DataTypeRecord {
     bool is_union = false;
     std::vector<DataMember> members;
 };
+
+struct AppliedStructureBinding {
+    std::uint64_t address = 0;
+    bool is_file_offset = false;
+    std::string type_name{};
+    std::uint32_t count = 1;
+    std::string label{};
+
+    auto operator<=>(const AppliedStructureBinding&) const = default;
+};
 [[nodiscard]] inline bool type_matches(const DataTypeRecord& type, std::string_view query) {
     if (symbol_name_matches(type.name, query)) return true;
     for (const auto& member : type.members)

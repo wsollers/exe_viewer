@@ -326,6 +326,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , handlers_panel_(model)
     , references_panel_(reference_index_, annotations_, symbol_index_, current_selection_)
     , strings_panel_(model, strings_index_, reference_index_, annotations_, current_selection_)
+    , struct_view_panel_(model, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -333,6 +334,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 {
     references_panel_.set_visible(false);
     strings_panel_.set_visible(false);
+    struct_view_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
 #ifdef _WIN32
@@ -373,6 +375,43 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         }
         last_navigation_selection_ = current_selection_;
         navigation_history_.visit(current_selection_);
+    });
+    struct_view_panel_.set_extra_types_provider([this]() -> std::span<const DataTypeRecord> {
+        return decompiled_.types;
+    });
+    struct_view_panel_.set_field_selected_callback(
+        [this](std::optional<std::uint64_t> window_offset,
+               std::optional<std::uint64_t> virtual_address,
+               std::uint64_t size,
+               std::string label) {
+            const std::uint64_t byte_len = std::max<std::uint64_t>(1u, size);
+            current_selection_ = ViewerSelection{
+                .kind = SelectionKind::ByteRange,
+                .label = std::move(label),
+                .file_offset = model_.is_live_process() ? std::nullopt : window_offset,
+                .virtual_address = virtual_address,
+                .size = byte_len,
+                .object_index = 0,
+                .preferred_view = PreferredView::Hex,
+                .graph_root = std::nullopt,
+            };
+            if (window_offset) {
+                hex_panel_.set_visible(true);
+                hex_panel_.navigate_to_range(clamp_to_size_t(*window_offset), clamp_to_size_t(byte_len));
+            } else if (virtual_address && model_.is_live_process() &&
+                       model_.navigate_to_virtual_address(*virtual_address)) {
+                sync_live_process_view(false);
+                if (const auto off = model_.virtual_address_to_offset(*virtual_address)) {
+                    hex_panel_.set_visible(true);
+                    hex_panel_.navigate_to_range(clamp_to_size_t(*off), clamp_to_size_t(byte_len));
+                }
+            }
+        });
+    struct_view_panel_.set_pointer_activated_callback([this](std::uint64_t target_va) {
+        navigate_to_address(target_va, PreferredView::Hex);
+    });
+    hex_panel_.set_apply_structure_callback([this](std::uint64_t address, bool is_file_offset) {
+        open_structure_view({}, address, is_file_offset);
     });
     strings_panel_.set_referrer_activated_callback(
         [this](const StringReferrer& ref, StringReferrerTargetView target) {
@@ -894,6 +933,7 @@ void UiApp::render() {
     if (show_data_types_) render_data_types();
     references_panel_.draw();
     strings_panel_.draw();
+    struct_view_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
@@ -902,6 +942,10 @@ void UiApp::render() {
     if (focus_strings_) {
         activate_panel(strings_panel_.name().c_str());
         focus_strings_ = false;
+    }
+    if (focus_struct_view_) {
+        activate_panel(struct_view_panel_.name().c_str());
+        focus_struct_view_ = false;
     }
     pe_headers_panel_.draw();
     pe_imports_panel_.draw();
@@ -988,6 +1032,22 @@ void UiApp::open_references() {
 void UiApp::open_strings() {
     strings_panel_.set_visible(true);
     focus_strings_ = true;
+}
+
+void UiApp::open_structure_view(std::string_view type_name,
+                                std::optional<std::uint64_t> address,
+                                bool is_file_offset) {
+    struct_view_panel_.set_visible(true);
+    focus_struct_view_ = true;
+    if (address) {
+        struct_view_panel_.apply_structure_at(type_name, *address, is_file_offset, 1);
+    } else if (!type_name.empty()) {
+        const bool use_off = !model_.is_live_process() && !current_selection_.virtual_address.has_value();
+        const std::uint64_t addr = use_off
+            ? current_selection_.file_offset.value_or(0)
+            : current_selection_.virtual_address.value_or(model_.view_base_address());
+        struct_view_panel_.apply_structure_at(type_name, addr, use_off, 1);
+    }
 }
 
 void UiApp::rebuild_strings() {
@@ -1309,6 +1369,7 @@ void UiApp::render_main_menu() {
 
         for (UiPanel* extra : {static_cast<UiPanel*>(&functions_panel_),
                                static_cast<UiPanel*>(&strings_panel_),
+                               static_cast<UiPanel*>(&struct_view_panel_),
                                static_cast<UiPanel*>(&references_panel_),
                                static_cast<UiPanel*>(&threads_panel_),
                                static_cast<UiPanel*>(&thread_locals_panel_),
@@ -2289,6 +2350,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(handlers_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(references_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(strings_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(struct_view_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
@@ -2570,6 +2632,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             return;
         }
         sync_live_process_view(true);
+        struct_view_panel_.reset_for_new_binary();
         Log().info("Attached to PID {} ({}): {} regions, {} modules, {} symbols",
                    model_.process_session()->pid(),
                    model_.process_session()->info().name,
@@ -2591,6 +2654,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         strings_index_.clear();
         strings_dirty_ = true;
         strings_panel_.reset_selection();
+        struct_view_panel_.reset_for_new_binary();
         navigation_history_.clear();
         disassembly_location_.reset();
         thumb_mode_ = false;

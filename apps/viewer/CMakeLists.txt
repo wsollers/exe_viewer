@@ -62,11 +62,15 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_references.cpp
         src/ui/ui_panels_strings.hpp
         src/ui/ui_panels_strings.cpp
+        src/ui/ui_panels_struct_view.hpp
+        src/ui/ui_panels_struct_view.cpp
         src/analysis/function_index.hpp
         src/analysis/function_index.cpp
         src/analysis/reference_index.cpp
         src/analysis/strings_index.hpp
         src/analysis/strings_index.cpp
+        src/analysis/structure_interpreter.hpp
+        src/analysis/structure_interpreter.cpp
         src/analysis/patch_preview.cpp
         src/analysis/project.cpp
         src/decompile/decompiler.cpp
