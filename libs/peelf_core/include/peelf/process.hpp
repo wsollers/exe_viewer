@@ -206,6 +206,43 @@ enum class MemoryRegionKind : std::uint8_t {
     return "Unknown";
 }
 
+struct MemoryRegionUsage {
+    std::optional<std::uint64_t> committed_bytes{};
+    std::optional<std::uint64_t> rss_bytes{};  ///< Resident Set Size (Linux) / Working Set (Win32)
+    std::optional<std::uint64_t> pss_bytes{};  ///< Proportional Set Size (Linux smaps)
+    std::optional<std::uint64_t> private_clean_bytes{};
+    std::optional<std::uint64_t> private_dirty_bytes{};
+    std::optional<std::uint64_t> shared_clean_bytes{};
+    std::optional<std::uint64_t> shared_dirty_bytes{};
+    std::optional<std::uint64_t> swap_bytes{};
+    std::optional<std::uint64_t> locked_bytes{};
+    std::optional<std::uint64_t> allocation_base{};
+    bool is_reserved_only{false};
+    std::optional<ThreadId> owner_tid{};
+    std::optional<std::uint32_t> heap_id{};
+    std::string vm_flags{};
+
+    [[nodiscard]] constexpr std::optional<std::uint64_t> working_set_bytes() const noexcept {
+        return rss_bytes;
+    }
+
+    [[nodiscard]] constexpr std::optional<std::uint64_t> private_bytes() const noexcept {
+        if (!private_clean_bytes.has_value() && !private_dirty_bytes.has_value()) {
+            return std::nullopt;
+        }
+        return private_clean_bytes.value_or(0) + private_dirty_bytes.value_or(0);
+    }
+
+    [[nodiscard]] constexpr std::optional<std::uint64_t> shared_bytes() const noexcept {
+        if (!shared_clean_bytes.has_value() && !shared_dirty_bytes.has_value()) {
+            return std::nullopt;
+        }
+        return shared_clean_bytes.value_or(0) + shared_dirty_bytes.value_or(0);
+    }
+
+    auto operator<=>(const MemoryRegionUsage&) const = default;
+};
+
 struct MemoryRegion {
     std::uint64_t start_address{0};
     std::uint64_t end_address{0};
@@ -214,6 +251,7 @@ struct MemoryRegion {
     std::uint64_t file_offset{0};
     std::string pathname{};
     std::string module_name{};
+    MemoryRegionUsage usage{};
 
     [[nodiscard]] constexpr std::uint64_t size() const noexcept {
         return end_address >= start_address ? (end_address - start_address) : 0;
@@ -224,6 +262,65 @@ struct MemoryRegion {
     }
 
     auto operator<=>(const MemoryRegion&) const = default;
+};
+
+struct ProcessMemorySummary {
+    // Overall virtual & physical KPIs
+    std::uint64_t total_virtual_bytes{0};
+    std::uint64_t committed_bytes{0};
+    std::uint64_t reserved_only_bytes{0};
+    std::optional<std::uint64_t> rss_bytes{};
+    std::optional<std::uint64_t> pss_bytes{};
+    std::optional<std::uint64_t> private_clean_bytes{};
+    std::optional<std::uint64_t> private_dirty_bytes{};
+    std::optional<std::uint64_t> shared_clean_bytes{};
+    std::optional<std::uint64_t> shared_dirty_bytes{};
+    std::optional<std::uint64_t> swap_bytes{};
+    std::optional<std::uint64_t> locked_bytes{};
+
+    // Category / Type breakdown (virtual bytes)
+    std::uint64_t image_bytes{0};
+    std::uint64_t heap_bytes{0};
+    std::uint64_t stack_bytes{0};
+    std::uint64_t mapped_file_bytes{0};
+    std::uint64_t anonymous_bytes{0};
+    std::uint64_t vdso_bytes{0};
+    std::uint64_t reserved_bytes{0};
+
+    // Protection breakdown (virtual bytes)
+    std::uint64_t rx_bytes{0};
+    std::uint64_t readonly_bytes{0};
+    std::uint64_t rw_bytes{0};
+    std::uint64_t rwx_bytes{0};
+    std::uint64_t noaccess_or_guard_bytes{0};
+    std::size_t rwx_region_count{0};
+
+    [[nodiscard]] constexpr std::optional<std::uint64_t> shared_bytes() const noexcept {
+        if (!shared_clean_bytes.has_value() && !shared_dirty_bytes.has_value()) {
+            return std::nullopt;
+        }
+        return shared_clean_bytes.value_or(0) + shared_dirty_bytes.value_or(0);
+    }
+
+    [[nodiscard]] constexpr std::uint64_t unresident_committed_bytes() const noexcept {
+        const std::uint64_t res = rss_bytes.value_or(0);
+        return committed_bytes > res ? (committed_bytes - res) : 0;
+    }
+
+    auto operator<=>(const ProcessMemorySummary&) const = default;
+};
+
+/// Contiguous or near-contiguous cluster of virtual memory mappings separated by collapsed
+/// multi-MiB / multi-TiB canonical address-space holes for the VMMap visual VA strip.
+struct AddressSpaceCluster {
+    std::uint64_t start_address{0};
+    std::uint64_t end_address{0};
+    std::uint64_t preceding_gap_bytes{0};
+    std::vector<std::size_t> region_indices{};
+
+    [[nodiscard]] constexpr std::uint64_t span_bytes() const noexcept {
+        return end_address >= start_address ? (end_address - start_address) : 0;
+    }
 };
 
 struct ModuleInfo {
@@ -319,6 +416,11 @@ public:
     [[nodiscard]] virtual ForgivingValue<std::uint64_t> process_environment_block_address() {
         return {std::nullopt, SubsystemStatus::unavailable("os", "PEB address not available")};
     }
+
+    /// Aggregate VMMap-style virtual/physical memory telemetry across `regions` (or freshly
+    /// queried `memory_regions()` when `regions` is empty).
+    [[nodiscard]] virtual ForgivingValue<ProcessMemorySummary> memory_summary(
+        std::span<const MemoryRegion> regions = {});
 };
 
 /// RAII helper that pauses a running process session on construction (unless already paused)
@@ -410,6 +512,30 @@ public:
 [[nodiscard]] Result<std::vector<MemoryRegion>> parse_proc_maps(
     std::string_view maps_text,
     std::string_view main_exe_path = {});
+
+/// Parse Linux `/proc/<pid>/smaps` text in a single pass, populating per-region RSS, PSS,
+/// Private/Shared Clean/Dirty, Swap, Locked, VmFlags, `[stack:<tid>]` owner_tid, and `[heap]`.
+[[nodiscard]] Result<std::vector<MemoryRegion>> parse_proc_smaps(
+    std::string_view smaps_text,
+    std::string_view main_exe_path = {});
+
+/// Cross-reference thread stack pointers (and main thread `[stack]`) onto `regions`, setting
+/// `MemoryRegionKind::Stack` and `usage.owner_tid` for thread stack mappings.
+void attribute_thread_stacks(std::vector<MemoryRegion>& regions,
+                             std::span<const ThreadInfo> threads,
+                             std::optional<ThreadId> main_tid = std::nullopt);
+
+/// Aggregate per-category, per-protection, and physical-footprint totals across `regions`,
+/// optionally enriching physical totals from Linux `/proc/<pid>/smaps_rollup` text.
+[[nodiscard]] ProcessMemorySummary summarize_process_memory(
+    std::span<const MemoryRegion> regions,
+    std::string_view smaps_rollup_text = {});
+
+/// Group sorted/unsorted memory regions into visual VA clusters while collapsing gaps >=
+/// `gap_collapse_threshold` (default 64 MiB) so multi-TiB canonical holes don't dwarf mappings.
+[[nodiscard]] std::vector<AddressSpaceCluster> build_address_space_clusters(
+    std::span<const MemoryRegion> regions,
+    std::uint64_t gap_collapse_threshold = 64ull * 1024ull * 1024ull);
 
 /// Group mapped file/image regions into loaded PE/ELF modules and annotate `regions` in place
 /// with `MemoryRegionKind::Image` and `module_name` where matched.

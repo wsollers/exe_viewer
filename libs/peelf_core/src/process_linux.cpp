@@ -1014,18 +1014,79 @@ public:
         if (!is_alive()) {
             return make_error("target process is no longer running");
         }
-        const std::filesystem::path maps_path =
-            std::filesystem::path("/proc") / std::to_string(info_.pid) / "maps";
-        const std::string maps_text = read_text_file(maps_path);
-        if (maps_text.empty()) {
-            return make_error("failed to open /proc/<pid>/maps (permission denied or process exited)");
+        const std::filesystem::path proc_dir =
+            std::filesystem::path("/proc") / std::to_string(info_.pid);
+
+        Result<std::vector<MemoryRegion>> parsed = make_error("uninitialized");
+        const ProcReadResult smaps_raw = read_proc_binary(proc_dir / "smaps", 32u * 1024u * 1024u);
+        if (smaps_raw.ok && !smaps_raw.bytes.empty()) {
+            const std::string_view smaps_text(
+                reinterpret_cast<const char*>(smaps_raw.bytes.data()), smaps_raw.bytes.size());
+            parsed = parse_proc_smaps(smaps_text, info_.executable_path.string());
+            if (parsed) {
+                last_memmap_status_ = SubsystemStatus::available(
+                    "/proc/<pid>/smaps",
+                    std::to_string(parsed->size()) + " regions with RSS/PSS telemetry");
+            }
         }
-        auto parsed = parse_proc_maps(maps_text, info_.executable_path.string());
+
         if (!parsed) {
-            return std::unexpected(parsed.error());
+            const std::string maps_text = read_text_file(proc_dir / "maps");
+            if (maps_text.empty()) {
+                return make_error(
+                    "failed to open /proc/<pid>/maps (permission denied or process exited)");
+            }
+            parsed = parse_proc_maps(maps_text, info_.executable_path.string());
+            if (!parsed) {
+                return std::unexpected(parsed.error());
+            }
+            last_memmap_status_ = SubsystemStatus::partial(
+                "/proc/<pid>/maps",
+                "/proc/<pid>/smaps unreadable; physical RSS/PSS unavailable");
         }
+
         (void)derive_modules_from_regions(*parsed, info_.executable_path.string(), this);
+        if (auto tlist = threads()) {
+            attribute_thread_stacks(*parsed, *tlist, static_cast<ThreadId>(info_.pid));
+        } else {
+            attribute_thread_stacks(*parsed, {}, static_cast<ThreadId>(info_.pid));
+        }
         return parsed;
+    }
+
+    [[nodiscard]] ForgivingValue<ProcessMemorySummary> memory_summary(
+        std::span<const MemoryRegion> regions) override {
+        std::vector<MemoryRegion> owned;
+        if (regions.empty()) {
+            auto fetched = memory_regions();
+            if (!fetched) {
+                return {std::nullopt,
+                        SubsystemStatus::unavailable("/proc/<pid>/maps", fetched.error().message)};
+            }
+            owned = std::move(*fetched);
+            regions = owned;
+        }
+        const std::filesystem::path rollup_path =
+            std::filesystem::path("/proc") / std::to_string(info_.pid) / "smaps_rollup";
+        std::string rollup_text;
+        const ProcReadResult rollup_raw = read_proc_binary(rollup_path, 64u * 1024u);
+        if (rollup_raw.ok && !rollup_raw.bytes.empty()) {
+            rollup_text.assign(reinterpret_cast<const char*>(rollup_raw.bytes.data()),
+                               rollup_raw.bytes.size());
+        }
+        ProcessMemorySummary sum = summarize_process_memory(regions, rollup_text);
+        SubsystemStatus st = last_memmap_status_;
+        if (st.source.empty()) {
+            st = sum.rss_bytes.has_value()
+                     ? SubsystemStatus::available("/proc/<pid>/smaps", "RSS/PSS telemetry")
+                     : SubsystemStatus::partial("/proc/<pid>/maps",
+                                                "physical RSS/PSS unavailable");
+        } else if (st.availability == Availability::Partial && sum.rss_bytes.has_value()) {
+            st = SubsystemStatus::partial(
+                "/proc/<pid>/smaps_rollup",
+                "aggregate RSS/PSS available via smaps_rollup; per-region smaps unavailable");
+        }
+        return {std::move(sum), std::move(st)};
     }
 
     [[nodiscard]] Result<std::vector<ModuleInfo>> modules() override {
@@ -1442,6 +1503,8 @@ private:
         PtraceSeize,
         SigStop,
     };
+
+    SubsystemStatus last_memmap_status_{};
 
     int ensure_mem_read_fd() {
         if (mem_read_fd_ >= 0) {

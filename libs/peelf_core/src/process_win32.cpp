@@ -473,8 +473,101 @@ public:
 
         SYSTEM_INFO si{};
         ::GetNativeSystemInfo(&si);
+        const std::uint64_t page_size = si.dwPageSize > 0 ? si.dwPageSize : 4096u;
         auto cursor = reinterpret_cast<std::uintptr_t>(si.lpMinimumApplicationAddress);
         const auto max_addr = reinterpret_cast<std::uintptr_t>(si.lpMaximumApplicationAddress);
+
+        // Gather thread TEB StackLimit..StackBase ranges (non-suspending read via NT_TIB).
+        struct WinStackRange {
+            std::uint64_t low{0};
+            std::uint64_t high{0};
+            ThreadId tid{0};
+        };
+        std::vector<WinStackRange> thread_stacks;
+        if (has_vm_read_) {
+            if (auto tlist = threads()) {
+                for (const ThreadInfo& ti : *tlist) {
+                    ScopedWinHandle th(::OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
+                                                    FALSE,
+                                                    static_cast<DWORD>(ti.tid)));
+                    if (!th.valid()) {
+                        continue;
+                    }
+                    const auto teb = query_win32_thread_teb(th.get(), info_.is_64bit);
+                    if (!teb.has_value() || *teb == 0) {
+                        continue;
+                    }
+                    std::array<std::uint8_t, 24> tib{};
+                    const std::size_t need = info_.is_64bit ? 24u : 12u;
+                    auto r = read_memory(*teb, std::span<std::uint8_t>(tib.data(), need));
+                    if (!r || *r < need) {
+                        continue;
+                    }
+                    const EndianReader rd(std::span<const std::uint8_t>(tib.data(), *r),
+                                          Endianness::Little,
+                                          info_.is_64bit ? AddressWidth::Bits64
+                                                         : AddressWidth::Bits32);
+                    const auto stack_base = rd.read_ptr(info_.is_64bit ? 0x08u : 0x04u);
+                    const auto stack_limit = rd.read_ptr(info_.is_64bit ? 0x10u : 0x08u);
+                    if (stack_base && stack_limit && *stack_base > *stack_limit) {
+                        thread_stacks.push_back(WinStackRange{*stack_limit, *stack_base, ti.tid});
+                    }
+                }
+            }
+        }
+
+        // Gather process heap bases from PEB ProcessHeaps (plus Toolhelp fallback).
+        std::unordered_map<std::uint64_t, std::uint32_t> heap_bases;
+        if (has_vm_read_ && peb_data_.peb_address.has_value() && *peb_data_.peb_address != 0) {
+            const std::uint64_t peb_va = *peb_data_.peb_address;
+            std::array<std::uint8_t, 16> hdr{};
+            const std::uint64_t off = info_.is_64bit ? 0xE8u : 0x88u;
+            const std::size_t need = info_.is_64bit ? 16u : 8u;
+            if (auto r = read_memory(peb_va + off, std::span<std::uint8_t>(hdr.data(), need));
+                r && *r >= need) {
+                const EndianReader rd(std::span<const std::uint8_t>(hdr.data(), *r),
+                                      Endianness::Little,
+                                      info_.is_64bit ? AddressWidth::Bits64 : AddressWidth::Bits32);
+                const std::uint32_t num_heaps = rd.read_u32(0).value_or(0);
+                const std::uint64_t heaps_va = rd.read_ptr(info_.is_64bit ? 8u : 4u).value_or(0);
+                const std::uint32_t capped = std::min<std::uint32_t>(num_heaps, 256u);
+                const std::size_t ptr_sz = info_.is_64bit ? 8u : 4u;
+                if (capped > 0 && heaps_va != 0) {
+                    std::vector<std::uint8_t> ptrs(capped * ptr_sz, 0);
+                    if (auto pr = read_memory(heaps_va, ptrs); pr && *pr >= ptr_sz) {
+                        const EndianReader prd(std::span<const std::uint8_t>(ptrs.data(), *pr),
+                                               Endianness::Little,
+                                               info_.is_64bit ? AddressWidth::Bits64
+                                                              : AddressWidth::Bits32);
+                        for (std::uint32_t i = 0; i < capped; ++i) {
+                            if (const auto hbase = prd.read_ptr(i * ptr_sz); hbase && *hbase != 0) {
+                                heap_bases.emplace(*hbase, i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (heap_bases.empty()) {
+            ScopedWinHandle hsnap(::CreateToolhelp32Snapshot(TH32CS_SNAPHEAPLIST,
+                                                             static_cast<DWORD>(info_.pid)));
+            if (hsnap.valid()) {
+                HEAPLIST32 hl{};
+                hl.dwSize = sizeof(hl);
+                std::uint32_t idx = 0;
+                if (::Heap32ListFirst(hsnap.get(), &hl)) {
+                    do {
+                        heap_bases.emplace(static_cast<std::uint64_t>(hl.th32HeapID), idx++);
+                    } while (idx < 256u && ::Heap32ListNext(hsnap.get(), &hl));
+                }
+            }
+        }
+
+        // Reusable bounded batch buffer for QueryWorkingSetEx (max 4096 pages = 16 MiB exact,
+        // strided sampling above 16 MiB so multi-GiB mappings never allocate giant arrays).
+        constexpr std::size_t kMaxWsBatchPages = 4096u;
+        std::vector<PSAPI_WORKING_SET_EX_INFORMATION> ws_batch;
+        ws_batch.reserve(256u);
 
         std::vector<MemoryRegion> result;
         MEMORY_BASIC_INFORMATION mbi{};
@@ -482,19 +575,31 @@ public:
                ::VirtualQueryEx(handle_.get(), reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) ==
                    sizeof(mbi)) {
             const auto base = reinterpret_cast<std::uint64_t>(mbi.BaseAddress);
+            const auto alloc_base = reinterpret_cast<std::uint64_t>(mbi.AllocationBase);
             const auto region_size = static_cast<std::uint64_t>(mbi.RegionSize);
-            if (mbi.State == MEM_COMMIT && region_size > 0) {
+            if ((mbi.State == MEM_COMMIT || mbi.State == MEM_RESERVE) && region_size > 0) {
                 MemoryRegion reg;
                 reg.start_address = base;
                 reg.end_address = base + region_size;
-                reg.protection = decode_win32_protect(mbi.Protect, mbi.Type);
+                reg.usage.allocation_base = alloc_base;
+
+                if (mbi.State == MEM_RESERVE) {
+                    reg.usage.is_reserved_only = true;
+                    reg.usage.committed_bytes = 0;
+                    reg.protection = MemoryProtection{};
+                } else {
+                    reg.usage.is_reserved_only = false;
+                    reg.usage.committed_bytes = region_size;
+                    reg.protection = decode_win32_protect(mbi.Protect, mbi.Type);
+                }
+
                 if (mbi.Type == MEM_IMAGE) {
                     reg.kind = MemoryRegionKind::Image;
                     for (const ModuleInfo& mod : mod_list) {
-                        if (mod.contains(base)) {
+                        if (mod.contains(base) || (alloc_base != 0 && mod.base_address == alloc_base)) {
                             reg.module_name = mod.name;
                             reg.pathname = mod.path.string();
-                            reg.file_offset = base - mod.base_address;
+                            reg.file_offset = base >= mod.base_address ? (base - mod.base_address) : 0;
                             break;
                         }
                     }
@@ -509,7 +614,77 @@ public:
                     }
                 } else {
                     reg.kind = MemoryRegionKind::Anonymous;
+                    for (const WinStackRange& sr : thread_stacks) {
+                        if (reg.end_address > sr.low && reg.start_address < sr.high) {
+                            reg.kind = MemoryRegionKind::Stack;
+                            reg.usage.owner_tid = sr.tid;
+                            break;
+                        }
+                    }
+                    if (reg.kind == MemoryRegionKind::Anonymous) {
+                        auto hit = heap_bases.find(alloc_base);
+                        if (hit == heap_bases.end()) {
+                            hit = heap_bases.find(base);
+                        }
+                        if (hit != heap_bases.end()) {
+                            reg.kind = MemoryRegionKind::Heap;
+                            reg.usage.heap_id = hit->second;
+                        }
+                    }
                 }
+
+                if (mbi.State == MEM_COMMIT) {
+                    const std::uint64_t total_pages =
+                        std::max<std::uint64_t>(1u, (region_size + page_size - 1u) / page_size);
+                    const std::size_t sample_pages = static_cast<std::size_t>(
+                        std::min<std::uint64_t>(total_pages, kMaxWsBatchPages));
+                    const std::uint64_t stride =
+                        total_pages > kMaxWsBatchPages ? (total_pages / kMaxWsBatchPages) : 1u;
+
+                    ws_batch.assign(sample_pages, PSAPI_WORKING_SET_EX_INFORMATION{});
+                    for (std::size_t p = 0; p < sample_pages; ++p) {
+                        ws_batch[p].VirtualAddress =
+                            reinterpret_cast<PVOID>(static_cast<std::uintptr_t>(
+                                base + static_cast<std::uint64_t>(p) * stride * page_size));
+                    }
+                    if (::QueryWorkingSetEx(
+                            handle_.get(),
+                            ws_batch.data(),
+                            static_cast<DWORD>(ws_batch.size() *
+                                               sizeof(PSAPI_WORKING_SET_EX_INFORMATION))) != 0) {
+                        std::uint64_t valid_pages = 0;
+                        std::uint64_t shared_pages = 0;
+                        std::uint64_t private_pages = 0;
+                        std::uint64_t locked_pages = 0;
+                        for (const auto& entry : ws_batch) {
+                            if (entry.VirtualAttributes.Valid) {
+                                ++valid_pages;
+                                if (entry.VirtualAttributes.Shared) {
+                                    ++shared_pages;
+                                } else {
+                                    ++private_pages;
+                                }
+                                if (entry.VirtualAttributes.Locked) {
+                                    ++locked_pages;
+                                }
+                            }
+                        }
+                        const auto scale_bytes = [&](std::uint64_t count) -> std::uint64_t {
+                            if (sample_pages == total_pages) {
+                                return std::min<std::uint64_t>(count * page_size, region_size);
+                            }
+                            return std::min<std::uint64_t>(
+                                (count * total_pages / sample_pages) * page_size, region_size);
+                        };
+                        reg.usage.rss_bytes = scale_bytes(valid_pages);
+                        reg.usage.private_dirty_bytes = scale_bytes(private_pages);
+                        reg.usage.shared_clean_bytes = scale_bytes(shared_pages);
+                        reg.usage.locked_bytes = scale_bytes(locked_pages);
+                    }
+                } else {
+                    reg.usage.rss_bytes = 0;
+                }
+
                 result.push_back(std::move(reg));
             }
             if (region_size == 0 || cursor > max_addr - static_cast<std::uintptr_t>(region_size)) {
@@ -519,6 +694,40 @@ public:
         }
 
         return result;
+    }
+
+    [[nodiscard]] ForgivingValue<ProcessMemorySummary> memory_summary(
+        std::span<const MemoryRegion> regions) override {
+        std::vector<MemoryRegion> owned;
+        if (regions.empty()) {
+            auto fetched = memory_regions();
+            if (!fetched) {
+                return {std::nullopt,
+                        SubsystemStatus::unavailable("VirtualQueryEx", fetched.error().message)};
+            }
+            owned = std::move(*fetched);
+            regions = owned;
+        }
+        ProcessMemorySummary sum = summarize_process_memory(regions);
+        PROCESS_MEMORY_COUNTERS_EX pmc{};
+        pmc.cb = sizeof(pmc);
+        if (::GetProcessMemoryInfo(handle_.get(),
+                                   reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                   sizeof(pmc)) != 0) {
+            if (!sum.rss_bytes.has_value() || *sum.rss_bytes == 0) {
+                sum.rss_bytes = static_cast<std::uint64_t>(pmc.WorkingSetSize);
+            }
+            if (!sum.private_dirty_bytes.has_value() && pmc.PrivateUsage > 0) {
+                sum.private_dirty_bytes = static_cast<std::uint64_t>(pmc.PrivateUsage);
+            }
+        }
+        const SubsystemStatus st =
+            sum.rss_bytes.has_value()
+                ? SubsystemStatus::available("VirtualQueryEx+QueryWorkingSetEx",
+                                             "working set & VirtualQueryEx telemetry")
+                : SubsystemStatus::partial("VirtualQueryEx",
+                                           "working set counters unavailable; showing virtual map");
+        return {std::move(sum), st};
     }
 
     [[nodiscard]] Result<std::size_t> read_memory(std::uint64_t address,

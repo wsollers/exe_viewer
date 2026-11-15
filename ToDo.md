@@ -62,7 +62,7 @@ Each work unit below is sized as a self-contained, testable commit+push slice on
   - Add Itanium C++/Rust (`_Z...`, `_R...`, `_ZN...17h...E`) and MSVC (`?...`) symbol demangling (`View > Demangle symbols` display vs. raw name toggle across `Symbols`, `Functions`, `Disassembly`, `Decompile`, `Flow Graph`, and `Details`) plus an in-tree LE/BE 32/64-bit ELF DWARF v2–v5 & separate-debug reader (`.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line_str`, `.debug_str_offsets`, `.debug_addr`, `.debug_line`, `.gnu_debuglink`, `.note.gnu.build-id` sidecar discovery, and live ASLR rebasing) feeding `SymbolIndex`, `FunctionIndex`, `DataTypeRecord` layouts, and `[file:line]` source annotations.
 - [x] **WU-06** — **Apply Structures to Static & Live Bytes (Feedback Priority #4).** *(Depends on: `WU-01`, `WU-05`)*
   - Bind PDB/Ghidra/DWARF `DataTypeRecord` layouts plus built-in PE/ELF/PEB/TEB/`r_debug` schemas onto any static file offset or live process VA using `EndianReader` + `TargetLayout`, rendering field values, nested structs, bounded arrays, and click-to-follow pointers.
-- [ ] **WU-07** — **Sysinternals VMMap-Style Visual Process RAM Explorer.** *(Depends on: `WU-01`)*
+- [x] **WU-07** — **Sysinternals VMMap-Style Visual Process RAM Explorer.** *(Depends on: `WU-01`)*
   - Harvest Linux `/proc/<pid>/smaps` + `smaps_rollup` (`Rss`, `Pss`, `Private_Clean/Dirty`, `Shared_Clean/Dirty`, `Swap`, `Locked`, `VmFlags`) and Windows `QueryWorkingSetEx` / `GetProcessMemoryInfo` + Toolhelp/TEB heap & thread-stack attribution.
   - Render VMMap-style proportional stacked horizontal bars (by Type, Committed vs. Working Set/PSS, and Protection with `RWX` callouts) plus a clickable virtual-address fragmentation/heat strip synchronized with `MemoryMapPanel`, `Details`, and `Hex View`.
 - [ ] **WU-08** — **Process Explorer & System Informer User-Mode Harvest (`P6-18` Completion).** *(Depends on: `WU-07`)*
@@ -321,6 +321,6 @@ Items promoted into the active **Next-Gen Execution Queue (`§1b`)** carry their
 - [ ] Binary comparison & disk-vs-live-RAM diff workspace (`WU-12`).
 - [ ] Reusable JSON patch bundles with `SHA-256`/original-byte conflict checks (`WU-11`); IPS/BPS export stretch.
 - [~] Process Explorer / System Informer user-mode harvest — threads/registers/stacks/TLS/PEB-TEB/Linux `status`/`auxv`/handlers shipped; handles/FDs, sockets, tokens/mitigations, and CPU deltas queued in `WU-08`.
-- [~] Sysinternals VMMap feature harvest — region classification & protection table shipped (`P6-16`); `smaps`/working-set visual stacked bars & address-space heat strip queued in `WU-07`.
+- [x] Sysinternals VMMap feature harvest — region classification & protection table (`P6-16`) plus `smaps`/working-set visual stacked bars, thread-stack/heap attribution, & compressed canonical VA heat strip (`WU-07`).
 - [ ] BinSkim feature harvest — formalize security rule IDs, evidence formatting, remediation text, baseline suppression, and JSON/SARIF export (`WU-13`).
 - [ ] Offline crash-dump adapters (`.dmp` Minidump + ELF `ET_CORE`) behind `IProcessSession` (`WU-14`) and opt-in `IDebugSession` (`WU-15`).

@@ -96,6 +96,8 @@ std::filesystem::path utf8_path(std::string_view text) {
         session_.reset();
         resolved_exe_path_.reset();
         regions_.clear();
+        memory_summary_ = {};
+        address_space_clusters_.clear();
         modules_.clear();
         active_module_index_.reset();
         active_region_index_.reset();
@@ -489,6 +491,8 @@ std::filesystem::path utf8_path(std::string_view text) {
 
         regions_ = std::move(*regs);
         modules_ = std::move(*mods);
+        memory_summary_ = session_->memory_summary(regions_);
+        address_space_clusters_ = peelf::build_address_space_clusters(regions_);
 
         // Hydrate main module backing path from command-line resolution when missing on disk.
         if (resolved_exe_path_) {

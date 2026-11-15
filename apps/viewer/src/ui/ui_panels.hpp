@@ -64,6 +64,9 @@ namespace viewer {
         bool filter_exec_only_ = false;
         bool filter_writable_only_ = false;
         bool filter_modules_only_ = false;
+        int category_filter_ = -1;     // -1 = all, 0..6 = VMMap category slice
+        int footprint_filter_ = -1;    // -1 = all, 0..5 = physical footprint slice
+        int protection_filter_ = -1;   // -1 = all, 0..4 = protection slice
         std::function<void()> on_attach_requested_;
         std::function<void()> on_refresh_requested_;
         std::function<void()> on_detach_requested_;

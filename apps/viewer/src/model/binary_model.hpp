@@ -128,6 +128,12 @@ namespace viewer {
             return resolved_exe_path_;
         }
         [[nodiscard]] const std::vector<peelf::MemoryRegion>& memory_regions() const noexcept { return regions_; }
+        [[nodiscard]] const peelf::ForgivingValue<peelf::ProcessMemorySummary>& memory_summary() const noexcept {
+            return memory_summary_;
+        }
+        [[nodiscard]] const std::vector<peelf::AddressSpaceCluster>& address_space_clusters() const noexcept {
+            return address_space_clusters_;
+        }
         [[nodiscard]] const std::vector<peelf::ModuleInfo>& process_modules() const noexcept { return modules_; }
         [[nodiscard]] std::optional<std::size_t> active_module_index() const noexcept { return active_module_index_; }
         [[nodiscard]] std::optional<std::size_t> active_region_index() const noexcept { return active_region_index_; }
@@ -271,6 +277,8 @@ namespace viewer {
         std::unique_ptr<peelf::IProcessSession> session_;
         std::optional<std::filesystem::path> resolved_exe_path_;
         std::vector<peelf::MemoryRegion> regions_;
+        peelf::ForgivingValue<peelf::ProcessMemorySummary> memory_summary_;
+        std::vector<peelf::AddressSpaceCluster> address_space_clusters_;
         std::vector<peelf::ModuleInfo> modules_;
         std::optional<std::size_t> active_module_index_;
         std::optional<std::size_t> active_region_index_;

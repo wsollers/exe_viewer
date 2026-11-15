@@ -47,6 +47,47 @@ namespace {
     return value;
 }
 
+[[nodiscard]] std::optional<std::uint64_t> parse_dec_u64(std::string_view token) noexcept {
+    if (token.empty()) {
+        return std::nullopt;
+    }
+    std::uint64_t value = 0;
+    const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 10);
+    if (ec != std::errc{} || ptr != token.data() + token.size()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+void annotate_special_pathname_usage(MemoryRegion& region) {
+    if (region.pathname == "[heap]") {
+        region.usage.heap_id = 0u;
+    } else if (region.pathname.starts_with("[heap:") && region.pathname.back() == ']') {
+        const std::string_view inner(region.pathname.data() + 6, region.pathname.size() - 7);
+        if (const auto hid = parse_dec_u64(inner);
+            hid && *hid <= std::numeric_limits<std::uint32_t>::max()) {
+            region.usage.heap_id = static_cast<std::uint32_t>(*hid);
+        }
+    } else if (region.pathname.starts_with("[stack:") && region.pathname.back() == ']') {
+        const std::string_view inner(region.pathname.data() + 7, region.pathname.size() - 8);
+        if (const auto tid = parse_dec_u64(inner);
+            tid && *tid <= std::numeric_limits<ThreadId>::max()) {
+            region.usage.owner_tid = static_cast<ThreadId>(*tid);
+            region.kind = MemoryRegionKind::Stack;
+        }
+    }
+
+    const bool is_anon_like = region.pathname.empty() || region.pathname.starts_with("[anon");
+    const bool no_access_private = !region.protection.readable && !region.protection.writable &&
+                                   !region.protection.executable && !region.protection.shared;
+    if (is_anon_like && no_access_private) {
+        region.usage.is_reserved_only = true;
+        region.usage.committed_bytes = 0;
+    } else {
+        region.usage.committed_bytes = region.size();
+    }
+}
+
 [[nodiscard]] std::string_view next_whitespace_token(std::string_view& rest) noexcept {
     while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) {
         rest.remove_prefix(1);
@@ -835,11 +876,409 @@ Result<std::vector<MemoryRegion>> parse_proc_maps(std::string_view maps_text,
         region.file_offset = *file_off;
         region.pathname = std::string(path_view);
         region.kind = classify_initial_region_kind(region.pathname, clean_main);
+        annotate_special_pathname_usage(region);
 
         regions.push_back(std::move(region));
     }
 
     return regions;
+}
+
+Result<std::vector<MemoryRegion>> parse_proc_smaps(std::string_view smaps_text,
+                                                   std::string_view main_exe_path) {
+    const std::string clean_main = strip_deleted_proc_suffix(trim_ascii(main_exe_path));
+    std::vector<MemoryRegion> regions;
+
+    std::size_t pos = 0;
+    while (pos < smaps_text.size()) {
+        const std::size_t nl = smaps_text.find('\n', pos);
+        std::string_view line =
+            (nl == std::string_view::npos) ? smaps_text.substr(pos) : smaps_text.substr(pos, nl - pos);
+        pos = (nl == std::string_view::npos) ? smaps_text.size() : (nl + 1);
+
+        line = trim_ascii(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        std::string_view probe = line;
+        const std::string_view first_tok = next_whitespace_token(probe);
+
+        // Metric / flag detail line belonging to the most recent VMA header (e.g. "Rss: 16 kB").
+        if (first_tok.ends_with(':')) {
+            if (regions.empty()) {
+                continue;
+            }
+            MemoryRegion& cur = regions.back();
+            const std::string_view key = first_tok.substr(0, first_tok.size() - 1);
+            if (key == "VmFlags") {
+                cur.usage.vm_flags = std::string(trim_ascii(probe));
+                continue;
+            }
+            const std::string_view val_tok = next_whitespace_token(probe);
+            const auto kb = parse_dec_u64(val_tok);
+            if (!kb) {
+                continue;
+            }
+            const std::uint64_t bytes = *kb * 1024ull;
+            if (key == "Rss") {
+                cur.usage.rss_bytes = bytes;
+                if (bytes > 0 && cur.usage.is_reserved_only) {
+                    cur.usage.is_reserved_only = false;
+                    cur.usage.committed_bytes = cur.size();
+                }
+            } else if (key == "Pss") {
+                cur.usage.pss_bytes = bytes;
+            } else if (key == "Shared_Clean") {
+                cur.usage.shared_clean_bytes = bytes;
+            } else if (key == "Shared_Dirty") {
+                cur.usage.shared_dirty_bytes = bytes;
+            } else if (key == "Private_Clean") {
+                cur.usage.private_clean_bytes = bytes;
+            } else if (key == "Private_Dirty") {
+                cur.usage.private_dirty_bytes = bytes;
+            } else if (key == "Swap") {
+                cur.usage.swap_bytes = bytes;
+                if (bytes > 0 && cur.usage.is_reserved_only) {
+                    cur.usage.is_reserved_only = false;
+                    cur.usage.committed_bytes = cur.size();
+                }
+            } else if (key == "Locked") {
+                cur.usage.locked_bytes = bytes;
+            }
+            continue;
+        }
+
+        const std::string_view perms_tok = next_whitespace_token(probe);
+        const std::string_view offset_tok = next_whitespace_token(probe);
+        const std::string_view dev_tok = next_whitespace_token(probe);
+        const std::string_view inode_tok = next_whitespace_token(probe);
+        (void)dev_tok;
+        (void)inode_tok;
+
+        const std::size_t dash = first_tok.find('-');
+        if (dash == std::string_view::npos || perms_tok.size() < 4 || offset_tok.empty()) {
+            return make_error("malformed /proc/smaps VMA header entry");
+        }
+
+        const auto start = parse_hex_u64(first_tok.substr(0, dash));
+        const auto end = parse_hex_u64(first_tok.substr(dash + 1));
+        const auto file_off = parse_hex_u64(offset_tok);
+        if (!start || !end || !file_off || *end < *start) {
+            return make_error("invalid address or offset in /proc/smaps entry");
+        }
+
+        MemoryRegion region;
+        region.start_address = *start;
+        region.end_address = *end;
+        region.protection.readable = perms_tok[0] == 'r';
+        region.protection.writable = perms_tok[1] == 'w';
+        region.protection.executable = perms_tok[2] == 'x';
+        region.protection.shared = perms_tok[3] == 's';
+        region.file_offset = *file_off;
+        region.pathname = std::string(trim_ascii(probe));
+        region.kind = classify_initial_region_kind(region.pathname, clean_main);
+        annotate_special_pathname_usage(region);
+
+        regions.push_back(std::move(region));
+    }
+
+    return regions;
+}
+
+void attribute_thread_stacks(std::vector<MemoryRegion>& regions,
+                             std::span<const ThreadInfo> threads,
+                             std::optional<ThreadId> main_tid) {
+    if (main_tid.has_value()) {
+        for (MemoryRegion& reg : regions) {
+            if (reg.pathname == "[stack]" && !reg.usage.owner_tid.has_value()) {
+                reg.kind = MemoryRegionKind::Stack;
+                reg.usage.owner_tid = *main_tid;
+            }
+        }
+    }
+
+    for (const ThreadInfo& t : threads) {
+        if (t.tid == 0) {
+            continue;
+        }
+        bool already_owned = false;
+        for (const MemoryRegion& reg : regions) {
+            if (reg.usage.owner_tid == t.tid && !reg.usage.is_reserved_only) {
+                already_owned = true;
+                break;
+            }
+        }
+        if (already_owned || !t.stack_pointer.has_value() || *t.stack_pointer == 0) {
+            continue;
+        }
+        const std::uint64_t sp = *t.stack_pointer;
+        for (std::size_t i = 0; i < regions.size(); ++i) {
+            MemoryRegion& reg = regions[i];
+            if (!reg.contains(sp)) {
+                continue;
+            }
+            if (reg.kind == MemoryRegionKind::Anonymous || reg.kind == MemoryRegionKind::Stack) {
+                reg.kind = MemoryRegionKind::Stack;
+                reg.usage.owner_tid = t.tid;
+                // Attribute an immediately preceding anonymous guard/reserved page if adjacent.
+                if (i > 0 && regions[i - 1].end_address == reg.start_address &&
+                    regions[i - 1].usage.is_reserved_only &&
+                    !regions[i - 1].usage.owner_tid.has_value()) {
+                    regions[i - 1].usage.owner_tid = t.tid;
+                }
+            }
+            break;
+        }
+    }
+}
+
+ProcessMemorySummary summarize_process_memory(std::span<const MemoryRegion> regions,
+                                              std::string_view smaps_rollup_text) {
+    ProcessMemorySummary sum{};
+
+    std::uint64_t rss_acc = 0;
+    std::uint64_t pss_acc = 0;
+    std::uint64_t priv_clean_acc = 0;
+    std::uint64_t priv_dirty_acc = 0;
+    std::uint64_t sh_clean_acc = 0;
+    std::uint64_t sh_dirty_acc = 0;
+    std::uint64_t swap_acc = 0;
+    std::uint64_t locked_acc = 0;
+
+    bool has_rss = false;
+    bool has_pss = false;
+    bool has_priv_clean = false;
+    bool has_priv_dirty = false;
+    bool has_sh_clean = false;
+    bool has_sh_dirty = false;
+    bool has_swap = false;
+    bool has_locked = false;
+
+    for (const MemoryRegion& reg : regions) {
+        const std::uint64_t sz = reg.size();
+        sum.total_virtual_bytes += sz;
+
+        if (reg.usage.is_reserved_only) {
+            sum.reserved_only_bytes += sz;
+            sum.reserved_bytes += sz;
+        } else {
+            const std::uint64_t comm = reg.usage.committed_bytes.value_or(sz);
+            sum.committed_bytes += comm;
+            if (sz > comm) {
+                sum.reserved_only_bytes += (sz - comm);
+                sum.reserved_bytes += (sz - comm);
+            }
+
+            switch (reg.kind) {
+                case MemoryRegionKind::Image:
+                    sum.image_bytes += comm;
+                    break;
+                case MemoryRegionKind::Heap:
+                    sum.heap_bytes += comm;
+                    break;
+                case MemoryRegionKind::Stack:
+                    sum.stack_bytes += comm;
+                    break;
+                case MemoryRegionKind::MappedFile:
+                    sum.mapped_file_bytes += comm;
+                    break;
+                case MemoryRegionKind::Vdso:
+                    sum.vdso_bytes += comm;
+                    break;
+                case MemoryRegionKind::Anonymous:
+                case MemoryRegionKind::Unknown:
+                    sum.anonymous_bytes += comm;
+                    break;
+            }
+        }
+
+        if (reg.protection.guarded ||
+            (!reg.protection.readable && !reg.protection.writable && !reg.protection.executable)) {
+            sum.noaccess_or_guard_bytes += sz;
+        } else if (reg.protection.readable && reg.protection.writable && reg.protection.executable) {
+            sum.rwx_bytes += sz;
+            ++sum.rwx_region_count;
+        } else if (reg.protection.executable) {
+            sum.rx_bytes += sz;
+            if (reg.protection.writable) {
+                // w+x without r is equally dangerous W^X violation.
+                ++sum.rwx_region_count;
+            }
+        } else if (reg.protection.writable) {
+            sum.rw_bytes += sz;
+        } else {
+            sum.readonly_bytes += sz;
+        }
+
+        if (reg.usage.rss_bytes.has_value()) {
+            rss_acc += *reg.usage.rss_bytes;
+            has_rss = true;
+        }
+        if (reg.usage.pss_bytes.has_value()) {
+            pss_acc += *reg.usage.pss_bytes;
+            has_pss = true;
+        }
+        if (reg.usage.private_clean_bytes.has_value()) {
+            priv_clean_acc += *reg.usage.private_clean_bytes;
+            has_priv_clean = true;
+        }
+        if (reg.usage.private_dirty_bytes.has_value()) {
+            priv_dirty_acc += *reg.usage.private_dirty_bytes;
+            has_priv_dirty = true;
+        }
+        if (reg.usage.shared_clean_bytes.has_value()) {
+            sh_clean_acc += *reg.usage.shared_clean_bytes;
+            has_sh_clean = true;
+        }
+        if (reg.usage.shared_dirty_bytes.has_value()) {
+            sh_dirty_acc += *reg.usage.shared_dirty_bytes;
+            has_sh_dirty = true;
+        }
+        if (reg.usage.swap_bytes.has_value()) {
+            swap_acc += *reg.usage.swap_bytes;
+            has_swap = true;
+        }
+        if (reg.usage.locked_bytes.has_value()) {
+            locked_acc += *reg.usage.locked_bytes;
+            has_locked = true;
+        }
+    }
+
+    if (has_rss) {
+        sum.rss_bytes = rss_acc;
+    }
+    if (has_pss) {
+        sum.pss_bytes = pss_acc;
+    }
+    if (has_priv_clean) {
+        sum.private_clean_bytes = priv_clean_acc;
+    }
+    if (has_priv_dirty) {
+        sum.private_dirty_bytes = priv_dirty_acc;
+    }
+    if (has_sh_clean) {
+        sum.shared_clean_bytes = sh_clean_acc;
+    }
+    if (has_sh_dirty) {
+        sum.shared_dirty_bytes = sh_dirty_acc;
+    }
+    if (has_swap) {
+        sum.swap_bytes = swap_acc;
+    }
+    if (has_locked) {
+        sum.locked_bytes = locked_acc;
+    }
+
+    if (!smaps_rollup_text.empty()) {
+        std::size_t pos = 0;
+        while (pos < smaps_rollup_text.size()) {
+            const std::size_t nl = smaps_rollup_text.find('\n', pos);
+            std::string_view line = (nl == std::string_view::npos)
+                                        ? smaps_rollup_text.substr(pos)
+                                        : smaps_rollup_text.substr(pos, nl - pos);
+            pos = (nl == std::string_view::npos) ? smaps_rollup_text.size() : (nl + 1);
+            line = trim_ascii(line);
+            std::string_view cur = line;
+            const std::string_view tok = next_whitespace_token(cur);
+            if (!tok.ends_with(':')) {
+                continue;
+            }
+            const std::string_view key = tok.substr(0, tok.size() - 1);
+            const auto kb = parse_dec_u64(next_whitespace_token(cur));
+            if (!kb) {
+                continue;
+            }
+            const std::uint64_t bytes = *kb * 1024ull;
+            if (key == "Rss" && !sum.rss_bytes.has_value()) {
+                sum.rss_bytes = bytes;
+            } else if (key == "Pss" && !sum.pss_bytes.has_value()) {
+                sum.pss_bytes = bytes;
+            } else if (key == "Private_Clean" && !sum.private_clean_bytes.has_value()) {
+                sum.private_clean_bytes = bytes;
+            } else if (key == "Private_Dirty" && !sum.private_dirty_bytes.has_value()) {
+                sum.private_dirty_bytes = bytes;
+            } else if (key == "Shared_Clean" && !sum.shared_clean_bytes.has_value()) {
+                sum.shared_clean_bytes = bytes;
+            } else if (key == "Shared_Dirty" && !sum.shared_dirty_bytes.has_value()) {
+                sum.shared_dirty_bytes = bytes;
+            } else if (key == "Swap" && !sum.swap_bytes.has_value()) {
+                sum.swap_bytes = bytes;
+            } else if (key == "Locked" && !sum.locked_bytes.has_value()) {
+                sum.locked_bytes = bytes;
+            }
+        }
+    }
+
+    return sum;
+}
+
+std::vector<AddressSpaceCluster> build_address_space_clusters(
+    std::span<const MemoryRegion> regions,
+    std::uint64_t gap_collapse_threshold) {
+    std::vector<AddressSpaceCluster> clusters;
+    if (regions.empty()) {
+        return clusters;
+    }
+
+    std::vector<std::size_t> order(regions.size());
+    for (std::size_t i = 0; i < regions.size(); ++i) {
+        order[i] = i;
+    }
+    std::ranges::sort(order, [&](std::size_t a, std::size_t b) {
+        if (regions[a].start_address != regions[b].start_address) {
+            return regions[a].start_address < regions[b].start_address;
+        }
+        return regions[a].end_address < regions[b].end_address;
+    });
+
+    const std::size_t first_idx = order.front();
+    AddressSpaceCluster current;
+    current.start_address = regions[first_idx].start_address;
+    current.end_address = regions[first_idx].end_address;
+    current.preceding_gap_bytes = regions[first_idx].start_address;
+    current.region_indices.push_back(first_idx);
+
+    for (std::size_t k = 1; k < order.size(); ++k) {
+        const std::size_t idx = order[k];
+        const MemoryRegion& reg = regions[idx];
+        const std::uint64_t gap =
+            reg.start_address > current.end_address ? (reg.start_address - current.end_address) : 0;
+        if (gap >= gap_collapse_threshold) {
+            clusters.push_back(std::move(current));
+            current = AddressSpaceCluster{};
+            current.start_address = reg.start_address;
+            current.end_address = reg.end_address;
+            current.preceding_gap_bytes = gap;
+            current.region_indices.push_back(idx);
+        } else {
+            current.end_address = std::max(current.end_address, reg.end_address);
+            current.region_indices.push_back(idx);
+        }
+    }
+
+    clusters.push_back(std::move(current));
+    return clusters;
+}
+
+ForgivingValue<ProcessMemorySummary> IProcessSession::memory_summary(
+    std::span<const MemoryRegion> regions) {
+    std::vector<MemoryRegion> owned;
+    if (regions.empty()) {
+        auto fetched = memory_regions();
+        if (!fetched) {
+            return {std::nullopt, SubsystemStatus::unavailable("vmmap", fetched.error().message)};
+        }
+        owned = std::move(*fetched);
+        regions = owned;
+    }
+    ProcessMemorySummary summary = summarize_process_memory(regions);
+    const SubsystemStatus st = summary.rss_bytes.has_value()
+                                   ? SubsystemStatus::available("vmmap", "physical RSS telemetry")
+                                   : SubsystemStatus::partial(
+                                         "vmmap",
+                                         "physical RSS/PSS unavailable; showing virtual map only");
+    return {std::move(summary), st};
 }
 
 std::vector<ModuleInfo> derive_modules_from_regions(std::vector<MemoryRegion>& regions,
