@@ -34,6 +34,12 @@ Menus provide File, Edit, Navigate, Analyze, View, and Help commands. Ctrl+O ope
 a binary; Ctrl+Shift+S exports a patched copy. Code views retain monospace fonts;
 Windows interface controls use Segoe UI when available.
 
+Windows builds embed `resources/viewer.ico` in the launcher and use it for the
+window/taskbar icon. On GUI startup, a responsive splash displays the original
+`resources/splash.png` artwork and supported CPU families (x86/X64, ARM, RISC-V,
+MIPS, and PowerPC), then closes after initialization (minimum 1.2 seconds).
+`--headless` and `--help` do not display the splash.
+
 - **Visual Studio 2022** (MSVC v143, **17.6 or newer** — required for `std::expected`, `std::format`, and `std::byteswap`)
 - **Clang 18** with **Ninja** (recommended on Linux)
 

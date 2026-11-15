@@ -1,5 +1,6 @@
 #include "application.h"
 #include "ui/theme.hpp"
+#include "ui/startup_branding.hpp"
 
 #include <array>
 #include <cstdio>
@@ -125,6 +126,7 @@ namespace viewer {
             throw std::runtime_error("Failed to create GLFW window");
         }
 
+        set_window_branding(window_);
         glfwSetWindowUserPointer(window_, this);
         glfwSetFramebufferSizeCallback(window_, glfw_framebuffer_resize_callback);
     }

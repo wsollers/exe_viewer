@@ -1,4 +1,5 @@
 #include "application.h"
+#include "ui/startup_branding.hpp"
 #include "crash/crash_handler.hpp"
 #include <cstdio>
 #include <exception>
@@ -12,6 +13,7 @@ extern "C" PEELF_GUI_EXPORT int peelf_run_gui() {
     viewer::crash::install_crash_handlers();
     viewer::Application app;
     try {
+        viewer::StartupSplash splash;
         app.init();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "GUI unavailable: %s; headless startup completed.\n", error.what());

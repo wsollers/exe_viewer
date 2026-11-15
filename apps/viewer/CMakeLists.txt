@@ -14,12 +14,18 @@ if(TARGET vulkan)
 endif()
 
 add_executable(peelf_viewer src/launcher.cpp)
+if(WIN32)
+  enable_language(RC)
+  target_sources(peelf_viewer PRIVATE resources/branding.rc)
+  target_include_directories(peelf_viewer PRIVATE resources)
+endif()
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)
 target_link_libraries(peelf_viewer PRIVATE ${CMAKE_DL_LIBS})
 if(NOT PEELF_BUILD_GUI)
   return()
 endif()
 add_library(peelf_gui SHARED
+  src/ui/startup_branding.cpp
   src/gui_entry.cpp
         src/crash/crash_handler.hpp
         src/crash/crash_handler.cpp
@@ -101,6 +107,10 @@ target_link_libraries(peelf_gui PRIVATE
         peelf::graphviz
         peelf::asmtk
 )
+
+if(WIN32)
+  target_link_libraries(peelf_gui PRIVATE gdiplus ole32)
+endif()
 
 if(MSVC)
   target_link_libraries(peelf_gui PRIVATE Dbghelp)
