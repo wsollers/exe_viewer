@@ -327,6 +327,7 @@ struct ElfDynamicEntry {
     std::uint64_t tag = 0;
     std::uint64_t value = 0;
     std::string   needed_library;
+    std::string   string_value;
 };
 
 struct ElfRelocation {
@@ -337,6 +338,7 @@ struct ElfRelocation {
     std::uint64_t type = 0;
     std::int64_t  addend = 0;
     bool          has_addend = false;
+    std::string   symbol_name;
 };
 
 struct ElfNote {

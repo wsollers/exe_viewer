@@ -1574,9 +1574,13 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             ElfDynamicEntry raw_entry;
             raw_entry.tag = tag;
             raw_entry.value = value;
-            if (tag == 1 && value <= std::numeric_limits<std::uint32_t>::max()) {  // DT_NEEDED
-                raw_entry.needed_library = read_string(strings.offset, strings.size,
-                                                       static_cast<std::uint32_t>(value));
+            if ((tag == 1 || tag == 14 || tag == 15 || tag == 29) &&
+                value <= std::numeric_limits<std::uint32_t>::max()) {
+                raw_entry.string_value = read_string(strings.offset, strings.size,
+                                                     static_cast<std::uint32_t>(value));
+                if (tag == 1) {  // DT_NEEDED
+                    raw_entry.needed_library = raw_entry.string_value;
+                }
             }
             dynamic_entries_out.push_back(raw_entry);
             if (tag == 0) {  // DT_NULL
@@ -1648,7 +1652,23 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                     relocation.addend = static_cast<std::int32_t>(rd32(b, off + 0x08, big));
                 }
             }
-            relocations_out.push_back(relocation);
+            if (relocation.symbol_index != 0 && sh.link < headers.size()) {
+                const ElfSectionHeader& sym_sh = headers[sh.link];
+                const std::uint64_t min_sym = is64 ? 0x18 : 0x10;
+                const std::uint64_t sym_ent_sz = sym_sh.entry_size != 0 ? sym_sh.entry_size : min_sym;
+                if ((sym_sh.type == 2 || sym_sh.type == 11) && sym_ent_sz >= min_sym &&
+                    sym_sh.link < headers.size() &&
+                    relocation.symbol_index < (sym_sh.size / sym_ent_sz)) {
+                    const ElfSectionHeader& str_sh = headers[sym_sh.link];
+                    const std::uint64_t sym_off = sym_sh.offset + relocation.symbol_index * sym_ent_sz;
+                    if (fits_range(sym_off, 4u, static_cast<std::uint64_t>(b.size())) &&
+                        fits_range(str_sh.offset, str_sh.size, static_cast<std::uint64_t>(b.size()))) {
+                        const std::uint32_t name_off = rd32(b, static_cast<std::size_t>(sym_off), big);
+                        relocation.symbol_name = read_string(str_sh.offset, str_sh.size, name_off);
+                    }
+                }
+            }
+            relocations_out.push_back(std::move(relocation));
         }
     }
 }
@@ -2621,12 +2641,16 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse_mapped(
                 };
 
                 for (ElfDynamicEntry& de : elf->dynamic_entries_) {
-                    if (de.tag == 1) {  // DT_NEEDED
-                        de.needed_library = read_dynstr(static_cast<std::uint32_t>(de.value));
-                        if (!de.needed_library.empty()) {
-                            ImportEntry imp;
-                            imp.library = de.needed_library;
-                            elf->imports_.push_back(std::move(imp));
+                    if ((de.tag == 1 || de.tag == 14 || de.tag == 15 || de.tag == 29) &&
+                        de.value <= std::numeric_limits<std::uint32_t>::max()) {
+                        de.string_value = read_dynstr(static_cast<std::uint32_t>(de.value));
+                        if (de.tag == 1) {  // DT_NEEDED
+                            de.needed_library = de.string_value;
+                            if (!de.needed_library.empty()) {
+                                ImportEntry imp;
+                                imp.library = de.needed_library;
+                                elf->imports_.push_back(std::move(imp));
+                            }
                         }
                     }
                 }

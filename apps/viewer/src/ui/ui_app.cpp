@@ -328,6 +328,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , strings_panel_(model, strings_index_, reference_index_, annotations_, current_selection_)
     , struct_view_panel_(model, current_selection_)
     , process_internals_panel_(model)
+    , dependencies_panel_(model, symbol_index_, reference_index_, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -337,6 +338,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     strings_panel_.set_visible(false);
     struct_view_panel_.set_visible(false);
     process_internals_panel_.set_visible(false);
+    dependencies_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
 #ifdef _WIN32
@@ -958,6 +960,7 @@ void UiApp::render() {
     strings_panel_.draw();
     struct_view_panel_.draw();
     process_internals_panel_.draw();
+    dependencies_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
@@ -1724,7 +1727,8 @@ void UiApp::render_main_menu() {
                 symbols_panel_.set_visible(v);
         }
 
-        for (UiPanel* extra : {static_cast<UiPanel*>(&functions_panel_),
+        for (UiPanel* extra : {static_cast<UiPanel*>(&dependencies_panel_),
+                               static_cast<UiPanel*>(&functions_panel_),
                                static_cast<UiPanel*>(&strings_panel_),
                                static_cast<UiPanel*>(&struct_view_panel_),
                                static_cast<UiPanel*>(&references_panel_),
@@ -2711,6 +2715,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(strings_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(struct_view_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(process_internals_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(dependencies_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);

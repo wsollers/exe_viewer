@@ -57,6 +57,7 @@ add_executable(peelf_tests
   vmmap_explorer_test.cpp
   process_internals_test.cpp
   analysis_project_test.cpp
+  dependency_tree_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp
   shellcode_converter_test.cpp
