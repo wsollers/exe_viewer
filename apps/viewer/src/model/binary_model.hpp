@@ -120,6 +120,7 @@ namespace viewer {
 
         // Live process state accessors.
         [[nodiscard]] const peelf::IProcessSession* process_session() const noexcept { return session_.get(); }
+        [[nodiscard]] peelf::IProcessSession* process_session() noexcept { return session_.get(); }
         [[nodiscard]] const std::optional<std::filesystem::path>& resolved_executable_path() const noexcept {
             return resolved_exe_path_;
         }

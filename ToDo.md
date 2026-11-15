@@ -56,7 +56,7 @@ Each work unit below is sized as a self-contained, testable commit+push slice on
   - Reuse analyzed Ghidra headless workspaces per `(binary_sha256, patch_revision, arch, endian, ghidra_home)` in an isolated Linux/WSL/OS cache directory (never on `/mnt/c`, LRU-bounded): cold runs use `-import` without `-deleteProject`; subsequent function switches run `-process` + `-noanalysis` with incremental symbol sync and automatic cold-retry fallback if a project lock/state is corrupt. Expose cache provenance + manual **Re-analyze / Clear Cache** in the Decompile UI.
 - [x] **WU-03** — **Resumable Background Reference & Indirect-Branch Scanner.** *(Depends on: `WU-01`)*
   - Lift the 4 MiB synchronous scan cap in `ReferenceIndex` using chunked `std::jthread` / `std::stop_token` background scanning over executable sections/regions (`ReferenceScanJob` + `AsyncReferenceScanner` in 256 KiB slices with $O(\log N + K)$ sorted `incoming`/`outgoing` indices), surface explicit scan progress & coverage % indicators plus Pause/Resume/Scan Full Binary controls in `References` and `Flow Graph`, and recover PIC/RIP-relative i32 jump tables, ARM Thumb-2 `tbb`/`tbh` & ARM64 PC-relative jump tables, plus GOT/IAT indirect calls/branches with explicit `ReferenceConfidence` and `evidence` tags.
-- [ ] **WU-04** — **Strings Browser Linked to References & Functions (Feedback Priority #2).** *(Depends on: `WU-03`)*
+- [x] **WU-04** — **Strings Browser Linked to References & Functions (Feedback Priority #2).** *(Depends on: `WU-03`)*
   - Extract ASCII/UTF-8 and UTF-16LE/BE strings across static sections and live readable regions with section/region, VA/offset, byte/char length, encoding, and `ReferenceIndex` xref counts. Selecting a string lists referencing functions/instructions and navigates Hex, Disassembly, Decompile, and `Flow Graph`.
 - [ ] **WU-05** — **Symbol Demangling & Initial ELF DWARF Reader.** *(Depends on: `WU-01`)*
   - Add Itanium C++/Rust and MSVC symbol demangling (display vs. raw name toggle) plus an initial ELF DWARF reader (`.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.gnu_debuglink`, `.note.gnu.build-id` sidecar discovery) feeding `SymbolIndex`, `FunctionIndex`, and `DataTypeRecord` layouts.
@@ -313,7 +313,7 @@ Each item is owned by a Phase-0/6/7 task above.
 Items promoted into the active **Next-Gen Execution Queue (`§1b`)** carry their `WU-*` cross-reference below:
 
 - [ ] Mach-O support (third format) behind the same `IBinaryImage`.
-- [ ] String extraction browser linked to `ReferenceIndex` (`WU-04`); entropy/packer heuristics.
+- [x] String extraction browser linked to `ReferenceIndex` (`WU-04`); `[ ]` entropy/packer heuristics stretch.
 - [ ] Symbol demangling — Itanium C++/Rust + MSVC (`WU-05`).
 - [~] PDB / DWARF debug-info association — Windows PDB/DIA shipped; ELF DWARF + split-debug/build-id queued in `WU-05`.
 - [x] Endian-aware search across static sections and live memory regions (byte/wildcard patterns, ASCII/UTF-16 strings, scalars, pointer xrefs — shipped in `Memory Search`); regex filter stretch remains open.

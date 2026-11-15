@@ -8,10 +8,12 @@
 #include <string>
 #include <vector>
 
+#include "analysis/strings_index.hpp"
 #include "model/binary_model.hpp"
 #include "model/recent_binaries.hpp"
 #include "ui_panels.hpp"
 #include "ui_panels_references.hpp"
+#include "ui_panels_strings.hpp"
 #include "decompile/decompiler.hpp"
 #include <future>
 #include "disasm/disassembler.hpp"
@@ -121,10 +123,14 @@ namespace viewer {
         SymbolIndex symbol_index_;
         ReferenceIndex reference_index_;
         AsyncReferenceScanner reference_scanner_;
+        StringsIndex strings_index_;
         AnnotationStore annotations_;
         bool references_dirty_ = true;
+        bool strings_dirty_ = true;
         bool focus_references_ = false;
+        bool focus_strings_ = false;
         std::uint64_t reference_revision_ = 0;
+        std::uint64_t strings_revision_ = 0;
         std::uint64_t annotation_revision_ = 0;
         bool reference_thumb_mode_ = false;
         ViewerSelection current_selection_;
@@ -152,6 +158,7 @@ namespace viewer {
         RuntimeAndFlagsPanel runtime_flags_panel_;
         HandlersPanel   handlers_panel_;
         ReferencesPanel references_panel_;
+        StringsPanel    strings_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;
@@ -224,6 +231,8 @@ namespace viewer {
         void render_decompiler();
         void rebuild_references();
         void open_references();
+        void rebuild_strings();
+        void open_strings();
         void render_dockspace();
         void render_attach_process_modal();
         void open_attach_process_modal();

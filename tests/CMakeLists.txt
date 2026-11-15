@@ -51,6 +51,7 @@ add_executable(peelf_tests
   call_graph_test.cpp
   symbol_index_test.cpp
   reference_index_test.cpp
+  strings_index_test.cpp
   analysis_project_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp
@@ -67,6 +68,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/reference_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/strings_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/patch_preview.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/project.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler.cpp

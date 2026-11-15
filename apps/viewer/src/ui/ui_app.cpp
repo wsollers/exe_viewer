@@ -321,12 +321,14 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , runtime_flags_panel_(model)
     , handlers_panel_(model)
     , references_panel_(reference_index_, annotations_, symbol_index_, current_selection_)
+    , strings_panel_(model, strings_index_, reference_index_, annotations_, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
     , pe_exports_panel_(model)
 {
     references_panel_.set_visible(false);
+    strings_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
 #ifdef _WIN32
@@ -341,6 +343,63 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         navigate_to_address(address, PreferredView::Disassembly);
     });
     references_panel_.set_rebuild_callback([this] { references_dirty_ = true; });
+    strings_panel_.set_rebuild_callback([this](std::size_t, bool) { strings_dirty_ = true; });
+    strings_panel_.set_string_selected_callback([this](const ExtractedString& s) {
+        std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(s.virtual_address);
+        if (!nav_offset && !model_.is_live_process()) {
+            nav_offset = s.file_offset;
+        }
+        if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(s.virtual_address)) {
+            sync_live_process_view(false);
+            nav_offset = model_.virtual_address_to_offset(s.virtual_address);
+        }
+        navigation_history_.visit(current_selection_);
+        const std::size_t byte_len = std::max<std::size_t>(s.byte_length, 1u);
+        current_selection_ = ViewerSelection{
+            .kind = SelectionKind::ByteRange,
+            .label = "String: " + format_single_line_string_preview(s.preview, 96),
+            .file_offset = nav_offset,
+            .virtual_address = s.virtual_address,
+            .size = byte_len,
+            .preferred_view = PreferredView::Hex,
+        };
+        if (nav_offset) {
+            hex_panel_.set_visible(true);
+            hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(byte_len));
+        }
+        last_navigation_selection_ = current_selection_;
+        navigation_history_.visit(current_selection_);
+    });
+    strings_panel_.set_referrer_activated_callback(
+        [this](const StringReferrer& ref, StringReferrerTargetView target) {
+            if (target == StringReferrerTargetView::FlowGraph) {
+                navigate_to_address(ref.instruction_address, PreferredView::Graph);
+                return;
+            }
+            if (target == StringReferrerTargetView::Decompile) {
+                navigate_to_address(ref.function_address.value_or(ref.instruction_address),
+                                    PreferredView::Disassembly);
+                selected_code_address_ = ref.instruction_address;
+                request_decompile();
+                return;
+            }
+            navigate_to_address(ref.instruction_address, PreferredView::Disassembly);
+            if (target == StringReferrerTargetView::SyncAllOpen) {
+                if (show_call_graph_panel_ && model_.image() != nullptr) {
+                    if (const auto root = navigation_graph_root(ref.instruction_address)) {
+                        if (!active_graph_root_ || active_graph_root_->virtual_address != root->virtual_address) {
+                            pending_call_graph_root_ = *root;
+                            pending_call_graph_delay_frames_ = 0;
+                        }
+                        center_graph_selection_ = true;
+                    }
+                }
+                if (show_decompiler_) {
+                    selected_code_address_ = ref.instruction_address;
+                    request_decompile();
+                }
+            }
+        });
     references_panel_.set_pause_callback([this] { reference_scanner_.pause(); });
     references_panel_.set_resume_callback([this] { reference_scanner_.resume(reference_index_); });
     references_panel_.set_scan_full_callback([this] {
@@ -701,6 +760,8 @@ void UiApp::render() {
             activate_panel(functions_panel_.name().c_str());
         }
         ImGui::SameLine();
+        if (ImGui::Button("Strings")) open_strings();
+        ImGui::SameLine();
         if (ImGui::Button("Decompile")) request_decompile();
         ImGui::SameLine();
         if (ImGui::Button("Search")) {
@@ -823,10 +884,15 @@ void UiApp::render() {
     handlers_panel_.draw();
     if (show_data_types_) render_data_types();
     references_panel_.draw();
+    strings_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
         focus_references_ = false;
+    }
+    if (focus_strings_) {
+        activate_panel(strings_panel_.name().c_str());
+        focus_strings_ = false;
     }
     pe_headers_panel_.draw();
     pe_imports_panel_.draw();
@@ -908,6 +974,51 @@ peelf::Result<void> UiApp::save_patch_report(const std::filesystem::path& path) 
 void UiApp::open_references() {
     references_panel_.set_visible(true);
     focus_references_ = true;
+}
+
+void UiApp::open_strings() {
+    strings_panel_.set_visible(true);
+    focus_strings_ = true;
+}
+
+void UiApp::rebuild_strings() {
+    StringScanOptions opts;
+    opts.min_length = strings_panel_.requested_min_length();
+    opts.include_all_live_regions = strings_panel_.scan_all_live_regions();
+
+    if (model_.is_live_process() && model_.process_session() != nullptr) {
+        std::optional<std::uint64_t> active_base;
+        if (const auto mod_idx = model_.active_module_index();
+            mod_idx && *mod_idx < model_.process_modules().size()) {
+            active_base = model_.process_modules()[*mod_idx].base_address;
+        }
+        if (!opts.include_all_live_regions && model_.image() != nullptr &&
+            !model_.analysis_image_bytes().empty()) {
+            strings_index_ = StringsIndex::extract(*model_.image(), model_.analysis_image_bytes(), opts);
+        } else {
+            strings_index_ = StringsIndex::extract_live(
+                *model_.process_session(),
+                model_.memory_regions(),
+                model_.image(),
+                active_base,
+                opts);
+        }
+    } else if (const auto* image = model_.image()) {
+        if (model_.changed_intervals().empty()) {
+            strings_index_ = StringsIndex::extract(*image, model_.analysis_image_bytes(), opts);
+        } else if (auto patched = model_.read_effective_bytes(0, model_.bytes().size())) {
+            strings_index_ = StringsIndex::extract(*image, *patched, opts);
+        } else {
+            strings_index_.clear();
+        }
+    } else {
+        strings_index_.clear();
+    }
+
+    strings_index_.refresh_xrefs(
+        reference_index_, &model_.function_index(), &symbol_index_, symbol_revision_);
+    strings_revision_ = model_.edit_revision();
+    strings_dirty_ = false;
 }
 
 void UiApp::rebuild_references() {
@@ -1066,6 +1177,7 @@ void UiApp::render_main_menu() {
             activate_panel(functions_panel_.name().c_str());
         }
         if (ImGui::MenuItem("Symbols")) symbols_panel_.set_visible(true);
+        if (ImGui::MenuItem("Strings", nullptr, false, model_.has_file())) open_strings();
         if (ImGui::MenuItem("Threads & Stack", nullptr, false, model_.is_live_process())) {
             threads_panel_.set_visible(true);
             activate_panel(threads_panel_.name().c_str());
@@ -1180,6 +1292,8 @@ void UiApp::render_main_menu() {
         }
 
         for (UiPanel* extra : {static_cast<UiPanel*>(&functions_panel_),
+                               static_cast<UiPanel*>(&strings_panel_),
+                               static_cast<UiPanel*>(&references_panel_),
                                static_cast<UiPanel*>(&threads_panel_),
                                static_cast<UiPanel*>(&thread_locals_panel_),
                                static_cast<UiPanel*>(&memory_search_panel_),
@@ -1499,8 +1613,18 @@ void UiApp::process_deferred_gpu_work() {
     reference_scanner_.poll(reference_index_);
     if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
         references_dirty_ = true;
-    if ((references_panel_.visible() || show_call_graph_panel_) && references_dirty_ && model_.image())
+    if ((references_panel_.visible() || strings_panel_.visible() || show_call_graph_panel_) &&
+        references_dirty_ && model_.image())
         rebuild_references();
+    if (strings_revision_ != model_.edit_revision())
+        strings_dirty_ = true;
+    if (strings_panel_.visible() && model_.has_file()) {
+        if (strings_dirty_) {
+            rebuild_strings();
+        }
+        strings_index_.refresh_xrefs(
+            reference_index_, &model_.function_index(), &symbol_index_, symbol_revision_);
+    }
     if (annotation_revision_ != annotations_.revision()) {
         annotation_revision_ = annotations_.revision();
         if (active_graph_root_) pending_call_graph_root_ = active_graph_root_;
@@ -2139,6 +2263,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(runtime_flags_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(handlers_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(references_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(strings_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
@@ -2324,6 +2449,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
 
         symbol_index_ = model_.symbol_index();
+        strings_dirty_ = true;
+        references_dirty_ = true;
         const peelf::IProcessSession* sess = model_.process_session();
         structure_tree_ = build_live_process_structure_tree(
             sess->info(),
@@ -2403,6 +2530,9 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         reference_scanner_.cancel(&reference_index_);
         reference_index_ = {};
         references_dirty_ = true;
+        strings_index_.clear();
+        strings_dirty_ = true;
+        strings_panel_.reset_selection();
         navigation_history_.clear();
         disassembly_location_.reset();
         thumb_mode_ = false;
