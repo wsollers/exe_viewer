@@ -61,6 +61,7 @@ add_executable(peelf_tests
   binary_diff_test.cpp
   security_headless_test.cpp
   crash_dump_test.cpp
+  debugger_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp
   shellcode_converter_test.cpp

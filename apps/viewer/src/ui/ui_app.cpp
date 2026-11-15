@@ -336,6 +336,11 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
           [this]() {
               if (on_analysis_file_) on_analysis_file_(3);
           })
+    , debugger_panel_(
+          model,
+          [this](std::uint64_t address, PreferredView view) { navigate_to_address(address, view); },
+          [this]() { on_process_attached(); },
+          [this]() { open_attach_process_modal(); })
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -346,6 +351,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     struct_view_panel_.set_visible(false);
     process_internals_panel_.set_visible(false);
     binary_diff_panel_.set_visible(false);
+    debugger_panel_.set_visible(false);
     dependencies_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
@@ -819,6 +825,10 @@ UiApp::~UiApp() {
 }
 
 void UiApp::render() {
+    if (const auto stop_ip = model_.sync_debugger_stop_state(); stop_ip.has_value()) {
+        sync_live_process_view(false);
+        navigate_to_address(*stop_ip, PreferredView::Disassembly);
+    }
     render_main_menu();
     auto* viewport = ImGui::GetMainViewport();
     if (ImGui::BeginViewportSideBar("##workspace-actions", viewport, ImGuiDir_Up,
@@ -830,6 +840,14 @@ void UiApp::render() {
         if (ImGui::Button("Open binary") && on_open_file_) on_open_file_();
         ImGui::SameLine();
         if (ImGui::Button("Attach process")) open_attach_process_modal();
+        ImGui::SameLine();
+        if (ImGui::Button("Debugger")) {
+            debugger_panel_.set_visible(true);
+            activate_panel(debugger_panel_.name().c_str());
+            if (!model_.is_debug_session()) {
+                debugger_panel_.open_opt_in_modal();
+            }
+        }
         ImGui::SameLine();
         ImGui::BeginDisabled(!model_.has_file());
         if (ImGui::Button("Functions")) {
@@ -941,6 +959,7 @@ void UiApp::render() {
     render_dockspace();
     render_recovery_banner();
     render_attach_process_modal();
+    debugger_panel_.render_opt_in_modal();
     render_relocate_project_modal();
 
     file_panel_.draw();
@@ -970,6 +989,7 @@ void UiApp::render() {
     process_internals_panel_.draw();
     dependencies_panel_.draw();
     binary_diff_panel_.draw();
+    debugger_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
@@ -1495,11 +1515,47 @@ void UiApp::rebuild_references() {
 }
 
 void UiApp::render_main_menu() {
-    if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F5)) {
-        if (ImGui::GetIO().KeyCtrl && model_.is_live_process()) {
-            if (auto result = model_.refresh_process_map()) sync_live_process_view(false);
-            else Log().error("Refresh failed: {}", result.error().message);
-        } else if (!ImGui::GetIO().KeyCtrl) request_decompile();
+    if (!ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+            if (ImGui::GetIO().KeyCtrl && model_.is_live_process()) {
+                if (auto result = model_.refresh_process_map()) sync_live_process_view(false);
+                else Log().error("Refresh failed: {}", result.error().message);
+            } else if (!ImGui::GetIO().KeyCtrl && model_.is_debug_session()) {
+                if (auto* dbg = model_.debug_session();
+                    dbg != nullptr && dbg->state() == peelf::debugger::DebugSessionState::Paused) {
+                    if (auto r = dbg->continue_execution(false); !r) Log().error("Debugger continue: {}", r.error().message);
+                }
+            } else if (!ImGui::GetIO().KeyCtrl) {
+                request_decompile();
+            }
+        }
+        if (model_.is_debug_session()) {
+            auto* dbg = model_.debug_session();
+            if (ImGui::IsKeyPressed(ImGuiKey_F9) && current_selection_.virtual_address.has_value()) {
+                if (auto r = model_.toggle_software_breakpoint(*current_selection_.virtual_address); r) {
+                    Log().info("{} software breakpoint at 0x{:X}",
+                               *r ? "Set" : "Removed",
+                               *current_selection_.virtual_address);
+                } else {
+                    Log().error("Breakpoint toggle: {}", r.error().message);
+                }
+            }
+            if (dbg != nullptr && dbg->state() == peelf::debugger::DebugSessionState::Paused) {
+                if (ImGui::IsKeyPressed(ImGuiKey_F10)) {
+                    if (auto r = dbg->step_over(model_.selected_thread_id()); !r) {
+                        Log().error("Step over: {}", r.error().message);
+                    }
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_F11)) {
+                    auto r = ImGui::GetIO().KeyShift
+                        ? dbg->step_out(model_.selected_thread_id())
+                        : dbg->step_into(model_.selected_thread_id());
+                    if (!r) {
+                        Log().error("Step: {}", r.error().message);
+                    }
+                }
+            }
+        }
     }
     if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_X, ImGuiInputFlags_RouteGlobal)) open_references();
     if (!ImGui::GetIO().WantTextInput &&
@@ -1674,6 +1730,48 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Rebuild loaded call graph", nullptr, false, model_.has_file())) queue_call_graph_sample(CallGraphSample::LoadedImage);
         ImGui::EndMenu();
     }
+    if (ImGui::BeginMenu("Inspect")) {
+        if (ImGui::MenuItem("Start / Attach Debugger (Opt-in)...")) {
+            debugger_panel_.set_visible(true);
+            activate_panel(debugger_panel_.name().c_str());
+            debugger_panel_.open_opt_in_modal();
+        }
+        if (ImGui::MenuItem("Attach to Process (Read-Only Default)...", "Ctrl+P")) {
+            open_attach_process_modal();
+        }
+        ImGui::Separator();
+        auto* dbg = model_.debug_session();
+        const bool dbg_paused = dbg != nullptr && dbg->state() == peelf::debugger::DebugSessionState::Paused;
+        const bool dbg_running = dbg != nullptr && dbg->state() == peelf::debugger::DebugSessionState::Running;
+        if (ImGui::MenuItem("Continue", "F5", false, dbg_paused)) {
+            (void)dbg->continue_execution(false);
+        }
+        if (ImGui::MenuItem("Pause", nullptr, false, dbg_running)) {
+            (void)dbg->pause_execution();
+        }
+        if (ImGui::MenuItem("Step Into", "F11", false, dbg_paused)) {
+            (void)dbg->step_into(model_.selected_thread_id());
+        }
+        if (ImGui::MenuItem("Step Over", "F10", false, dbg_paused)) {
+            (void)dbg->step_over(model_.selected_thread_id());
+        }
+        if (ImGui::MenuItem("Step Out", "Shift+F11", false, dbg_paused)) {
+            (void)dbg->step_out(model_.selected_thread_id());
+        }
+        if (ImGui::MenuItem("Toggle Breakpoint at Selection",
+                            "F9",
+                            false,
+                            dbg_paused && current_selection_.virtual_address.has_value())) {
+            (void)model_.toggle_software_breakpoint(*current_selection_.virtual_address);
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Detach Debugger Cleanly", nullptr, false, dbg_paused || dbg_running)) {
+            (void)dbg->detach();
+            model_.detach_process();
+            on_process_attached();
+        }
+        ImGui::EndMenu();
+    }
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Data Structures", nullptr, &show_data_types_);
         {
@@ -1763,7 +1861,8 @@ void UiApp::render_main_menu() {
                 symbols_panel_.set_visible(v);
         }
 
-        for (UiPanel* extra : {static_cast<UiPanel*>(&binary_diff_panel_),
+        for (UiPanel* extra : {static_cast<UiPanel*>(&debugger_panel_),
+                               static_cast<UiPanel*>(&binary_diff_panel_),
                                static_cast<UiPanel*>(&dependencies_panel_),
                                static_cast<UiPanel*>(&functions_panel_),
                                static_cast<UiPanel*>(&strings_panel_),
@@ -2761,6 +2860,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(pe_exports_panel_.name().c_str(), right_id);
 
     ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), center_bottom_id);
+    ImGui::DockBuilderDockWindow(debugger_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(memory_search_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow("Disassembly", main_id);
@@ -2823,16 +2923,24 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
     }
     if (!disasm_status_.empty()) ImGui::TextWrapped("%s", disasm_status_.c_str());
-    // Simple table view
-    if (ImGui::BeginTable("DisasmTableReadable", 5,
+
+    const std::optional<std::uint64_t> active_debug_ip =
+        (model_.debug_session() != nullptr &&
+         model_.debug_session()->state() == peelf::debugger::DebugSessionState::Paused)
+            ? std::optional<std::uint64_t>(model_.debug_session()->stop_status().instruction_pointer)
+            : std::nullopt;
+
+    // Simple table view with debugger breakpoint + current IP/PC gutter
+    if (ImGui::BeginTable("DisasmTableReadable", 6,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("BP", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, 36.0f);
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoResize, ImGui::CalcTextSize("0000000000000000").x + 16.0f);
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 180.0f);
         ImGui::TableSetupColumn("Mnemonic", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableSetupColumn("Operands", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 22.0f);
         ImGui::TableSetupColumn("Symbol / annotation", ImGuiTableColumnFlags_WidthFixed, ImGui::GetFontSize() * 28.0f);
-        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableSetupScrollFreeze(2, 1);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
@@ -2841,11 +2949,43 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const auto& inst = current_instructions_[static_cast<std::size_t>(row)];
+            const auto* row_bp = model_.find_breakpoint_at(inst.address);
+            const bool is_ip = active_debug_ip.has_value() && *active_debug_ip == inst.address;
+
             ImGui::TableNextRow();
+            if (is_ip) {
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                       ImGui::GetColorU32(ImVec4(0.08f, 0.34f, 0.42f, 0.48f)));
+            }
+
+            // Debugger Gutter (Breakpoint badge + Current IP/PC arrow)
+            ImGui::TableNextColumn();
+            ImGui::PushID(row * 2 + 1);
+            if (row_bp != nullptr) {
+                const ImVec4 bp_col = row_bp->enabled
+                    ? ImVec4(0.95f, 0.28f, 0.28f, 1.0f)
+                    : ImVec4(0.55f, 0.55f, 0.60f, 1.0f);
+                ImGui::TextColored(bp_col, row_bp->enabled ? "●" : "○");
+                if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && model_.is_debug_session()) {
+                    (void)model_.toggle_software_breakpoint(inst.address);
+                }
+            } else if (model_.is_debug_session() && !is_ip) {
+                if (ImGui::Selectable("##BpGutter", false, 0, ImVec2(14.0f, 0.0f))) {
+                    (void)model_.toggle_software_breakpoint(inst.address);
+                }
+            }
+            if (is_ip) {
+                if (row_bp != nullptr) ImGui::SameLine(0.0f, 2.0f);
+                ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.98f, 1.0f), "▶");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Current instruction pointer (IP/PC)");
+                }
+            }
+            ImGui::PopID();
 
             // Address
             ImGui::TableNextColumn();
-            ImGui::PushID(row);
+            ImGui::PushID(row * 2);
             if (ImGui::Selectable(std::format("{:016X}", inst.address).c_str(),
                 current_selection_.virtual_address == inst.address, ImGuiSelectableFlags_AllowDoubleClick)) {
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) follow_target = inst.branch_target;

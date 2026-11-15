@@ -25,6 +25,9 @@ add_library(peelf_core
   src/security_audit.cpp
   src/crash_dump_minidump.cpp
   src/crash_dump_elf_core.cpp
+  src/debugger_common.cpp
+  src/debugger_linux.cpp
+  src/debugger_win32.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
@@ -48,6 +51,7 @@ add_library(peelf_core
   include/peelf/handlers.hpp
   include/peelf/security_audit.hpp
   include/peelf/crash_dump.hpp
+  include/peelf/debugger.hpp
   include/mapping/file_mapping.hpp
   src/mapping/map_errors.cpp
   src/mapping/file_mapping_posix.cpp

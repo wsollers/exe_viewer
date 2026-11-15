@@ -20,8 +20,14 @@ namespace viewer {
 
         ImGui::BeginChild("InstructionsScroll", ImVec2(0,0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
-        if (ImGui::BeginTable("Instructions", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-            for (const char* column : {"Address", "Bytes", "Mnemonic", "Operands", "Comment"}) ImGui::TableSetupColumn(column);
+        const std::optional<std::uint64_t> active_ip =
+            (model_.debug_session() != nullptr &&
+             model_.debug_session()->state() == peelf::debugger::DebugSessionState::Paused)
+                ? std::optional<std::uint64_t>(model_.debug_session()->stop_status().instruction_pointer)
+                : std::nullopt;
+
+        if (ImGui::BeginTable("Instructions", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+            for (const char* column : {"BP", "Address", "Bytes", "Mnemonic", "Operands", "Comment"}) ImGui::TableSetupColumn(column);
             ImGui::TableHeadersRow();
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(current_instructions_.size()));
@@ -29,6 +35,16 @@ namespace viewer {
                 for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                     const auto& instruction = current_instructions_[static_cast<std::size_t>(row)];
                     ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const auto* bp = model_.find_breakpoint_at(instruction.address);
+                    const bool is_ip = active_ip.has_value() && *active_ip == instruction.address;
+                    if (bp != nullptr && bp->enabled) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.28f, 0.28f, 1.0f), "●");
+                    }
+                    if (is_ip) {
+                        if (bp != nullptr && bp->enabled) ImGui::SameLine(0.0f, 2.0f);
+                        ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.98f, 1.0f), "▶");
+                    }
                     ImGui::TableNextColumn();
                     ImGui::TextUnformatted(std::format("{:016X}", instruction.address).c_str());
                     ImGui::TableNextColumn();

@@ -71,6 +71,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_dependencies.cpp
         src/ui/ui_panels_diff.hpp
         src/ui/ui_panels_diff.cpp
+        src/ui/ui_panels_debugger.hpp
+        src/ui/ui_panels_debugger.cpp
         src/analysis/function_index.hpp
         src/analysis/function_index.cpp
         src/analysis/reference_index.cpp

@@ -62,6 +62,83 @@ std::filesystem::path utf8_path(std::string_view text) {
     return address >= prev.offset && (address - prev.offset) < len;
 }
 
+class DebugSessionProcessProxy final : public peelf::IProcessSession {
+public:
+    explicit DebugSessionProcessProxy(peelf::debugger::IDebugSession& dbg) noexcept
+        : dbg_(dbg) {}
+
+    [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override {
+        return dbg_.session().info();
+    }
+    [[nodiscard]] bool is_alive() const noexcept override {
+        return dbg_.session().is_alive();
+    }
+    [[nodiscard]] bool is_read_only() const noexcept override {
+        return dbg_.session().is_read_only();
+    }
+    [[nodiscard]] bool is_crash_dump() const noexcept override {
+        return dbg_.session().is_crash_dump();
+    }
+    [[nodiscard]] bool is_suspended() const noexcept override {
+        return dbg_.state() == peelf::debugger::DebugSessionState::Paused ||
+               dbg_.session().is_suspended();
+    }
+    [[nodiscard]] peelf::Result<void> suspend() override {
+        return dbg_.pause_execution();
+    }
+    [[nodiscard]] peelf::Result<void> resume() override {
+        return dbg_.continue_execution(false);
+    }
+    [[nodiscard]] peelf::Result<void> suspend_thread(peelf::ThreadId tid) override {
+        return dbg_.session().suspend_thread(tid);
+    }
+    [[nodiscard]] peelf::Result<void> resume_thread(peelf::ThreadId tid) override {
+        return dbg_.session().resume_thread(tid);
+    }
+    [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
+        return dbg_.session().memory_regions();
+    }
+    [[nodiscard]] peelf::ForgivingValue<peelf::ProcessMemorySummary> memory_summary(
+        std::span<const peelf::MemoryRegion> regions) override {
+        return dbg_.session().memory_summary(regions);
+    }
+    [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
+        return dbg_.session().modules();
+    }
+    [[nodiscard]] peelf::Result<std::vector<peelf::ThreadInfo>> threads() override {
+        return dbg_.session().threads();
+    }
+    [[nodiscard]] peelf::ThreadContext thread_context(peelf::ThreadId tid) override {
+        return dbg_.session().thread_context(tid);
+    }
+    [[nodiscard]] peelf::ForgivingValue<std::vector<std::uint8_t>> proc_auxv() override {
+        return dbg_.session().proc_auxv();
+    }
+    [[nodiscard]] peelf::ForgivingValue<std::string> proc_status_text() override {
+        return dbg_.session().proc_status_text();
+    }
+    [[nodiscard]] peelf::ForgivingValue<std::vector<std::string>> environment_variables() override {
+        return dbg_.session().environment_variables();
+    }
+    [[nodiscard]] peelf::ForgivingValue<std::uint64_t> process_environment_block_address() override {
+        return dbg_.session().process_environment_block_address();
+    }
+    [[nodiscard]] peelf::Result<std::size_t> read_memory(
+        std::uint64_t address,
+        std::span<std::uint8_t> buffer) override {
+        return dbg_.session().read_memory(address, buffer);
+    }
+    [[nodiscard]] peelf::Result<std::size_t> write_memory(
+        std::uint64_t address,
+        std::span<const std::uint8_t> data,
+        peelf::MemoryWriteOptions options) override {
+        return dbg_.session().write_memory(address, data, options);
+    }
+
+private:
+    peelf::debugger::IDebugSession& dbg_;
+};
+
 } // namespace
 
     void BinaryModel::reset_all() {
@@ -98,6 +175,15 @@ std::filesystem::path utf8_path(std::string_view text) {
         ++structure_binding_revision_;
         ++bookmark_revision_;
         session_.reset();
+        if (debug_session_ != nullptr) {
+            (void)debug_session_->detach();
+            debug_session_.reset();
+        }
+        debug_breakpoints_.clear();
+        last_synced_debug_stop_revision_ = 0;
+        previous_debug_registers_.clear();
+        current_debug_registers_.clear();
+        has_previous_debug_stop_ = false;
         resolved_exe_path_.reset();
         regions_.clear();
         memory_summary_ = {};
@@ -506,6 +592,187 @@ std::filesystem::path utf8_path(std::string_view text) {
         }
         const auto* dump = dynamic_cast<const peelf::ICrashDumpSession*>(session_.get());
         return dump != nullptr ? &dump->crash_summary() : nullptr;
+    }
+
+    void BinaryModel::set_debug_backend(std::shared_ptr<peelf::debugger::IDebugBackend> backend) {
+        debug_backend_ = std::move(backend);
+    }
+
+    peelf::debugger::IDebugBackend& BinaryModel::debug_backend() {
+        if (!debug_backend_) {
+            debug_backend_ = peelf::debugger::create_native_debug_backend();
+        }
+        return *debug_backend_;
+    }
+
+    peelf::Result<void> BinaryModel::launch_debug_process(
+        const std::filesystem::path& executable,
+        std::span<const std::string> args,
+        const std::filesystem::path& working_dir) {
+        auto launched = debug_backend().launch(executable, args, working_dir);
+        if (!launched) {
+            last_diagnostic_ = launched.error().message;
+            return std::unexpected(launched.error());
+        }
+        return attach_debug_session(std::move(*launched));
+    }
+
+    peelf::Result<void> BinaryModel::attach_debug_process(peelf::ProcessId pid) {
+        auto attached = debug_backend().attach(pid);
+        if (!attached) {
+            last_diagnostic_ = attached.error().message;
+            return std::unexpected(attached.error());
+        }
+        return attach_debug_session(std::move(*attached));
+    }
+
+    peelf::Result<void> BinaryModel::attach_debug_session(
+        std::unique_ptr<peelf::debugger::IDebugSession> debug_session) {
+        if (!debug_session) {
+            last_diagnostic_ = "Debug session is null";
+            return peelf::make_error(last_diagnostic_);
+        }
+
+        reset_all();
+        debug_session_ = std::move(debug_session);
+        session_ = std::make_unique<DebugSessionProcessProxy>(*debug_session_);
+        source_kind_ = BinarySourceKind::LiveProcess;
+        architecture_ = session_->info().architecture != peelf::Architecture::Unknown
+                            ? session_->info().architecture
+                            : peelf::Architecture::X86_64;
+        endianness_ = session_->info().endianness;
+
+        std::error_code ec;
+        if (!session_->info().executable_path.empty() &&
+            std::filesystem::is_regular_file(session_->info().executable_path, ec)) {
+            resolved_exe_path_ = session_->info().executable_path;
+        } else if (!session_->info().command_line.empty()) {
+            resolved_exe_path_ = peelf::resolve_executable_from_command_line(
+                session_->info().command_line,
+                session_->info().working_directory);
+        }
+
+        auto map_res = refresh_process_map();
+        refresh_debug_breakpoints();
+        (void)sync_debugger_stop_state();
+        return map_res;
+    }
+
+    std::optional<std::uint64_t> BinaryModel::sync_debugger_stop_state() {
+        if (!debug_session_) {
+            return std::nullopt;
+        }
+
+        const peelf::debugger::DebugStopStatus st = debug_session_->stop_status();
+        if (st.stop_revision == last_synced_debug_stop_revision_) {
+            return std::nullopt;
+        }
+        last_synced_debug_stop_revision_ = st.stop_revision;
+        refresh_debug_breakpoints();
+
+        if (st.state != peelf::debugger::DebugSessionState::Paused) {
+            return std::nullopt;
+        }
+
+        if (!current_debug_registers_.empty()) {
+            previous_debug_registers_ = current_debug_registers_;
+            has_previous_debug_stop_ = true;
+        }
+
+        (void)refresh_process_map();
+        (void)refresh_threads();
+        if (st.active_tid != 0u) {
+            select_thread(st.active_tid);
+        } else {
+            refresh_selected_thread_inspection();
+        }
+        refresh_runtime_and_handlers();
+
+        current_debug_registers_.clear();
+        if (selected_thread_context_.has_value()) {
+            for (const peelf::RegisterValue& rv : selected_thread_context_.value->registers) {
+                current_debug_registers_[rv.name] = rv.value_u64;
+            }
+        }
+
+        if (st.instruction_pointer != 0u) {
+            (void)navigate_to_virtual_address(st.instruction_pointer);
+            return st.instruction_pointer;
+        }
+        return std::nullopt;
+    }
+
+    void BinaryModel::refresh_debug_breakpoints() {
+        if (debug_session_) {
+            debug_breakpoints_ = debug_session_->breakpoints();
+        } else {
+            debug_breakpoints_.clear();
+        }
+    }
+
+    const peelf::debugger::BreakpointDescriptor* BinaryModel::find_breakpoint_at(
+        std::uint64_t virtual_address) const noexcept {
+        for (const peelf::debugger::BreakpointDescriptor& bp : debug_breakpoints_) {
+            if (bp.address == virtual_address) {
+                return &bp;
+            }
+        }
+        return nullptr;
+    }
+
+    peelf::Result<bool> BinaryModel::toggle_software_breakpoint(
+        std::uint64_t virtual_address,
+        std::string label) {
+        if (!debug_session_) {
+            last_diagnostic_ = "No active opt-in debugger session";
+            return peelf::make_error(last_diagnostic_);
+        }
+        refresh_debug_breakpoints();
+        if (const auto* existing = find_breakpoint_at(virtual_address); existing != nullptr) {
+            const auto id = existing->id;
+            auto rem = debug_session_->remove_breakpoint(id);
+            refresh_debug_breakpoints();
+            if (!rem) {
+                last_diagnostic_ = rem.error().message;
+                return std::unexpected(rem.error());
+            }
+            return false;
+        }
+        if (label.empty()) {
+            label = resolve_address_symbol(virtual_address);
+        }
+        auto added = debug_session_->add_software_breakpoint(
+            virtual_address,
+            std::move(label),
+            analysis_thumb_mode_);
+        refresh_debug_breakpoints();
+        if (!added) {
+            last_diagnostic_ = added.error().message;
+            return std::unexpected(added.error());
+        }
+        return true;
+    }
+
+    bool BinaryModel::has_debug_register_changed(
+        std::string_view reg_name,
+        std::uint64_t current_value) const noexcept {
+        if (!has_previous_debug_stop_) {
+            return false;
+        }
+        const auto it = previous_debug_registers_.find(reg_name);
+        return it != previous_debug_registers_.end() && it->second != current_value;
+    }
+
+    std::optional<std::uint64_t> BinaryModel::previous_debug_register_value(
+        std::string_view reg_name) const noexcept {
+        if (!has_previous_debug_stop_) {
+            return std::nullopt;
+        }
+        const auto it = previous_debug_registers_.find(reg_name);
+        if (it == previous_debug_registers_.end()) {
+            return std::nullopt;
+        }
+        return it->second;
     }
 
     void BinaryModel::detach_process() {

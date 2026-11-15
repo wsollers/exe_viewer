@@ -21,6 +21,7 @@
 #include "ui_panels_process_internals.hpp"
 #include "ui_panels_dependencies.hpp"
 #include "ui_panels_diff.hpp"
+#include "ui_panels_debugger.hpp"
 #include "decompile/decompiler.hpp"
 #include <future>
 #include "disasm/disassembler.hpp"
@@ -175,6 +176,7 @@ namespace viewer {
         ProcessInternalsPanel process_internals_panel_;
         DependenciesPanel dependencies_panel_;
         BinaryDiffPanel binary_diff_panel_;
+        DebuggerPanel   debugger_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;

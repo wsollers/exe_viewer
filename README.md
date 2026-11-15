@@ -1,11 +1,11 @@
 # PE / ELF Explorer (C++23)
 
-A cross-platform executable & shared-library viewer:
-- **Core parsing library**: `peelf_core` (ELF + PE parsers, binary identity, sections/segments, imports/exports, symbols, relocations, PE data directories, and parser fixtures)
-- **GUI app**: `peelf_viewer` (Vulkan + GLFW + Dear ImGui), with structure navigation, Details/Hex/Disassembly panels, PE-specific tables, symbol/import/export browsing, call graph rendering, and a shellcode scratch panel
-- **Analysis integrations**: Capstone-backed disassembly, Graphviz-backed call graph layout, PDB/DIA symbol loading on Windows, and early AsmJit/AsmTK dependency support for future assembly-to-bytes providers
+A cross-platform executable, shared-library, crash-dump, and live-process analysis suite:
+- **Core parsing & runtime library**: `peelf_core` (PE32/PE32+ & ELF32/ELF64 LE/BE parsers, DWARF v4/v5 types & lines, multi-ABI demangling, dependency DAG resolution, binary & disk-vs-live-RAM diffing, BinSkim/checksec security rules, offline Windows `.dmp` Minidump & Linux `ET_CORE` crash dump sessions, strictly read-only `IProcessSession`, and opt-in BSD-2-Clause `IDebugSession` debugger)
+- **GUI app & headless CLI**: `peelf_viewer` + `peelf_gui` (Vulkan + GLFW + Dear ImGui), with structure navigation, Details/Hex/Disassembly, VMMap `Memory Map`, `Threads & Stack`, `Thread Locals`, `Structure View`, `Strings`, `References`, `Dependencies`, `Binary Diff`, `Process Internals`, opt-in `Debugger` workspace, interactive `Flow Graph`, multi-backend `Decompiler`, and JSON/SARIF 2.1.0 `--headless` CLI export
+- **Analysis integrations**: Capstone disassembly, Graphviz CFG layout, PDB/DIA & DWARF debug symbol hydration, AsmTK + `llvm-mc` assembly-to-bytes providers, `.pepatch.json` patch bundles, and Ghidra / Binary Ninja / RetDec / Structured Pseudo-C decompilation
 
-> Status: active development. The static PE/ELF parser and UI navigation paths are useful today, with richer PE/ELF spec coverage, live-process analysis, patch editing, and assembler/decompiler providers tracked in `ToDo.md`.
+> Status: Phase 0 (`P0-1..P0-10`) and the Next-Gen Execution Queue (`WU-01..WU-15`) are complete and covered by GoogleTest/CTest suites (`ToDo.md`).
 
 For architecture diagrams and data-flow notes, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -36,11 +36,12 @@ Original captures are stored in [`docs/screenshots`](docs/screenshots).
 ### UI resources and headless startup
 
 The executable is a small launcher. It loads the optional `peelf_gui` module only
-for interactive use. `peelf_viewer --headless` exits successfully without loading
-graphics dependencies. A missing GUI module or unavailable graphics initialization
-also exits successfully; failures after interactive startup still report failure.
+for interactive use. `peelf_viewer --headless` with no arguments exits `0` without
+loading graphics dependencies, while `peelf_viewer --headless <binary|dump> [--format json|sarif] [--compare <other>] [--fail-on none|error|warning]`
+exports structured metadata, dependencies, symbols, security findings (`PE1001..PE1008`,
+`ELF2001..ELF2008`), crash-dump summaries, and binary diffs for CI pipelines.
 Configure with `-DPEELF_BUILD_GUI=OFF` to build the launcher without Vulkan, GLFW,
-ImGui, or native file dialogs. Headless analysis commands are not implemented yet.
+ImGui, or native file dialogs.
 
 The GUI loads `resources/theme.ini` beside the executable at startup. It contains
 RGBA color tokens and spacing/rounding metrics. Use **View > Reload theme** to

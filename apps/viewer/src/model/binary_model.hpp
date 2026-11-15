@@ -19,6 +19,7 @@
 
 #include <peelf/binary_image.hpp>
 #include <peelf/crash_dump.hpp>
+#include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/handlers.hpp>
@@ -82,7 +83,7 @@ namespace viewer {
 
         bool load_file(const std::string& path);
 
-        // Live process inspection & attach API.
+        // Live process inspection & attach API (100% strictly read-only by default).
         void set_process_backend(std::shared_ptr<peelf::IProcessBackend> backend);
         [[nodiscard]] peelf::IProcessBackend& process_backend();
         [[nodiscard]] peelf::Result<std::vector<peelf::ProcessInfo>> list_processes();
@@ -90,6 +91,37 @@ namespace viewer {
         [[nodiscard]] peelf::Result<void> attach_session(std::unique_ptr<peelf::IProcessSession> session);
         void detach_process();
         [[nodiscard]] peelf::Result<void> refresh_process_map();
+
+        // Explicit opt-in active debugger session API (uses IDebugSession breakpoints & execution control).
+        void set_debug_backend(std::shared_ptr<peelf::debugger::IDebugBackend> backend);
+        [[nodiscard]] peelf::debugger::IDebugBackend& debug_backend();
+        [[nodiscard]] peelf::Result<void> launch_debug_process(
+            const std::filesystem::path& executable,
+            std::span<const std::string> args = {},
+            const std::filesystem::path& working_dir = {});
+        [[nodiscard]] peelf::Result<void> attach_debug_process(peelf::ProcessId pid);
+        [[nodiscard]] peelf::Result<void> attach_debug_session(
+            std::unique_ptr<peelf::debugger::IDebugSession> debug_session);
+        [[nodiscard]] bool is_debug_session() const noexcept { return debug_session_ != nullptr; }
+        [[nodiscard]] peelf::debugger::IDebugSession* debug_session() noexcept { return debug_session_.get(); }
+        [[nodiscard]] const peelf::debugger::IDebugSession* debug_session() const noexcept {
+            return debug_session_.get();
+        }
+        [[nodiscard]] std::optional<std::uint64_t> sync_debugger_stop_state();
+        void refresh_debug_breakpoints();
+        [[nodiscard]] std::span<const peelf::debugger::BreakpointDescriptor> debug_breakpoints() const noexcept {
+            return debug_breakpoints_;
+        }
+        [[nodiscard]] const peelf::debugger::BreakpointDescriptor* find_breakpoint_at(
+            std::uint64_t virtual_address) const noexcept;
+        [[nodiscard]] peelf::Result<bool> toggle_software_breakpoint(
+            std::uint64_t virtual_address,
+            std::string label = {});
+        [[nodiscard]] bool has_debug_register_changed(
+            std::string_view reg_name,
+            std::uint64_t current_value) const noexcept;
+        [[nodiscard]] std::optional<std::uint64_t> previous_debug_register_value(
+            std::string_view reg_name) const noexcept;
 
         [[nodiscard]] peelf::Result<void> select_process_module(std::size_t module_index);
         [[nodiscard]] peelf::Result<void> select_memory_region(std::size_t region_index,
@@ -337,7 +369,14 @@ namespace viewer {
         std::uint64_t bookmark_revision_ = 0;
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
+        std::shared_ptr<peelf::debugger::IDebugBackend> debug_backend_;
+        std::unique_ptr<peelf::debugger::IDebugSession> debug_session_;
         std::unique_ptr<peelf::IProcessSession> session_;
+        std::vector<peelf::debugger::BreakpointDescriptor> debug_breakpoints_;
+        std::uint64_t last_synced_debug_stop_revision_ = 0;
+        std::map<std::string, std::uint64_t, std::less<>> previous_debug_registers_;
+        std::map<std::string, std::uint64_t, std::less<>> current_debug_registers_;
+        bool has_previous_debug_stop_ = false;
         std::optional<std::filesystem::path> resolved_exe_path_;
         std::vector<peelf::MemoryRegion> regions_;
         peelf::ForgivingValue<peelf::ProcessMemorySummary> memory_summary_;
