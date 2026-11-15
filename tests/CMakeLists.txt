@@ -59,6 +59,7 @@ add_executable(peelf_tests
   analysis_project_test.cpp
   dependency_tree_test.cpp
   binary_diff_test.cpp
+  security_headless_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp
   shellcode_converter_test.cpp
@@ -171,8 +172,16 @@ if(Python3_Interpreter_FOUND)
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/bn_bridge_test.py)
 endif()
 if(TARGET peelf_viewer)
+  target_compile_definitions(peelf_tests PRIVATE
+    PEELF_VIEWER_EXE="$<TARGET_FILE:peelf_viewer>"
+  )
+  add_dependencies(peelf_tests peelf_viewer)
   add_test(NAME Startup.Headless COMMAND peelf_viewer --headless)
   add_test(NAME Startup.Help COMMAND peelf_viewer --help)
+  add_test(NAME Headless.FixtureJson
+    COMMAND peelf_viewer --headless $<TARGET_FILE:peelf_callgraph_fixture> --format json --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture.json)
+  add_test(NAME Headless.FixtureSarif
+    COMMAND peelf_viewer --headless $<TARGET_FILE:peelf_callgraph_fixture> --format sarif --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture.sarif)
   add_test(NAME Startup.WithoutGuiModule COMMAND ${CMAKE_COMMAND}
     -DLAUNCHER=$<TARGET_FILE:peelf_viewer>
     -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-isolated

@@ -440,6 +440,8 @@ namespace viewer {
     private:
         BinaryModel& model_;
         char flags_filter_buf_[128] = {};
+        char audit_filter_buf_[128] = {};
+        int audit_severity_filter_ = 0; // 0 = All, 1 = Warnings & Errors, 2 = Errors Only
         std::function<void(std::uint64_t, PreferredView)> on_address_activated_;
     };
 

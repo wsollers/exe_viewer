@@ -27,6 +27,7 @@
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
 #include <peelf/runtime_structures.hpp>
+#include <peelf/security_audit.hpp>
 #include <peelf/stack_tls.hpp>
 
 namespace viewer {
@@ -221,6 +222,7 @@ namespace viewer {
             return thread_env_;
         }
         [[nodiscard]] const peelf::HandlersReport& handlers_report() const noexcept { return handlers_report_; }
+        [[nodiscard]] const peelf::SecurityAuditReport& security_audit() const noexcept { return security_audit_; }
 
         // Read-only lazy/manual Process Explorer & System Informer user-mode telemetry.
         void refresh_process_internals();
@@ -353,6 +355,7 @@ namespace viewer {
         peelf::ProcessEnvironmentSnapshot process_env_;
         peelf::ThreadEnvironmentSnapshot thread_env_;
         peelf::HandlersReport handlers_report_;
+        peelf::SecurityAuditReport security_audit_;
         peelf::ProcessInternalsSnapshot process_internals_{};
         bool process_internals_loaded_{false};
         peelf::ThreadCpuTracker thread_cpu_tracker_{};

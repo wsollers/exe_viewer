@@ -99,6 +99,120 @@ void RuntimeAndFlagsPanel::draw_contents() {
     }
 
     if (ImGui::BeginTabBar("RuntimeAndFlagsTabs")) {
+        if (ImGui::BeginTabItem("Security Audit (BinSkim)")) {
+            const peelf::SecurityAuditReport& audit = model_.security_audit();
+            const std::string_view av = peelf::to_string(audit.status.availability);
+            ImGui::TextColored(runtime_avail_color(audit.status.availability),
+                               "[%.*s] %s",
+                               static_cast<int>(av.size()),
+                               av.data(),
+                               audit.status.detail.c_str());
+
+            ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "Errors: %zu", audit.error_count);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.00f, 0.78f, 0.28f, 1.0f), "  Warnings: %zu", audit.warning_count);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.55f, 0.80f, 1.00f, 1.0f), "  Notes: %zu", audit.note_count);
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.42f, 0.92f, 0.58f, 1.0f), "  Passed: %zu", audit.pass_count);
+
+            ImGui::SetNextItemWidth(190.0f);
+            ImGui::Combo("Severity##AuditSev",
+                         &audit_severity_filter_,
+                         "All Rules\0Warnings & Errors\0Errors Only\0");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##AuditFilter",
+                                     "Filter rule ID (PE1001, ELF2003, LIVE3001), summary, or evidence...",
+                                     audit_filter_buf_,
+                                     sizeof(audit_filter_buf_));
+            const std::string_view afilter(audit_filter_buf_);
+
+            if (ImGui::BeginTable("SecurityAuditTable",
+                                  5,
+                                  ImGuiTableFlags_Borders |
+                                      ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_Resizable |
+                                      ImGuiTableFlags_ScrollY)) {
+                ImGui::TableSetupColumn("Rule ID", ImGuiTableColumnFlags_WidthFixed, 86.0f);
+                ImGui::TableSetupColumn("Severity", ImGuiTableColumnFlags_WidthFixed, 78.0f);
+                ImGui::TableSetupColumn("Subject / VA", ImGuiTableColumnFlags_WidthFixed, 175.0f);
+                ImGui::TableSetupColumn("Finding & Evidence", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Remediation", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableHeadersRow();
+
+                for (std::size_t idx = 0; idx < audit.findings.size(); ++idx) {
+                    const peelf::SecurityFinding& f = audit.findings[idx];
+                    if (audit_severity_filter_ == 1 &&
+                        f.severity != peelf::SecuritySeverity::Warning &&
+                        f.severity != peelf::SecuritySeverity::Error) {
+                        continue;
+                    }
+                    if (audit_severity_filter_ == 2 &&
+                        f.severity != peelf::SecuritySeverity::Error) {
+                        continue;
+                    }
+                    if (!afilter.empty() &&
+                        !icontains_rt(f.rule_id, afilter) &&
+                        !icontains_rt(f.rule_name, afilter) &&
+                        !icontains_rt(f.subject, afilter) &&
+                        !icontains_rt(f.summary, afilter) &&
+                        !icontains_rt(f.evidence, afilter)) {
+                        continue;
+                    }
+
+                    ImVec4 sev_col(0.75f, 0.75f, 0.75f, 1.0f);
+                    switch (f.severity) {
+                        case peelf::SecuritySeverity::Pass:    sev_col = ImVec4(0.42f, 0.92f, 0.58f, 1.0f); break;
+                        case peelf::SecuritySeverity::Note:    sev_col = ImVec4(0.55f, 0.80f, 1.00f, 1.0f); break;
+                        case peelf::SecuritySeverity::Warning: sev_col = ImVec4(1.00f, 0.78f, 0.28f, 1.0f); break;
+                        case peelf::SecuritySeverity::Error:   sev_col = ImVec4(0.95f, 0.42f, 0.42f, 1.0f); break;
+                    }
+
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::PushID(static_cast<int>(idx));
+                    std::optional<std::uint64_t> nav_va = f.virtual_address;
+                    if (!nav_va.has_value() && f.file_offset.has_value()) {
+                        nav_va = model_.offset_to_virtual_address(*f.file_offset);
+                    }
+                    if (nav_va.has_value() && on_address_activated_) {
+                        if (ImGui::Selectable(f.rule_id.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                            on_address_activated_(*nav_va, PreferredView::Hex);
+                        }
+                    } else {
+                        ImGui::TextUnformatted(f.rule_id.c_str());
+                    }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s\n%s", f.rule_name.c_str(), f.evidence.c_str());
+                    }
+                    ImGui::PopID();
+
+                    ImGui::TableNextColumn();
+                    const std::string_view sv = peelf::to_string(f.severity);
+                    ImGui::TextColored(sev_col, "%.*s", static_cast<int>(sv.size()), sv.data());
+
+                    ImGui::TableNextColumn();
+                    if (f.virtual_address.has_value()) {
+                        ImGui::Text("%s (0x%" PRIX64 ")", f.subject.c_str(), *f.virtual_address);
+                    } else if (f.file_offset.has_value()) {
+                        ImGui::Text("%s (+0x%" PRIX64 ")", f.subject.c_str(), *f.file_offset);
+                    } else {
+                        ImGui::TextUnformatted(f.subject.c_str());
+                    }
+
+                    ImGui::TableNextColumn();
+                    ImGui::TextWrapped("%s  [%s]", f.summary.c_str(), f.evidence.c_str());
+
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", f.remediation.c_str());
+                }
+                ImGui::EndTable();
+            }
+            ImGui::EndTabItem();
+        }
+
         if (ImGui::BeginTabItem("Header & Security Flags")) {
             const peelf::HeaderFlagsReport& hf = model_.header_flags();
             const std::string_view av = peelf::to_string(hf.status.availability);

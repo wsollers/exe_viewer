@@ -1,6 +1,10 @@
+#include <peelf/security_audit.hpp>
+
 #include <cstdio>
 #include <filesystem>
+#include <iostream>
 #include <string_view>
+#include <vector>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -8,13 +12,19 @@
 #endif
 
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i) {
-        if (std::string_view(argv[i]) == "--headless") return 0;
-        if (std::string_view(argv[i]) == "--help") {
-            std::puts("PE/ELF Explorer\n  --headless  Exit successfully without loading the GUI\n  --help      Show this help");
-            return 0;
+    std::vector<std::string_view> args;
+    if (argc > 1) {
+        args.reserve(static_cast<std::size_t>(argc - 1));
+        for (int i = 1; i < argc; ++i) {
+            args.emplace_back(argv[i]);
         }
     }
+
+    if (const auto cli_exit = peelf::try_run_headless_or_help_cli(args, std::cout, std::cerr);
+        cli_exit.has_value()) {
+        return *cli_exit;
+    }
+
 #ifdef _WIN32
     wchar_t executable[32768]{};
     GetModuleFileNameW(nullptr, executable, 32768);

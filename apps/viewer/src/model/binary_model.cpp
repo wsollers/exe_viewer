@@ -118,6 +118,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         process_env_ = {};
         thread_env_ = {};
         handlers_report_ = {};
+        security_audit_ = {};
         process_internals_ = {};
         process_internals_loaded_ = false;
         thread_cpu_tracker_.reset();
@@ -1906,6 +1907,25 @@ std::filesystem::path utf8_path(std::string_view text) {
             modules_,
             ctx_ptr,
             sym_fn);
+
+        const peelf::ProcessSecurityProfile* cached_sec =
+            (process_internals_loaded_ && process_internals_.security.has_value())
+                ? &(*process_internals_.security.value)
+                : nullptr;
+        if (image_ != nullptr) {
+            security_audit_ = peelf::audit_security(
+                *image_,
+                analysis_image_bytes(),
+                is_live_process() ? session_.get() : nullptr,
+                cached_sec);
+        } else if (is_live_process() && session_ != nullptr) {
+            security_audit_ = peelf::audit_live_process_security(*session_, cached_sec);
+        } else {
+            security_audit_ = {};
+            security_audit_.status = peelf::SubsystemStatus::unavailable(
+                "security_audit",
+                "Open a PE/ELF image or attach to a process to evaluate security rules");
+        }
     }
 
     void BinaryModel::refresh_process_internals() {
@@ -1922,6 +1942,13 @@ std::filesystem::path utf8_path(std::string_view text) {
         }
         process_internals_ = peelf::inspect_process_internals(*session_);
         process_internals_loaded_ = true;
+        const peelf::ProcessSecurityProfile* cached_sec =
+            process_internals_.security.has_value() ? &(*process_internals_.security.value) : nullptr;
+        if (image_ != nullptr) {
+            security_audit_ = peelf::audit_security(*image_, analysis_image_bytes(), session_.get(), cached_sec);
+        } else {
+            security_audit_ = peelf::audit_live_process_security(*session_, cached_sec);
+        }
     }
 
 } // namespace viewer

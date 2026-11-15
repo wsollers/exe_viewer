@@ -264,3 +264,9 @@ targets refresh the matrix when cross-toolchain coverage changes.
 - `peelf::compare_module_disk_to_live` rebases an on-disk PE/ELF module to its live runtime `ModuleInfo::base_address`, normalizes `.reloc` / ELF `RELATIVE` entries, LoadConfig security cookies, and legitimate IAT/GOT loader resolutions, and surfaces unexpected `.text` `InlineCodeHook` detours and `IatGotPointerHook` hijacks.
 - `viewer::BinaryDiffPanel` (`View > Binary Diff`, `File > Compare With Binary...`) provides tabbed inspection plus synchronized side-by-side Hex and Disassembly views.
 
+## Security & Hardening Rule Engine & Headless CLI (`WU-13`)
+
+- `peelf::audit_security` and `peelf::audit_live_process_security` (`libs/peelf_core/include/peelf/security_audit.hpp`) evaluate 19 formalized BinSkim/checksec-style rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`) with `Pass`/`Note`/`Warning`/`Error` severities, header/directory/segment/live-region evidence, navigable virtual-address/file-offset anchors, and remediation guidance, surfaced in the GUI inside `PEB / TEB & Flags` (`Security Audit (BinSkim)` tab).
+- `peelf_viewer` links `peelf::core` directly (with zero Vulkan/GLFW/ImGui shared-library dependencies) so `peelf_viewer --headless [<binary> [options]]` works in GUI-less CI containers: bare `--headless` exits `0` for smoke compatibility, while `--headless <binary>` supports `--compare`, `--format json|sarif` (valid SARIF 2.1.0), `--output` (atomic write), `--search-root`, `--include-strings` / `--min-string-len`, and `--fail-on none|error|warning` (`0` clean, `1` CLI/file/parse error, `2` policy gate failure).
+
+
