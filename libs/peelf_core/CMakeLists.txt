@@ -2,6 +2,7 @@ add_library(peelf_core
   src/pe/pe_parser.cpp
   src/elf/elf_parser.cpp
   src/file_reader.cpp
+  src/sha256.cpp
   src/endian_reader.cpp
   src/binary_image.cpp
   src/patching.cpp
@@ -16,6 +17,7 @@ add_library(peelf_core
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
   include/peelf/error.hpp
+  include/peelf/sha256.hpp
   include/peelf/forgiving.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp

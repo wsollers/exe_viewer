@@ -1664,3 +1664,98 @@ TEST(BinaryImageReview, PeResolvesCoffLongSectionNames) {
     ASSERT_FALSE((*parsed)->sections().empty());
     EXPECT_EQ((*parsed)->sections()[0].name, ".debug_long_name");
 }
+
+TEST(BinaryImageReview, ElfRelocatableObjectMapsAllocatedSectionsWithoutDebugCollision) {
+    // 64-bit little-endian ET_REL (.o) with zero program headers:
+    //   [0] SHT_NULL
+    //   [1] .debug_info (SHT_PROGBITS, flags=0, addr=0x0, off=0x80, size=0x20)
+    //   [2] .text       (SHT_PROGBITS, SHF_ALLOC|SHF_EXECINSTR, addr=0x0, off=0xA0, size=0x18)
+    //   [3] .data       (SHT_PROGBITS, SHF_ALLOC|SHF_WRITE, addr=0x100, off=0xC0, size=0x10)
+    //   [4] .bss        (SHT_NOBITS,   SHF_ALLOC|SHF_WRITE, addr=0x200, off=0xD0, size=0x40)
+    //   [5] .shstrtab   (SHT_STRTAB,   flags=0, addr=0x0, off=0xE0, size=0x30)
+    std::vector<std::uint8_t> bytes(0x300, 0);
+    bytes[0] = 0x7F;
+    bytes[1] = 'E';
+    bytes[2] = 'L';
+    bytes[3] = 'F';
+    bytes[4] = 2;  // ELFCLASS64
+    bytes[5] = 1;  // ELFDATA2LSB
+    bytes[6] = 1;  // EV_CURRENT
+    put16(bytes, 16, 1);     // ET_REL
+    put16(bytes, 18, 62);    // EM_X86_64
+    put32(bytes, 20, 1);     // EV_CURRENT
+    put64(bytes, 40, 0x140); // e_shoff
+    put16(bytes, 52, 64);    // e_ehsize
+    put16(bytes, 58, 64);    // e_shentsize
+    put16(bytes, 60, 6);     // e_shnum
+    put16(bytes, 62, 5);     // e_shstrndx
+
+    // .shstrtab at 0xE0: "\0.debug_info\0.text\0.data\0.bss\0.shstrtab\0"
+    const std::size_t strtab_off = 0xE0;
+    put_ascii(bytes, strtab_off + 1, ".debug_info");  // 1
+    put_ascii(bytes, strtab_off + 13, ".text");       // 13
+    put_ascii(bytes, strtab_off + 19, ".data");       // 19
+    put_ascii(bytes, strtab_off + 25, ".bss");        // 25
+    put_ascii(bytes, strtab_off + 30, ".shstrtab");   // 30
+
+    auto write_sh64 = [&](std::size_t idx, std::uint32_t name, std::uint32_t type,
+                          std::uint64_t flags, std::uint64_t addr, std::uint64_t off,
+                          std::uint64_t size) {
+        const std::size_t base = 0x140 + idx * 64;
+        put32(bytes, base + 0, name);
+        put32(bytes, base + 4, type);
+        put64(bytes, base + 8, flags);
+        put64(bytes, base + 16, addr);
+        put64(bytes, base + 24, off);
+        put64(bytes, base + 32, size);
+    };
+
+    write_sh64(1, 1, 1, 0x0, 0x0, 0x80, 0x20);     // .debug_info (unallocated at VA 0)
+    write_sh64(2, 13, 1, 0x6, 0x0, 0xA0, 0x18);    // .text (SHF_ALLOC | SHF_EXECINSTR)
+    write_sh64(3, 19, 1, 0x3, 0x100, 0xC0, 0x10);  // .data (SHF_ALLOC | SHF_WRITE)
+    write_sh64(4, 25, 8, 0x3, 0x200, 0xD0, 0x40);  // .bss  (SHT_NOBITS)
+    write_sh64(5, 30, 3, 0x0, 0x0, strtab_off, 0x30);
+
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const auto& img = **parsed;
+    EXPECT_EQ(img.kind(), peelf::ImageKind::Object);
+    EXPECT_TRUE(img.segments().empty());
+
+    // VA 0 resolves to allocated .text (0xA0), never to unallocated .debug_info (0x80).
+    EXPECT_EQ(img.virtual_address_to_file_offset(0x0), 0xA0u);
+    EXPECT_EQ(img.file_offset_to_virtual_address(0xA4), 0x4u);
+
+    // Allocated .data resolves in both directions.
+    EXPECT_EQ(img.virtual_address_to_file_offset(0x108), 0xC8u);
+    EXPECT_EQ(img.file_offset_to_virtual_address(0xC8), 0x108u);
+
+    // Unallocated .debug_info and SHT_NOBITS .bss do not fabricate file/VA mappings.
+    EXPECT_EQ(img.file_offset_to_virtual_address(0x80), std::nullopt);
+    EXPECT_EQ(img.virtual_address_to_file_offset(0x200), std::nullopt);
+}
+
+TEST(BinaryImageReview, LiveMappedHeaderOnlyElfFallsBackToMappedSpan) {
+    std::vector<std::uint8_t> mapped(0x1200, 0);
+    mapped[0] = 0x7F;
+    mapped[1] = 'E';
+    mapped[2] = 'L';
+    mapped[3] = 'F';
+    mapped[4] = 2;  // ELFCLASS64
+    mapped[5] = 1;  // ELFDATA2LSB
+    mapped[6] = 1;  // EV_CURRENT
+    put16(mapped, 16, 3);   // ET_DYN
+    put16(mapped, 18, 62);  // EM_X86_64
+    put32(mapped, 20, 1);   // EV_CURRENT
+    put16(mapped, 52, 64);  // e_ehsize
+
+    constexpr std::uint64_t kLiveBase = 0x7f1234000000ull;
+    auto parsed = peelf::parse_mapped_image(mapped, kLiveBase);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const auto& img = **parsed;
+    EXPECT_TRUE(img.segments().empty());
+    EXPECT_EQ(img.file_offset_to_virtual_address(0x1080), kLiveBase + 0x1080u);
+    EXPECT_EQ(img.virtual_address_to_file_offset(kLiveBase + 0x1080), 0x1080u);
+    EXPECT_EQ(img.file_offset_to_virtual_address(0x1200), std::nullopt);
+    EXPECT_EQ(img.virtual_address_to_file_offset(kLiveBase + 0x1200), std::nullopt);
+}

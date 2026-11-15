@@ -272,9 +272,15 @@ public:
     [[nodiscard]] virtual Result<std::vector<ModuleInfo>> modules() = 0;
     [[nodiscard]] virtual Result<std::size_t> read_memory(std::uint64_t address,
                                                           std::span<std::uint8_t> buffer) = 0;
-    [[nodiscard]] virtual Result<std::size_t> write_memory(std::uint64_t address,
-                                                           std::span<const std::uint8_t> data,
-                                                           MemoryWriteOptions options = {}) = 0;
+
+    /// Live process inspection is strictly read-only (`is_read_only() == true`).
+    /// Retained only as a retired error-returning stub so existing `LiveMemoryPatchSpace`
+    /// error-handling contracts and fake test doubles fail closed without modifying target RAM.
+    [[nodiscard]] virtual Result<std::size_t> write_memory(std::uint64_t /*address*/,
+                                                           std::span<const std::uint8_t> /*data*/,
+                                                           MemoryWriteOptions /*options*/ = {}) {
+        return make_error("live process inspection is strictly read-only; target memory is never modified");
+    }
 
     [[nodiscard]] virtual Result<void> suspend() {
         return make_error("process suspend is not supported by this session");

@@ -145,15 +145,26 @@ public:
     [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
         return {};
     }
+    [[nodiscard]] bool has_elf_pt_load() const noexcept {
+        for (const auto& segment : segments_) {
+            if (segment.type == 1) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
-        if (format_ == Format::ELF) {
+        if (format_ == Format::ELF && has_elf_pt_load()) {
             for (const auto& segment : segments_) {
                 if (segment.type == 1 && file_offset >= segment.file_offset &&
-                    file_offset - segment.file_offset < std::min(segment.file_size, segment.virtual_size))
+                    file_offset - segment.file_offset < std::min(segment.file_size, segment.virtual_size)) {
                     return checked_add_u64(segment.virtual_address, file_offset - segment.file_offset);
+                }
             }
-            // Section headers are not a loader mapping (debug sections may have VA zero).
+            // When PT_LOAD program headers exist, section headers are not a loader mapping
+            // (non-SHF_ALLOC debug sections may have VA zero).
             return std::nullopt;
         }
         for (const Section& section : sections_) {
@@ -161,22 +172,11 @@ public:
                 continue;
             }
             if (format_ == Format::ELF && !section.readable && !section.writable &&
-                !section.executable && section.virtual_address == 0) {
+                !section.executable) {
                 continue;
             }
             if (file_offset >= section.file_offset && file_offset - section.file_offset < section.file_size) {
                 return checked_add_u64(section.virtual_address, file_offset - section.file_offset);
-            }
-        }
-        if (format_ == Format::ELF) {
-            for (const Segment& segment : segments_) {
-                if (segment.type != 1 || segment.file_size == 0) {  // PT_LOAD
-                    continue;
-                }
-                if (file_offset >= segment.file_offset &&
-                    file_offset - segment.file_offset < segment.file_size) {
-                    return checked_add_u64(segment.virtual_address, file_offset - segment.file_offset);
-                }
             }
         }
         if (is_live_mapped_ && file_offset < mapped_span_size_) {
@@ -187,17 +187,18 @@ public:
 
     [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
         std::uint64_t virtual_address) const noexcept override {
-        if (format_ == Format::ELF) {
+        if (format_ == Format::ELF && has_elf_pt_load()) {
             for (const auto& segment : segments_) {
                 if (segment.type == 1 && virtual_address >= segment.virtual_address &&
-                    virtual_address - segment.virtual_address < std::min(segment.file_size, segment.virtual_size))
+                    virtual_address - segment.virtual_address < std::min(segment.file_size, segment.virtual_size)) {
                     return checked_add_u64(segment.file_offset, virtual_address - segment.virtual_address);
+                }
             }
             return std::nullopt;
         }
         for (const Section& section : sections_) {
             if (format_ == Format::ELF && !section.readable && !section.writable &&
-                !section.executable && section.virtual_address == 0) {
+                !section.executable) {
                 continue;
             }
             const std::uint64_t mapped_size = section.virtual_size != 0 ? section.virtual_size : section.file_size;
@@ -211,26 +212,6 @@ public:
                     return std::nullopt;
                 }
                 return checked_add_u64(section.file_offset, delta);
-            }
-        }
-        if (format_ == Format::ELF) {
-            for (const Segment& segment : segments_) {
-                if (segment.type != 1) {  // PT_LOAD
-                    continue;
-                }
-                const std::uint64_t mapped_size =
-                    segment.virtual_size != 0 ? segment.virtual_size : segment.file_size;
-                if (mapped_size == 0) {
-                    continue;
-                }
-                if (virtual_address >= segment.virtual_address &&
-                    virtual_address - segment.virtual_address < mapped_size) {
-                    const std::uint64_t delta = virtual_address - segment.virtual_address;
-                    if (delta >= segment.file_size) {
-                        return std::nullopt;
-                    }
-                    return checked_add_u64(segment.file_offset, delta);
-                }
             }
         }
         if (is_live_mapped_ && virtual_address >= image_base_ &&
@@ -2693,6 +2674,8 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse_mapped(
     }
 
     elf->rebase_to_live_base(live_base);
+    elf->mapped_span_size_ =
+        std::max<std::uint64_t>(elf->mapped_span_size_, static_cast<std::uint64_t>(mapped_bytes.size()));
     return parsed;
 }
 

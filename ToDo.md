@@ -46,7 +46,7 @@ and raising overall code quality.
 
 Each work unit below is sized as a self-contained, testable commit+push slice on `main` (C++23, CppCoreGuidelines, Effective Modern C++, zero regressions across `ctest`).
 
-- [ ] **WU-01** — **Core `SHA-256` Digest + ELF Mapping Fallback & WOW64 Thread-Context Fixes.** *(Depends on: none)*
+- [x] **WU-01** — **Core `SHA-256` Digest + ELF Mapping Fallback & WOW64 Thread-Context Fixes.** *(Depends on: none)*
   - Add dependency-free C++23 `peelf/sha256.hpp` + `src/sha256.cpp` (`Sha256Hasher`, `sha256_bytes`, `sha256_hex`) validated against NIST FIPS 180-4 vectors.
   - Fix `ImageBase::file_offset_to_virtual_address` and `ImageBase::virtual_address_to_file_offset` in `libs/peelf_core/src/binary_image.cpp` so ELF images with `PT_LOAD` keep `PT_LOAD` authoritative (preventing non-`SHF_ALLOC` debug sections at VA `0` from shadowing VA `0`), while `ET_REL` object files, section-only ELFs without `PT_LOAD`, and pure-RAM `is_live_mapped_` spans cleanly reach the allocated-section / live-mapped fallback instead of dead code.
   - Fix `Win32ProcessSession::thread_context` in `process_win32.cpp` to use `Wow64SuspendThread` for 32-bit WOW64 threads on 64-bit hosts, and document `IProcessSession::write_memory` as an explicit read-only error stub.

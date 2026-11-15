@@ -42,6 +42,7 @@ add_executable(peelf_tests
   smoke_test.cpp
   file_mapping_test.cpp
   peelf_core_test.cpp
+  sha256_test.cpp
   parsers_test.cpp
   binary_image_test.cpp
   disassembler_test.cpp

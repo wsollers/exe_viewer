@@ -709,7 +709,13 @@ public:
 
         bool transiently_paused = false;
         if (can_suspend && !is_self && !already_paused) {
-            if (::SuspendThread(th.get()) != static_cast<DWORD>(-1)) {
+            const DWORD prev =
+#if defined(_M_X64) || defined(__x86_64__)
+                (!info_.is_64bit) ? ::Wow64SuspendThread(th.get()) : ::SuspendThread(th.get());
+#else
+                ::SuspendThread(th.get());
+#endif
+            if (prev != static_cast<DWORD>(-1)) {
                 transiently_paused = true;
             }
         }
