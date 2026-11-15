@@ -93,6 +93,9 @@ std::filesystem::path utf8_path(std::string_view text) {
         active_debug_types_.clear();
         active_source_lines_.clear();
         applied_structures_.clear();
+        bookmarks_.clear();
+        ++structure_binding_revision_;
+        ++bookmark_revision_;
         session_.reset();
         resolved_exe_path_.reset();
         regions_.clear();
@@ -1012,16 +1015,68 @@ std::filesystem::path utf8_path(std::string_view text) {
                 if (!binding.label.empty()) {
                     existing.label = std::move(binding.label);
                 }
+                ++structure_binding_revision_;
                 return;
             }
         }
         applied_structures_.push_back(std::move(binding));
+        ++structure_binding_revision_;
     }
 
     void BinaryModel::remove_applied_structure(std::size_t index) {
         if (index < applied_structures_.size()) {
             applied_structures_.erase(applied_structures_.begin() + static_cast<std::ptrdiff_t>(index));
+            ++structure_binding_revision_;
         }
+    }
+
+    void BinaryModel::add_or_update_bookmark(Bookmark bookmark) {
+        for (Bookmark& existing : bookmarks_) {
+            if (existing.address == bookmark.address &&
+                existing.is_file_offset == bookmark.is_file_offset) {
+                existing = std::move(bookmark);
+                ++bookmark_revision_;
+                return;
+            }
+        }
+        const auto pos = std::ranges::lower_bound(
+            bookmarks_,
+            bookmark,
+            [](const Bookmark& lhs, const Bookmark& rhs) {
+                if (lhs.is_file_offset != rhs.is_file_offset) {
+                    return lhs.is_file_offset < rhs.is_file_offset;
+                }
+                return lhs.address < rhs.address;
+            });
+        bookmarks_.insert(pos, std::move(bookmark));
+        ++bookmark_revision_;
+    }
+
+    bool BinaryModel::remove_bookmark_at(std::uint64_t address, bool is_file_offset) {
+        const auto it = std::ranges::find_if(bookmarks_, [&](const Bookmark& bm) {
+            return bm.address == address && bm.is_file_offset == is_file_offset;
+        });
+        if (it == bookmarks_.end()) {
+            return false;
+        }
+        bookmarks_.erase(it);
+        ++bookmark_revision_;
+        return true;
+    }
+
+    void BinaryModel::remove_bookmark_index(std::size_t index) {
+        if (index < bookmarks_.size()) {
+            bookmarks_.erase(bookmarks_.begin() + static_cast<std::ptrdiff_t>(index));
+            ++bookmark_revision_;
+        }
+    }
+
+    const Bookmark* BinaryModel::find_bookmark(std::uint64_t address,
+                                               bool is_file_offset) const noexcept {
+        const auto it = std::ranges::find_if(bookmarks_, [&](const Bookmark& bm) {
+            return bm.address == address && bm.is_file_offset == is_file_offset;
+        });
+        return it != bookmarks_.end() ? &*it : nullptr;
     }
 
     std::uint64_t BinaryModel::view_base_address() const noexcept {

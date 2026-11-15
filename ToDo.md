@@ -68,7 +68,7 @@ Each work unit below is sized as a self-contained, testable commit+push slice on
 - [x] **WU-08** — **Process Explorer & System Informer User-Mode Harvest (`P6-18` Completion).** *(Depends on: `WU-07`)*
   - *Licensing note:* System Informer v3+ and `phnt` are MIT-licensed (compatible with `exe_viewer`'s BSD-2-Clause license).
   - Add lazy-loaded, forgiving (`Available`/`Partial`/`Unavailable`) inspection tabs for Open Handles & File Descriptors (`/proc/<pid>/fd` + `fdinfo`; Win32 handle table), Network Sockets (`/proc/net/{tcp,udp,unix}` inode correlation; Win32 `GetExtendedTcpTable`/`GetExtendedUdpTable`), Security Token/Capabilities/Mitigations (Win32 Token/Integrity/`GetProcessMitigationPolicy`; Linux `Cap*`/`Seccomp`/`NoNewPrivs`/LSM/cgroups/namespaces), and Thread Start Address + Wait Reason (`wchan`) + CPU deltas.
-- [ ] **WU-09** — **Reliable `.peproj` v2 Analysis Sessions (Feedback Priority #6).** *(Depends on: `WU-01`, `WU-06`)*
+- [x] **WU-09** — **Reliable `.peproj` v2 Analysis Sessions (Feedback Priority #6).** *(Depends on: `WU-01`, `WU-06`)*
   - Upgrade `.peproj` with versioned schema migration (`v1 -> v2`), target `SHA-256` identity checks, workspace-relative binary paths with missing-file relocation UI, user bookmarks, applied structure bindings, and atomic autosave/crash-recovery journals.
 - [ ] **WU-10** — **Static & Live Dependency Explorer Tree (`FG-DEPS`, Feedback Priority #5).** *(Depends on: `WU-01`)*
   - Turn PE imports/delay-load/bound imports + API-set names and ELF `DT_NEEDED` (`DT_RPATH`/`DT_RUNPATH`, interpreter, configurable search roots) + live loaded modules into a navigable dependency DAG/tree surfacing unresolved libraries/symbols, architecture/bitness mismatches, and explicit resolution-path provenance.

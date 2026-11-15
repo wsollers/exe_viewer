@@ -22,6 +22,16 @@ struct AppliedStructureBinding {
 
     auto operator<=>(const AppliedStructureBinding&) const = default;
 };
+
+struct Bookmark {
+    std::uint64_t address = 0;
+    bool is_file_offset = false;
+    std::string label{};
+    std::string category{};
+    std::string note{};
+
+    auto operator<=>(const Bookmark&) const = default;
+};
 [[nodiscard]] inline bool type_matches(const DataTypeRecord& type, std::string_view query) {
     if (symbol_name_matches(type.name, query)) return true;
     for (const auto& member : type.members)

@@ -1,13 +1,16 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include "analysis/project.hpp"
 #include "analysis/strings_index.hpp"
 #include "model/binary_model.hpp"
 #include "model/recent_binaries.hpp"
@@ -39,7 +42,10 @@ namespace viewer {
         void set_exit_callback(std::function<void()> cb) { on_exit_ = std::move(cb); }
         void set_analysis_file_callback(std::function<void(int)> cb) { on_analysis_file_ = std::move(cb); }
         peelf::Result<void> save_project(const std::filesystem::path&);
-        peelf::Result<void> open_project(const std::filesystem::path&);
+        peelf::Result<void> open_project(const std::filesystem::path& path,
+                                         const std::filesystem::path& relocated_binary = {},
+                                         bool allow_modified_binary = false,
+                                         bool skip_mismatched_patches = false);
         peelf::Result<void> save_patch_report(const std::filesystem::path&);
         void set_code_font(ImFont* font) { code_font_ = font; }
 
@@ -183,6 +189,20 @@ namespace viewer {
         bool show_disassembly_panel_ = true;
         bool show_call_graph_panel_ = false;
 
+        // .peproj v2 relocation, bookmarks, and autosave crash-recovery state
+        std::filesystem::path current_project_path_;
+        std::uint64_t current_project_saved_ms_ = 0;
+        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t> last_autosave_revisions_{0, 0, 0, 0};
+        std::chrono::steady_clock::time_point last_autosave_check_{};
+        bool open_relocate_modal_next_frame_ = false;
+        std::optional<AnalysisProject> pending_relocation_project_;
+        std::filesystem::path pending_relocation_peproj_path_;
+        ProjectBinaryResolution pending_relocation_resolution_;
+        char relocate_binary_buf_[2048] = {};
+        std::string relocate_modal_error_;
+        std::optional<AnalysisProject> pending_recovery_project_;
+        std::filesystem::path pending_recovery_key_path_;
+
         // Live process attach modal state
         bool open_attach_modal_next_frame_ = false;
         std::vector<peelf::ProcessInfo> cached_process_list_;
@@ -243,6 +263,13 @@ namespace viewer {
                                  bool is_file_offset = false);
         void render_dockspace();
         void render_attach_process_modal();
+        void render_relocate_project_modal();
+        void render_recovery_banner();
+        void toggle_bookmark_at_selection();
+        void apply_loaded_project_metadata(const AnalysisProject& project);
+        void poll_project_autosave(bool force_now = false);
+        void mark_autosave_baseline() noexcept;
+        [[nodiscard]] std::filesystem::path active_recovery_key_path() const;
         void open_attach_process_modal();
         void refresh_process_list();
         void sync_live_process_view(bool navigate_to_entry);

@@ -63,8 +63,121 @@ void ReferencesPanel::draw_contents() {
         else if (const auto* symbol = symbols_.find_containing_address(address)) text += "  " + symbol->name;
         return text;
     };
+
+    if (model_ != nullptr && ImGui::CollapsingHeader("Bookmarks (Ctrl+B)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const bool has_va = selection_.virtual_address.has_value();
+        const bool has_off = selection_.file_offset.has_value();
+        const bool can_bookmark = has_va || has_off;
+        const bool bm_is_off = !has_va && has_off;
+        const std::uint64_t bm_addr = has_va ? *selection_.virtual_address : selection_.file_offset.value_or(0);
+        const std::optional<std::pair<std::uint64_t, bool>> active_key =
+            can_bookmark ? std::optional<std::pair<std::uint64_t, bool>>{{bm_addr, bm_is_off}} : std::nullopt;
+
+        if (editing_bookmark_key_ != active_key || bookmark_revision_ != model_->bookmark_revision()) {
+            editing_bookmark_key_ = active_key;
+            bookmark_revision_ = model_->bookmark_revision();
+            const Bookmark* existing =
+                active_key ? model_->find_bookmark(active_key->first, active_key->second) : nullptr;
+            if (existing != nullptr) {
+                std::snprintf(bm_label_, sizeof(bm_label_), "%s", existing->label.c_str());
+                std::snprintf(bm_category_, sizeof(bm_category_), "%s", existing->category.c_str());
+                std::snprintf(bm_note_, sizeof(bm_note_), "%s", existing->note.c_str());
+            } else {
+                const std::string fallback = !selection_.label.empty()
+                                                 ? selection_.label
+                                                 : (has_va ? describe(bm_addr) : std::format("off_{:X}", bm_addr));
+                std::snprintf(bm_label_, sizeof(bm_label_), "%s", fallback.c_str());
+                bm_category_[0] = '\0';
+                bm_note_[0] = '\0';
+            }
+        }
+
+        ImGui::BeginDisabled(!can_bookmark);
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::InputTextWithHint("##bm_label", "Bookmark label", bm_label_, sizeof(bm_label_));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140.0f);
+        ImGui::InputTextWithHint("##bm_category", "Category (e.g. Entry, Crypto)", bm_category_, sizeof(bm_category_));
+        ImGui::SameLine();
+        if (ImGui::Button("Save Bookmark") && can_bookmark) {
+            model_->add_or_update_bookmark(Bookmark{
+                .address = bm_addr,
+                .is_file_offset = bm_is_off,
+                .label = bm_label_,
+                .category = bm_category_,
+                .note = bm_note_,
+            });
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Remove Bookmark") && can_bookmark) {
+            model_->remove_bookmark_at(bm_addr, bm_is_off);
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##bm_note", "Optional bookmark note...", bm_note_, sizeof(bm_note_));
+        ImGui::EndDisabled();
+
+        const auto bookmarks = model_->bookmarks();
+        if (!bookmarks.empty() &&
+            ImGui::BeginTable("bookmarks_table",
+                              5,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 130.0f);
+            ImGui::TableSetupColumn("Category", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+            ImGui::TableSetupColumn("Label");
+            ImGui::TableSetupColumn("Note");
+            ImGui::TableSetupColumn("##Del", ImGuiTableColumnFlags_WidthFixed, 34.0f);
+            ImGui::TableHeadersRow();
+
+            std::optional<std::size_t> erase_idx;
+            std::optional<Bookmark> jump_bm;
+            for (std::size_t i = 0; i < bookmarks.size(); ++i) {
+                const Bookmark& bm = bookmarks[i];
+                const std::string addr_str = bm.is_file_offset
+                                                 ? std::format("off+0x{:X}", bm.address)
+                                                 : std::format("0x{:X}", bm.address);
+                const std::string search_blob =
+                    addr_str + " " + bm.category + " " + bm.label + " " + bm.note;
+                if (!symbol_name_matches(search_blob, filter_)) continue;
+
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable((addr_str + "##bmaddr").c_str())) {
+                    jump_bm = bm;
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(bm.category.empty() ? "-" : bm.category.c_str());
+                ImGui::TableNextColumn();
+                if (ImGui::Selectable(((bm.label.empty() ? "<unnamed>" : bm.label) + "##bmlbl").c_str())) {
+                    jump_bm = bm;
+                }
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(bm.note.c_str());
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("X")) {
+                    erase_idx = i;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+            if (erase_idx) {
+                model_->remove_bookmark_index(*erase_idx);
+            }
+            if (jump_bm) {
+                if (jump_bm->is_file_offset) {
+                    if (navigate_offset_) navigate_offset_(jump_bm->address);
+                } else if (navigate_) {
+                    navigate_(jump_bm->address);
+                }
+            }
+        } else if (bookmarks.empty()) {
+            ImGui::TextDisabled("No bookmarks saved yet (press Ctrl+B to bookmark the current selection).");
+        }
+    }
+
     if (ImGui::CollapsingHeader("Names & comments", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::TextDisabled("Session only: annotations are cleared when another binary is loaded.");
+        ImGui::TextDisabled("Saved in .peproj v2 sessions and crash-recovery journals.");
         if (editing_address_ != selection_.virtual_address || annotation_revision_ != annotations_.revision()) {
             editing_address_ = selection_.virtual_address;
             annotation_revision_ = annotations_.revision();

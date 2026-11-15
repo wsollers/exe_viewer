@@ -155,7 +155,29 @@ namespace viewer {
         }
         void add_applied_structure(AppliedStructureBinding binding);
         void remove_applied_structure(std::size_t index);
-        void clear_applied_structures() noexcept { applied_structures_.clear(); }
+        void clear_applied_structures() noexcept {
+            if (!applied_structures_.empty()) {
+                applied_structures_.clear();
+                ++structure_binding_revision_;
+            }
+        }
+        [[nodiscard]] std::uint64_t structure_binding_revision() const noexcept {
+            return structure_binding_revision_;
+        }
+
+        [[nodiscard]] std::span<const Bookmark> bookmarks() const noexcept { return bookmarks_; }
+        void add_or_update_bookmark(Bookmark bookmark);
+        bool remove_bookmark_at(std::uint64_t address, bool is_file_offset = false);
+        void remove_bookmark_index(std::size_t index);
+        void clear_bookmarks() noexcept {
+            if (!bookmarks_.empty()) {
+                bookmarks_.clear();
+                ++bookmark_revision_;
+            }
+        }
+        [[nodiscard]] const Bookmark* find_bookmark(std::uint64_t address,
+                                                    bool is_file_offset = false) const noexcept;
+        [[nodiscard]] std::uint64_t bookmark_revision() const noexcept { return bookmark_revision_; }
         [[nodiscard]] bool demangle_symbols() const noexcept { return demangle_symbols_; }
         void set_demangle_symbols(bool enabled) noexcept { demangle_symbols_ = enabled; }
         void set_analysis_thumb_mode(bool thumb_mode);
@@ -280,6 +302,9 @@ namespace viewer {
         std::vector<DataTypeRecord> active_debug_types_;
         std::vector<SourceLineMapping> active_source_lines_;
         std::vector<AppliedStructureBinding> applied_structures_;
+        std::vector<Bookmark> bookmarks_;
+        std::uint64_t structure_binding_revision_ = 0;
+        std::uint64_t bookmark_revision_ = 0;
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
         std::unique_ptr<peelf::IProcessSession> session_;

@@ -131,6 +131,14 @@ to Details/Hex/Disassembly when readable bytes exist. Selections without readabl
 bytes should remain valid and display a clear "hex not available" style message
 as that path is hardened.
 
+## `.peproj` v2 Analysis Sessions & Crash Recovery
+
+Static analysis state persists in versioned `.peproj` (`PEELF_PROJECT 2`) files with
+automatic in-memory migration from `PEELF_PROJECT 1`:
+- **Target Identity & Portable Relocation**: Records both `relative_source` (proximate to the `.peproj` parent directory) and canonical `source`, verified against original `source_sha256` (`peelf::sha256_hex`) and `source_size` with structured `ExactMatch`, `ModifiedMismatch`, and `RelocationNeeded` handling.
+- **Session State**: Persists staged static patches, user symbol/comment annotations, imported debug symbols, bookmarks (`Bookmark`), pinned `AppliedStructureBinding`s, navigation history, and docking layout.
+- **Atomic Saves & Autosave Journals**: Project writes stage to a sibling `.tmp` file before atomic rename, while dirty session edits periodically write crash-recovery journals under `$PEELF_CACHE_DIR/recovery` or `/tmp/peelf_viewer-recovery-<uid>`.
+
 ## Call Graph Flow
 
 ```mermaid
