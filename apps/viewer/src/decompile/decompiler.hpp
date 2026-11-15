@@ -2,14 +2,21 @@
 #include "graph/call_graph.hpp"
 #include <chrono>
 #include <stop_token>
+#include "symbols/data_types.hpp"
 
 namespace viewer {
 enum class DecompileStatus { Ready, Unavailable, Unsupported, NoFunction, Timeout, Cancelled, Failed };
-struct DecompiledLine { std::optional<std::uint64_t> address; std::string text; };
+struct CodeRange { std::uint64_t address{}, size{}; };
+struct DecompiledLine {
+    std::optional<std::uint64_t> address;
+    std::string text;
+    std::vector<CodeRange> ranges;
+};
 struct DecompiledUnit {
     DecompileStatus status = DecompileStatus::Failed;
     std::string provider, diagnostic;
     std::vector<DecompiledLine> lines;
+    std::vector<DataTypeRecord> types;
 };
 struct DecompileRequest {
     std::uint64_t address{};
@@ -17,6 +24,9 @@ struct DecompileRequest {
     std::vector<std::uint8_t> image_bytes;
     CallGraph fallback_graph;
     bool thumb = false;
+    std::uint64_t function_size = 0; // Only authoritative symbol/runtime bounds.
+    std::vector<SymbolRecord> symbols;
+    std::vector<DataTypeRecord> types;
 };
 class IDecompiler {
 public:
@@ -49,6 +59,9 @@ private:
     const IBackendRunner& runner_;
 };
 [[nodiscard]] DecompiledUnit parse_decompiler_output(std::string_view);
+[[nodiscard]] std::optional<SymbolRecord> containing_function(const peelf::IBinaryImage&, const SymbolIndex&,
+    std::uint64_t address, const std::optional<SymbolRecord>& fallback = {});
+[[nodiscard]] std::string encode_decompiler_symbols(const DecompileRequest&);
 enum class DecompilerProvider { Ghidra, BinaryNinja, AnnotatedCode };
 struct DecompilerSettings {
     DecompilerProvider provider = DecompilerProvider::Ghidra;

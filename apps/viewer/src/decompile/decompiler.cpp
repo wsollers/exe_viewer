@@ -7,6 +7,7 @@
 #include <atomic>
 #include <charconv>
 #include <cerrno>
+#include <limits>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -35,7 +36,13 @@ DecompiledUnit parse_decompiler_output(std::string_view text) {
     DecompiledUnit unit; unit.provider="Binary Ninja HLIL";
     if (text.size()>4*1024*1024) { unit.diagnostic="Backend output exceeds 4 MiB"; return unit; }
     std::istringstream in{std::string(text)}; std::string magic,status; int version;
-    if (!(in>>magic>>version>>status>>std::quoted(unit.diagnostic)) || magic!="PEELF_DECOMPILE" || (version!=1 && version!=2)) { unit.diagnostic="Malformed backend response"; return unit; }
+    const auto read_unsigned = [&in](std::uint64_t& value) {
+        std::string token;
+        if (!(in >> token)) return false;
+        const auto [end, error] = std::from_chars(token.data(), token.data()+token.size(), value);
+        return error == std::errc{} && end == token.data()+token.size();
+    };
+    if (!(in>>magic>>version>>status>>std::quoted(unit.diagnostic)) || magic!="PEELF_DECOMPILE" || version<1 || version>3) { unit.diagnostic="Malformed backend response"; return unit; }
     if (status=="unavailable") unit.status=DecompileStatus::Unavailable;
     else if (status=="unsupported") unit.status=DecompileStatus::Unsupported;
     else if (status=="no_function") unit.status=DecompileStatus::NoFunction;
@@ -46,6 +53,20 @@ DecompiledUnit parse_decompiler_output(std::string_view text) {
     std::size_t count;
     if (!(in>>count) || count>100000) { unit.status=DecompileStatus::Failed; unit.diagnostic="Invalid backend line count"; return unit; }
     for (std::size_t i=0;i<count;++i) {
+        if (version == 3) {
+            DecompiledLine line; std::size_t ranges=0;
+            if (!(in>>ranges) || ranges>4096) return {DecompileStatus::Failed,unit.provider,"Invalid code range count"};
+            for (std::size_t r=0;r<ranges;++r) {
+                CodeRange range;
+                if (!read_unsigned(range.address) || !read_unsigned(range.size) || !range.size || range.size>1048576 ||
+                    range.address>std::numeric_limits<std::uint64_t>::max()-range.size)
+                    return {DecompileStatus::Failed,unit.provider,"Invalid code byte range"};
+                line.ranges.push_back(range);
+            }
+            if (!(in>>std::quoted(line.text))) return {DecompileStatus::Failed,unit.provider,"Truncated code line"};
+            if (!line.ranges.empty()) line.address=line.ranges.front().address;
+            unit.lines.push_back(std::move(line)); continue;
+        }
         std::string address, line;
         if (!(in>>address>>std::quoted(line))) { unit.status=DecompileStatus::Failed; unit.diagnostic="Truncated backend lines"; unit.lines.clear(); return unit; }
         std::optional<std::uint64_t> mapped;
@@ -58,6 +79,23 @@ DecompiledUnit parse_decompiler_output(std::string_view text) {
             mapped = value;
         }
         unit.lines.push_back({mapped,std::move(line)});
+    }
+    if (version == 3) {
+        std::size_t types=0;
+        if (!(in>>types) || types>10000) return {DecompileStatus::Failed,unit.provider,"Invalid structure count"};
+        for (std::size_t t=0;t<types;++t) {
+            DataTypeRecord type; std::size_t members=0;
+            if (!(in>>std::quoted(type.name)>>type.size>>type.is_union>>members) || members>4096 || type.size>16777216)
+                return {DecompileStatus::Failed,unit.provider,"Invalid structure record"};
+            for (std::size_t m=0;m<members;++m) {
+                DataMember member;
+                if (!(in>>member.offset>>member.size>>std::quoted(member.name)>>std::quoted(member.type)) ||
+                    member.offset>type.size || member.size>type.size-member.offset)
+                    return {DecompileStatus::Failed,unit.provider,"Invalid structure member"};
+                type.members.push_back(std::move(member));
+            }
+            unit.types.push_back(std::move(type));
+        }
     }
     in>>std::ws;
     if (!in.eof() || (unit.status==DecompileStatus::Ready && unit.lines.empty())) { unit.status=DecompileStatus::Failed; unit.diagnostic="Invalid backend response"; unit.lines.clear(); }

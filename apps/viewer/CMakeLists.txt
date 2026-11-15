@@ -53,6 +53,7 @@ add_library(peelf_gui SHARED
         src/analysis/project.cpp
         src/decompile/decompiler.cpp
         src/decompile/ghidra_decompiler.cpp
+        src/decompile/decompiler_symbols.cpp
         src/ui/ui_decompile.cpp
         src/ui/ui_panels_log.cpp
         src/ui/ui_panels_shellcode.cpp

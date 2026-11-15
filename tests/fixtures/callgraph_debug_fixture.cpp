@@ -14,13 +14,19 @@ volatile std::int32_t g_sink = 0;
 
 namespace peelf_fixture {
 
+struct DecompilerPacket {
+    std::int32_t count;
+    double weight;
+};
+volatile DecompilerPacket packet{3, 2.0};
+
 PEELF_NOINLINE std::int32_t leaf(std::int32_t value) {
     g_sink += value;
     return value + 7;
 }
 
 PEELF_NOINLINE std::int32_t first(std::int32_t value) {
-    return leaf(value + 1);
+    return leaf(value + 1 + packet.count);
 }
 
 PEELF_NOINLINE std::int32_t second(std::int32_t value) {

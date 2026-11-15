@@ -4,6 +4,26 @@
 #include "model/binary_model.hpp"
 #include <algorithm>
 #include <thread>
+#include "symbols/debug_symbols.hpp"
+using namespace viewer;
+
+TEST(Decompiler, MappedRangesAndStructuresRoundTrip) {
+    const auto unit=parse_decompiler_output("PEELF_DECOMPILE 3 ready \"C\" 2 0 \"{\" 2 4096 3 4102 5 \"  return count;\" 1 \"Packet\" 16 0 1 8 8 \"weight\" \"double\"");
+    ASSERT_EQ(unit.status,viewer::DecompileStatus::Ready);
+    EXPECT_FALSE(unit.lines[0].address);
+    ASSERT_EQ(unit.lines[1].ranges.size(),2);
+    EXPECT_EQ(unit.lines[1].address,4096);
+    EXPECT_EQ(unit.lines[1].ranges[1].size,5);
+    ASSERT_EQ(unit.types.size(),1);
+    EXPECT_TRUE(viewer::type_matches(unit.types[0],"EIGH"));
+    EXPECT_TRUE(viewer::type_matches(unit.types[0],"DOUBLE"));
+    EXPECT_FALSE(viewer::type_matches(unit.types[0],"missing"));
+}
+TEST(Decompiler, RejectsInvalidRangesAndLayouts) {
+    for (const auto* range : {"-2 1","4096 0","18446744073709551615 2","4096 1048577"})
+        EXPECT_EQ(viewer::parse_decompiler_output(std::string("PEELF_DECOMPILE 3 ready \"\" 1 1 ")+range+" \"x\" 0").status,viewer::DecompileStatus::Failed);
+    EXPECT_EQ(viewer::parse_decompiler_output("PEELF_DECOMPILE 3 ready \"\" 1 0 \"x\" 1 \"bad\" 4 0 1 3 2 \"field\" \"short\"").status,viewer::DecompileStatus::Failed);
+}
 
 using namespace viewer;
 TEST(Decompiler, ValidatesProtocolAndAddressMapping) {
@@ -165,3 +185,51 @@ INSTANTIATE_TEST_SUITE_P(RealBackend,GhidraIntegration,::testing::Values(
     "known-linux-riscv32-elf32-le.elf", "elf-linux-riscv64-64-le-callgraph.elf",
     "pe-windows-x86-32-le-callgraph.dll", "pe-windows-x86_64-64-le-callgraph.dll",
     "known-linux-arm-elf32-le.elf"));
+
+TEST(Decompiler, ContainingFunctionWinsOverInteriorBlock) {
+    BinaryModel model;
+    ASSERT_TRUE(model.load_file((std::filesystem::path(PEELF_BIN_MATRIX_DIR)/"elf-linux-x86_64-64-le-callgraph.elf").string()));
+    auto index=SymbolIndex::build(*model.image());
+    const auto* first=index.find_by_name("first");
+    ASSERT_NE(first,nullptr); ASSERT_TRUE(first->virtual_address); ASSERT_GT(first->size,1);
+    const auto start=*first->virtual_address;
+    SymbolRecord block{.name="block",.virtual_address=start+1,.size=1,.function=true};
+    auto root=containing_function(*model.image(),index,start+1,block);
+    ASSERT_TRUE(root); EXPECT_EQ(root->virtual_address,start); EXPECT_EQ(root->size,first->size);
+}
+
+TEST(Decompiler, SymbolManifestPreservesNamesAndPrefersDebugNames) {
+    DecompileRequest request; request.address=4096; request.function_size=32;
+    request.symbols={{.name="entry",.source=SymbolSource::EntryPoint,.virtual_address=4096},
+        {.name="My name",.source=SymbolSource::DebugSymbol,.virtual_address=4096,.size=32,.function=true},
+        {.name="external",.virtual_address=8192,.external=true}};
+    const auto manifest=encode_decompiler_symbols(request);
+    EXPECT_EQ(manifest,"PEELF_SYMBOLS 1\n4096 32\n1\n4096 32 1 4d79206e616d65\n0\n");
+}
+
+TEST(Decompiler, PdbStructuresAndRealSymbolAwareFunction) {
+    BinaryModel model; ASSERT_TRUE(model.load_file(PEELF_CALLGRAPH_FIXTURE_EXE));
+    const auto pdb=load_pdb_debug_symbols(PEELF_CALLGRAPH_FIXTURE_PDB,*model.image());
+    if(pdb.status!=DebugSymbolLoadStatus::Loaded) GTEST_SKIP()<<pdb.diagnostic;
+    auto type=std::ranges::find_if(pdb.types,[](const auto& t){return t.name.find("DecompilerPacket")!=std::string::npos;});
+    ASSERT_NE(type,pdb.types.end()); EXPECT_EQ(type->size,16);
+    ASSERT_EQ(type->members.size(),2); EXPECT_TRUE(type_matches(*type,"weight"));
+    auto index=SymbolIndex::build(*model.image()); index.add_debug_symbols(*model.image(),pdb.symbols);
+    auto first=std::ranges::find_if(index.records(),[](const auto& s){return s.name.find("peelf_fixture::first")!=std::string::npos && s.size>0;});
+    ASSERT_NE(first,index.records().end());
+    auto root=containing_function(*model.image(),index,*first->virtual_address+1);
+    ASSERT_TRUE(root); EXPECT_EQ(root->virtual_address,first->virtual_address);
+    auto settings=discover_decompilers({});
+    if(settings.ghidra_home.empty()) GTEST_SKIP()<<"Set GHIDRA_INSTALL_DIR for real symbol integration";
+    DecompileRequest request; request.address=*root->virtual_address; request.function_size=root->size;
+    request.architecture=model.image()->architecture(); request.image_bytes.assign(model.bytes().begin(),model.bytes().end());
+    request.symbols.assign(index.records().begin(),index.records().end()); request.types=pdb.types;
+    for(auto& symbol:request.symbols) if(symbol.name.find("peelf_fixture::leaf")!=std::string::npos) symbol.name="readable_leaf";
+    BackendRunner runner;
+    auto scripts=std::filesystem::path(PEELF_TEST_FIXTURES_DIR).parent_path().parent_path()/"apps/viewer/resources";
+    auto result=GhidraDecompiler(settings,scripts,runner).decompile(request);
+    ASSERT_EQ(result.status,DecompileStatus::Ready)<<result.diagnostic;
+    EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return line.text.find("readable_leaf")!=std::string::npos;}));
+    EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return !line.ranges.empty();}));
+    EXPECT_TRUE(std::ranges::any_of(result.types,[](const auto& t){return t.name.find("DecompilerPacket")!=std::string::npos;}));
+}

@@ -85,6 +85,15 @@ namespace viewer {
         std::filesystem::path decompiler_directory_;
         std::string decompiler_settings_status_;
         void initialize_decompiler();
+        void render_data_types();
+        void select_decompiled_line(std::size_t index);
+        bool show_data_types_ = true;
+        char data_type_filter_[256] = {};
+        std::vector<DataTypeRecord> debug_types_;
+        std::optional<SymbolRecord> decompiled_root_;
+        std::vector<CodeRange> selected_code_ranges_;
+        std::optional<std::uint64_t> selected_code_address_;
+        std::uint64_t decompile_annotation_revision_ = 0, symbol_revision_ = 0, decompile_symbol_revision_ = 0;
         char decompiler_python_[1024] = "python";
         DecompiledUnit decompiled_;
         std::future<DecompiledUnit> decompile_job_;

@@ -261,6 +261,25 @@ approximate. Byte edits and ARM/Thumb changes mark existing output stale.
 
 ### Installing and configuring Ghidra
 
+The decompiler uses loaded image/PDB symbols and user-renamed symbols for function
+and data names. F5 resolves an interior selection to its containing function using
+symbol lengths or PE runtime function metadata when available. Ghidra analysis
+supplies function discovery when authoritative bounds are absent.
+
+The listing has Address and Code columns. Clicking a mapped code row selects its
+instruction ranges in Hex View and highlights the corresponding flow graph blocks.
+Mappings are approximate: optimized C can represent several disjoint instructions;
+declarations and braces without addresses remain unlinked. Select a contiguous hex
+range before editing a multi-range selection. Byte or symbol changes mark the
+decompiler snapshot stale until reanalysis.
+
+The **Data Structures** tab beside **Functions & Names** searches structure names,
+member names and member types by substring. It displays PDB and Ghidra structure/
+union layouts, plus a separate searchable data-symbol list linked to Hex View.
+Structure layouts require debug type information; symbol names alone cannot recover
+them. Importing names and layouts does not recover every original local variable or
+function prototype.
+
 Use a local, extracted [official Ghidra release](https://github.com/NationalSecurityAgency/ghidra/releases)
 and the JDK required by that release. This integration is tested with **Ghidra 12.2
 and JDK 25**. Ghidra is a runtime dependency, not linked into the C++ application

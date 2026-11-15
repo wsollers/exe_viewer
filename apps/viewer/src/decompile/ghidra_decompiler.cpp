@@ -88,6 +88,9 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
     if (!std::filesystem::create_directory(directory, ec)) return failure(DecompileStatus::Failed, "Cannot create Ghidra workspace");
     struct Workspace { std::filesystem::path path; ~Workspace() { std::error_code ignored; std::filesystem::remove_all(path, ignored); } } workspace{directory};
     const auto input = directory / "input.bin", output = directory / "result.txt";
+    const auto metadata = directory / "symbols.txt";
+    { std::ofstream file(metadata, std::ios::binary); file << encode_decompiler_symbols(request);
+      file.close(); if (!file) return failure(DecompileStatus::Failed,"Cannot write symbol snapshot"); }
     { std::ofstream file(input, std::ios::binary);
       file.write(reinterpret_cast<const char*>(request.image_bytes.data()), static_cast<std::streamsize>(request.image_bytes.size()));
       file.close(); if (!file) return failure(DecompileStatus::Failed, "Cannot write binary snapshot"); }
@@ -98,8 +101,8 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
         "-cp", (settings_.ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").string(),
         "ghidra.Ghidra", "ghidra.app.util.headless.AnalyzeHeadless", directory.string(), "analysis",
         "-import", input.string(), "-scriptPath", scripts_.string(),
-        "-preScript", "PeelfDecompile.java", "prepare", output.string(), std::to_string(request.address), request.thumb ? "true" : "false",
-        "-postScript", "PeelfDecompile.java", "export", output.string(), std::to_string(request.address), request.thumb ? "true" : "false",
+        "-preScript", "PeelfDecompile.java", "prepare", output.string(), std::to_string(request.address), request.thumb ? "true" : "false", metadata.string(),
+        "-postScript", "PeelfDecompile.java", "export", output.string(), std::to_string(request.address), request.thumb ? "true" : "false", metadata.string(),
         "-analysisTimeoutPerFile", std::to_string(settings_.timeout_seconds), "-max-cpu", "2", "-deleteProject"};
     const auto result = runner_.run(settings_.java, args, std::chrono::seconds(settings_.timeout_seconds), stop);
     if (result.cancelled) return failure(DecompileStatus::Cancelled, "Decompilation cancelled");

@@ -13,6 +13,7 @@
 #include "ui_panel.hpp"
 #include "symbols/symbol_index.hpp"
 #include "analysis/patch_preview.hpp"
+#include "navigation/byte_range.hpp"
 
 namespace viewer {
 
@@ -73,6 +74,7 @@ namespace viewer {
         // Invoked with the file offset of the byte the user clicks.
         void set_byte_activated_callback(std::function<void(std::size_t, std::size_t)> cb) { on_byte_activated_ = std::move(cb); }
         void navigate_to_range(std::size_t file_offset, std::size_t size);
+        void navigate_to_ranges(std::span<const ByteRange> ranges);
         void clear_selection() noexcept;
     protected:
         void draw_contents() override;
@@ -81,6 +83,7 @@ namespace viewer {
         std::size_t selected_offset_ = 0;
         std::size_t highlighted_offset_ = 0;
         std::size_t highlighted_size_ = 0;
+        std::vector<ByteRange> mapped_ranges_;
         std::optional<std::size_t> pending_scroll_offset_;
         std::size_t bytes_per_row_ = 16;
         std::uint64_t goto_offset_ = 0;

@@ -18,6 +18,7 @@ HexViewPanel::HexViewPanel(BinaryModel& model)
 {}
 
 void HexViewPanel::clear_selection() noexcept {
+    mapped_ranges_.clear();
     selected_offset_ = 0;
     highlighted_offset_ = 0;
     highlighted_size_ = 0;
@@ -26,6 +27,7 @@ void HexViewPanel::clear_selection() noexcept {
 }
 
 void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) {
+    mapped_ranges_.clear();
     const auto& bytes = model_.bytes();
     if (bytes.empty() || file_offset >= bytes.size()) {
         clear_selection();
@@ -37,6 +39,14 @@ void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) 
     highlighted_size_ = std::min(size, bytes.size() - file_offset);
     pending_scroll_offset_ = file_offset;
     goto_offset_ = file_offset;
+}
+
+void HexViewPanel::navigate_to_ranges(std::span<const ByteRange> ranges) {
+    if (ranges.empty()) { clear_selection(); return; }
+    navigate_to_range(ranges.front().offset,ranges.front().size);
+    for (const auto& range : ranges)
+        if (range.offset<model_.bytes().size() && range.size && range.size<=model_.bytes().size()-range.offset)
+            mapped_ranges_.push_back(range);
 }
 
 void HexViewPanel::draw_contents() {
@@ -59,7 +69,7 @@ void HexViewPanel::draw_contents() {
     ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Apply bytes").x - 28.0f));
     ImGui::InputTextWithHint("##Replacement", "Replacement hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
     ImGui::SameLine();
-    ImGui::BeginDisabled(highlighted_size_ == 0);
+    ImGui::BeginDisabled(highlighted_size_ == 0 || mapped_ranges_.size()>1);
     if (ImGui::Button("Apply bytes")) {
         const auto parsed = parse_hex_shellcode(edit_bytes_);
         if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
@@ -77,7 +87,8 @@ void HexViewPanel::draw_contents() {
         }
     }
     ImGui::EndDisabled();
-    if (ImGui::Button("Copy hex")) {
+    if (mapped_ranges_.size()>1) ImGui::TextDisabled("%zu mapped instruction ranges. Select a contiguous range to edit.",mapped_ranges_.size());
+    if (ImGui::Button(mapped_ranges_.size()>1 ? "Copy primary range" : "Copy hex")) {
         const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);
         if (selected) {
             std::string text;
@@ -126,12 +137,13 @@ void HexViewPanel::draw_contents() {
                 char buf[32];
                 std::snprintf(buf, sizeof(buf), "%02X##%zu", row_data[i - start], i);
 
-                const bool in_highlight =
+                const bool in_highlight = std::ranges::any_of(mapped_ranges_,[i](const ByteRange& range){ return i>=range.offset && i-range.offset<range.size; }) || (
                     highlighted_size_ != 0 &&
                     i >= highlighted_offset_ &&
-                    i - highlighted_offset_ < highlighted_size_;
+                    i - highlighted_offset_ < highlighted_size_);
                 bool selected = (i == selected_offset_) || in_highlight;
                 if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(ImGui::CalcTextSize("FF").x, 0))) {
+                    mapped_ranges_.clear();
                     if (ImGui::GetIO().KeyShift) {
                         if (const auto range = selected_byte_range(selected_offset_, i, bytes.size())) {
                             highlighted_offset_ = range->offset;

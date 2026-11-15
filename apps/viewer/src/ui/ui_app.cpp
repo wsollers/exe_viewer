@@ -558,6 +558,7 @@ void UiApp::render() {
     imports_panel_.draw();
     exports_panel_.draw();
     symbols_panel_.draw();
+    if (show_data_types_) render_data_types();
     references_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
@@ -729,6 +730,7 @@ void UiApp::render_main_menu() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
+        ImGui::MenuItem("Data Structures", nullptr, &show_data_types_);
         if (ImGui::MenuItem("Reset Layout")) {
             reset_dock_layout_ = true;
         }
@@ -882,7 +884,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV5");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV6");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
@@ -1313,6 +1315,10 @@ void UiApp::render_call_graph_panel() {
                     const auto address = *current_selection_.virtual_address;
                     const auto start = *graph_node->bytes.start.virtual_address;
                     selected = address >= start && address - start < std::max<std::uint64_t>(graph_node->bytes.size, 1);
+                    if (selected_code_address_ == current_selection_.virtual_address && decompile_revision_ == model_.edit_revision()) {
+                        for (const auto& range : selected_code_ranges_)
+                            if (range.address >= start && range.address-start < graph_node->bytes.size) selected = true;
+                    }
                 }
             }
             const ImVec2 top_left = to_screen(layout_node.center_x - layout_node.width * 0.5,
@@ -1419,6 +1425,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow("Data Structures", left_id);
     ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
 
     ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
@@ -1584,6 +1591,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         patch_set_panel_.reset_preview();
         decompile_stop_.request_stop(); ++file_generation_; decompiled_ = {};
         annotations_.clear();
+        debug_types_.clear(); ++symbol_revision_; decompiled_root_.reset();
+        selected_code_ranges_.clear(); selected_code_address_.reset();
         reference_index_ = {};
         references_dirty_ = true;
         navigation_history_.clear();
@@ -1686,6 +1695,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
 
         symbol_index_.add_debug_symbols(*img, std::span<const DebugSymbol>(result.symbols.data(), result.symbols.size()));
+        debug_types_ = std::move(result.types); ++symbol_revision_;
         Log().info("Loaded {} debug symbols from {}; symbol index now has {} records",
                    result.symbols.size(),
                    path.string(),

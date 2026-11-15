@@ -9,6 +9,7 @@
 #include <peelf/binary_image.hpp>
 
 #include "symbols/symbol_index.hpp"
+#include "symbols/data_types.hpp"
 
 namespace viewer {
 
@@ -23,6 +24,7 @@ enum class DebugSymbolLoadStatus : std::uint8_t {
 struct DebugSymbolLoadResult {
     DebugSymbolLoadStatus status = DebugSymbolLoadStatus::BackendError;
     std::vector<DebugSymbol> symbols;
+    std::vector<DataTypeRecord> types;
     std::string diagnostic;
 };
 

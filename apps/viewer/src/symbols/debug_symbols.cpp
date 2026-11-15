@@ -255,16 +255,79 @@ void add_dia_children(IDiaSymbol& global,
         if (FAILED(symbol->get_length(&length))) {
             length = 0;
         }
+        BOOL code = FALSE;
+        const bool is_function = function || (SUCCEEDED(symbol->get_code(&code)) && code);
+        if (!is_function && length == 0) {
+            ComPtr<IDiaSymbol> type;
+            if (SUCCEEDED(symbol->get_type(type.put())) && type) type->get_length(&length);
+        }
 
         out.push_back(DebugSymbol{
             .name = to_utf8(name.get()),
             .relative_virtual_address = rva,
             .virtual_address = image_base + rva,
             .size = static_cast<std::uint64_t>(length),
-            .function = function,
+            .function = is_function,
         });
         symbol.reset();
     }
+}
+std::string dia_type_name(IDiaSymbol& type, unsigned depth = 0) {
+    if (depth > 12) return "recursive type";
+    Bstr name;
+    if (SUCCEEDED(type.get_name(name.put())) && name.get()) return to_utf8(name.get());
+    DWORD tag = 0; type.get_symTag(&tag);
+    ULONGLONG length = 0; type.get_length(&length);
+    if (tag == SymTagPointerType || tag == SymTagArrayType || tag == SymTagTypedef) {
+        ComPtr<IDiaSymbol> element;
+        if (SUCCEEDED(type.get_type(element.put())) && element) {
+            auto text=dia_type_name(*element.get(),depth+1);
+            if (tag == SymTagPointerType) return text + "*";
+            if (tag == SymTagArrayType) { DWORD count=0; type.get_count(&count); return text+"["+std::to_string(count)+"]"; }
+            return text;
+        }
+    }
+    DWORD basic=0; type.get_baseType(&basic);
+    switch (basic) {
+    case btVoid: return "void";
+    case btChar: return "char";
+    case btWChar: return "wchar_t";
+    case btBool: return "bool";
+    case btFloat: return length==4 ? "float" : "double";
+    case btInt: case btLong: return "int"+std::to_string(length*8)+"_t";
+    case btUInt: case btULong: return "uint"+std::to_string(length*8)+"_t";
+    default: return "unknown ("+std::to_string(length)+" bytes)";
+    }
+}
+void add_dia_types(IDiaSymbol& global, std::vector<DataTypeRecord>& out) {
+    ComPtr<IDiaEnumSymbols> types;
+    if (FAILED(global.findChildren(SymTagUDT,nullptr,nsNone,types.put())) || !types) return;
+    ComPtr<IDiaSymbol> type; ULONG fetched=0;
+    while (out.size()<10000 && SUCCEEDED(types->Next(1,type.put(),&fetched)) && fetched==1) {
+        Bstr name; ULONGLONG size=0; DWORD kind=0;
+        type->get_length(&size); type->get_udtKind(&kind);
+        if (FAILED(type->get_name(name.put())) || !name.get()) continue;
+        DataTypeRecord record{to_utf8(name.get()),size,kind==UdtUnion};
+        ComPtr<IDiaEnumSymbols> members;
+        if (SUCCEEDED(type->findChildren(SymTagData,nullptr,nsNone,members.put())) && members) {
+            ComPtr<IDiaSymbol> member; ULONG count=0;
+            while (record.members.size()<4096 && SUCCEEDED(members->Next(1,member.put(),&count)) && count==1) {
+                LONG offset=0; DWORD data_kind=0;
+                member->get_dataKind(&data_kind);
+                if (data_kind != DataIsMember || FAILED(member->get_offset(&offset)) || offset<0) continue;
+                Bstr field; ComPtr<IDiaSymbol> field_type; ULONGLONG length=0;
+                if (FAILED(member->get_name(field.put())) || !field.get() || FAILED(member->get_type(field_type.put())) || !field_type) continue;
+                field_type->get_length(&length);
+                auto field_name=dia_type_name(*field_type.get());
+                DWORD location=0; member->get_locationType(&location);
+                if (location==LocIsBitField) field_name += " (bit field)";
+                record.members.push_back({to_utf8(field.get()),std::move(field_name),static_cast<std::uint64_t>(offset),length});
+            }
+        }
+        out.push_back(std::move(record));
+    }
+    std::ranges::sort(out,{},&DataTypeRecord::name);
+    out.erase(std::ranges::unique(out,{},&DataTypeRecord::name).begin(),out.end());
 }
 #endif
 
@@ -395,6 +458,8 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     DebugSymbolLoadResult result;
     add_dia_children(*global.get(), SymTagFunction, image_base, true, result.symbols);
     add_dia_children(*global.get(), SymTagPublicSymbol, image_base, false, result.symbols);
+    add_dia_children(*global.get(), SymTagData, image_base, false, result.symbols);
+    add_dia_types(*global.get(), result.types);
 
     std::ranges::sort(result.symbols, {}, &DebugSymbol::name);
     result.symbols.erase(std::ranges::unique(result.symbols, [](const DebugSymbol& lhs, const DebugSymbol& rhs) {
