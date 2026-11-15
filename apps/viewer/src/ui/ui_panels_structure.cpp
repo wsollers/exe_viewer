@@ -119,9 +119,10 @@ void StructureNavigatorPanel::draw_node(const StructureNode& node) {
     ImGui::PopID();
 }
 
-SelectionDetailsPanel::SelectionDetailsPanel(const ViewerSelection& selection)
+SelectionDetailsPanel::SelectionDetailsPanel(const ViewerSelection& selection, const BinaryModel* model)
     : UiPanel("Details")
     , selection_(selection)
+    , model_(model)
 {}
 
 void SelectionDetailsPanel::draw_contents() {
@@ -137,6 +138,39 @@ void SelectionDetailsPanel::draw_contents() {
         draw_optional_hex_value("File offset", selection_.file_offset);
         draw_optional_hex_value("Virtual address", selection_.virtual_address);
         ImGui::Text("Size: %" PRIu64 " bytes", selection_.size);
+    }
+    if (model_ != nullptr && selection_.virtual_address.has_value()) {
+        const std::uint64_t va = *selection_.virtual_address;
+        const SymbolRecord* sym = model_->symbol_index().find_containing_address(va);
+        const SourceLineMapping* src = model_->find_source_line(va, 64);
+        if ((sym != nullptr && sym->virtual_address.has_value()) || src != nullptr) {
+            if (ImGui::CollapsingHeader("Symbol & Debug Info", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (sym != nullptr && sym->virtual_address.has_value()) {
+                    const std::string& raw = !sym->raw_name.empty() ? sym->raw_name : sym->name;
+                    const std::string& demangled = sym->display_name(true);
+                    const std::uint64_t delta = va - *sym->virtual_address;
+                    if (demangled != raw) {
+                        ImGui::TextWrapped("Demangled: %s", demangled.c_str());
+                        ImGui::TextWrapped("Raw mangled: %s", raw.c_str());
+                    } else {
+                        ImGui::TextWrapped("Symbol: %s", raw.c_str());
+                    }
+                    if (delta != 0) {
+                        ImGui::Text("Symbol offset: +0x%" PRIX64, delta);
+                    }
+                    if (!sym->library.empty()) {
+                        ImGui::TextWrapped("Unit / Library: %s", sym->library.c_str());
+                    }
+                }
+                if (src != nullptr) {
+                    if (src->column != 0) {
+                        ImGui::TextWrapped("Source: %s:%u:%u", src->file_path.c_str(), src->line, src->column);
+                    } else {
+                        ImGui::TextWrapped("Source: %s:%u", src->file_path.c_str(), src->line);
+                    }
+                }
+            }
+        }
     }
 }
 

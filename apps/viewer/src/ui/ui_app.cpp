@@ -111,8 +111,12 @@ struct GraphLayoutBounds {
     return buffer.data();
 }
 
-[[nodiscard]] std::string call_graph_node_display_label(const CallGraphNode& node) {
-    const std::string base_label = node.label.empty() ? node.id : node.label;
+[[nodiscard]] std::string call_graph_node_display_label(const CallGraphNode& node, bool demangle = true) {
+    std::string base_label = node.label.empty() ? node.id : node.label;
+    if (demangle && node.symbol && !node.symbol->demangled_name.empty() &&
+        (node.label.empty() || node.label == node.symbol->name)) {
+        base_label = node.symbol->demangled_name;
+    }
     std::string label = base_label;
     if (!node.instructions.empty()) {
         for (const auto& instruction : node.instructions)
@@ -306,7 +310,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , file_panel_(model)
     , memory_map_panel_(model, current_selection_)
     , structure_panel_(structure_tree_, current_selection_)
-    , details_panel_(current_selection_)
+    , details_panel_(current_selection_, &model)
     , sections_panel_(model)
     , hex_panel_(model)
     , patch_set_panel_(model, current_selection_)
@@ -426,8 +430,13 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     });
     symbols_panel_.set_display_name_resolver([this](const SymbolRecord& symbol) {
         const auto* annotation = symbol.virtual_address ? annotations_.find(*symbol.virtual_address) : nullptr;
-        return annotation && !annotation->name.empty() ? annotation->name : symbol.name;
+        if (annotation && !annotation->name.empty()) {
+            return annotation->name;
+        }
+        return symbol.display_name(model_.demangle_symbols());
     });
+    symbols_panel_.set_demangle_changed_callback([this](bool) { ++symbol_revision_; });
+    functions_panel_.set_demangle_changed_callback([this](bool) { ++symbol_revision_; });
     hex_panel_.set_byte_activated_callback([this](std::size_t off, std::size_t size) {
         current_selection_ = ViewerSelection{
             .kind = SelectionKind::ByteRange,
@@ -1211,6 +1220,13 @@ void UiApp::render_main_menu() {
     }
     if (ImGui::BeginMenu("View")) {
         ImGui::MenuItem("Data Structures", nullptr, &show_data_types_);
+        {
+            bool demangle = model_.demangle_symbols();
+            if (ImGui::MenuItem("Demangle symbols", nullptr, &demangle)) {
+                model_.set_demangle_symbols(demangle);
+                ++symbol_revision_;
+            }
+        }
         if (ImGui::MenuItem("Reset Layout")) {
             reset_dock_layout_ = true;
         }
@@ -2013,9 +2029,18 @@ void UiApp::render_call_graph_panel() {
         ImGui::BeginChild("GraphSearchResults", ImVec2(0, 100), true);
         for (const auto& node : current_call_graph_->nodes) {
             if (!symbol_name_matches(node.label, graph_search_) &&
-                (!node.symbol || !symbol_name_matches(node.symbol->name, graph_search_))) continue;
+                (!node.symbol || (!symbol_name_matches(node.symbol->name, graph_search_) &&
+                                  (node.symbol->demangled_name.empty() ||
+                                   !symbol_name_matches(node.symbol->demangled_name, graph_search_))))) continue;
             ImGui::PushID(node.id.c_str());
-            if (ImGui::Selectable(node.label.c_str())) activate_call_graph_node(node);
+            const std::string item_label =
+                (model_.demangle_symbols() && node.symbol && !node.symbol->demangled_name.empty())
+                    ? node.symbol->demangled_name
+                    : node.label;
+            if (ImGui::Selectable(item_label.c_str())) activate_call_graph_node(node);
+            if (ImGui::IsItemHovered() && node.symbol && item_label != node.symbol->name) {
+                ImGui::SetTooltip("Raw symbol: %s", node.symbol->name.c_str());
+            }
             ImGui::PopID();
         }
         ImGui::EndChild();
@@ -2108,7 +2133,7 @@ void UiApp::render_call_graph_panel() {
             });
             const std::string label = graph_node == current_call_graph_->nodes.end()
                                           ? layout_node.node_id
-                                          : call_graph_node_display_label(*graph_node);
+                                          : call_graph_node_display_label(*graph_node, model_.demangle_symbols());
             bool selected = false;
             const peelf::IBinaryImage* img = model_.image();
             if (graph_node != current_call_graph_->nodes.end() && img != nullptr) {
@@ -2419,19 +2444,50 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                 const auto* target = symbol_index_.find_containing_address(*inst.branch_target);
                 if (target && target->virtual_address) {
                     const auto delta = *inst.branch_target - *target->virtual_address;
-                    const auto label = delta ? std::format("{}+0x{:X}", target->name, delta) : target->name;
+                    const std::string& tname = target->display_name(model_.demangle_symbols());
+                    const auto label = delta ? std::format("{}+0x{:X}", tname, delta) : tname;
                     ImGui::SameLine();
                     ImGui::TextDisabled("; %s", label.c_str());
+                    if (ImGui::IsItemHovered() && tname != target->name) {
+                        ImGui::SetTooltip("Raw symbol: %s", target->name.c_str());
+                    }
                 }
             }
             ImGui::TableNextColumn();
+            const SourceLineMapping* exact_src = model_.find_source_line(inst.address, 0);
+            const SourceLineMapping* near_src = exact_src != nullptr
+                ? exact_src
+                : model_.find_source_line(inst.address, 32);
+            std::string col_text;
+            std::string raw_tooltip;
             if (const auto* note = annotations_.find(inst.address); note && (!note->name.empty() || !note->comment.empty())) {
-                ImGui::TextUnformatted((note->name + (note->comment.empty() ? "" : " ; " + note->comment)).c_str());
-            } else
-            if (const auto* symbol = symbol_index_.find_containing_address(inst.address); symbol && symbol->virtual_address) {
+                col_text = note->name + (note->comment.empty() ? "" : " ; " + note->comment);
+            } else if (const auto* symbol = symbol_index_.find_containing_address(inst.address); symbol && symbol->virtual_address) {
                 const auto offset = inst.address - *symbol->virtual_address;
-                const auto label = offset == 0 ? symbol->name : std::format("{}+0x{:X}", symbol->name, offset);
-                ImGui::TextUnformatted(label.c_str());
+                const std::string& sname = symbol->display_name(model_.demangle_symbols());
+                col_text = offset == 0 ? sname : std::format("{}+0x{:X}", sname, offset);
+                if (sname != symbol->name) {
+                    raw_tooltip = symbol->name;
+                }
+            }
+            if (exact_src != nullptr) {
+                const std::string src_tag = std::format("[{}:{}]",
+                    !exact_src->file_name.empty() ? exact_src->file_name : exact_src->file_path,
+                    exact_src->line);
+                col_text = col_text.empty() ? src_tag : (col_text + "  " + src_tag);
+            }
+            if (!col_text.empty()) {
+                ImGui::TextUnformatted(col_text.c_str());
+                if (ImGui::IsItemHovered() && (!raw_tooltip.empty() || near_src != nullptr)) {
+                    if (!raw_tooltip.empty() && near_src != nullptr) {
+                        ImGui::SetTooltip("Raw symbol: %s\nSource: %s:%u",
+                                          raw_tooltip.c_str(), near_src->file_path.c_str(), near_src->line);
+                    } else if (!raw_tooltip.empty()) {
+                        ImGui::SetTooltip("Raw symbol: %s", raw_tooltip.c_str());
+                    } else if (near_src != nullptr) {
+                        ImGui::SetTooltip("Source: %s:%u", near_src->file_path.c_str(), near_src->line);
+                    }
+                }
             }
         }
         }
@@ -2449,6 +2505,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
 
         symbol_index_ = model_.symbol_index();
+        debug_types_.assign(model_.debug_types().begin(), model_.debug_types().end());
+        ++symbol_revision_;
         strings_dirty_ = true;
         references_dirty_ = true;
         const peelf::IProcessSession* sess = model_.process_session();
@@ -2561,6 +2619,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         recent_binaries_.remember(model_.file_info().path);
         if (!recent_binaries_.save(recent_binaries_path_)) Log().error("Could not save recent binary history");
         symbol_index_ = model_.symbol_index();
+        debug_types_.assign(model_.debug_types().begin(), model_.debug_types().end());
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         pending_call_graph_request_.reset();
@@ -2577,7 +2636,10 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
         current_selection_ = structure_tree_->selection;
         last_navigation_selection_.reset();
-        Log().info("Loaded {} symbol records", model_.symbol_index().size());
+        Log().info("Loaded {} symbol records ({} debug types, {} source lines)",
+                   model_.symbol_index().size(),
+                   model_.debug_types().size(),
+                   model_.source_lines().size());
 
         // Map the unified architecture onto the disassembler's enum.
         const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());
@@ -2635,7 +2697,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             return;
         }
 
-        DebugSymbolLoadResult result = load_pdb_debug_symbols(path, *img);
+        DebugSymbolLoadResult result = load_debug_symbols_file(path, *img);
         if (result.status != DebugSymbolLoadStatus::Loaded) {
             Log().warn("Debug symbols not loaded ({}): {}",
                        to_string(result.status),
@@ -2643,11 +2705,14 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             return;
         }
 
-        model_.add_debug_symbols(std::span<const DebugSymbol>(result.symbols.data(), result.symbols.size()));
+        model_.apply_debug_symbol_result(result);
         symbol_index_ = model_.symbol_index();
-        debug_types_ = std::move(result.types); ++symbol_revision_;
-        Log().info("Loaded {} debug symbols from {}; symbol index now has {} records",
+        debug_types_.assign(model_.debug_types().begin(), model_.debug_types().end());
+        ++symbol_revision_;
+        Log().info("Loaded {} debug symbols, {} types, and {} source lines from {}; symbol index now has {} records",
                    result.symbols.size(),
+                   result.types.size(),
+                   result.lines.size(),
                    path.string(),
                    model_.symbol_index().size());
 

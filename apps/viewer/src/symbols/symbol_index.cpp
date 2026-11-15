@@ -1,5 +1,7 @@
 #include "symbols/symbol_index.hpp"
 
+#include <peelf/demangle.hpp>
+
 #include <algorithm>
 #include <limits>
 #include <string>
@@ -136,8 +138,19 @@ namespace {
 } // namespace
 
 void SymbolIndex::push_record(SymbolRecord record) {
+    if (record.name.empty() && !record.raw_name.empty()) {
+        record.name = record.raw_name;
+    }
     if (record.name.empty() || is_elf_mapping_symbol(record.name)) {
         return;
+    }
+    if (record.raw_name.empty()) {
+        record.raw_name = record.name;
+    }
+    if (record.demangled_name.empty()) {
+        if (peelf::DemangleResult dem = peelf::demangle_symbol(record.raw_name); dem.succeeded) {
+            record.demangled_name = std::move(dem.demangled);
+        }
     }
     const std::size_t idx = records_.size();
     if (record.virtual_address.has_value()) {
@@ -363,7 +376,9 @@ std::vector<std::string> SymbolIndex::libraries() const {
 
 const SymbolRecord* SymbolIndex::find_by_name(std::string_view name) const noexcept {
     const auto it = std::ranges::find_if(records_, [&](const SymbolRecord& record) {
-        return record.name == name;
+        return record.name == name ||
+               record.raw_name == name ||
+               (!record.demangled_name.empty() && record.demangled_name == name);
     });
     return it == records_.end() ? nullptr : &*it;
 }

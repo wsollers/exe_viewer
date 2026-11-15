@@ -27,7 +27,8 @@ struct GraphByteRange {
 };
 
 struct GraphSymbolRef {
-    std::string name;
+    std::string name{};
+    std::string demangled_name{};
     std::uint64_t symbol_index = 0;
     bool dynamic = false;
 };

@@ -31,6 +31,8 @@ struct DebugSymbol {
 
 struct SymbolRecord {
     std::string name{};
+    std::string raw_name{};
+    std::string demangled_name{};
     SymbolSource source = SymbolSource::ImageSymbol;
     std::uint64_t source_index = 0;
     std::optional<std::uint64_t> virtual_address{};
@@ -38,9 +40,21 @@ struct SymbolRecord {
     std::uint64_t size = 0;
     bool dynamic = false;
     bool external = false;
-    // Known PDB classification; other symbol formats use executable section membership.
+    // Known PDB/DWARF classification; other symbol formats use executable section membership.
     std::optional<bool> function{};
     std::string library{};
+
+    [[nodiscard]] const std::string& display_name(bool demangle = true) const noexcept {
+        if (demangle && !demangled_name.empty()) {
+            return demangled_name;
+        }
+        return !raw_name.empty() ? raw_name : name;
+    }
+
+    [[nodiscard]] bool is_demangled() const noexcept {
+        const std::string& raw = !raw_name.empty() ? raw_name : name;
+        return !demangled_name.empty() && demangled_name != raw;
+    }
 };
 
 class SymbolIndex {

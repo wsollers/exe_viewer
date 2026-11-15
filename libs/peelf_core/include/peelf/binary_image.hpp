@@ -365,6 +365,11 @@ struct ElfGnuHashTable {
     std::vector<std::uint32_t> chains;
 };
 
+struct GnuDebugLink {
+    std::string filename;
+    std::uint32_t crc32 = 0;
+};
+
 // Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
 // internal to binary_image.cpp; callers obtain one via parse_image().
 class IBinaryImage {
@@ -384,6 +389,7 @@ public:
     [[nodiscard]] virtual const std::vector<Symbol>& symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
+    [[nodiscard]] virtual const GnuDebugLink* gnu_debuglink() const noexcept { return nullptr; }
     [[nodiscard]] virtual const PeHeader* pe_header() const noexcept { return nullptr; }
     [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;

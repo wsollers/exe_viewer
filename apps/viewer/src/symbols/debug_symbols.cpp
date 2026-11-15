@@ -1,5 +1,7 @@
 #include "symbols/debug_symbols.hpp"
 
+#include <peelf/dwarf.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -10,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -515,6 +518,188 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
 #endif
 }
 
+std::optional<std::filesystem::path> find_local_elf_debug_file(
+    const peelf::IBinaryImage& image,
+    const std::filesystem::path& image_path,
+    std::span<const std::filesystem::path> extra_search_dirs) {
+    return peelf::find_separate_debug_file(image_path, image, extra_search_dirs);
+}
+
+std::optional<std::filesystem::path> find_local_debug_symbols_file(
+    const peelf::IBinaryImage& image,
+    const std::filesystem::path& image_path) {
+    if (const auto pdb = find_local_codeview_pdb(image, image_path)) {
+        return pdb;
+    }
+    return find_local_elf_debug_file(image, image_path);
+}
+
+DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
+    const peelf::IBinaryImage& dwarf_source_image,
+    std::span<const std::uint8_t> dwarf_source_bytes,
+    const peelf::IBinaryImage& target_image,
+    std::string_view diagnostic_label) {
+    if (!peelf::has_embedded_dwarf(dwarf_source_image)) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::UnsupportedFormat,
+            .diagnostic = "Image contains neither .debug_info nor .debug_line DWARF sections",
+        };
+    }
+
+    auto parsed = peelf::parse_dwarf_image(dwarf_source_image, dwarf_source_bytes);
+    if (!parsed) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::BackendError,
+            .diagnostic = parsed.error().message,
+        };
+    }
+
+    const std::uint64_t source_base = dwarf_source_image.image_base();
+    const std::uint64_t target_base = target_image.image_base();
+    const bool phdr_less_source = (source_base == 0 && dwarf_source_image.segments().empty());
+
+    const auto compute_rva_and_va = [&](std::uint64_t raw_addr) -> std::pair<std::uint64_t, std::uint64_t> {
+        std::uint64_t rva = raw_addr;
+        if (source_base != 0) {
+            rva = (raw_addr >= source_base) ? (raw_addr - source_base) : raw_addr;
+        } else if (phdr_less_source && target_base != 0 && raw_addr >= target_base &&
+                   target_image.virtual_address_to_file_offset(raw_addr).has_value()) {
+            rva = raw_addr - target_base;
+        }
+        const std::uint64_t va = (target_base != 0) ? (target_base + rva) : raw_addr;
+        return {rva, va};
+    };
+
+    DebugSymbolLoadResult result;
+    result.status = DebugSymbolLoadStatus::Loaded;
+    result.diagnostic = diagnostic_label.empty() ? std::string("DWARF") : std::string(diagnostic_label);
+
+    result.symbols.reserve(parsed->functions.size());
+    for (const peelf::DwarfFunctionSymbol& fn : parsed->functions) {
+        if (fn.low_pc == 0) {
+            continue;
+        }
+        const auto [rva, va] = compute_rva_and_va(fn.low_pc);
+        const std::string& sym_name = !fn.linkage_name.empty() ? fn.linkage_name : fn.name;
+        if (sym_name.empty()) {
+            continue;
+        }
+        result.symbols.push_back(DebugSymbol{
+            .name = sym_name,
+            .relative_virtual_address = rva,
+            .virtual_address = va,
+            .size = fn.byte_size,
+            .function = true,
+            .library = fn.comp_unit,
+        });
+    }
+
+    result.types.reserve(parsed->types.size());
+    for (const peelf::DwarfAggregateType& agg : parsed->types) {
+        DataTypeRecord rec;
+        rec.name = agg.name;
+        rec.size = agg.byte_size;
+        rec.is_union = (agg.kind == peelf::DwarfAggregateKind::Union);
+        rec.members.reserve(agg.members.size());
+        for (const peelf::DwarfMemberInfo& m : agg.members) {
+            rec.members.push_back(DataMember{
+                .name = m.name,
+                .type = m.type_name,
+                .offset = m.byte_offset,
+                .size = m.byte_size,
+            });
+        }
+        result.types.push_back(std::move(rec));
+    }
+
+    result.lines.reserve(parsed->lines.size());
+    for (const peelf::DwarfLineEntry& line : parsed->lines) {
+        if (line.address == 0 || line.line == 0) {
+            continue;
+        }
+        const auto [rva, va] = compute_rva_and_va(line.address);
+        result.lines.push_back(SourceLineMapping{
+            .virtual_address = va,
+            .relative_virtual_address = rva,
+            .file_path = line.file_path,
+            .file_name = line.file_name,
+            .line = line.line,
+            .column = line.column,
+            .is_stmt = line.is_stmt,
+        });
+    }
+
+    std::ranges::sort(result.lines, [](const SourceLineMapping& a, const SourceLineMapping& b) {
+        if (a.virtual_address != b.virtual_address) {
+            return a.virtual_address < b.virtual_address;
+        }
+        return a.line < b.line;
+    });
+
+    return result;
+}
+
+DebugSymbolLoadResult load_dwarf_debug_symbols(const std::filesystem::path& debug_path,
+                                               const peelf::IBinaryImage& target_image) {
+    std::error_code ec;
+    if (!std::filesystem::exists(debug_path, ec)) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::FileNotFound,
+            .diagnostic = debug_path.string(),
+        };
+    }
+
+    constexpr std::uintmax_t kMaxDwarfFileSize = 512ull * 1024ull * 1024ull;
+    const auto fsize = std::filesystem::file_size(debug_path, ec);
+    if (ec || fsize < 16u || fsize > kMaxDwarfFileSize) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::BackendError,
+            .diagnostic = "Unable to read DWARF file size: " + debug_path.string(),
+        };
+    }
+
+    std::ifstream file(debug_path, std::ios::binary);
+    if (!file) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::FileNotFound,
+            .diagnostic = debug_path.string(),
+        };
+    }
+
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(fsize));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::BackendError,
+            .diagnostic = "Failed reading DWARF file: " + debug_path.string(),
+        };
+    }
+
+    auto parsed_image = peelf::parse_image(bytes);
+    if (!parsed_image) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::UnsupportedFormat,
+            .diagnostic = parsed_image.error().message,
+        };
+    }
+
+    return load_dwarf_debug_symbols_from_image(**parsed_image, bytes, target_image, debug_path.string());
+}
+
+DebugSymbolLoadResult load_debug_symbols_file(const std::filesystem::path& debug_path,
+                                              const peelf::IBinaryImage& target_image) {
+    std::error_code ec;
+    if (!std::filesystem::exists(debug_path, ec)) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::FileNotFound,
+            .diagnostic = debug_path.string(),
+        };
+    }
+    if (has_pdb_extension(debug_path) || has_native_pdb_signature(debug_path)) {
+        return load_pdb_debug_symbols(debug_path, target_image);
+    }
+    return load_dwarf_debug_symbols(debug_path, target_image);
+}
+
 std::vector<DebugSymbol> rebase_debug_symbols(std::span<const DebugSymbol> symbols,
                                               std::uint64_t image_base) {
     std::vector<DebugSymbol> rebased;
@@ -525,6 +710,25 @@ std::vector<DebugSymbol> rebase_debug_symbols(std::span<const DebugSymbol> symbo
         }
         rebased.push_back(std::move(sym));
     }
+    return rebased;
+}
+
+std::vector<SourceLineMapping> rebase_source_lines(std::span<const SourceLineMapping> lines,
+                                                   std::uint64_t image_base) {
+    std::vector<SourceLineMapping> rebased;
+    rebased.reserve(lines.size());
+    for (SourceLineMapping entry : lines) {
+        if (entry.relative_virtual_address != 0) {
+            entry.virtual_address = image_base + entry.relative_virtual_address;
+        }
+        rebased.push_back(std::move(entry));
+    }
+    std::ranges::sort(rebased, [](const SourceLineMapping& a, const SourceLineMapping& b) {
+        if (a.virtual_address != b.virtual_address) {
+            return a.virtual_address < b.virtual_address;
+        }
+        return a.line < b.line;
+    });
     return rebased;
 }
 

@@ -9,7 +9,7 @@
 
 namespace viewer {
 
-SymbolsPanel::SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, const BinaryModel& model)
+SymbolsPanel::SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, BinaryModel& model)
     : UiPanel("Functions & Names")
     , index_(index)
     , model_(model)
@@ -41,6 +41,14 @@ void SymbolsPanel::draw_contents() {
         ImGui::EndCombo();
     }
     ImGui::Checkbox("Functions only", &functions_only_);
+    ImGui::SameLine();
+    bool demangle = model_.demangle_symbols();
+    if (ImGui::Checkbox("Demangle symbols", &demangle)) {
+        model_.set_demangle_symbols(demangle);
+        if (on_demangle_changed_) {
+            on_demangle_changed_(demangle);
+        }
+    }
     const std::string filter = filter_buf_;
     const bool has_filter = !filter.empty();
     const auto records = index_.records();
@@ -69,6 +77,7 @@ void SymbolsPanel::draw_contents() {
         std::optional<int> selected_row;
         for (std::size_t i = 0; i < records.size(); ++i)
             if ((!has_filter || symbol_name_matches(records[i].name, filter) ||
+                 (!records[i].demangled_name.empty() && symbol_name_matches(records[i].demangled_name, filter)) ||
                  (display_name_resolver_ && symbol_name_matches(display_name_resolver_(records[i]), filter))) &&
                 (library_filter_.empty() || records[i].library == library_filter_) &&
                 (!functions_only_ || records[i].source == SymbolSource::Import ||
@@ -96,8 +105,20 @@ void SymbolsPanel::draw_contents() {
                     on_symbol_activated_(symbol, row_id);
                 }
             }
-            if (ImGui::IsItemHovered() && resolved_name != symbol.name)
-                ImGui::SetTooltip("Original symbol: %s", symbol.name.c_str());
+            if (ImGui::IsItemHovered()) {
+                const std::string& raw = !symbol.raw_name.empty() ? symbol.raw_name : symbol.name;
+                const SourceLineMapping* src = symbol.virtual_address
+                    ? model_.find_source_line(*symbol.virtual_address, 16)
+                    : nullptr;
+                if (resolved_name != raw && src != nullptr) {
+                    ImGui::SetTooltip("Raw symbol: %s\nSource: %s:%u",
+                                      raw.c_str(), src->file_path.c_str(), src->line);
+                } else if (resolved_name != raw) {
+                    ImGui::SetTooltip("Raw symbol: %s", raw.c_str());
+                } else if (src != nullptr) {
+                    ImGui::SetTooltip("Source: %s:%u", src->file_path.c_str(), src->line);
+                }
+            }
             if (selected && last_scrolled_selected_ != row_id) {
                 ImGui::SetScrollHereY(0.5f);
                 last_scrolled_selected_ = row_id;
@@ -111,7 +132,7 @@ void SymbolsPanel::draw_contents() {
             ImGui::Text("0x%llX", static_cast<unsigned long long>(symbol.size));
             const char* source = "Embedded";
             switch (symbol.source) {
-                case SymbolSource::DebugSymbol: source = "PDB"; break;
+                case SymbolSource::DebugSymbol: source = "Debug Info (PDB/DWARF)"; break;
                 case SymbolSource::Import: source = "Import"; break;
                 case SymbolSource::Export: source = "Export"; break;
                 case SymbolSource::EntryPoint: source = "Entry point"; break;

@@ -61,7 +61,15 @@ void FunctionsPanel::draw_contents() {
     ImGui::SetNextItemWidth(155.0f);
     ImGui::Combo("##FnOrigin",
                  &origin_filter_,
-                 "All Origins\0Symbols / PDB\0Unwind (.pdata/.eh_frame)\0Exports / Entry\0Callbacks (TLS/Init)\0Call Targets\0");
+                 "All Origins\0Symbols / Debug\0Unwind (.pdata/.eh_frame)\0Exports / Entry\0Callbacks (TLS/Init)\0Call Targets\0");
+    ImGui::SameLine();
+    bool demangle = model_.demangle_symbols();
+    if (ImGui::Checkbox("Demangle", &demangle)) {
+        model_.set_demangle_symbols(demangle);
+        if (on_demangle_changed_) {
+            on_demangle_changed_(demangle);
+        }
+    }
     ImGui::SameLine();
     ImGui::TextDisabled("(%zu total)", all_entries.size());
 
@@ -83,6 +91,7 @@ void FunctionsPanel::draw_contents() {
         std::snprintf(va_hex.data(), va_hex.size(), "0x%" PRIX64, fn.virtual_address);
         if (!filter.empty() &&
             !icontains_fn(fn.name, filter) &&
+            (fn.demangled_name.empty() || !icontains_fn(fn.demangled_name, filter)) &&
             !icontains_fn(fn.section_name, filter) &&
             !icontains_fn(va_hex.data(), filter)) {
             continue;
@@ -135,7 +144,20 @@ void FunctionsPanel::draw_contents() {
                 ImGui::PopID();
 
                 ImGui::TableNextColumn();
-                ImGui::TextUnformatted(fn.name.c_str());
+                const std::string& disp_name = fn.display_name(demangle);
+                ImGui::TextUnformatted(disp_name.c_str());
+                if (ImGui::IsItemHovered()) {
+                    const std::string& raw = !fn.raw_name.empty() ? fn.raw_name : fn.name;
+                    const SourceLineMapping* src = model_.find_source_line(fn.virtual_address, 16);
+                    if (disp_name != raw && src != nullptr) {
+                        ImGui::SetTooltip("Raw symbol: %s\nSource: %s:%u",
+                                          raw.c_str(), src->file_path.c_str(), src->line);
+                    } else if (disp_name != raw) {
+                        ImGui::SetTooltip("Raw symbol: %s", raw.c_str());
+                    } else if (src != nullptr) {
+                        ImGui::SetTooltip("Source: %s:%u", src->file_path.c_str(), src->line);
+                    }
+                }
 
                 ImGui::TableNextColumn();
                 if (fn.size != 0) {

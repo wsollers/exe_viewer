@@ -344,7 +344,7 @@ namespace viewer {
 
         nfdchar_t *out_path = nullptr;
         nfdfilteritem_t filters[2] = {
-            {"Program Database", "pdb"},
+            {"Debug Symbols (PDB / DWARF)", "pdb,debug,dbg,elf,so,dll,exe"},
             {"All Files", "*"}
         };
 

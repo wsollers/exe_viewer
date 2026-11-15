@@ -5,6 +5,8 @@ add_library(peelf_core
   src/sha256.cpp
   src/endian_reader.cpp
   src/binary_image.cpp
+  src/demangle.cpp
+  src/dwarf.cpp
   src/patching.cpp
   src/process_common.cpp
   src/process_linux.cpp
@@ -21,6 +23,8 @@ add_library(peelf_core
   include/peelf/forgiving.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
+  include/peelf/demangle.hpp
+  include/peelf/dwarf.hpp
   include/peelf/patching.hpp
   include/peelf/process.hpp
   include/peelf/stack_tls.hpp

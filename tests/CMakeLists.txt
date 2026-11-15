@@ -52,6 +52,7 @@ add_executable(peelf_tests
   symbol_index_test.cpp
   reference_index_test.cpp
   strings_index_test.cpp
+  demangle_dwarf_test.cpp
   analysis_project_test.cpp
   decompiler_test.cpp
   recent_binaries_test.cpp

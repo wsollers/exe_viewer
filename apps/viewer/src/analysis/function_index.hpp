@@ -39,6 +39,8 @@ enum class FunctionOrigin : std::uint8_t {
 
 struct FunctionEntry {
     std::string name;
+    std::string raw_name;
+    std::string demangled_name;
     std::uint64_t virtual_address{0};
     std::optional<std::uint64_t> file_offset;
     std::uint64_t size{0};
@@ -46,6 +48,18 @@ struct FunctionEntry {
     std::string section_name;
     std::string library;
     bool is_thunk{false};
+
+    [[nodiscard]] const std::string& display_name(bool demangle = true) const noexcept {
+        if (demangle && !demangled_name.empty()) {
+            return demangled_name;
+        }
+        return !raw_name.empty() ? raw_name : name;
+    }
+
+    [[nodiscard]] bool is_demangled() const noexcept {
+        const std::string& raw = !raw_name.empty() ? raw_name : name;
+        return !demangled_name.empty() && demangled_name != raw;
+    }
 };
 
 /// Unified multi-source function discovery index across static files and live-rebased modules.

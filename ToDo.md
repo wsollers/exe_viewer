@@ -58,8 +58,8 @@ Each work unit below is sized as a self-contained, testable commit+push slice on
   - Lift the 4 MiB synchronous scan cap in `ReferenceIndex` using chunked `std::jthread` / `std::stop_token` background scanning over executable sections/regions (`ReferenceScanJob` + `AsyncReferenceScanner` in 256 KiB slices with $O(\log N + K)$ sorted `incoming`/`outgoing` indices), surface explicit scan progress & coverage % indicators plus Pause/Resume/Scan Full Binary controls in `References` and `Flow Graph`, and recover PIC/RIP-relative i32 jump tables, ARM Thumb-2 `tbb`/`tbh` & ARM64 PC-relative jump tables, plus GOT/IAT indirect calls/branches with explicit `ReferenceConfidence` and `evidence` tags.
 - [x] **WU-04** — **Strings Browser Linked to References & Functions (Feedback Priority #2).** *(Depends on: `WU-03`)*
   - Extract ASCII/UTF-8 and UTF-16LE/BE strings across static sections and live readable regions with section/region, VA/offset, byte/char length, encoding, and `ReferenceIndex` xref counts. Selecting a string lists referencing functions/instructions and navigates Hex, Disassembly, Decompile, and `Flow Graph`.
-- [ ] **WU-05** — **Symbol Demangling & Initial ELF DWARF Reader.** *(Depends on: `WU-01`)*
-  - Add Itanium C++/Rust and MSVC symbol demangling (display vs. raw name toggle) plus an initial ELF DWARF reader (`.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line`, `.gnu_debuglink`, `.note.gnu.build-id` sidecar discovery) feeding `SymbolIndex`, `FunctionIndex`, and `DataTypeRecord` layouts.
+- [x] **WU-05** — **Symbol Demangling & Initial ELF DWARF Reader.** *(Depends on: `WU-01`)*
+  - Add Itanium C++/Rust (`_Z...`, `_R...`, `_ZN...17h...E`) and MSVC (`?...`) symbol demangling (`View > Demangle symbols` display vs. raw name toggle across `Symbols`, `Functions`, `Disassembly`, `Decompile`, `Flow Graph`, and `Details`) plus an in-tree LE/BE 32/64-bit ELF DWARF v2–v5 & separate-debug reader (`.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line_str`, `.debug_str_offsets`, `.debug_addr`, `.debug_line`, `.gnu_debuglink`, `.note.gnu.build-id` sidecar discovery, and live ASLR rebasing) feeding `SymbolIndex`, `FunctionIndex`, `DataTypeRecord` layouts, and `[file:line]` source annotations.
 - [ ] **WU-06** — **Apply Structures to Static & Live Bytes (Feedback Priority #4).** *(Depends on: `WU-01`, `WU-05`)*
   - Bind PDB/Ghidra/DWARF `DataTypeRecord` layouts plus built-in PE/ELF/PEB/TEB/`r_debug` schemas onto any static file offset or live process VA using `EndianReader` + `TargetLayout`, rendering field values, nested structs, bounded arrays, and click-to-follow pointers.
 - [ ] **WU-07** — **Sysinternals VMMap-Style Visual Process RAM Explorer.** *(Depends on: `WU-01`)*
@@ -314,8 +314,8 @@ Items promoted into the active **Next-Gen Execution Queue (`§1b`)** carry their
 
 - [ ] Mach-O support (third format) behind the same `IBinaryImage`.
 - [x] String extraction browser linked to `ReferenceIndex` (`WU-04`); `[ ]` entropy/packer heuristics stretch.
-- [ ] Symbol demangling — Itanium C++/Rust + MSVC (`WU-05`).
-- [~] PDB / DWARF debug-info association — Windows PDB/DIA shipped; ELF DWARF + split-debug/build-id queued in `WU-05`.
+- [x] Symbol demangling — Itanium C++/Rust + MSVC (`WU-05`).
+- [x] PDB / DWARF debug-info association — Windows PDB/DIA + ELF/MinGW DWARF v2–v5 & `.gnu_debuglink`/`.note.gnu.build-id` separate-debug discovery + live ASLR rebasing (`WU-05`).
 - [x] Endian-aware search across static sections and live memory regions (byte/wildcard patterns, ASCII/UTF-16 strings, scalars, pointer xrefs — shipped in `Memory Search`); regex filter stretch remains open.
 - [ ] Headless CLI & report export to JSON/SARIF/CSV (`WU-13`).
 - [ ] Binary comparison & disk-vs-live-RAM diff workspace (`WU-12`).

@@ -16,6 +16,8 @@
 #include <string_view>
 #include <utility>
 
+#include <peelf/demangle.hpp>
+
 #include "disasm/disassembler.hpp"
 
 #ifdef _WIN32
@@ -467,6 +469,7 @@ namespace {
     }
     return GraphSymbolRef{
         .name = record->name,
+        .demangled_name = record->demangled_name,
         .symbol_index = record->source_index,
         .dynamic = record->dynamic,
     };
@@ -481,6 +484,7 @@ namespace {
         .bytes = record_range(record),
         .symbol = GraphSymbolRef{
             .name = record.name,
+            .demangled_name = record.demangled_name,
             .symbol_index = record.source_index,
             .dynamic = record.dynamic,
         },
@@ -510,6 +514,7 @@ namespace {
         },
         .symbol = GraphSymbolRef{
             .name = record.name,
+            .demangled_name = record.demangled_name,
             .symbol_index = record.source_index,
             .dynamic = record.dynamic,
         },
@@ -588,6 +593,7 @@ namespace {
         .bytes = symbol_range(image, symbol),
         .symbol = GraphSymbolRef{
             .name = symbol.name,
+            .demangled_name = peelf::demangle_symbol(symbol.name).demangled,
             .symbol_index = static_cast<std::uint64_t>(index),
             .dynamic = symbol.dynamic,
         },
@@ -875,6 +881,7 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolI
                 },
                 .symbol = GraphSymbolRef{
                     .name = libc_start_record->name,
+                    .demangled_name = libc_start_record->demangled_name,
                     .symbol_index = libc_start_record->source_index,
                     .dynamic = libc_start_record->dynamic,
                 },
@@ -2160,6 +2167,7 @@ std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage&
         if (virtual_address >= symbol.virtual_address && virtual_address < symbol.virtual_address + symbol_size) {
             return GraphSymbolRef{
                 .name = symbol.name,
+                .demangled_name = peelf::demangle_symbol(symbol.name).demangled,
                 .symbol_index = index,
                 .dynamic = symbol.dynamic,
             };

@@ -3,6 +3,7 @@
 #include "pe_parser.hpp"
 #include "symbols/debug_symbols.hpp"
 
+#include <peelf/dwarf.hpp>
 #include <peelf/error.hpp>
 #include <peelf/sha256.hpp>
 
@@ -86,6 +87,11 @@ std::filesystem::path utf8_path(std::string_view text) {
         function_index_ = {};
         analysis_thumb_mode_ = false;
         debug_symbols_by_key_.clear();
+        debug_types_by_key_.clear();
+        source_lines_by_key_.clear();
+        auto_loaded_debug_keys_.clear();
+        active_debug_types_.clear();
+        active_source_lines_.clear();
         session_.reset();
         resolved_exe_path_.reset();
         regions_.clear();
@@ -123,7 +129,100 @@ std::filesystem::path utf8_path(std::string_view text) {
         return file_info_.path;
     }
 
+    void BinaryModel::store_debug_symbol_result_for_key(const std::string& key,
+                                                        const DebugSymbolLoadResult& result) {
+        if (key.empty() || result.status != DebugSymbolLoadStatus::Loaded) {
+            return;
+        }
+        if (!result.symbols.empty()) {
+            const std::vector<DebugSymbol> rebased =
+                (image_ != nullptr && image_->image_base() != 0)
+                    ? rebase_debug_symbols(result.symbols, image_->image_base())
+                    : result.symbols;
+            auto& stored = debug_symbols_by_key_[key];
+            stored.insert(stored.end(), rebased.begin(), rebased.end());
+        }
+        if (!result.types.empty()) {
+            auto& stored_types = debug_types_by_key_[key];
+            stored_types.insert(stored_types.end(), result.types.begin(), result.types.end());
+            std::ranges::sort(stored_types, [](const DataTypeRecord& a, const DataTypeRecord& b) {
+                if (a.name != b.name) return a.name < b.name;
+                return a.members.size() > b.members.size();
+            });
+            stored_types.erase(
+                std::ranges::unique(stored_types, [](const DataTypeRecord& a, const DataTypeRecord& b) {
+                    return a.name == b.name && a.size == b.size;
+                }).begin(),
+                stored_types.end());
+        }
+        if (!result.lines.empty()) {
+            const std::vector<SourceLineMapping> rebased_lines =
+                (image_ != nullptr && image_->image_base() != 0)
+                    ? rebase_source_lines(result.lines, image_->image_base())
+                    : result.lines;
+            auto& stored_lines = source_lines_by_key_[key];
+            stored_lines.insert(stored_lines.end(), rebased_lines.begin(), rebased_lines.end());
+        }
+    }
+
+    bool BinaryModel::auto_load_debug_info_for_current_image(const std::filesystem::path& image_path) {
+        if (!image_) {
+            return false;
+        }
+        const std::string key = current_debug_symbol_key();
+        if (key.empty() || auto_loaded_debug_keys_.contains(key)) {
+            return false;
+        }
+        auto_loaded_debug_keys_.insert(key);
+
+        bool loaded_any = false;
+        const auto absorb = [&](const DebugSymbolLoadResult& res) {
+            if (res.status == DebugSymbolLoadStatus::Loaded &&
+                (!res.symbols.empty() || !res.types.empty() || !res.lines.empty())) {
+                store_debug_symbol_result_for_key(key, res);
+                loaded_any = true;
+            }
+        };
+
+        if (is_live_process()) {
+            // Live mapped modules do not map non-SHF_ALLOC `.debug_*` or `.gnu_debuglink` sections into RAM,
+            // so inspect the backing on-disk ELF/PE image when available and rebase onto `image_->image_base()`.
+            std::unique_ptr<peelf::IBinaryImage> disk_image;
+            if (!live_backing_file_bytes_.empty()) {
+                if (auto parsed_disk = peelf::parse_image(live_backing_file_bytes_)) {
+                    disk_image = std::move(*parsed_disk);
+                }
+            }
+            const peelf::IBinaryImage& metadata_source = disk_image ? *disk_image : *image_;
+            if (disk_image && peelf::has_embedded_dwarf(*disk_image)) {
+                absorb(load_dwarf_debug_symbols_from_image(
+                    *disk_image, live_backing_file_bytes_, *image_, image_path.string()));
+            }
+            if (!image_path.empty()) {
+                if (const auto sidecar = find_local_elf_debug_file(metadata_source, image_path)) {
+                    absorb(load_dwarf_debug_symbols(*sidecar, *image_));
+                }
+                if (const auto pdb = find_local_codeview_pdb(*image_, image_path)) {
+                    absorb(load_pdb_debug_symbols(*pdb, *image_));
+                }
+            }
+        } else {
+            if (peelf::has_embedded_dwarf(*image_) && !bytes_.empty()) {
+                absorb(load_dwarf_debug_symbols_from_image(*image_, bytes_, *image_, image_path.string()));
+            }
+            if (!image_path.empty()) {
+                if (const auto sidecar = find_local_elf_debug_file(*image_, image_path)) {
+                    absorb(load_dwarf_debug_symbols(*sidecar, *image_));
+                }
+            }
+        }
+
+        return loaded_any;
+    }
+
     void BinaryModel::rebuild_symbol_index() {
+        active_debug_types_.clear();
+        active_source_lines_.clear();
         if (!image_) {
             symbol_index_ = {};
             function_index_ = {};
@@ -140,6 +239,21 @@ std::filesystem::path utf8_path(std::string_view text) {
                         ? rebase_debug_symbols(it->second, image_->image_base())
                         : it->second;
                 symbol_index_.add_debug_symbols(*image_, rebased);
+            }
+            if (const auto tit = debug_types_by_key_.find(key); tit != debug_types_by_key_.end()) {
+                active_debug_types_ = tit->second;
+            }
+            if (const auto lit = source_lines_by_key_.find(key); lit != source_lines_by_key_.end()) {
+                active_source_lines_ =
+                    image_->image_base() != 0
+                        ? rebase_source_lines(lit->second, image_->image_base())
+                        : lit->second;
+                std::ranges::sort(active_source_lines_, [](const SourceLineMapping& a, const SourceLineMapping& b) {
+                    if (a.virtual_address != b.virtual_address) {
+                        return a.virtual_address < b.virtual_address;
+                    }
+                    return a.line < b.line;
+                });
             }
         }
 
@@ -251,6 +365,7 @@ std::filesystem::path utf8_path(std::string_view text) {
                 if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
+                (void)auto_load_debug_info_for_current_image(utf8_path(path));
                 rebuild_symbol_index();
             }
             return loaded;
@@ -265,6 +380,7 @@ std::filesystem::path utf8_path(std::string_view text) {
                 if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
+                (void)auto_load_debug_info_for_current_image(utf8_path(path));
                 rebuild_symbol_index();
             }
             return loaded;
@@ -543,16 +659,12 @@ std::filesystem::path utf8_path(std::string_view text) {
                 });
             }
 
-            rebuild_symbol_index();
-            if (!mod.path.empty() &&
-                debug_symbols_by_key_.find(current_debug_symbol_key()) == debug_symbols_by_key_.end()) {
-                if (const auto pdb = find_local_codeview_pdb(*image_, mod.path)) {
-                    const DebugSymbolLoadResult pdb_res = load_pdb_debug_symbols(*pdb, *image_);
-                    if (pdb_res.status == DebugSymbolLoadStatus::Loaded && !pdb_res.symbols.empty()) {
-                        add_debug_symbols(pdb_res.symbols);
-                    }
-                }
+            std::filesystem::path debug_probe_path = mod.path;
+            if (debug_probe_path.empty() && mod.is_main_module && resolved_exe_path_) {
+                debug_probe_path = *resolved_exe_path_;
             }
+            (void)auto_load_debug_info_for_current_image(debug_probe_path);
+            rebuild_symbol_index();
             if (selected_tid_) {
                 refresh_selected_thread_inspection();
             }
@@ -801,7 +913,8 @@ std::filesystem::path utf8_path(std::string_view text) {
             const std::uint64_t delta = virtual_address - *sym->virtual_address;
             const std::uint64_t limit = sym->size != 0 ? sym->size : 0x4000u;
             if (delta == 0 || delta < limit) {
-                std::string label = module_prefix.empty() ? sym->name : (module_prefix + "!" + sym->name);
+                const std::string& sname = sym->display_name(demangle_symbols_);
+                std::string label = module_prefix.empty() ? sname : (module_prefix + "!" + sname);
                 if (delta != 0) {
                     label += "+" + format_hex_addr(delta);
                 }
@@ -840,6 +953,40 @@ std::filesystem::path utf8_path(std::string_view text) {
             stored.insert(stored.end(), rebased.begin(), rebased.end());
         }
         rebuild_symbol_index();
+    }
+
+    void BinaryModel::apply_debug_symbol_result(const DebugSymbolLoadResult& result) {
+        if (!image_ || result.status != DebugSymbolLoadStatus::Loaded) {
+            return;
+        }
+        const std::string key = current_debug_symbol_key();
+        if (!key.empty()) {
+            store_debug_symbol_result_for_key(key, result);
+        }
+        rebuild_symbol_index();
+    }
+
+    const SourceLineMapping* BinaryModel::find_source_line(std::uint64_t virtual_address,
+                                                           std::uint64_t max_distance) const noexcept {
+        if (active_source_lines_.empty() || virtual_address == 0) {
+            return nullptr;
+        }
+        const auto upper = std::upper_bound(
+            active_source_lines_.begin(),
+            active_source_lines_.end(),
+            virtual_address,
+            [](std::uint64_t addr, const SourceLineMapping& entry) {
+                return addr < entry.virtual_address;
+            });
+        if (upper == active_source_lines_.begin()) {
+            return nullptr;
+        }
+        const SourceLineMapping& candidate = *std::prev(upper);
+        const std::uint64_t delta = virtual_address - candidate.virtual_address;
+        if (delta > max_distance) {
+            return nullptr;
+        }
+        return &candidate;
     }
 
     std::uint64_t BinaryModel::view_base_address() const noexcept {

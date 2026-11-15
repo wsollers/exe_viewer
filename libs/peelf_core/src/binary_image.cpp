@@ -73,6 +73,9 @@ public:
     [[nodiscard]] const std::vector<Symbol>& symbols() const noexcept override { return symbols_; }
     [[nodiscard]] const std::vector<ImportEntry>& imports() const noexcept override { return imports_; }
     [[nodiscard]] const std::vector<ExportEntry>& exports() const noexcept override { return exports_; }
+    [[nodiscard]] const GnuDebugLink* gnu_debuglink() const noexcept override {
+        return gnu_debuglink_.has_value() ? &*gnu_debuglink_ : nullptr;
+    }
     [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
         static const std::vector<PeBaseRelocationBlock> empty;
         return empty;
@@ -236,6 +239,33 @@ protected:
     std::vector<Symbol> symbols_;
     std::vector<ImportEntry> imports_;
     std::vector<ExportEntry> exports_;
+    std::optional<GnuDebugLink> gnu_debuglink_;
+
+    void parse_gnu_debuglink_section(std::span<const std::uint8_t> b, bool big) {
+        for (const Section& sec : sections_) {
+            if (sec.name != ".gnu_debuglink" || sec.file_size < 5 ||
+                !fits_range(sec.file_offset, sec.file_size, static_cast<std::uint64_t>(b.size()))) {
+                continue;
+            }
+            const auto start = static_cast<std::size_t>(sec.file_offset);
+            const auto max_len = static_cast<std::size_t>(std::min<std::uint64_t>(sec.file_size, 1024));
+            std::size_t nul_rel = 0;
+            while (nul_rel < max_len && b[start + nul_rel] != 0) {
+                ++nul_rel;
+            }
+            if (nul_rel == 0 || nul_rel >= max_len) {
+                continue;
+            }
+            GnuDebugLink link;
+            link.filename.assign(reinterpret_cast<const char*>(b.data() + start), nul_rel);
+            const std::size_t crc_rel = (nul_rel + 1u + 3u) & ~std::size_t{3u};
+            if (crc_rel + 4u <= sec.file_size) {
+                link.crc32 = rd32(b, start + crc_rel, big);
+            }
+            gnu_debuglink_ = std::move(link);
+            return;
+        }
+    }
 };
 
 class ElfImage final : public ImageBase {
@@ -1771,6 +1801,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     if (img->arch_ == Architecture::PowerPC64 && img->endian_ == Endianness::Big) {
         resolve_powerpc64_function_descriptors(b, big, img->section_headers_, img->symbols_);
     }
+    img->parse_gnu_debuglink_section(b, big);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }
@@ -2106,6 +2137,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
 
     parse_pe_delay_load_imports(b, img->sections_, image_base, is64, delay_import_dir_rva,
                                 delay_import_dir_size, img->imports_);
+    img->parse_gnu_debuglink_section(b, false);
 
     return std::unique_ptr<IBinaryImage>(std::move(img));
 }

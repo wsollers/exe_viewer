@@ -2,6 +2,7 @@
 
 #include "disasm/disassembler.hpp"
 
+#include <peelf/demangle.hpp>
 #include <peelf/endian_reader.hpp>
 
 #include <algorithm>
@@ -418,9 +419,17 @@ void upsert_function(
         cur.origin = candidate.origin;
         if (cand_has_real_name || !cur_has_real_name) {
             cur.name = std::move(candidate.name);
+            cur.raw_name = std::move(candidate.raw_name);
+            cur.demangled_name = std::move(candidate.demangled_name);
         }
     } else if (!cur_has_real_name && cand_has_real_name) {
         cur.name = std::move(candidate.name);
+        cur.raw_name = std::move(candidate.raw_name);
+        cur.demangled_name = std::move(candidate.demangled_name);
+    } else if (cur.demangled_name.empty() && !candidate.demangled_name.empty()) {
+        // Prefer mangled linkage symbol when an unmangled short DWARF name lacked full signature.
+        cur.raw_name = std::move(candidate.raw_name);
+        cur.demangled_name = std::move(candidate.demangled_name);
     }
 
     if (cur.size == 0u && candidate.size != 0u) {
@@ -459,8 +468,15 @@ void upsert_function(
         known_offset.has_value() ? known_offset : image.virtual_address_to_file_offset(lookup_va);
     std::string sec_name = resolve_section_name(image, lookup_va);
     const bool thunk = detect_is_thunk(name, sec_name, file_off, image_bytes, image.architecture());
+    std::string raw_name = name;
+    std::string demangled;
+    if (peelf::DemangleResult dem = peelf::demangle_symbol(raw_name); dem.succeeded) {
+        demangled = std::move(dem.demangled);
+    }
     return FunctionEntry{
         .name = std::move(name),
+        .raw_name = std::move(raw_name),
+        .demangled_name = std::move(demangled),
         .virtual_address = va,
         .file_offset = file_off,
         .size = size,

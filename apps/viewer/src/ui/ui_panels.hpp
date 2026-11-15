@@ -86,11 +86,12 @@ namespace viewer {
 
     class SelectionDetailsPanel : public UiPanel {
     public:
-        explicit SelectionDetailsPanel(const ViewerSelection& selection);
+        explicit SelectionDetailsPanel(const ViewerSelection& selection, const BinaryModel* model = nullptr);
     protected:
         void draw_contents() override;
     private:
         const ViewerSelection& selection_;
+        const BinaryModel* model_ = nullptr;
     };
 
     class SectionsPanel : public UiPanel {
@@ -203,7 +204,7 @@ namespace viewer {
 
     class SymbolsPanel : public UiPanel {
     public:
-        SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, const BinaryModel& model);
+        SymbolsPanel(const SymbolIndex& index, const ViewerSelection& selection, BinaryModel& model);
         void set_display_name_resolver(std::function<std::string(const SymbolRecord&)> resolver) {
             display_name_resolver_ = std::move(resolver);
         }
@@ -211,11 +212,14 @@ namespace viewer {
             std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> cb) {
             on_symbol_activated_ = std::move(cb);
         }
+        void set_demangle_changed_callback(std::function<void(bool)> cb) {
+            on_demangle_changed_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         const SymbolIndex& index_;
-        const BinaryModel& model_;
+        BinaryModel& model_;
         bool functions_only_ = true;
         std::string library_filter_;
         std::string library_filter_file_;
@@ -224,6 +228,7 @@ namespace viewer {
         std::optional<std::uint64_t> last_scrolled_selected_;
         std::function<std::string(const SymbolRecord&)> display_name_resolver_;
         std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> on_symbol_activated_;
+        std::function<void(bool)> on_demangle_changed_;
     };
 
     class ImportsPanel : public UiPanel {
@@ -317,6 +322,9 @@ namespace viewer {
             std::function<void(std::uint64_t virtual_address, bool decompile)> cb) {
             on_function_activated_ = std::move(cb);
         }
+        void set_demangle_changed_callback(std::function<void(bool)> cb) {
+            on_demangle_changed_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
@@ -325,6 +333,7 @@ namespace viewer {
         char filter_buf_[128] = {};
         int origin_filter_ = 0;
         std::function<void(std::uint64_t, bool)> on_function_activated_;
+        std::function<void(bool)> on_demangle_changed_;
     };
 
     class ThreadsAndStackPanel : public UiPanel {

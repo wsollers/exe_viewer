@@ -63,7 +63,9 @@ void UiApp::request_decompile(bool force_reanalyze) {
     DecompileRequest request;
     request.binary_sha256 = model_.content_sha256();
     request.patch_revision = model_.edit_revision();
-    request.symbol_revision = symbol_revision_ ^ (annotations_.revision() * 0x9E3779B97F4A7C15ULL);
+    request.symbol_revision =
+        symbol_revision_ ^ (annotations_.revision() * 0x9E3779B97F4A7C15ULL) ^
+        (model_.demangle_symbols() ? 0xD3A461E5ULL : 0ULL);
     request.force_reanalyze = force_reanalyze;
     selected_code_ranges_.clear();
     selected_code_address_.reset();
@@ -111,11 +113,16 @@ void UiApp::request_decompile(bool force_reanalyze) {
         }
         for (auto symbol : symbol_index_.records()) {
             symbol.function = symbol_has_code(*image, symbol);
+            bool annotated = false;
             if (symbol.virtual_address) {
                 if (const auto* note = annotations_.find(*symbol.virtual_address); note && !note->name.empty()) {
                     symbol.name = note->name;
                     symbol.source = SymbolSource::DebugSymbol;
+                    annotated = true;
                 }
+            }
+            if (!annotated && model_.demangle_symbols() && !symbol.demangled_name.empty()) {
+                symbol.name = symbol.demangled_name;
             }
             request.symbols.push_back(std::move(symbol));
         }
@@ -299,6 +306,12 @@ void UiApp::render_decompiler() {
     if (ImGui::Button("Re-analyze")) request_decompile(true);
     ImGui::SameLine();
     if (ImGui::Button("Clear Cache")) clear_decompiler_caches();
+    ImGui::SameLine();
+    bool demangle_decompile = model_.demangle_symbols();
+    if (ImGui::Checkbox("Demangle", &demangle_decompile)) {
+        model_.set_demangle_symbols(demangle_decompile);
+        ++symbol_revision_;
+    }
     ImGui::EndDisabled();
     if (decompile_job_.valid()) { ImGui::SameLine(); if (ImGui::Button("Cancel")) decompile_stop_.request_stop(); }
     ImGui::TextWrapped("%s", decompiled_.provider.c_str());
@@ -333,6 +346,11 @@ void UiApp::render_decompiler() {
                 for (const auto& range : line.ranges) if (current_selection_.virtual_address && *current_selection_.virtual_address>=range.address &&
                     *current_selection_.virtual_address-range.address<range.size) selected=true;
                 if (ImGui::Selectable(label.c_str(),selected,ImGuiSelectableFlags_SpanAllColumns) && !stale) navigate=static_cast<std::size_t>(i);
+                if (ImGui::IsItemHovered()) {
+                    if (const SourceLineMapping* src = model_.find_source_line(*line.address, 32)) {
+                        ImGui::SetTooltip("Source: %s:%u", src->file_path.c_str(), src->line);
+                    }
+                }
             } else ImGui::TextDisabled("—");
             ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(line.text.c_str());
             ImGui::PopID();

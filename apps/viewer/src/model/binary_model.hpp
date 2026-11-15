@@ -6,12 +6,15 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "analysis/function_index.hpp"
 #include "pe_model.hpp"
+#include "symbols/data_types.hpp"
+#include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_image.hpp>
@@ -131,10 +134,17 @@ namespace viewer {
         [[nodiscard]] const peelf::ModuleInfo* active_module() const noexcept;
         [[nodiscard]] const peelf::MemoryRegion* active_region() const noexcept;
 
-        // Unified symbol & function indices (PE/ELF symbols, imports, exports, .pdata, call targets, PDB symbols).
+        // Unified symbol & function indices (PE/ELF symbols, imports, exports, .pdata, call targets, PDB/DWARF symbols).
         [[nodiscard]] const SymbolIndex& symbol_index() const noexcept { return symbol_index_; }
         [[nodiscard]] const FunctionIndex& function_index() const noexcept { return function_index_; }
         void add_debug_symbols(std::span<const DebugSymbol> symbols);
+        void apply_debug_symbol_result(const DebugSymbolLoadResult& result);
+        [[nodiscard]] std::span<const DataTypeRecord> debug_types() const noexcept { return active_debug_types_; }
+        [[nodiscard]] std::span<const SourceLineMapping> source_lines() const noexcept { return active_source_lines_; }
+        [[nodiscard]] const SourceLineMapping* find_source_line(std::uint64_t virtual_address,
+                                                                std::uint64_t max_distance = 64) const noexcept;
+        [[nodiscard]] bool demangle_symbols() const noexcept { return demangle_symbols_; }
+        void set_demangle_symbols(bool enabled) noexcept { demangle_symbols_ = enabled; }
         void set_analysis_thumb_mode(bool thumb_mode);
         [[nodiscard]] std::string resolve_address_symbol(std::uint64_t virtual_address) const;
 
@@ -242,7 +252,13 @@ namespace viewer {
         SymbolIndex symbol_index_;
         FunctionIndex function_index_;
         bool analysis_thumb_mode_ = false;
+        bool demangle_symbols_ = true;
         std::map<std::string, std::vector<DebugSymbol>> debug_symbols_by_key_;
+        std::map<std::string, std::vector<DataTypeRecord>> debug_types_by_key_;
+        std::map<std::string, std::vector<SourceLineMapping>> source_lines_by_key_;
+        std::set<std::string> auto_loaded_debug_keys_;
+        std::vector<DataTypeRecord> active_debug_types_;
+        std::vector<SourceLineMapping> active_source_lines_;
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
         std::unique_ptr<peelf::IProcessSession> session_;
@@ -274,6 +290,8 @@ namespace viewer {
 
         void reset_all();
         [[nodiscard]] std::string current_debug_symbol_key() const;
+        void store_debug_symbol_result_for_key(const std::string& key, const DebugSymbolLoadResult& result);
+        bool auto_load_debug_info_for_current_image(const std::filesystem::path& image_path);
         void rebuild_symbol_index();
         void load_live_module_backing_bytes(const peelf::ModuleInfo& module);
         bool load_pe(const std::string& path);
