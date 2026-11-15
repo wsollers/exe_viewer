@@ -102,14 +102,14 @@ flowchart TD
     imports["Imports panel"]
     exports["Exports panel"]
     symbolsPanel["Symbols panel<br/>source + VA + offset"]
-    patchPanel["Patch Set panel<br/>staged + committed RAM"]
-    graphPanel["Call Graph panel"]
+    patchPanel["Patch Set panel<br/>staged static edits"]
+    graphPanel["Flow Graph panel<br/>draggable cards + live edges"]
 
     selection["ViewerSelection<br/>kind, label, window offset, VA, size, preferred view"]
 
     details["Details panel"]
-    hex["Hex View<br/>VA/offset + inline edit + ?? unmapped + patch highlights"]
-    disasmPanel["Disassembly panel<br/>symbol labels + staged/committed tint"]
+    hex["Hex View<br/>VA/offset + static inline edit + ?? unmapped"]
+    disasmPanel["Disassembly panel<br/>symbol labels + staged static patch tint"]
 
     structure --> selection
     memmap --> selection
