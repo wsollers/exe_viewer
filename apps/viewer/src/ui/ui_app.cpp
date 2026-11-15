@@ -80,6 +80,11 @@ struct GraphLayoutBounds {
 [[nodiscard]] std::string call_graph_node_display_label(const CallGraphNode& node) {
     const std::string base_label = node.label.empty() ? node.id : node.label;
     std::string label = base_label;
+    if (!node.instructions.empty()) {
+        for (const auto& instruction : node.instructions)
+            label += std::format("\n{:X}  {:6} {}", instruction.address, instruction.mnemonic, instruction.operands);
+        return label;
+    }
     if (node.bytes.start.virtual_address) {
         label += "\nVA " + format_graph_hex(*node.bytes.start.virtual_address);
     }
@@ -311,7 +316,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             last_navigation_selection_ = current_selection_;
         });
     symbols_panel_.set_symbol_activated_callback([this](const SymbolRecord& symbol, std::uint64_t object_index) {
-        focus_listing_ = true;
+        focus_graph_ = true;
         activate_panel(details_panel_.name().c_str());
         activate_panel("Disassembly");
         const peelf::IBinaryImage* img = model_.image();
@@ -362,7 +367,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             pending_call_graph_root_ = symbol;
             pending_call_graph_delay_frames_ = 1;
             show_call_graph_panel_ = true;
-            call_graph_status_ = "Queued fan-out from " + symbol.name;
+            call_graph_status_ = "Analyzing " + symbol.name;
         }
         last_navigation_selection_ = current_selection_;
     });
@@ -542,7 +547,7 @@ void UiApp::render() {
     }
     if (show_call_graph_panel_) {
         render_call_graph_panel();
-        if (focus_graph_) { activate_panel("Call Graph"); focus_graph_ = false; }
+        if (focus_graph_) { activate_panel("Flow Graph"); focus_graph_ = false; }
     }
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
@@ -707,7 +712,7 @@ void UiApp::render_main_menu() {
         }
 
         {
-            ImGui::MenuItem("Call Graph", nullptr, &show_call_graph_panel_);
+            ImGui::MenuItem("Flow Graph", nullptr, &show_call_graph_panel_);
         }
 
         {
@@ -763,7 +768,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV2");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV3");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
@@ -804,6 +809,10 @@ void UiApp::queue_call_graph_sample(CallGraphSample sample) {
 }
 
 void UiApp::process_deferred_gpu_work() {
+    if (active_graph_root_ && graph_revision_ != model_.edit_revision()) {
+        pending_call_graph_root_ = active_graph_root_;
+        graph_revision_ = model_.edit_revision();
+    }
     if (pending_call_graph_request_) {
         if (pending_call_graph_request_->delay_frames > 0) {
             --pending_call_graph_request_->delay_frames;
@@ -823,18 +832,34 @@ void UiApp::process_deferred_gpu_work() {
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         if (img != nullptr) {
-            load_call_graph_from_graph(
-                build_symbol_fanout_call_graph(*img,
-                                               std::span<const std::uint8_t>(model_.bytes().data(), model_.bytes().size()),
-                                               symbol_index_,
-                                               root),
-                "loaded_symbol_fanout_call_graph.bmp");
-            call_graph_status_ = "Loaded fan-out from " + root.name;
+            active_graph_root_ = root;
+            graph_revision_ = model_.edit_revision();
+            graph_pan_ = {};
+            graph_zoom_ = 1.0f;
+            if (function_cfg_ && root.file_offset && root.virtual_address && *root.file_offset < model_.bytes().size()) {
+                const auto offset = static_cast<std::size_t>(*root.file_offset);
+                auto size = std::min<std::size_t>(root.size ? static_cast<std::size_t>(std::min<std::uint64_t>(root.size, 16384)) : 256,
+                                                  model_.bytes().size() - offset);
+                if (root.size == 0) for (const auto& candidate : symbol_index_.records())
+                    if (candidate.file_offset && *candidate.file_offset > offset && symbol_has_code(*img, candidate))
+                        size = std::min(size, static_cast<std::size_t>(*candidate.file_offset - offset));
+                if (const auto bytes = model_.read_effective_bytes(offset, size)) {
+                    load_call_graph_from_graph(build_function_cfg_call_graph(*bytes, *root.virtual_address,
+                        img->architecture(), img->endianness(), offset, root.name, thumb_mode_), "function_cfg");
+                    if (current_call_graph_) call_graph_status_ = root.name + std::format("  |  {} bytes", size) +
+                        (root.size == size ? "  |  Function control flow" : "  |  Bounded code preview");
+                }
+            } else {
+                load_call_graph_from_graph(build_symbol_fanout_call_graph(*img, model_.bytes(), symbol_index_, root), "function_calls");
+                if (current_call_graph_) call_graph_status_ = root.name + "  |  Calls";
+            }
         }
     }
 }
 
 void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name) {
+    current_call_graph_.reset();
+    current_call_graph_layout_.reset();
     const std::filesystem::path plain_path = std::filesystem::temp_directory_path() / (output_name.string() + ".plain");
     const DefaultProcessRunner runner;
     const GraphRenderResult render_result =
@@ -916,6 +941,7 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
     }
     last_navigation_selection_ = current_selection_;
 
+    if (node.kind == CallGraphNodeKind::BasicBlock) return;
     const SymbolRecord* record = nullptr;
     if (node.symbol && !node.symbol->name.empty()) {
         record = symbol_index_.find_by_name(node.symbol->name);
@@ -937,18 +963,33 @@ void UiApp::activate_call_graph_node(const CallGraphNode& node) {
 
 void UiApp::render_call_graph_panel() {
     ImGui::SetNextWindowSize(ImVec2(900.0f, 420.0f), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Call Graph", &show_call_graph_panel_)) {
+    if (!ImGui::Begin("Flow Graph", &show_call_graph_panel_)) {
         ImGui::End();
         return;
     }
 
-    if (ImGui::Button("Loaded Image")) {
+    if (ImGui::RadioButton("Control flow", function_cfg_)) {
+        function_cfg_ = true; pending_call_graph_root_ = active_graph_root_;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Calls", !function_cfg_)) {
+        function_cfg_ = false; pending_call_graph_root_ = active_graph_root_;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Image overview")) {
         queue_call_graph_sample(CallGraphSample::LoadedImage);
     }
     ImGui::SameLine();
     if (ImGui::Button("Reload")) {
-        queue_call_graph_sample(call_graph_sample_);
+        if (active_graph_root_) pending_call_graph_root_ = active_graph_root_;
+        else queue_call_graph_sample(call_graph_sample_);
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Fit")) { fit_graph_ = true; graph_pan_ = {}; }
+    ImGui::SameLine();
+    if (ImGui::Button("100%")) { graph_zoom_ = 1; graph_pan_ = {}; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("Wheel: zoom  |  Middle-drag: pan  |  Click: inspect block");
 
     if (!call_graph_status_.empty()) {
         ImGui::TextUnformatted(call_graph_status_.c_str());
@@ -956,7 +997,8 @@ void UiApp::render_call_graph_panel() {
     if (!current_call_graph_) ImGui::TextWrapped("Select a function in Functions & Names to explore its calls, or build the loaded-image graph.");
 
     ImGui::InputTextWithHint("Find node", "Any part of a function name...", graph_search_, sizeof(graph_search_));
-    if (current_call_graph_ && ImGui::CollapsingHeader("Callers / Callees (current graph)")) {
+    if (current_call_graph_ && current_call_graph_->id != "function_cfg" &&
+        ImGui::CollapsingHeader("Callers / Callees (current graph)")) {
         ImGui::BeginChild("CallRelations", ImVec2(0, 160), true);
         for (const auto& root : current_call_graph_->nodes) {
             if (graph_search_[0] && !symbol_name_matches(root.label, graph_search_)) continue;
@@ -998,7 +1040,16 @@ void UiApp::render_call_graph_panel() {
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const ImVec2 canvas_size(std::max(available.x, 64.0f), std::max(available.y, 64.0f));
     const ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+    if (ImGui::IsWindowHovered() && ImGui::IsMouseHoveringRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y))) {
+        if (ImGui::GetIO().MouseWheel != 0)
+            graph_zoom_ = std::clamp(graph_zoom_ * (1.0f + ImGui::GetIO().MouseWheel * 0.12f), 0.05f, 4.0f);
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
+            graph_pan_.x += ImGui::GetIO().MouseDelta.x;
+            graph_pan_.y += ImGui::GetIO().MouseDelta.y;
+        }
+    }
     ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->PushClipRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), true);
     draw_list->AddRectFilled(canvas_pos,
                              ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
                              ImGui::GetColorU32(ImGuiCol_ChildBg));
@@ -1010,12 +1061,16 @@ void UiApp::render_call_graph_panel() {
         constexpr float kGraphPadding = 32.0f;
         const ImVec2 padded_canvas_size(std::max(1.0f, canvas_size.x - kGraphPadding * 2.0f),
                                         std::max(1.0f, canvas_size.y - kGraphPadding * 2.0f));
-        const float scale = std::min({padded_canvas_size.x / graph_width,
-                                     padded_canvas_size.y / graph_height,
-                                     ImGui::GetFontSize() * 6.0f});
+        const float native_scale = ImGui::GetFontSize() * 7.2f;
+        if (fit_graph_) {
+            graph_zoom_ = std::min({padded_canvas_size.x / graph_width,
+                                   padded_canvas_size.y / graph_height, native_scale}) / native_scale;
+            fit_graph_ = false;
+        }
+        const float scale = native_scale * graph_zoom_;
         const ImVec2 draw_size(std::max(1.0f, graph_width * scale), std::max(1.0f, graph_height * scale));
-        const ImVec2 graph_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f,
-                               canvas_pos.y + (canvas_size.y - draw_size.y) * 0.5f);
+        const ImVec2 graph_pos(canvas_pos.x + (canvas_size.x - draw_size.x) * 0.5f + graph_pan_.x,
+                               canvas_pos.y + kGraphPadding + graph_pan_.y);
 
         const auto to_screen = [&](double graph_x, double graph_y) {
             return ImVec2(graph_pos.x + static_cast<float>(graph_x - bounds.min_x) * scale,
@@ -1034,10 +1089,18 @@ void UiApp::render_call_graph_panel() {
             if (from == nullptr || to == nullptr) {
                 continue;
             }
-            draw_list->AddLine(to_screen(from->center_x, from->center_y),
-                               to_screen(to->center_x, to->center_y),
-                               ImGui::GetColorU32(ImGuiCol_SliderGrab),
-                               2.0f);
+            const bool cfg = current_call_graph_->id == "function_cfg";
+            const auto start = to_screen(from->center_x + (cfg ? 0 : from->width / 2), from->center_y - (cfg ? from->height / 2 : 0));
+            const auto end = to_screen(to->center_x - (cfg ? 0 : to->width / 2), to->center_y + (cfg ? to->height / 2 : 0));
+            const auto color = ImGui::GetColorU32(edge.kind == CallGraphEdgeKind::ConditionalBranch ? ImGuiCol_PlotLines :
+                edge.kind == CallGraphEdgeKind::Fallthrough ? ImGuiCol_PlotHistogramHovered : ImGuiCol_CheckMark);
+            const float bend = std::max(24.0f, (cfg ? std::abs(end.y - start.y) : std::abs(end.x - start.x)) * 0.45f);
+            draw_list->AddBezierCubic(start, ImVec2(start.x + (cfg ? 0 : bend), start.y + (cfg ? bend : 0)),
+                ImVec2(end.x - (cfg ? 0 : bend), end.y - (cfg ? bend : 0)), end, color, 1.8f);
+            if (cfg) draw_list->AddTriangleFilled(end, ImVec2(end.x - 5, end.y - 9), ImVec2(end.x + 5, end.y - 9), color);
+            else draw_list->AddTriangleFilled(end, ImVec2(end.x - 9, end.y - 5), ImVec2(end.x - 9, end.y + 5), color);
+            if (!edge.label.empty()) draw_list->AddText(ImGui::GetFont(), std::max(3.0f, scale / 7.2f),
+                ImVec2((start.x + end.x) * 0.5f + 6, (start.y + end.y) * 0.5f), color, edge.label.c_str());
         }
 
         for (const GraphLayoutNode& layout_node : current_call_graph_layout_->nodes) {
@@ -1066,14 +1129,16 @@ void UiApp::render_call_graph_panel() {
                                4.0f,
                                0,
                                selected ? 3.0f : 2.0f);
-            const ImVec2 text_size = ImGui::CalcTextSize(label.c_str());
-            const ImVec2 text_pos(top_left.x + std::max(4.0f, (bottom_right.x - top_left.x - text_size.x) * 0.5f),
-                                  top_left.y + std::max(4.0f, (bottom_right.y - top_left.y - text_size.y) * 0.5f));
-            draw_list->AddText(text_pos, ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
+            const float font_size = std::max(3.0f, scale / 7.2f);
+            draw_list->AddRectFilled(top_left, ImVec2(bottom_right.x, top_left.y + font_size + 10), ImGui::GetColorU32(ImGuiCol_Header), 4);
+            draw_list->PushClipRect(top_left, bottom_right, true);
+            draw_list->AddText(code_font_ ? code_font_ : ImGui::GetFont(), font_size,
+                ImVec2(top_left.x + 8, top_left.y + 5), ImGui::GetColorU32(ImGuiCol_Text), label.c_str());
+            draw_list->PopClipRect();
         }
 
-        ImGui::SetCursorScreenPos(graph_pos);
-        ImGui::InvisibleButton("CallGraphVectorHitTarget", draw_size);
+        ImGui::SetCursorScreenPos(canvas_pos);
+        ImGui::InvisibleButton("CallGraphVectorHitTarget", canvas_size);
         if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
             if (const CallGraphNode* node =
                     hit_test_call_graph_node(graph_pos, scale, bounds.min_x, bounds.max_y, ImGui::GetIO().MousePos)) {
@@ -1116,6 +1181,8 @@ void UiApp::render_call_graph_panel() {
                            message);
     }
 
+    draw_list->PopClipRect();
+    ImGui::SetCursorScreenPos(canvas_pos);
     if (!call_graph_texture_) {
         ImGui::Dummy(canvas_size);
     } else {
@@ -1153,7 +1220,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow("Disassembly", main_id);
-    ImGui::DockBuilderDockWindow("Call Graph", main_id);
+    ImGui::DockBuilderDockWindow("Flow Graph", main_id);
     if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(symbols_panel_.name().c_str());
     if (auto* node = ImGui::DockBuilderGetNode(right_id)) node->SelectedTabId = ImHashStr(details_panel_.name().c_str());
     ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
@@ -1334,7 +1401,15 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
 
         call_graph_sample_ = CallGraphSample::LoadedImage;
-        call_graph_status_ = "Loaded image. Use Loaded Image or Reload to render the call graph.";
+        active_graph_root_.reset();
+        if (const auto offset = img->virtual_address_to_file_offset(img->entry_point())) {
+            const auto* symbol = symbol_index_.find_containing_address(img->entry_point());
+            pending_call_graph_root_ = symbol ? *symbol : SymbolRecord{.name = "Entry point", .virtual_address = img->entry_point(), .file_offset = *offset};
+            function_cfg_ = true;
+            show_call_graph_panel_ = true;
+            focus_graph_ = true;
+        }
+        call_graph_status_ = "Analyzing entry point";
         if (call_graph_texture_) {
             vulkan_.destroy_texture(*call_graph_texture_);
             call_graph_texture_.reset();

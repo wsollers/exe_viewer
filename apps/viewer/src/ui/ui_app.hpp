@@ -111,6 +111,12 @@ namespace viewer {
         std::optional<CallGraph> current_call_graph_;
         std::optional<GraphLayout> current_call_graph_layout_;
         std::optional<SymbolRecord> pending_call_graph_root_;
+        std::optional<SymbolRecord> active_graph_root_;
+        bool function_cfg_ = true;
+        float graph_zoom_ = 1.0f;
+        ImVec2 graph_pan_{};
+        bool fit_graph_ = false;
+        std::uint64_t graph_revision_ = 0;
         std::uint8_t pending_call_graph_delay_frames_ = 0;
         std::optional<PendingCallGraphRequest> pending_call_graph_request_;
         std::string call_graph_status_;

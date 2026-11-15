@@ -210,8 +210,16 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 Launch `peelf_viewer`, then **File → Open** and pick an executable
 (`.exe`, `.dll`, `.so`, `.elf`). Use **File → Open Debug Symbols...** to load a
 matching PDB when available. Use **View** to show or reset panels, including
-Call Graph, Disassembly, Symbols, Imports/Exports, PE tables, Log, and
+Flow Graph, Disassembly, Symbols, Imports/Exports, PE tables, Log, and
 Shellcode. Press `Esc` to quit.
+
+The analysis workspace opens a control-flow preview at the entry point. Select a
+function to view instruction-bearing basic blocks and directed branch edges.
+Use the mouse wheel to zoom, middle-drag to pan, **Fit** for an overview, and
+**100%** for readable code. Clicking a block synchronizes the byte selection and
+disassembly. **Calls** switches to function relationships. Graph layout requires
+Graphviz. Previews use symbol sizes when available (up to 16 KiB); unknown sizes
+use a bounded 256-byte window. Applied byte edits refresh the active graph.
 
 ## Notes
 
