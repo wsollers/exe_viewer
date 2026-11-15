@@ -336,10 +336,35 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 #endif
     if (!recent_binaries_.save(recent_binaries_path_)) Log().error("Could not save recent binary history");
     patch_set_panel_.set_analysis_context(&symbol_index_, &thumb_mode_);
+    references_panel_.set_scanner(&reference_scanner_);
     references_panel_.set_navigate_callback([this](std::uint64_t address) {
         navigate_to_address(address, PreferredView::Disassembly);
     });
     references_panel_.set_rebuild_callback([this] { references_dirty_ = true; });
+    references_panel_.set_pause_callback([this] { reference_scanner_.pause(); });
+    references_panel_.set_resume_callback([this] { reference_scanner_.resume(reference_index_); });
+    references_panel_.set_scan_full_callback([this] {
+        if (reference_scanner_.has_resumable_work()) {
+            reference_scanner_.scan_full(reference_index_);
+        } else if (const auto* image = model_.image()) {
+            std::vector<std::uint8_t> snapshot;
+            if (model_.changed_intervals().empty()) {
+                const auto span = model_.analysis_image_bytes();
+                snapshot.assign(span.begin(), span.end());
+            } else if (auto patched = model_.read_effective_bytes(0, model_.bytes().size())) {
+                snapshot = std::move(*patched);
+            }
+            if (!snapshot.empty()) {
+                reference_scanner_.start(
+                    reference_index_,
+                    *image,
+                    std::move(snapshot),
+                    thumb_mode_,
+                    std::numeric_limits<std::size_t>::max(),
+                    &symbol_index_);
+            }
+        }
+    });
     symbols_panel_.set_display_name_resolver([this](const SymbolRecord& symbol) {
         const auto* annotation = symbol.virtual_address ? annotations_.find(*symbol.virtual_address) : nullptr;
         return annotation && !annotation->name.empty() ? annotation->name : symbol.name;
@@ -888,13 +913,38 @@ void UiApp::open_references() {
 void UiApp::rebuild_references() {
     const auto* image = model_.image();
     if (!image) return;
+    reference_scanner_.cancel(&reference_index_);
+
+    std::span<const std::uint8_t> direct_span;
+    std::vector<std::uint8_t> owned_bytes;
     if (model_.changed_intervals().empty()) {
-        reference_index_ = ReferenceIndex::build(*image, model_.analysis_image_bytes(), thumb_mode_);
-    } else if (const auto bytes = model_.read_effective_bytes(0, model_.bytes().size())) {
-        reference_index_ = ReferenceIndex::build(*image, *bytes, thumb_mode_);
+        direct_span = model_.analysis_image_bytes();
+    } else if (auto bytes = model_.read_effective_bytes(0, model_.bytes().size())) {
+        owned_bytes = std::move(*bytes);
+        direct_span = owned_bytes;
     } else {
         reference_index_ = {};
         Log().warn("Unable to read patched bytes for reference analysis");
+        reference_revision_ = model_.edit_revision();
+        reference_thumb_mode_ = thumb_mode_;
+        references_dirty_ = false;
+        return;
+    }
+
+    if (direct_span.size() <= ReferenceIndex::kDefaultChunkBytes) {
+        reference_index_ = ReferenceIndex::build(
+            *image, direct_span, thumb_mode_, ReferenceIndex::kDefaultByteBudget, &symbol_index_);
+    } else {
+        if (owned_bytes.empty()) {
+            owned_bytes.assign(direct_span.begin(), direct_span.end());
+        }
+        reference_scanner_.start(
+            reference_index_,
+            *image,
+            std::move(owned_bytes),
+            thumb_mode_,
+            ReferenceIndex::kDefaultByteBudget,
+            &symbol_index_);
     }
     reference_revision_ = model_.edit_revision();
     reference_thumb_mode_ = thumb_mode_;
@@ -1446,9 +1496,11 @@ void UiApp::process_deferred_gpu_work() {
             decompiled_ = {DecompileStatus::Failed,"Decompiler",error.what()};
         }
     }
+    reference_scanner_.poll(reference_index_);
     if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
         references_dirty_ = true;
-    if (references_panel_.visible() && references_dirty_ && model_.image()) rebuild_references();
+    if ((references_panel_.visible() || show_call_graph_panel_) && references_dirty_ && model_.image())
+        rebuild_references();
     if (annotation_revision_ != annotations_.revision()) {
         annotation_revision_ = annotations_.revision();
         if (active_graph_root_) pending_call_graph_root_ = active_graph_root_;
@@ -1496,6 +1548,11 @@ void UiApp::process_deferred_gpu_work() {
                 if (const auto bytes = model_.read_virtual_bytes(extent->virtual_address, size)) {
                     const auto window_off = model_.virtual_address_to_offset(extent->virtual_address)
                         .value_or(extent->file_offset);
+                    const GraphByteReader va_reader = [this](std::uint64_t va, std::size_t len)
+                        -> std::vector<std::uint8_t> {
+                        auto res = model_.read_virtual_bytes(va, len);
+                        return res ? std::move(*res) : std::vector<std::uint8_t>{};
+                    };
                     load_call_graph_from_graph(
                         build_function_cfg_call_graph(
                             *bytes,
@@ -1506,7 +1563,8 @@ void UiApp::process_deferred_gpu_work() {
                             root.name,
                             thumb_mode_,
                             extent->source == FunctionExtentSource::ExecutableRegion ||
-                                extent->source == FunctionExtentSource::NextSymbol),
+                                extent->source == FunctionExtentSource::NextSymbol,
+                            va_reader),
                         "function_cfg");
                     if (current_call_graph_) {
                         call_graph_status_ = root.name + std::format(
@@ -1759,6 +1817,41 @@ void UiApp::render_call_graph_panel() {
 
     if (!call_graph_status_.empty()) {
         ImGui::TextUnformatted(call_graph_status_.c_str());
+    }
+    if (model_.image() != nullptr && reference_index_.total_executable_bytes() > 0) {
+        const bool scanning = reference_index_.is_scanning() || reference_scanner_.is_scanning();
+        ImGui::TextDisabled("Scan coverage: %.1f%% (%zu / %zu bytes%s)",
+            reference_index_.coverage_percent(),
+            reference_index_.scanned_bytes(),
+            reference_index_.total_executable_bytes(),
+            scanning ? ", scanning in background..." : (reference_index_.incomplete() ? ", budget capped" : ""));
+        if (!scanning && reference_index_.incomplete()) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Scan Full Binary##cfg_scan_full")) {
+                if (reference_scanner_.has_resumable_work()) {
+                    reference_scanner_.scan_full(reference_index_);
+                }
+            }
+        }
+    }
+    if (current_call_graph_ && !current_call_graph_->indirect_recoveries.empty()) {
+        const std::string header = std::format(
+            "Indirect branch / call recovery ({} resolved)",
+            current_call_graph_->indirect_recoveries.size());
+        if (ImGui::TreeNode("IndirectRecoveries", "%s", header.c_str())) {
+            for (std::size_t idx = 0; idx < current_call_graph_->indirect_recoveries.size(); ++idx) {
+                const auto& rec = current_call_graph_->indirect_recoveries[idx];
+                ImGui::PushID(static_cast<int>(idx));
+                const std::string line = std::format(
+                    "0x{:X} [{}] {}",
+                    rec.source_address, rec.confidence, rec.evidence);
+                if (ImGui::Selectable(line.c_str())) {
+                    navigate_to_address(rec.source_address, PreferredView::Disassembly);
+                }
+                ImGui::PopID();
+            }
+            ImGui::TreePop();
+        }
     }
     if (!current_call_graph_) ImGui::TextWrapped("Select a function in Functions & Names to explore its calls, or build the loaded-image graph.");
 
@@ -2307,6 +2400,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         annotations_.clear();
         debug_types_.clear(); ++symbol_revision_; decompiled_root_.reset();
         selected_code_ranges_.clear(); selected_code_address_.reset();
+        reference_scanner_.cancel(&reference_index_);
         reference_index_ = {};
         references_dirty_ = true;
         navigation_history_.clear();
@@ -2857,4 +2951,4 @@ void UiApp::switch_analysis_view(bool graph) {
     // Default - White
     return ImGui::GetStyleColorVec4(ImGuiCol_Text);
 }
-} // namespace viewer
+} // namespace viewe

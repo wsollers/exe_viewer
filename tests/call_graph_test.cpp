@@ -521,6 +521,7 @@ void assert_known_pe_dll_cfg_fixture(const BinMatrixCase& fixture) {
                 .label = "call",
             },
         },
+        .indirect_recoveries = {},
     };
 }
 
@@ -751,7 +752,7 @@ TEST(CallGraph, Arm64ConditionalBranchUsesFinalImmediate) {
 }
 
 TEST(CallGraph, ArmConditionalReturnPreservesFallthrough) {
-    const std::array<std::uint8_t,8> bytes{0x1E,0xFF,0x2F,0x11,0x1E,0xFF,0x2F,0xE1}; // bxne lr; bx lr
+    const std::array<std::uint8_t,8> bytes{0x1E,0xFF,0x2F,0x11,0x1E,0xFF,0x2F,0xE1}; // bxne lr; bx l
     const auto graph = viewer::build_function_cfg_call_graph(bytes,0x1000,
         peelf::Architecture::ARM,peelf::Endianness::Little);
     EXPECT_TRUE(has_edge(graph,"bb_0","return",viewer::CallGraphEdgeKind::Return));
@@ -1481,4 +1482,142 @@ TEST(CallGraph, MovingCardsRespectsZoomAndPreservesOtherNodes) {
     EXPECT_TRUE(viewer::move_graph_card(layout,"a",-250,-100,50));
     EXPECT_DOUBLE_EQ(layout.nodes[0].center_x,-1);
     EXPECT_DOUBLE_EQ(layout.nodes[0].center_y,4);
+}
+
+TEST(CallGraph, RecoversX64RipRelativeSignedOffsetJumpTableViaExternalReader) {
+    // 0x1000: cmp edi, 2
+    // 0x1003: ja 0x1024 (default)
+    // 0x1005: mov eax, edi
+    // 0x1007: lea rcx, [rip + 0xFF2] -> 0x2000 (.rodata table)
+    // 0x100E: movsxd rax, dword ptr [rcx + rax*4]
+    // 0x1012: add rax, rcx
+    // 0x1015: jmp rax
+    // 0x1017: mov eax, 10; ret (case 0)
+    // 0x101D: xor eax, eax; ret (case 1)
+    // 0x1020: mov al, 2; nop; ret (case 2)
+    // 0x1024: or eax, -1; ret (default)
+    const std::vector<std::uint8_t> code{
+        0x83, 0xFF, 0x02,
+        0x77, 0x1F,
+        0x89, 0xF8,
+        0x48, 0x8D, 0x0D, 0xF2, 0x0F, 0x00, 0x00,
+        0x48, 0x63, 0x04, 0x81,
+        0x48, 0x01, 0xC8,
+        0xFF, 0xE0,
+        0xB8, 0x0A, 0x00, 0x00, 0x00, 0xC3,
+        0x31, 0xC0, 0xC3,
+        0xB0, 0x02, 0x90, 0xC3,
+        0x83, 0xC8, 0xFF, 0xC3,
+    };
+    const std::array<std::uint8_t, 12> rodata_table{
+        0x17, 0xF0, 0xFF, 0xFF, // 0x1017 - 0x2000
+        0x1D, 0xF0, 0xFF, 0xFF, // 0x101D - 0x2000
+        0x20, 0xF0, 0xFF, 0xFF, // 0x1020 - 0x2000
+    };
+    const viewer::GraphByteReader reader = [&](std::uint64_t va, std::size_t len) -> std::vector<std::uint8_t> {
+        if (va == 0x2000 && len == rodata_table.size()) {
+            return std::vector<std::uint8_t>(rodata_table.begin(), rodata_table.end());
+        }
+        return {};
+    };
+
+    const viewer::CallGraph graph = viewer::build_function_cfg_call_graph(
+        code,
+        0x1000,
+        peelf::Architecture::X86_64,
+        peelf::Endianness::Little,
+        0x400,
+        "switch_fn",
+        false,
+        true,
+        reader);
+
+    EXPECT_TRUE(std::ranges::any_of(graph.edges, [](const auto& e) { return e.label == "case 0"; }));
+    EXPECT_TRUE(std::ranges::any_of(graph.edges, [](const auto& e) { return e.label == "case 1"; }));
+    EXPECT_TRUE(std::ranges::any_of(graph.edges, [](const auto& e) { return e.label == "case 2"; }));
+    ASSERT_EQ(graph.indirect_recoveries.size(), 1u);
+    EXPECT_EQ(graph.indirect_recoveries[0].confidence, "IndirectTable");
+    EXPECT_EQ(graph.indirect_recoveries[0].target_count, 3u);
+    EXPECT_NE(graph.indirect_recoveries[0].evidence.find("RIP-relative i32 jump table @ 0x2000"), std::string::npos);
+}
+
+TEST(CallGraph, RecoversThumb2TbbJumpTable) {
+    // 0x1000: cmp r0, #1      (01 28)
+    // 0x1002: bhi 0x100E      (04 D8)
+    // 0x1004: tbb [pc, r0]    (DF E8 00 F0)
+    // 0x1008: .byte 1, 2      (01 02 -> targets 0x100A, 0x100C)
+    // 0x100A: bx lr           (70 47)
+    // 0x100C: bx lr           (70 47)
+    // 0x100E: bx lr           (70 47)
+    const std::vector<std::uint8_t> code{
+        0x01, 0x28,
+        0x04, 0xD8,
+        0xDF, 0xE8, 0x00, 0xF0,
+        0x01, 0x02,
+        0x70, 0x47,
+        0x70, 0x47,
+        0x70, 0x47,
+    };
+    const viewer::CallGraph graph = viewer::build_function_cfg_call_graph(
+        code,
+        0x1000,
+        peelf::Architecture::ARM,
+        peelf::Endianness::Little,
+        std::nullopt,
+        "thumb_switch",
+        true);
+
+    EXPECT_TRUE(std::ranges::any_of(graph.edges, [](const auto& e) { return e.label == "case 0"; }));
+    EXPECT_TRUE(std::ranges::any_of(graph.edges, [](const auto& e) { return e.label == "case 1"; }));
+    ASSERT_EQ(graph.indirect_recoveries.size(), 1u);
+    EXPECT_EQ(graph.indirect_recoveries[0].confidence, "IndirectTable");
+    EXPECT_NE(graph.indirect_recoveries[0].evidence.find("Thumb-2 tbb"), std::string::npos);
+}
+
+TEST(CallGraph, ResolvesRipRelativeIatSlotIndirectCallsInFanoutGraph) {
+    std::vector<std::uint8_t> bytes = read_fixture("known-win-x64.exe");
+    auto parsed = peelf::parse_image(std::span<const std::uint8_t>(bytes.data(), bytes.size()));
+    ASSERT_TRUE(parsed.has_value());
+    const std::unique_ptr<peelf::IBinaryImage> image = std::move(*parsed);
+
+    const peelf::ImportEntry* imported = nullptr;
+    for (const peelf::ImportEntry& entry : image->imports()) {
+        if (entry.address != 0 && !entry.name.empty()) {
+            imported = &entry;
+            break;
+        }
+    }
+    ASSERT_NE(imported, nullptr);
+
+    const std::uint64_t root_va = image->entry_point();
+    const auto root_off = image->virtual_address_to_file_offset(root_va);
+    ASSERT_TRUE(root_off.has_value());
+    ASSERT_LE(*root_off + 8u, bytes.size());
+
+    const std::uint64_t slot_va = imported->address;
+    const auto disp32 = static_cast<std::uint32_t>(
+        static_cast<std::int32_t>(static_cast<std::int64_t>(slot_va) - static_cast<std::int64_t>(root_va + 6u)));
+    const auto pos = static_cast<std::size_t>(*root_off);
+    bytes[pos + 0] = 0xFFu;
+    bytes[pos + 1] = 0x15u; // call qword ptr [rip + disp32]
+    bytes[pos + 2] = static_cast<std::uint8_t>(disp32 & 0xFFu);
+    bytes[pos + 3] = static_cast<std::uint8_t>((disp32 >> 8u) & 0xFFu);
+    bytes[pos + 4] = static_cast<std::uint8_t>((disp32 >> 16u) & 0xFFu);
+    bytes[pos + 5] = static_cast<std::uint8_t>((disp32 >> 24u) & 0xFFu);
+    bytes[pos + 6] = 0xC3u;
+
+    viewer::SymbolIndex index = viewer::SymbolIndex::build(*image);
+    const viewer::DebugSymbol syms[] = {
+        viewer::DebugSymbol{.name = "iat_caller", .virtual_address = root_va, .size = 7, .function = true, .library = {}},
+    };
+    index.add_debug_symbols(*image, syms);
+    const viewer::SymbolRecord* root = index.find_by_name("iat_caller");
+    ASSERT_NE(root, nullptr);
+
+    const viewer::CallGraph graph = viewer::build_symbol_fanout_call_graph(
+        *image, std::span<const std::uint8_t>(bytes), index, *root);
+    const std::string dot = viewer::to_dot(graph);
+    EXPECT_NE(dot.find(imported->name), std::string::npos) << dot;
+    ASSERT_FALSE(graph.indirect_recoveries.empty());
+    EXPECT_EQ(graph.indirect_recoveries.front().confidence, "IndirectPointerSlot");
 }

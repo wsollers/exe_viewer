@@ -348,6 +348,8 @@ private:
              insn.id == PPC_INS_BCL || insn.id == PPC_INS_BCLA || insn.id == PPC_INS_BCCTRL || insn.id == PPC_INS_BCLRL))
             return InstructionFlow::Call;
         if (group(CS_GRP_CALL)) return InstructionFlow::Call;
+        if (arch_ == Architecture::ARM32 && (insn.id == ARM_INS_TBB || insn.id == ARM_INS_TBH))
+            return InstructionFlow::Branch;
         if (!group(CS_GRP_JUMP)) return InstructionFlow::Normal;
         switch (arch_) {
             case Architecture::X86_32: case Architecture::X86_64:
@@ -418,4 +420,4 @@ inline Architecture architecture_from_machine(std::uint16_t machine) {
     }
 }
 
-} // namespace viewer
+} // namespace viewe

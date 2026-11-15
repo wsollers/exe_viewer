@@ -120,6 +120,7 @@ namespace viewer {
         std::optional<StructureNode> structure_tree_;
         SymbolIndex symbol_index_;
         ReferenceIndex reference_index_;
+        AsyncReferenceScanner reference_scanner_;
         AnnotationStore annotations_;
         bool references_dirty_ = true;
         bool focus_references_ = false;
@@ -244,4 +245,4 @@ namespace viewer {
 
     };
 
-} // namespace viewer
+} // namespace viewe

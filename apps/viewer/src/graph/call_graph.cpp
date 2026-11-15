@@ -5,6 +5,9 @@
 #include <charconv>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
+#include <format>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -313,7 +316,7 @@ namespace {
            instruction.mnemonic == "br";
 }
 
-[[nodiscard]] bool is_conditional_branch_instruction(const Instruction& instruction) {
+[[maybe_unused]] [[nodiscard]] bool is_conditional_branch_instruction(const Instruction& instruction) {
     const std::string& mnemonic = instruction.mnemonic;
     if (mnemonic.empty() || is_unconditional_branch_instruction(instruction) || is_call_instruction(instruction) ||
         is_return_instruction(instruction)) {
@@ -762,6 +765,9 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolI
         .label = image_label(image),
         .architecture = image.architecture(),
         .endianness = image.endianness(),
+        .nodes = {},
+        .edges = {},
+        .indirect_recoveries = {},
     };
 
     const std::uint64_t entry_va = image.entry_point();
@@ -989,12 +995,55 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
         .endianness = image.endianness(),
         .nodes = {},
         .edges = {},
+        .indirect_recoveries = {},
     };
 
     graph.nodes.push_back(node_from_record(root, "root"));
 
     constexpr std::size_t max_function_scan = 4096;
     bool resolved_any_call = false;
+
+    std::vector<const peelf::ElfSymbol*> dynsyms;
+    for (const auto& es : image.elf_symbols()) {
+        if (es.dynamic) dynsyms.push_back(&es);
+    }
+
+    const auto lookup_pointer_slot_callee = [&](std::uint64_t slot_va) -> std::optional<SymbolRecord> {
+        if (const SymbolRecord* rec = symbol_index.find_containing_address(slot_va)) {
+            if (rec->virtual_address == slot_va) {
+                return *rec;
+            }
+        }
+        for (const auto& imp : image.imports()) {
+            if (imp.address == slot_va && (!imp.name.empty() || !imp.library.empty())) {
+                SymbolRecord synth{};
+                synth.name = imp.library.empty() ? imp.name
+                    : (imp.name.empty() ? imp.library : (imp.library + "!" + imp.name));
+                synth.virtual_address = slot_va;
+                synth.file_offset = image.virtual_address_to_file_offset(slot_va);
+                synth.size = image.is_64bit() ? 8u : 4u;
+                synth.source = SymbolSource::Import;
+                synth.external = true;
+                synth.dynamic = true;
+                return synth;
+            }
+        }
+        for (const auto& rel : image.elf_relocations()) {
+            if (rel.offset == slot_va && rel.symbol_index < dynsyms.size() &&
+                !dynsyms[rel.symbol_index]->name.empty()) {
+                SymbolRecord synth{};
+                synth.name = dynsyms[rel.symbol_index]->name;
+                synth.virtual_address = slot_va;
+                synth.file_offset = image.virtual_address_to_file_offset(slot_va);
+                synth.size = image.is_64bit() ? 8u : 4u;
+                synth.source = SymbolSource::Import;
+                synth.external = true;
+                synth.dynamic = true;
+                return synth;
+            }
+        }
+        return std::nullopt;
+    };
 
     if (root.file_offset && root.virtual_address && read_bytes) {
         const std::optional<Architecture> arch = disassembler_architecture(image.architecture());
@@ -1010,10 +1059,68 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                     const auto instructions = disassembler.disassemble(fn_bytes.data(),
                                                                         fn_bytes.size(),
                                                                         *root.virtual_address);
+
+                    // Track ARM64 ADRP + LDR pointer-slot pairs for indirect BLR calls
+                    std::map<std::string, std::uint64_t> arm64_page_by_reg;
+                    std::map<std::string, std::uint64_t> arm64_slot_by_reg;
+
                     std::uint64_t call_index = 0;
                     const Instruction* previous_instruction = nullptr;
                     for (const Instruction& instruction : instructions) {
-                        if (!is_call_instruction(instruction)) {
+                        if (image.architecture() == peelf::Architecture::ARM64) {
+                            if (instruction.mnemonic == "adrp") {
+                                const auto comma = instruction.operands.find(',');
+                                if (comma != std::string::npos) {
+                                    const std::string reg = instruction.operands.substr(0, comma);
+                                    const auto hex_pos = instruction.operands.find("0x", comma);
+                                    if (hex_pos != std::string::npos) {
+                                        std::size_t end = hex_pos + 2;
+                                        while (end < instruction.operands.size() &&
+                                               std::isxdigit(static_cast<unsigned char>(instruction.operands[end])) != 0) {
+                                            ++end;
+                                        }
+                                        if (const auto page = parse_hex_u64(
+                                                std::string_view(instruction.operands).substr(hex_pos, end - hex_pos))) {
+                                            arm64_page_by_reg[reg] = *page;
+                                            arm64_slot_by_reg.erase(reg);
+                                        }
+                                    }
+                                }
+                            } else if (instruction.mnemonic == "ldr") {
+                                const auto comma = instruction.operands.find(',');
+                                const auto lbr = instruction.operands.find('[', comma == std::string::npos ? 0 : comma);
+                                const auto rbr = instruction.operands.find(']', lbr == std::string::npos ? 0 : lbr);
+                                if (comma != std::string::npos && lbr != std::string::npos && rbr != std::string::npos) {
+                                    const std::string dst = instruction.operands.substr(0, comma);
+                                    const std::string mem_expr = instruction.operands.substr(lbr + 1, rbr - lbr - 1);
+                                    const auto inner_comma = mem_expr.find(',');
+                                    const std::string base = inner_comma == std::string::npos
+                                        ? mem_expr : mem_expr.substr(0, inner_comma);
+                                    if (const auto page_it = arm64_page_by_reg.find(base); page_it != arm64_page_by_reg.end()) {
+                                        std::uint64_t disp = 0;
+                                        if (inner_comma != std::string::npos) {
+                                            const auto hex_pos = mem_expr.find("0x", inner_comma);
+                                            if (hex_pos != std::string::npos) {
+                                                std::size_t end = hex_pos + 2;
+                                                while (end < mem_expr.size() &&
+                                                       std::isxdigit(static_cast<unsigned char>(mem_expr[end])) != 0) {
+                                                    ++end;
+                                                }
+                                                disp = parse_hex_u64(std::string_view(mem_expr).substr(hex_pos, end - hex_pos))
+                                                           .value_or(0u);
+                                            }
+                                        }
+                                        arm64_slot_by_reg[dst] = page_it->second + disp;
+                                    } else {
+                                        arm64_slot_by_reg.erase(dst);
+                                    }
+                                    arm64_page_by_reg.erase(dst);
+                                }
+                            }
+                        }
+
+                        const bool is_call = is_call_instruction(instruction) || instruction.flow == InstructionFlow::Call;
+                        if (!is_call) {
                             previous_instruction = &instruction;
                             continue;
                         }
@@ -1024,7 +1131,53 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
                         if (!target) {
                             target = parse_direct_call_target(instruction);
                         }
+
                         if (!target) {
+                            // Check IAT / GOT / PLT pointer-slot indirect calls:
+                            // x86-64 call [rip + disp], x86-32 call dword ptr [0x...], ARM64 adrp+ldr+bl
+                            std::optional<std::uint64_t> slot_va = parse_x86_rip_relative_memory_target(instruction);
+                            if (!slot_va && image.architecture() == peelf::Architecture::X86 &&
+                                instruction.operands.find("ptr [0x") != std::string::npos &&
+                                instruction.operands.find('+') == std::string::npos &&
+                                instruction.operands.find('*') == std::string::npos) {
+                                const auto hex_pos = instruction.operands.find("0x");
+                                std::size_t end = hex_pos + 2;
+                                while (end < instruction.operands.size() &&
+                                       std::isxdigit(static_cast<unsigned char>(instruction.operands[end])) != 0) {
+                                    ++end;
+                                }
+                                slot_va = parse_hex_u64(std::string_view(instruction.operands).substr(hex_pos, end - hex_pos));
+                            }
+                            if (!slot_va && image.architecture() == peelf::Architecture::ARM64 &&
+                                instruction.mnemonic == "blr") {
+                                if (const auto it = arm64_slot_by_reg.find(instruction.operands); it != arm64_slot_by_reg.end()) {
+                                    slot_va = it->second;
+                                }
+                            }
+
+                            if (slot_va) {
+                                if (const auto slot_callee = lookup_pointer_slot_callee(*slot_va)) {
+                                    if (slot_callee->name != root.name) {
+                                        const std::string callee_id = "callee_" + std::to_string(call_index++);
+                                        graph.nodes.push_back(node_from_call_target(image, *slot_callee, *slot_va, callee_id));
+                                        graph.edges.push_back(CallGraphEdge{
+                                            .from_node_id = "root",
+                                            .to_node_id = callee_id,
+                                            .kind = CallGraphEdgeKind::Call,
+                                            .label = "indirect call",
+                                        });
+                                        graph.indirect_recoveries.push_back(IndirectRecoveryNote{
+                                            .source_address = instruction.address,
+                                            .table_or_slot_address = *slot_va,
+                                            .target_count = 1,
+                                            .confidence = "IndirectPointerSlot",
+                                            .evidence = std::format("Indirect pointer slot [0x{:X}] -> {}",
+                                                                    *slot_va, slot_callee->name),
+                                        });
+                                        resolved_any_call = true;
+                                    }
+                                }
+                            }
                             previous_instruction = &instruction;
                             continue;
                         }
@@ -1148,6 +1301,572 @@ std::optional<FunctionExtent> discover_function_extent(const peelf::IBinaryImage
     return result;
 }
 
+namespace {
+
+[[nodiscard]] int cfg_norm_x86_gpr(unsigned reg) noexcept {
+    switch (reg) {
+    case X86_REG_RAX: case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL: case X86_REG_AH: return 0;
+    case X86_REG_RCX: case X86_REG_ECX: case X86_REG_CX: case X86_REG_CL: case X86_REG_CH: return 1;
+    case X86_REG_RDX: case X86_REG_EDX: case X86_REG_DX: case X86_REG_DL: case X86_REG_DH: return 2;
+    case X86_REG_RBX: case X86_REG_EBX: case X86_REG_BX: case X86_REG_BL: case X86_REG_BH: return 3;
+    case X86_REG_RSP: case X86_REG_ESP: case X86_REG_SP: case X86_REG_SPL: return 4;
+    case X86_REG_RBP: case X86_REG_EBP: case X86_REG_BP: case X86_REG_BPL: return 5;
+    case X86_REG_RSI: case X86_REG_ESI: case X86_REG_SI: case X86_REG_SIL: return 6;
+    case X86_REG_RDI: case X86_REG_EDI: case X86_REG_DI: case X86_REG_DIL: return 7;
+    case X86_REG_R8: case X86_REG_R8D: case X86_REG_R8W: case X86_REG_R8B: return 8;
+    case X86_REG_R9: case X86_REG_R9D: case X86_REG_R9W: case X86_REG_R9B: return 9;
+    case X86_REG_R10: case X86_REG_R10D: case X86_REG_R10W: case X86_REG_R10B: return 10;
+    case X86_REG_R11: case X86_REG_R11D: case X86_REG_R11W: case X86_REG_R11B: return 11;
+    case X86_REG_R12: case X86_REG_R12D: case X86_REG_R12W: case X86_REG_R12B: return 12;
+    case X86_REG_R13: case X86_REG_R13D: case X86_REG_R13W: case X86_REG_R13B: return 13;
+    case X86_REG_R14: case X86_REG_R14D: case X86_REG_R14W: case X86_REG_R14B: return 14;
+    case X86_REG_R15: case X86_REG_R15D: case X86_REG_R15W: case X86_REG_R15B: return 15;
+    default: return -1;
+    }
+}
+
+[[nodiscard]] int cfg_norm_arm_gpr(int reg) noexcept {
+    switch (reg) {
+    case ARM_REG_R0: return 0; case ARM_REG_R1: return 1; case ARM_REG_R2: return 2; case ARM_REG_R3: return 3;
+    case ARM_REG_R4: return 4; case ARM_REG_R5: return 5; case ARM_REG_R6: return 6; case ARM_REG_R7: return 7;
+    case ARM_REG_R8: return 8; case ARM_REG_R9: return 9; case ARM_REG_R10: return 10; case ARM_REG_R11: return 11;
+    case ARM_REG_R12: return 12; case ARM_REG_SP: return 13; case ARM_REG_LR: return 14; case ARM_REG_PC: return 15;
+    default: return -1;
+    }
+}
+
+[[nodiscard]] int cfg_norm_arm64_gpr(unsigned reg) noexcept {
+    if (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X28) return static_cast<int>(reg - ARM64_REG_X0);
+    if (reg == ARM64_REG_FP) return 29;
+    if (reg == ARM64_REG_LR) return 30;
+    if (reg >= ARM64_REG_W0 && reg <= ARM64_REG_W30) return static_cast<int>(reg - ARM64_REG_W0);
+    if (reg == ARM64_REG_XZR || reg == ARM64_REG_WZR) return 31;
+    if (reg == ARM64_REG_SP || reg == ARM64_REG_WSP) return 32;
+    return -1;
+}
+
+[[nodiscard]] std::uint64_t cfg_read_uint(const std::uint8_t* p, std::size_t width, peelf::Endianness endian) noexcept {
+    std::uint64_t v = 0;
+    if (endian == peelf::Endianness::Big) {
+        for (std::size_t i = 0; i < width; ++i) v = (v << 8u) | p[i];
+    } else {
+        for (std::size_t i = 0; i < width; ++i) v |= static_cast<std::uint64_t>(p[i]) << (i * 8u);
+    }
+    return v;
+}
+
+[[nodiscard]] std::int64_t cfg_read_sint(const std::uint8_t* p, std::size_t width, peelf::Endianness endian) noexcept {
+    const std::uint64_t u = cfg_read_uint(p, width, endian);
+    switch (width) {
+    case 1: return static_cast<std::int8_t>(u & 0xFFu);
+    case 2: return static_cast<std::int16_t>(u & 0xFFFFu);
+    case 4: return static_cast<std::int32_t>(u & 0xFFFFFFFFu);
+    default: return static_cast<std::int64_t>(u);
+    }
+}
+
+void recover_cfg_jump_tables(
+    std::span<const std::uint8_t> function_bytes,
+    std::uint64_t virtual_address,
+    peelf::Architecture architecture,
+    peelf::Endianness endianness,
+    bool thumb_mode,
+    const std::vector<Instruction>& instructions,
+    const std::map<std::uint64_t, std::size_t>& instruction_by_address,
+    const GraphByteReader& read_virtual_bytes,
+    std::set<std::uint64_t>& leaders,
+    std::map<std::size_t, std::vector<std::uint64_t>>& jump_tables,
+    std::vector<IndirectRecoveryNote>& recovery_notes) {
+
+    const auto read_table = [&](std::uint64_t table_va, std::size_t byte_len) -> std::vector<std::uint8_t> {
+        if (byte_len == 0) return {};
+        if (table_va >= virtual_address) {
+            const auto off = table_va - virtual_address;
+            if (off <= function_bytes.size() && byte_len <= function_bytes.size() - static_cast<std::size_t>(off)) {
+                return std::vector<std::uint8_t>(
+                    function_bytes.begin() + static_cast<std::ptrdiff_t>(off),
+                    function_bytes.begin() + static_cast<std::ptrdiff_t>(off + byte_len));
+            }
+        }
+        if (read_virtual_bytes) {
+            auto ext = read_virtual_bytes(table_va, byte_len);
+            if (ext.size() == byte_len) return ext;
+        }
+        return {};
+    };
+
+    const auto has_direct_bypass = [&](std::size_t guard_idx, std::size_t dispatch_idx) {
+        for (const Instruction& ins : instructions) {
+            if (!ins.branch_target) continue;
+            for (std::size_t k = guard_idx + 1u; k <= dispatch_idx; ++k) {
+                if (*ins.branch_target == instructions[k].address) return true;
+            }
+        }
+        return false;
+    };
+
+    cs_arch cs_target{};
+    unsigned cs_mode_flags = endianness == peelf::Endianness::Big
+        ? static_cast<unsigned>(CS_MODE_BIG_ENDIAN)
+        : static_cast<unsigned>(CS_MODE_LITTLE_ENDIAN);
+    switch (architecture) {
+    case peelf::Architecture::X86: cs_target = CS_ARCH_X86; cs_mode_flags = static_cast<unsigned>(CS_MODE_32); break;
+    case peelf::Architecture::X86_64: cs_target = CS_ARCH_X86; cs_mode_flags = static_cast<unsigned>(CS_MODE_64); break;
+    case peelf::Architecture::ARM:
+        cs_target = CS_ARCH_ARM;
+        cs_mode_flags |= thumb_mode ? static_cast<unsigned>(CS_MODE_THUMB) : static_cast<unsigned>(CS_MODE_ARM);
+        break;
+    case peelf::Architecture::ARM64: cs_target = CS_ARCH_ARM64; break;
+    default: return;
+    }
+
+    csh handle = 0;
+    if (cs_open(cs_target, static_cast<cs_mode>(cs_mode_flags), &handle) != CS_ERR_OK) return;
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+
+    cs_insn* raw = nullptr;
+    const std::size_t count_insns = cs_disasm(handle, function_bytes.data(), function_bytes.size(), virtual_address, 0, &raw);
+    if (count_insns == 0 || raw == nullptr) {
+        cs_close(&handle);
+        return;
+    }
+
+    const std::size_t limit = std::min(count_insns, instructions.size());
+
+    const auto find_x86_guard = [&](std::size_t search_end_exclusive,
+                                    int idx_reg,
+                                    std::size_t& out_guard_idx) -> std::optional<std::size_t> {
+        if (idx_reg < 0 || search_end_exclusive < 2) return std::nullopt;
+        int tracked = idx_reg;
+        bool saw_guard = false;
+        bool strict_above = true;
+        for (std::size_t pos = search_end_exclusive; pos-- > 0;) {
+            const cs_insn& ins = raw[pos];
+            if (!ins.detail) continue;
+            if (pos + 1u < search_end_exclusive &&
+                (ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET)) break;
+            const auto& x86 = ins.detail->x86;
+            if (!saw_guard) {
+                if ((ins.id == X86_INS_JA || ins.id == X86_INS_JAE) &&
+                    instructions[pos].branch_target &&
+                    *instructions[pos].branch_target != instructions[search_end_exclusive].address) {
+                    saw_guard = true;
+                    strict_above = (ins.id == X86_INS_JA);
+                    out_guard_idx = pos;
+                    continue;
+                }
+                if ((ins.id == X86_INS_MOV || ins.id == X86_INS_MOVZX || ins.id == X86_INS_MOVSXD) &&
+                    x86.op_count == 2 && x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_REG &&
+                    cfg_norm_x86_gpr(x86.operands[0].reg) == tracked) {
+                    tracked = cfg_norm_x86_gpr(x86.operands[1].reg);
+                }
+            } else {
+                if (ins.id == X86_INS_CMP && x86.op_count == 2 &&
+                    x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_IMM &&
+                    x86.operands[1].imm >= 0 && cfg_norm_x86_gpr(x86.operands[0].reg) == tracked) {
+                    const std::uint64_t cases = strict_above
+                        ? (static_cast<std::uint64_t>(x86.operands[1].imm) + 1u)
+                        : static_cast<std::uint64_t>(x86.operands[1].imm);
+                    if (cases >= 1u && cases <= 256u) return static_cast<std::size_t>(cases);
+                    return std::nullopt;
+                }
+                if ((ins.id == X86_INS_MOV || ins.id == X86_INS_MOVZX || ins.id == X86_INS_MOVSXD) &&
+                    x86.op_count == 2 && x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_REG &&
+                    cfg_norm_x86_gpr(x86.operands[0].reg) == tracked) {
+                    tracked = cfg_norm_x86_gpr(x86.operands[1].reg);
+                }
+            }
+        }
+        return std::nullopt;
+    };
+
+    for (std::size_t i = 2; i < limit; ++i) {
+        const cs_insn& dispatch = raw[i];
+        if (!dispatch.detail) continue;
+
+        if (architecture == peelf::Architecture::X86 || architecture == peelf::Architecture::X86_64) {
+            const auto& x86 = dispatch.detail->x86;
+            // 1) Guarded absolute u32/u64 jump table
+            if (dispatch.id == X86_INS_JMP && x86.op_count == 1 && x86.operands[0].type == X86_OP_MEM) {
+                const auto& mem = x86.operands[0].mem;
+                const std::uint8_t esz = x86.operands[0].size;
+                if (mem.base == X86_REG_INVALID && mem.index != X86_REG_INVALID &&
+                    mem.segment == X86_REG_INVALID && mem.disp >= 0 &&
+                    (esz == 4 || esz == 8) && mem.scale == esz) {
+                    std::size_t guard_idx = 0;
+                    const auto count = find_x86_guard(i, cfg_norm_x86_gpr(mem.index), guard_idx);
+                    if (count && !has_direct_bypass(guard_idx, i)) {
+                        const auto table_va = static_cast<std::uint64_t>(mem.disp);
+                        const auto bytes = read_table(table_va, *count * esz);
+                        if (!bytes.empty()) {
+                            std::vector<std::uint64_t> targets;
+                            targets.reserve(*count);
+                            for (std::size_t c = 0; c < *count; ++c) {
+                                const std::uint64_t dst = cfg_read_uint(bytes.data() + c * esz, esz, endianness);
+                                if (!instruction_by_address.contains(dst)) { targets.clear(); break; }
+                                targets.push_back(dst);
+                            }
+                            if (!targets.empty()) {
+                                for (const auto t : targets) leaders.insert(t);
+                                recovery_notes.push_back(IndirectRecoveryNote{
+                                    .source_address = dispatch.address,
+                                    .table_or_slot_address = table_va,
+                                    .target_count = targets.size(),
+                                    .confidence = "IndirectTable",
+                                    .evidence = std::format("Guarded absolute u{} jump table @ 0x{:X} ({} cases)",
+                                                            static_cast<unsigned>(esz * 8u), table_va, targets.size()),
+                                });
+                                jump_tables.emplace(i, std::move(targets));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 2) Guarded x86-64 RIP-relative signed 32-bit offset jump table
+            if (architecture == peelf::Architecture::X86_64 &&
+                dispatch.id == X86_INS_JMP && x86.op_count == 1 && x86.operands[0].type == X86_OP_REG) {
+                const int jmp_reg = cfg_norm_x86_gpr(x86.operands[0].reg);
+                int cand_a = -1;
+                int cand_b = -1;
+                int matched_base = -1;
+                int matched_idx = -1;
+                std::int64_t extra_disp = 0;
+                std::size_t movsxd_pos = 0;
+                bool found_movsxd = false;
+
+                for (std::size_t p = i; p-- > 0 && (i - p) <= 12u;) {
+                    const cs_insn& ins = raw[p];
+                    if (!ins.detail) continue;
+                    if (ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) break;
+                    const auto& d = ins.detail->x86;
+                    if (cand_a < 0) {
+                        if (ins.id == X86_INS_ADD && d.op_count == 2 &&
+                            d.operands[0].type == X86_OP_REG && d.operands[1].type == X86_OP_REG &&
+                            cfg_norm_x86_gpr(d.operands[0].reg) == jmp_reg) {
+                            cand_a = jmp_reg;
+                            cand_b = cfg_norm_x86_gpr(d.operands[1].reg);
+                        } else if (ins.id == X86_INS_LEA && d.op_count == 2 &&
+                                   d.operands[0].type == X86_OP_REG && d.operands[1].type == X86_OP_MEM &&
+                                   cfg_norm_x86_gpr(d.operands[0].reg) == jmp_reg &&
+                                   d.operands[1].mem.base != X86_REG_INVALID &&
+                                   d.operands[1].mem.index != X86_REG_INVALID &&
+                                   d.operands[1].mem.scale == 1 && d.operands[1].mem.disp == 0) {
+                            cand_a = cfg_norm_x86_gpr(d.operands[1].mem.base);
+                            cand_b = cfg_norm_x86_gpr(d.operands[1].mem.index);
+                        }
+                    } else if ((ins.id == X86_INS_MOVSXD || ins.id == X86_INS_MOVSX) &&
+                               d.op_count == 2 && d.operands[0].type == X86_OP_REG &&
+                               d.operands[1].type == X86_OP_MEM && d.operands[1].mem.scale == 4 &&
+                               d.operands[1].mem.base != X86_REG_INVALID &&
+                               d.operands[1].mem.index != X86_REG_INVALID) {
+                        const int dst_r = cfg_norm_x86_gpr(d.operands[0].reg);
+                        const int base_r = cfg_norm_x86_gpr(d.operands[1].mem.base);
+                        if ((dst_r == cand_a && base_r == cand_b) || (dst_r == cand_b && base_r == cand_a)) {
+                            matched_base = base_r;
+                            matched_idx = cfg_norm_x86_gpr(d.operands[1].mem.index);
+                            extra_disp = d.operands[1].mem.disp;
+                            movsxd_pos = p;
+                            found_movsxd = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (found_movsxd && matched_base >= 0 && matched_idx >= 0) {
+                    std::optional<std::uint64_t> anchor_va;
+                    for (std::size_t p = movsxd_pos; p-- > 0 && (movsxd_pos - p) <= 12u;) {
+                        const cs_insn& ins = raw[p];
+                        if (!ins.detail) continue;
+                        if (ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) break;
+                        const auto& d = ins.detail->x86;
+                        if (ins.id == X86_INS_LEA && d.op_count == 2 &&
+                            d.operands[0].type == X86_OP_REG &&
+                            cfg_norm_x86_gpr(d.operands[0].reg) == matched_base &&
+                            d.operands[1].type == X86_OP_MEM &&
+                            d.operands[1].mem.base == X86_REG_RIP &&
+                            d.operands[1].mem.index == X86_REG_INVALID) {
+                            anchor_va = ins.address + ins.size + static_cast<std::uint64_t>(d.operands[1].mem.disp);
+                            break;
+                        }
+                        if (d.op_count >= 1 && d.operands[0].type == X86_OP_REG &&
+                            ins.id != X86_INS_CMP && ins.id != X86_INS_TEST &&
+                            cfg_norm_x86_gpr(d.operands[0].reg) == matched_base) {
+                            break;
+                        }
+                    }
+
+                    std::size_t guard_idx = 0;
+                    const auto count = find_x86_guard(movsxd_pos, matched_idx, guard_idx);
+                    if (anchor_va && count && !has_direct_bypass(guard_idx, i)) {
+                        const auto table_va = static_cast<std::uint64_t>(
+                            static_cast<std::int64_t>(*anchor_va) + extra_disp);
+                        const auto bytes = read_table(table_va, *count * 4u);
+                        if (!bytes.empty()) {
+                            std::vector<std::uint64_t> targets;
+                            targets.reserve(*count);
+                            for (std::size_t c = 0; c < *count; ++c) {
+                                const std::int64_t rel = cfg_read_sint(bytes.data() + c * 4u, 4u, endianness);
+                                const auto dst = static_cast<std::uint64_t>(
+                                    static_cast<std::int64_t>(*anchor_va) + rel);
+                                if (!instruction_by_address.contains(dst)) { targets.clear(); break; }
+                                targets.push_back(dst);
+                            }
+                            if (!targets.empty()) {
+                                for (const auto t : targets) leaders.insert(t);
+                                recovery_notes.push_back(IndirectRecoveryNote{
+                                    .source_address = dispatch.address,
+                                    .table_or_slot_address = table_va,
+                                    .target_count = targets.size(),
+                                    .confidence = "IndirectTable",
+                                    .evidence = std::format("RIP-relative i32 jump table @ 0x{:X} ({} cases)",
+                                                            table_va, targets.size()),
+                                });
+                                jump_tables.emplace(i, std::move(targets));
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (architecture == peelf::Architecture::ARM && thumb_mode) {
+            const auto& arm = dispatch.detail->arm;
+            if ((dispatch.id == ARM_INS_TBB || dispatch.id == ARM_INS_TBH) &&
+                arm.op_count == 1 && arm.operands[0].type == ARM_OP_MEM &&
+                arm.operands[0].mem.base == ARM_REG_PC && arm.operands[0].mem.index != ARM_REG_INVALID) {
+                int tracked = cfg_norm_arm_gpr(arm.operands[0].mem.index);
+                bool saw_guard = false;
+                bool strict_above = true;
+                std::size_t guard_idx = 0;
+                std::optional<std::size_t> count;
+                for (std::size_t p = i; p-- > 0 && (i - p) <= 8u;) {
+                    const cs_insn& ins = raw[p];
+                    if (!ins.detail) continue;
+                    const auto& d = ins.detail->arm;
+                    if (!saw_guard) {
+                        if (ins.id == ARM_INS_B && (d.cc == ARM_CC_HI || d.cc == ARM_CC_HS)) {
+                            saw_guard = true;
+                            strict_above = (d.cc == ARM_CC_HI);
+                            guard_idx = p;
+                        } else if (ins.id == ARM_INS_MOV && d.op_count == 2 &&
+                                   d.operands[0].type == ARM_OP_REG && d.operands[1].type == ARM_OP_REG &&
+                                   cfg_norm_arm_gpr(d.operands[0].reg) == tracked) {
+                            tracked = cfg_norm_arm_gpr(d.operands[1].reg);
+                        }
+                    } else if (ins.id == ARM_INS_CMP && d.op_count == 2 &&
+                               d.operands[0].type == ARM_OP_REG && d.operands[1].type == ARM_OP_IMM &&
+                               d.operands[1].imm >= 0 && cfg_norm_arm_gpr(d.operands[0].reg) == tracked) {
+                        const std::uint64_t cases = strict_above
+                            ? (static_cast<std::uint64_t>(d.operands[1].imm) + 1u)
+                            : static_cast<std::uint64_t>(d.operands[1].imm);
+                        if (cases >= 1u && cases <= 256u) count = static_cast<std::size_t>(cases);
+                        break;
+                    }
+                }
+                if (count && !has_direct_bypass(guard_idx, i)) {
+                    const std::size_t esz = (dispatch.id == ARM_INS_TBH) ? 2u : 1u;
+                    const std::uint64_t table_va = dispatch.address + 4u;
+                    const auto bytes = read_table(table_va, *count * esz);
+                    if (!bytes.empty()) {
+                        std::vector<std::uint64_t> targets;
+                        targets.reserve(*count);
+                        for (std::size_t c = 0; c < *count; ++c) {
+                            const std::uint64_t e = cfg_read_uint(bytes.data() + c * esz, esz, endianness);
+                            const std::uint64_t dst = (table_va + e * 2u) & ~std::uint64_t{1};
+                            if (!instruction_by_address.contains(dst)) { targets.clear(); break; }
+                            targets.push_back(dst);
+                        }
+                        if (!targets.empty()) {
+                            for (const auto t : targets) leaders.insert(t);
+                            recovery_notes.push_back(IndirectRecoveryNote{
+                                .source_address = dispatch.address,
+                                .table_or_slot_address = table_va,
+                                .target_count = targets.size(),
+                                .confidence = "IndirectTable",
+                                .evidence = std::format("Thumb-2 {} jump table @ 0x{:X} ({} cases)",
+                                                        dispatch.id == ARM_INS_TBH ? "tbh" : "tbb",
+                                                        table_va, targets.size()),
+                            });
+                            jump_tables.emplace(i, std::move(targets));
+                        }
+                    }
+                }
+            }
+        } else if (architecture == peelf::Architecture::ARM64) {
+            const auto& a64 = dispatch.detail->arm64;
+            if (dispatch.id == ARM64_INS_BR && a64.op_count == 1 && a64.operands[0].type == ARM64_OP_REG) {
+                const int target_reg = cfg_norm_arm64_gpr(a64.operands[0].reg);
+
+                const auto resolve_a64_va = [&](std::size_t before_pos, int reg) -> std::optional<std::uint64_t> {
+                    if (reg < 0) return std::nullopt;
+                    int cur = reg;
+                    std::optional<std::uint64_t> add_off;
+                    for (std::size_t p = before_pos; p-- > 0 && (before_pos - p) <= 12u;) {
+                        const cs_insn& ins = raw[p];
+                        if (!ins.detail) continue;
+                        const auto& d = ins.detail->arm64;
+                        if ((ins.id == ARM64_INS_ADR || ins.id == ARM64_INS_ADRP) &&
+                            d.op_count == 2 && d.operands[0].type == ARM64_OP_REG &&
+                            cfg_norm_arm64_gpr(d.operands[0].reg) == cur &&
+                            d.operands[1].type == ARM64_OP_IMM) {
+                            return static_cast<std::uint64_t>(d.operands[1].imm) + add_off.value_or(0ULL);
+                        }
+                        if (!add_off && ins.id == ARM64_INS_ADD && d.op_count == 3 &&
+                            d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
+                            d.operands[2].type == ARM64_OP_IMM && d.operands[2].imm >= 0 &&
+                            cfg_norm_arm64_gpr(d.operands[0].reg) == cur) {
+                            const std::uint64_t sh = d.operands[2].shift.type == ARM64_SFT_LSL
+                                ? d.operands[2].shift.value : 0u;
+                            add_off = static_cast<std::uint64_t>(d.operands[2].imm) << sh;
+                            cur = cfg_norm_arm64_gpr(d.operands[1].reg);
+                            continue;
+                        }
+                        if (d.op_count >= 1 && d.operands[0].type == ARM64_OP_REG &&
+                            ins.id != ARM64_INS_CMP && ins.id != ARM64_INS_TST &&
+                            cfg_norm_arm64_gpr(d.operands[0].reg) == cur) {
+                            break;
+                        }
+                    }
+                    return std::nullopt;
+                };
+
+                const auto find_a64_guard = [&](std::size_t before_pos,
+                                                int idx_reg,
+                                                std::size_t& out_guard) -> std::optional<std::size_t> {
+                    if (idx_reg < 0 || before_pos < 2) return std::nullopt;
+                    int tracked = idx_reg;
+                    bool saw_guard = false;
+                    bool strict_above = true;
+                    for (std::size_t p = before_pos; p-- > 0 && (before_pos - p) <= 12u;) {
+                        const cs_insn& ins = raw[p];
+                        if (!ins.detail) continue;
+                        const auto& d = ins.detail->arm64;
+                        if (!saw_guard) {
+                            if (ins.id == ARM64_INS_B && (d.cc == ARM64_CC_HI || d.cc == ARM64_CC_HS)) {
+                                saw_guard = true;
+                                strict_above = (d.cc == ARM64_CC_HI);
+                                out_guard = p;
+                            } else if (ins.id == ARM64_INS_MOV && d.op_count == 2 &&
+                                       d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
+                                       cfg_norm_arm64_gpr(d.operands[0].reg) == tracked) {
+                                tracked = cfg_norm_arm64_gpr(d.operands[1].reg);
+                            }
+                        } else {
+                            if ((ins.id == ARM64_INS_CMP && d.op_count >= 2 &&
+                                 d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_IMM &&
+                                 d.operands[1].imm >= 0 && cfg_norm_arm64_gpr(d.operands[0].reg) == tracked) ||
+                                (ins.id == ARM64_INS_SUBS && d.op_count >= 3 &&
+                                 cfg_norm_arm64_gpr(d.operands[0].reg) == 31 &&
+                                 d.operands[1].type == ARM64_OP_REG && d.operands[2].type == ARM64_OP_IMM &&
+                                 d.operands[2].imm >= 0 && cfg_norm_arm64_gpr(d.operands[1].reg) == tracked)) {
+                                const unsigned imm_op = (ins.id == ARM64_INS_SUBS) ? 2u : 1u;
+                                const std::uint64_t sh = d.operands[imm_op].shift.type == ARM64_SFT_LSL
+                                    ? d.operands[imm_op].shift.value : 0u;
+                                const std::uint64_t imm = static_cast<std::uint64_t>(d.operands[imm_op].imm) << sh;
+                                const std::uint64_t cases = strict_above ? (imm + 1u) : imm;
+                                if (cases >= 1u && cases <= 256u) return static_cast<std::size_t>(cases);
+                                return std::nullopt;
+                            }
+                        }
+                    }
+                    return std::nullopt;
+                };
+
+                for (std::size_t p = i; p-- > 0 && (i - p) <= 8u;) {
+                    const cs_insn& ins = raw[p];
+                    if (!ins.detail) continue;
+                    const auto& d = ins.detail->arm64;
+                    if (ins.id == ARM64_INS_ADD && d.op_count == 3 &&
+                        d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
+                        d.operands[2].type == ARM64_OP_REG &&
+                        cfg_norm_arm64_gpr(d.operands[0].reg) == target_reg) {
+                        const int anchor_r = cfg_norm_arm64_gpr(d.operands[1].reg);
+                        const int off_r = cfg_norm_arm64_gpr(d.operands[2].reg);
+                        const unsigned shift = d.operands[2].shift.value;
+                        const bool ext_signed =
+                            d.operands[2].ext == ARM64_EXT_SXTB ||
+                            d.operands[2].ext == ARM64_EXT_SXTH ||
+                            d.operands[2].ext == ARM64_EXT_SXTW;
+
+                        for (std::size_t lp = p; lp-- > 0 && (p - lp) <= 8u;) {
+                            const cs_insn& lins = raw[lp];
+                            if (!lins.detail) continue;
+                            const auto& ld = lins.detail->arm64;
+                            if ((lins.id == ARM64_INS_LDRB || lins.id == ARM64_INS_LDRSB ||
+                                 lins.id == ARM64_INS_LDRH || lins.id == ARM64_INS_LDRSH ||
+                                 lins.id == ARM64_INS_LDRSW || lins.id == ARM64_INS_LDR) &&
+                                ld.op_count == 2 && ld.operands[0].type == ARM64_OP_REG &&
+                                cfg_norm_arm64_gpr(ld.operands[0].reg) == off_r &&
+                                ld.operands[1].type == ARM64_OP_MEM &&
+                                ld.operands[1].mem.base != ARM64_REG_INVALID &&
+                                ld.operands[1].mem.index != ARM64_REG_INVALID &&
+                                ld.operands[1].mem.disp == 0) {
+                                std::size_t esz = 4;
+                                bool is_signed = ext_signed;
+                                switch (lins.id) {
+                                case ARM64_INS_LDRB: esz = 1; break;
+                                case ARM64_INS_LDRSB: esz = 1; is_signed = true; break;
+                                case ARM64_INS_LDRH: esz = 2; break;
+                                case ARM64_INS_LDRSH: esz = 2; is_signed = true; break;
+                                case ARM64_INS_LDRSW: esz = 4; is_signed = true; break;
+                                default: break;
+                                }
+                                const int base_r = cfg_norm_arm64_gpr(ld.operands[1].mem.base);
+                                const int idx_r = cfg_norm_arm64_gpr(ld.operands[1].mem.index);
+                                const auto table_va = resolve_a64_va(lp, base_r);
+                                const auto anchor_va = (anchor_r == base_r) ? table_va : resolve_a64_va(p, anchor_r);
+                                std::size_t guard_idx = 0;
+                                const auto count = find_a64_guard(lp, idx_r, guard_idx);
+                                if (table_va && anchor_va && count && !has_direct_bypass(guard_idx, i)) {
+                                    const auto bytes = read_table(*table_va, *count * esz);
+                                    if (!bytes.empty()) {
+                                        std::vector<std::uint64_t> targets;
+                                        targets.reserve(*count);
+                                        for (std::size_t c = 0; c < *count; ++c) {
+                                            std::uint64_t dst = 0;
+                                            if (is_signed) {
+                                                const std::int64_t rel =
+                                                    cfg_read_sint(bytes.data() + c * esz, esz, endianness) *
+                                                    (std::int64_t{1} << shift);
+                                                dst = static_cast<std::uint64_t>(
+                                                    static_cast<std::int64_t>(*anchor_va) + rel);
+                                            } else {
+                                                const std::uint64_t rel =
+                                                    cfg_read_uint(bytes.data() + c * esz, esz, endianness) << shift;
+                                                dst = *anchor_va + rel;
+                                            }
+                                            if (!instruction_by_address.contains(dst)) { targets.clear(); break; }
+                                            targets.push_back(dst);
+                                        }
+                                        if (!targets.empty()) {
+                                            for (const auto t : targets) leaders.insert(t);
+                                            recovery_notes.push_back(IndirectRecoveryNote{
+                                                .source_address = dispatch.address,
+                                                .table_or_slot_address = *table_va,
+                                                .target_count = targets.size(),
+                                                .confidence = "IndirectTable",
+                                                .evidence = std::format("ARM64 jump table @ 0x{:X} ({} cases)",
+                                                                        *table_va, targets.size()),
+                                            });
+                                            jump_tables.emplace(i, std::move(targets));
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    cs_free(raw, count_insns);
+    cs_close(&handle);
+}
+
+} // namespace
+
 CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_bytes,
                                         std::uint64_t virtual_address,
                                         peelf::Architecture architecture,
@@ -1155,12 +1874,16 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
                                         std::optional<std::uint64_t> file_offset,
                                         std::string label,
                                         bool thumb_mode,
-                                        bool reachable_only) {
+                                        bool reachable_only,
+                                        const GraphByteReader& read_virtual_bytes) {
     CallGraph graph{
         .id = "function_cfg",
         .label = std::move(label),
         .architecture = architecture,
         .endianness = endianness,
+        .nodes = {},
+        .edges = {},
+        .indirect_recoveries = {},
     };
 
     const std::optional<Architecture> arch = disassembler_architecture(architecture);
@@ -1196,38 +1919,20 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
         return i.flow == InstructionFlow::Return || i.flow == InstructionFlow::ConditionalReturn;
     };
     const auto terminates = [&](const Instruction& i) { return conditional(i) || branch(i) || returns(i); };
-    // Recover only the proven, locally guarded absolute-pointer dispatch pattern:
-    // cmp index, max; ja default; jmp [index * pointer_size + table].
-    // Relative tables, register transformations and tables outside this mapping stay unresolved.
+
     std::map<std::size_t, std::vector<std::uint64_t>> jump_tables;
-    for (std::size_t i = 2; i < instructions.size(); ++i) {
-        const auto& dispatch = instructions[i];
-        const auto& guard = instructions[i - 1];
-        const auto& compare = instructions[i - 2];
-        if (!dispatch.jump_table || !compare.compare_bound || *compare.compare_bound >= 256 ||
-            guard.mnemonic != "ja" || !guard.branch_target || *guard.branch_target == dispatch.address ||
-            compare.compare_register != dispatch.jump_table->index_register) continue;
-        if (std::ranges::any_of(instructions, [&](const Instruction& instruction) {
-            return instruction.branch_target == dispatch.address;
-        })) continue; // A direct entry could bypass the bounds check.
-        const auto& table = *dispatch.jump_table;
-        const auto count = *compare.compare_bound + 1;
-        if (table.address < virtual_address) continue;
-        const auto offset = table.address - virtual_address;
-        if (offset > function_bytes.size() || count > (function_bytes.size() - offset) / table.entry_size) continue;
-        std::vector<std::uint64_t> targets;
-        for (std::uint64_t entry = 0; entry < count; ++entry) {
-            std::uint64_t destination = 0;
-            for (std::uint8_t byte = 0; byte < table.entry_size; ++byte)
-                destination |= static_cast<std::uint64_t>(function_bytes[offset + entry * table.entry_size + byte]) << (byte * 8);
-            if (!instruction_by_address.contains(destination)) { targets.clear(); break; }
-            targets.push_back(destination);
-        }
-        if (!targets.empty()) {
-            for (const auto target : targets) leaders.insert(target);
-            jump_tables.emplace(i, std::move(targets));
-        }
-    }
+    recover_cfg_jump_tables(
+        function_bytes,
+        virtual_address,
+        architecture,
+        endianness,
+        thumb_mode,
+        instructions,
+        instruction_by_address,
+        read_virtual_bytes,
+        leaders,
+        jump_tables,
+        graph.indirect_recoveries);
 
     for (std::size_t index = 0; index < instructions.size(); ++index) {
         const Instruction& instruction = instructions[index];
@@ -1548,4 +2253,4 @@ GraphRenderResult DefaultProcessRunner::run(std::string_view executable,
 #endif
 }
 
-} // namespace viewer
+} // namespace viewe

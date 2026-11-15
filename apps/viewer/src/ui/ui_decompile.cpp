@@ -141,6 +141,11 @@ void UiApp::request_decompile(bool force_reanalyze) {
             decompiled_ = make_decompile_message(DecompileStatus::Failed, bytes.error().message);
             return;
         }
+        const GraphByteReader va_reader = [this](std::uint64_t va, std::size_t len)
+            -> std::vector<std::uint8_t> {
+            auto res = model_.read_virtual_bytes(va, len);
+            return res ? std::move(*res) : std::vector<std::uint8_t>{};
+        };
         request.fallback_graph = build_function_cfg_call_graph(
             *bytes,
             extent->virtual_address,
@@ -149,7 +154,8 @@ void UiApp::request_decompile(bool force_reanalyze) {
             static_cast<std::size_t>(extent->file_offset),
             root->name,
             thumb_mode_,
-            true);
+            true,
+            va_reader);
         const auto chosen_provider = static_cast<DecompilerProvider>(decompiler_provider_);
         if (chosen_provider != DecompilerProvider::AnnotatedCode &&
             chosen_provider != DecompilerProvider::StructuredPseudoC) {

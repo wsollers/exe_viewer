@@ -92,6 +92,14 @@ struct CallGraphEdge {
     std::string label;
 };
 
+struct IndirectRecoveryNote {
+    std::uint64_t source_address = 0;
+    std::uint64_t table_or_slot_address = 0;
+    std::size_t target_count = 0;
+    std::string confidence;
+    std::string evidence;
+};
+
 struct CallGraph {
     std::string id;
     std::string label;
@@ -99,6 +107,7 @@ struct CallGraph {
     peelf::Endianness endianness = peelf::Endianness::Little;
     std::vector<CallGraphNode> nodes;
     std::vector<CallGraphEdge> edges;
+    std::vector<IndirectRecoveryNote> indirect_recoveries{};
 };
 
 // Relationships are limited to the currently analyzed graph, not a whole-image call index.
@@ -181,7 +190,8 @@ using GraphByteReader = std::function<std::vector<std::uint8_t>(std::uint64_t of
                                                       std::optional<std::uint64_t> file_offset = std::nullopt,
                                                       std::string label = "function",
                                                       bool thumb_mode = false,
-                                                      bool reachable_only = false);
+                                                      bool reachable_only = false,
+                                                      const GraphByteReader& read_virtual_bytes = {});
 [[nodiscard]] std::string_view graphviz_format_name(GraphRenderFormat format) noexcept;
 [[nodiscard]] std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain);
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,
@@ -195,4 +205,4 @@ using GraphByteReader = std::function<std::vector<std::uint8_t>(std::uint64_t of
                                                            GraphRenderFormat format,
                                                            const IProcessRunner& runner);
 
-} // namespace viewer
+} // namespace viewe
