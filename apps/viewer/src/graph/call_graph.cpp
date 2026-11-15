@@ -301,6 +301,7 @@ namespace {
            instruction.mnemonic == "retq" ||
            instruction.mnemonic == "jr" ||
            instruction.mnemonic == "blr" ||
+           (instruction.mnemonic == "bx" && instruction.operands == "lr") ||
            ((instruction.mnemonic == "pop" || instruction.mnemonic == "ldm" || instruction.mnemonic == "ldmia") &&
             instruction.operands.find("pc") != std::string::npos);
 }
@@ -621,6 +622,11 @@ void add_edge_if_missing(CallGraph& graph, CallGraphEdge edge) {
 [[nodiscard]] std::string node_label(const CallGraphNode& node) {
     const std::string base_label = node.label.empty() ? node.id : node.label;
     std::string label = base_label;
+    if (!node.instructions.empty()) {
+        for (const auto& instruction : node.instructions)
+            label += "\n" + format_hex(instruction.address) + "  " + instruction.mnemonic + " " + instruction.operands;
+        return label;
+    }
     if (node.bytes.start.virtual_address) {
         label += "\nVA " + format_hex(*node.bytes.start.virtual_address);
     }
@@ -675,7 +681,8 @@ void add_edge_if_missing(CallGraph& graph, CallGraphEdge edge) {
 std::string to_dot(const CallGraph& graph) {
     std::ostringstream out;
     out << "digraph \"" << dot_escape(graph.id.empty() ? "call_graph" : graph.id) << "\" {\n";
-    out << "  graph [rankdir=\"LR\", labelloc=\"t\", label=\"" << dot_escape(graph.label) << "\"];\n";
+    out << "  graph [rankdir=\"" << (graph.id == "function_cfg" ? "TB" : "LR")
+        << "\", labelloc=\"t\", label=\"" << dot_escape(graph.label) << "\"];\n";
     out << "  node [fontname=\"Consolas\", fontsize=\"10\"];\n";
     out << "  edge [fontname=\"Consolas\", fontsize=\"9\"];\n";
 
@@ -1062,7 +1069,8 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
                                         peelf::Architecture architecture,
                                         peelf::Endianness endianness,
                                         std::optional<std::uint64_t> file_offset,
-                                        std::string label) {
+                                        std::string label,
+                                        bool thumb_mode) {
     CallGraph graph{
         .id = "function_cfg",
         .label = std::move(label),
@@ -1079,6 +1087,7 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
     if (!disassembler.init(*arch, disassembler_endianness(endianness))) {
         return graph;
     }
+    if (architecture == peelf::Architecture::ARM && !disassembler.set_thumb_mode(thumb_mode)) return graph;
 
     const std::vector<Instruction> instructions =
         disassembler.disassemble(function_bytes.data(), function_bytes.size(), virtual_address);
@@ -1164,7 +1173,7 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
             file_offset ? std::optional(*file_offset + (block.start - virtual_address)) : std::nullopt;
         graph.nodes.push_back(CallGraphNode{
             .id = block.id,
-            .label = "basic block\n" + format_hex(block.start),
+            .label = "loc_" + format_hex(block.start),
             .kind = CallGraphNodeKind::BasicBlock,
             .bytes = GraphByteRange{
                 .start = GraphAddress{
@@ -1177,6 +1186,11 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
             .first_instruction_index = static_cast<std::uint64_t>(block.first_instruction),
             .instruction_count = static_cast<std::uint64_t>(block.instruction_count),
         });
+        auto& node = graph.nodes.back();
+        for (std::size_t i = block.first_instruction; i < block.first_instruction + block.instruction_count; ++i) {
+            const auto& instruction = instructions[i];
+            node.instructions.push_back({instruction.address, instruction.mnemonic, instruction.operands});
+        }
     }
 
     graph.nodes.push_back(CallGraphNode{

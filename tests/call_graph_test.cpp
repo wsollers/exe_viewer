@@ -300,6 +300,17 @@ void assert_known_function_cfg_fixture(const BinMatrixCase& fixture) {
 
     EXPECT_EQ(cfg.architecture, fixture.architecture) << name;
     EXPECT_EQ(cfg.endianness, fixture.endianness) << name;
+    for (const auto& node : cfg.nodes) {
+        if (node.kind != viewer::CallGraphNodeKind::BasicBlock) continue;
+        ASSERT_EQ(node.instructions.size(), node.instruction_count) << name;
+        ASSERT_FALSE(node.instructions.empty()) << name;
+        EXPECT_EQ(node.instructions.front().address, node.bytes.start.virtual_address) << name;
+        for (const auto& instruction : node.instructions) {
+            EXPECT_FALSE(instruction.mnemonic.empty()) << name;
+            EXPECT_GE(instruction.address, *node.bytes.start.virtual_address) << name;
+            EXPECT_LT(instruction.address - *node.bytes.start.virtual_address, node.bytes.size) << name;
+        }
+    }
     EXPECT_FALSE(cfg.nodes.empty()) << name;
     EXPECT_NE(find_node(cfg, "bb_0"), nullptr) << name;
     EXPECT_TRUE(std::ranges::any_of(cfg.nodes, [](const viewer::CallGraphNode& node) {
@@ -627,11 +638,29 @@ TEST(CallGraph, BuildsFunctionCfgWithConditionalBranchFallthroughAndReturn) {
     EXPECT_EQ(entry->bytes.size, 5u);
     EXPECT_EQ(entry->first_instruction_index, 0u);
     EXPECT_EQ(entry->instruction_count, 2u);
+    ASSERT_EQ(entry->instructions.size(), 2u);
+    EXPECT_EQ(entry->instructions.front().address, 0x1000u);
+    EXPECT_EQ(entry->instructions.back().mnemonic, "je");
+    EXPECT_NE(viewer::to_dot(graph).find("rankdir=\"TB\""), std::string::npos);
+    EXPECT_NE(viewer::to_dot(graph).find("je"), std::string::npos);
 
     EXPECT_TRUE(has_edge(graph, "bb_0", "bb_2", viewer::CallGraphEdgeKind::ConditionalBranch));
     EXPECT_TRUE(has_edge(graph, "bb_0", "bb_1", viewer::CallGraphEdgeKind::Fallthrough));
     EXPECT_TRUE(has_edge(graph, "bb_1", "bb_2", viewer::CallGraphEdgeKind::Fallthrough));
     EXPECT_TRUE(has_edge(graph, "bb_2", "return", viewer::CallGraphEdgeKind::Return));
+}
+
+TEST(CallGraph, ThumbCfgCarriesInstructionBodies) {
+    const std::array<std::uint8_t, 4> bytes{0x00, 0xBF, 0x70, 0x47};
+    const auto graph = viewer::build_function_cfg_call_graph(bytes, 0x1000,
+        peelf::Architecture::ARM, peelf::Endianness::Little, 0x200, "Thumb function", true);
+    const auto* block = find_node(graph, "bb_0");
+    ASSERT_NE(block, nullptr);
+    ASSERT_EQ(block->instructions.size(), 2u);
+    EXPECT_EQ(block->instructions[0].mnemonic, "nop");
+    EXPECT_EQ(block->instructions[1].mnemonic, "bx");
+    EXPECT_EQ(block->instructions[1].address, 0x1002u);
+    EXPECT_TRUE(has_edge(graph, "bb_0", "return", viewer::CallGraphEdgeKind::Return));
 }
 
 TEST(CallGraph, BuildsFunctionCfgWithUnconditionalBranch) {

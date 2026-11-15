@@ -50,6 +50,12 @@ enum class CallGraphEdgeKind : std::uint8_t {
     Unknown
 };
 
+struct GraphInstruction {
+    std::uint64_t address = 0;
+    std::string mnemonic;
+    std::string operands;
+};
+
 struct CallGraphNode {
     std::string id;
     std::string label;
@@ -58,6 +64,7 @@ struct CallGraphNode {
     std::optional<GraphSymbolRef> symbol;
     std::uint64_t first_instruction_index = 0;
     std::uint64_t instruction_count = 0;
+    std::vector<GraphInstruction> instructions;
 };
 
 struct CallGraphEdge {
@@ -148,7 +155,8 @@ public:
                                                       peelf::Architecture architecture,
                                                       peelf::Endianness endianness,
                                                       std::optional<std::uint64_t> file_offset = std::nullopt,
-                                                      std::string label = "function");
+                                                      std::string label = "function",
+                                                      bool thumb_mode = false);
 [[nodiscard]] std::string_view graphviz_format_name(GraphRenderFormat format) noexcept;
 [[nodiscard]] std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain);
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,
