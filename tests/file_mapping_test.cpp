@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <system_error>
 #include <utility>
 
@@ -74,4 +75,18 @@ TEST(FileMapping, MoveTransfersOwnership) {
     EXPECT_EQ(dst.size(), original_size);
     // Moved-from object is intentionally inspected: it must release ownership.
     EXPECT_FALSE(src.is_open());
+}
+
+TEST(FileMapping, UnicodePathRoundTrips) {
+    const auto path = std::filesystem::temp_directory_path() / std::filesystem::path(u8"peelf_\u65e5\u672c_\u00e9.bin");
+    { std::ofstream file(path, std::ios::binary); file << "mapped"; }
+    {
+        ByteMapping map(path);
+        ASSERT_EQ(map.size(), 6u);
+        EXPECT_EQ(map.view()[0], 'm');
+        const auto utf8 = path.u8string();
+        ByteMapping second;
+        EXPECT_FALSE(second.open(std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size())));
+    }
+    std::filesystem::remove(path);
 }

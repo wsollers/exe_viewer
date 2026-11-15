@@ -182,3 +182,41 @@ TEST(PagedBinaryImage, RefusesToOverwriteExistingOutputByDefault) {
     ASSERT_TRUE(exported_bytes.has_value()) << exported_bytes.error().message;
     EXPECT_EQ(*exported_bytes, (std::vector<std::uint8_t>{0, 1, 2, 3}));
 }
+
+TEST(PagedBinaryImage, SparseAndOverlappingTransactionUndoRedo) {
+    const auto path = write_temp_binary({0});
+    constexpr std::uint64_t distant = 256ull * 1024 * 1024;
+    { std::ofstream file(path, std::ios::binary | std::ios::in | std::ios::out);
+      file.seekp(distant); file.put(0); }
+    auto image = peelf::PagedBinaryImage::open(path);
+    ASSERT_TRUE(image);
+    auto tx = image->begin_transaction("sparse overlap");
+    ASSERT_TRUE(tx.write(0, std::vector<std::uint8_t>{1, 2}));
+    ASSERT_TRUE(tx.write(1, std::vector<std::uint8_t>{3}));
+    ASSERT_TRUE(tx.write(distant, std::vector<std::uint8_t>{4}));
+    ASSERT_TRUE(tx.commit());
+    EXPECT_EQ(*image->read_effective(0, 2), (std::vector<std::uint8_t>{1, 3}));
+    EXPECT_EQ(*image->read_effective(distant, 1), (std::vector<std::uint8_t>{4}));
+    ASSERT_TRUE(image->undo());
+    EXPECT_FALSE(image->dirty());
+    ASSERT_TRUE(image->redo());
+    EXPECT_EQ(*image->read_effective(0, 2), (std::vector<std::uint8_t>{1, 3}));
+    EXPECT_EQ(*image->read_effective(distant, 1), (std::vector<std::uint8_t>{4}));
+}
+
+TEST(PagedBinaryImage, FailedCommitRestoresPatchesAndHistory) {
+    const auto path = write_temp_binary(std::vector<std::uint8_t>(16384));
+    auto image = peelf::PagedBinaryImage::open(path);
+    ASSERT_TRUE(image);
+    ASSERT_TRUE(image->apply_patch(0, std::vector<std::uint8_t>{7}, "prior"));
+    auto tx = image->begin_transaction("will fail");
+    ASSERT_TRUE(tx.write(1, std::vector<std::uint8_t>{8}));
+    ASSERT_TRUE(tx.write(12288, std::vector<std::uint8_t>{9}));
+    std::filesystem::resize_file(path, 4096);
+    EXPECT_FALSE(tx.commit());
+    EXPECT_FALSE(tx.committed());
+    EXPECT_EQ(*image->read_effective(0, 2), (std::vector<std::uint8_t>{7, 0}));
+    ASSERT_TRUE(image->undo());
+    EXPECT_FALSE(image->dirty());
+    EXPECT_FALSE(image->can_undo());
+}

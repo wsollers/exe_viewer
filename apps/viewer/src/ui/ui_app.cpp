@@ -753,7 +753,8 @@ peelf::Result<void> UiApp::open_project(const std::filesystem::path& path) {
     model_ = std::move(restored); on_file_loaded();
     thumb_mode_ = project->thumb;
     if (model_.image()->architecture() == peelf::Architecture::ARM) disasm_.set_thumb_mode(thumb_mode_);
-    symbol_index_.add_debug_symbols(*model_.image(),project->symbols);
+    model_.add_debug_symbols(project->symbols);
+    symbol_index_ = model_.symbol_index();
     for (auto& [address,note] : project->annotations) annotations_.set(address,std::move(note.name),std::move(note.comment));
     navigation_history_.restore(project->history,project->cursor);
     if (!project->history.empty()) {
@@ -2158,6 +2159,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
         const peelf::IBinaryImage* img = model_.image();
         if (!img) {
+            symbol_index_ = {};
             file_loaded_ = false;
             structure_tree_.reset();
             current_selection_ = {};
@@ -2583,7 +2585,7 @@ void UiApp::switch_analysis_view(bool graph) {
         std::uint64_t va = pe_model_.entry_point_va();
         current_instructions_ = disasm_.disassemble(code, max_size, va);
 
-        Log().error("Entry Point: 0x%llX\n", va);
+        Log().info("Entry Point: 0x{:X}", va);
         printf("----------------------------------------\n");
 
         for (const auto& inst : current_instructions_) {
@@ -2594,7 +2596,7 @@ void UiApp::switch_analysis_view(bool graph) {
                 bytes_str += buf;
             }
 
-            Log().error("%016llX  %-24s  %s\n",
+            Log().info("{:016X}  {:24}  {}",
                    inst.address,
                    bytes_str.c_str(),
                    inst.to_string().c_str());

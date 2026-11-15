@@ -88,13 +88,13 @@ void HexViewPanel::draw_contents() {
         const auto parsed = parse_hex_shellcode(edit_bytes_);
         if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
         else {
-            if (highlighted_size_ > 1 && parsed.total64 != highlighted_size_) {
+            if (highlighted_size_ > 1 && parsed.bytes.size() != highlighted_size_) {
                 edit_status_ = "Replacement length must match the selected range.";
             } else {
             const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
-            edit_status_ = applied ? std::format("Applied {} bytes.", parsed.total64) : applied.error().message;
+            edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
             if (applied) {
-                highlighted_size_ = parsed.total64;
+                highlighted_size_ = parsed.bytes.size();
                 if (on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
             }
             }

@@ -14,6 +14,9 @@
 
 namespace viewer {
 namespace {
+std::filesystem::path utf8_path(std::string_view text) {
+    return std::filesystem::path(std::u8string(text.begin(), text.end()));
+}
 
 [[nodiscard]] std::string format_hex_addr(std::uint64_t value) {
     std::array<char, 32> buf{};
@@ -120,16 +123,17 @@ namespace {
     }
 
     bool BinaryModel::load_file(const std::string& path) {
-        std::ifstream f(path, std::ios::binary);
+        std::ifstream f(utf8_path(path), std::ios::binary | std::ios::ate);
         if (!f) {
             last_diagnostic_ = "Failed to open file: " + path;
             return false;
         }
 
-        std::vector<std::uint8_t> loaded_bytes(
-            (std::istreambuf_iterator<char>(f)),
-            std::istreambuf_iterator<char>()
-        );
+        const auto length = f.tellg();
+        if (length < 0) return false;
+        std::vector<std::uint8_t> loaded_bytes(static_cast<std::size_t>(length));
+        f.seekg(0);
+        if (!f.read(reinterpret_cast<char*>(loaded_bytes.data()), static_cast<std::streamsize>(loaded_bytes.size()))) return false;
 
         reset_all();
         bytes_ = std::move(loaded_bytes);
@@ -155,7 +159,7 @@ namespace {
                     architecture_ = pe_->is_pe32_plus ? peelf::Architecture::X86_64
                                                       : peelf::Architecture::X86;
                 }
-                if (auto editable = peelf::PagedBinaryImage::open(path)) {
+                if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
                 rebuild_symbol_index();
@@ -168,7 +172,7 @@ namespace {
             const bool loaded = load_elf(path);
             if (loaded) {
                 source_kind_ = BinarySourceKind::StaticFile;
-                if (auto editable = peelf::PagedBinaryImage::open(path)) {
+                if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
                 rebuild_symbol_index();
@@ -655,9 +659,9 @@ namespace {
 
         file_info_.path = path;
         file_info_.format_str = "PE";
-        file_info_.arch_str = result.is_64 ? "x64" : "x86";
+        file_info_.arch_str = image_ ? std::string(peelf::to_string(image_->architecture())) : "Unknown";
         file_info_.size_bytes = bytes_.size();
-        file_info_.entry_point = result.entry_point_va;
+        file_info_.entry_point = image_ ? image_->entry_point() : result.entry_point_va;
         file_info_.flags = result.flags;
 
         sections_.clear();
@@ -811,12 +815,15 @@ namespace {
         if (!res) {
             last_diagnostic_ = res.error().message;
         }
+        if (res) ++edit_revision_;
         return res;
     }
 
     peelf::Result<void> BinaryModel::undo_patch() {
         if (is_live_process()) {
-            return live_patches_.undo(*session_);
+            auto result = live_patches_.undo(*session_);
+            if (result) ++edit_revision_;
+            return result;
         }
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
@@ -828,7 +835,9 @@ namespace {
 
     peelf::Result<void> BinaryModel::redo_patch() {
         if (is_live_process()) {
-            return live_patches_.redo(*session_);
+            auto result = live_patches_.redo(*session_);
+            if (result) ++edit_revision_;
+            return result;
         }
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
@@ -841,6 +850,7 @@ namespace {
     void BinaryModel::discard_staged_patches() noexcept {
         if (is_live_process()) {
             live_patches_.clear_staged();
+            ++edit_revision_;
         }
     }
 
@@ -857,6 +867,7 @@ namespace {
         if (!committed) {
             last_diagnostic_ = committed.error().message;
         }
+        ++edit_revision_;
         return committed;
     }
 
@@ -873,6 +884,7 @@ namespace {
         if (!reverted) {
             last_diagnostic_ = reverted.error().message;
         }
+        ++edit_revision_;
         return reverted;
     }
 
@@ -891,6 +903,7 @@ namespace {
         if (!reverted) {
             last_diagnostic_ = reverted.error().message;
         }
+        ++edit_revision_;
         return reverted;
     }
 

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <fstream>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -115,8 +116,9 @@ private:
     std::uint64_t page_size_{default_page_size};
     mutable std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> page_cache_;
     std::map<std::uint64_t, PatchInterval> patches_;
-    std::vector<PatchEdit> undo_stack_;
-    std::vector<PatchEdit> redo_stack_;
+    mutable std::ifstream input_;
+    std::vector<std::vector<PatchEdit>> undo_stack_;
+    std::vector<std::vector<PatchEdit>> redo_stack_;
 };
 
 enum class LiveByteState : std::uint8_t {

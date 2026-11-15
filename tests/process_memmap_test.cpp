@@ -356,6 +356,7 @@ TEST(PagedBinaryImageSparse, MultiSpanDisjointTransactionAvoidsBoundingBoxAndUnd
                   static_cast<std::streamsize>(bytes.size()));
     }
 
+    { // Release the retained input stream before removing the file on Windows.
     auto img = peelf::PagedBinaryImage::open(tmp, 4096);
     ASSERT_TRUE(img.has_value()) << img.error().message;
 
@@ -375,6 +376,7 @@ TEST(PagedBinaryImageSparse, MultiSpanDisjointTransactionAvoidsBoundingBoxAndUnd
 
     ASSERT_TRUE(img->redo().has_value());
     EXPECT_EQ(img->changed_intervals().size(), 2u);
+    }
     std::filesystem::remove(tmp);
 }
 
@@ -613,15 +615,17 @@ TEST(BinaryModelLiveProcess, StagesSparsePatchesCommitsWithRollbackAndRevertsInR
     // Stage 1st patch in heap (writable) and 2nd patch in main (.text, RX read-only).
     // Heap VA (0x7FFF10000010) is > kLiveBase, so commit order visits main_va (RX) or heap_va (RW)
     // depending on address order; let's also add a low RW page below kLiveBase so RW writes FIRST
-    // and RX fails SECOND when protection override is disabled — testing transactional rollback!
+    // and RX fails SECOND when protection override is disabled â€” testing transactional rollback!
     const std::vector<std::uint8_t> patch_low_rw{0x12, 0x34};
     const std::vector<std::uint8_t> patch_main{0x90, 0x90, 0x90, 0xC3};
     const std::vector<std::uint8_t> patch_heap{0xDE, 0xAD, 0xBE, 0xEF};
 
+    const auto before_stage_revision = model.edit_revision();
     ASSERT_TRUE(model.stage_patch_at_va(0x10008ull, patch_low_rw, "stage low rw").has_value());
     ASSERT_TRUE(model.stage_patch_at_va(kHeapBase + 0x10, patch_heap, "stage heap").has_value());
     ASSERT_TRUE(model.stage_patch_at_va(main_va, patch_main, "stage main rx").has_value());
 
+    EXPECT_GT(model.edit_revision(), before_stage_revision);
     EXPECT_EQ(model.staged_live_patches().size(), 3u);
     EXPECT_TRUE(model.committed_live_patches().empty());
     // Active window is `hello.elf`, so window-relative `changed_intervals()` exposes the 1 in-module patch.
@@ -642,9 +646,13 @@ TEST(BinaryModelLiveProcess, StagesSparsePatchesCommitsWithRollbackAndRevertsInR
     EXPECT_EQ(*eff_main, patch_main);
 
     // Undo / Redo of staged patch before committing to RAM.
+    const auto before_undo_revision = model.edit_revision();
     ASSERT_TRUE(model.undo_patch().has_value());
+    EXPECT_GT(model.edit_revision(), before_undo_revision);
     EXPECT_EQ(*model.read_effective_bytes(*main_off, 4), orig_main_bytes);
+    const auto before_redo_revision = model.edit_revision();
     ASSERT_TRUE(model.redo_patch().has_value());
+    EXPECT_GT(model.edit_revision(), before_redo_revision);
     EXPECT_EQ(*model.read_effective_bytes(*main_off, 4), patch_main);
 
     // Commit WITHOUT protection override writes 0x10008 (RW) first, then fails on `main_va` (RX),

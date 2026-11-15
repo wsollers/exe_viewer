@@ -22,6 +22,10 @@
 
 namespace viewer {
     namespace {
+        std::filesystem::path utf8_path(std::string_view text) {
+            return std::filesystem::path(std::u8string(text.begin(), text.end()));
+        }
+
         constexpr float kUiFontSize = 16.0f;
 
         std::filesystem::path find_monospace_font() {
@@ -225,6 +229,7 @@ namespace viewer {
         if (!running_) return;
 
         vulkan_.wait_idle();
+        Logger::instance().init(nullptr);
         delete ui_;
         ui_ = nullptr;
         shutdown_imgui();
@@ -263,7 +268,10 @@ namespace viewer {
             }
 
             // Start frame
-            vulkan_.begin_frame();
+            if (!vulkan_.begin_frame()) {
+                glfwWaitEventsTimeout(0.01);
+                continue;
+            }
 
             // ImGui frame
             ImGui_ImplVulkan_NewFrame();
@@ -344,7 +352,7 @@ namespace viewer {
         if (result == NFD_OKAY) {
             std::string path(out_path);
             NFD_FreePath(out_path);
-            ui_->load_debug_symbols(path);
+            ui_->load_debug_symbols(utf8_path(path));
         } else if (result == NFD_ERROR) {
             Log().error(std::string("Debug symbol dialog error: ") + NFD_GetError());
         }
@@ -356,7 +364,7 @@ namespace viewer {
         nfdfilteritem_t filter{action == 2 ? "Patch report" : "Analysis project", action == 2 ? "txt" : "peproj"};
         auto result = action == 0 ? NFD_OpenDialog(&path, &filter, 1, nullptr) : NFD_SaveDialog(&path, &filter, 1, nullptr, nullptr);
         if (result == NFD_OKAY) {
-            std::filesystem::path selected(path); NFD_FreePath(path);
+            std::filesystem::path selected = utf8_path(path); NFD_FreePath(path);
             auto saved = action == 0 ? ui_->open_project(selected) : action == 1 ? ui_->save_project(selected) : ui_->save_patch_report(selected);
             if (saved) Log().info("{}: {}", action == 0 ? "Project restored" : "Saved", selected.string());
             else Log().error("Analysis file: {}", saved.error().message);
@@ -389,7 +397,7 @@ namespace viewer {
         if (result == NFD_OKAY) {
             std::string path(out_path);
             NFD_FreePath(out_path);
-            auto saved = model_.save_patched_as(path);
+            auto saved = model_.save_patched_as(utf8_path(path));
             if (saved) {
                 Log().info("Saved patched image: " + path);
             } else {

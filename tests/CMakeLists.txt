@@ -89,6 +89,9 @@ target_include_directories(peelf_tests PRIVATE
 )
 
 if(MSVC)
+  # Keep function pointers equal to PDB function RVAs in the live ASLR self-test.
+  # Incremental linking otherwise routes pointers through ILT jump thunks.
+  target_link_options(peelf_tests PRIVATE /INCREMENTAL:NO)
   find_path(PEELF_DIA_INCLUDE_DIR dia2.h
     PATHS
       "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/include"

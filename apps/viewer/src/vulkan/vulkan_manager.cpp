@@ -1,5 +1,7 @@
 #include "vulkan_manager.h"
 #include <cstring>
+#include <algorithm>
+#include <limits>
 #include <iterator>
 #include <stdexcept>
 #include <vector>
@@ -18,6 +20,7 @@ VulkanManager::~VulkanManager() {
 }
 
 void VulkanManager::init(GLFWwindow* window, const VulkanConfig& cfg) {
+    window_ = window;
     create_instance(cfg);
     create_surface(window);
     select_physical_device();
@@ -37,7 +40,8 @@ void VulkanManager::shutdown() {
     vkDeviceWaitIdle(device_);
 
     vkDestroyFence(device_, in_flight_fence_, nullptr);
-    vkDestroySemaphore(device_, render_finished_semaphore_, nullptr);
+    for (auto semaphore : render_finished_semaphores_) vkDestroySemaphore(device_, semaphore, nullptr);
+    render_finished_semaphores_.clear();
     vkDestroySemaphore(device_, image_available_semaphore_, nullptr);
 
     vkDestroyDescriptorPool(device_, descriptor_pool_, nullptr);
@@ -155,6 +159,13 @@ void VulkanManager::create_swapchain(GLFWwindow* window) {
     VkSurfaceCapabilitiesKHR caps{};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &caps);
 
+    if (caps.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
+        swapchain_extent_ = caps.currentExtent;
+    } else {
+        swapchain_extent_.width = std::clamp(swapchain_extent_.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+        swapchain_extent_.height = std::clamp(swapchain_extent_.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
+
     uint32_t image_count = caps.minImageCount + 1;
     if (caps.maxImageCount > 0 && image_count > caps.maxImageCount)
         image_count = caps.maxImageCount;
@@ -181,6 +192,12 @@ void VulkanManager::create_swapchain(GLFWwindow* window) {
     swapchain_images_.resize(image_count);
     vkGetSwapchainImagesKHR(device_, swapchain_, &image_count, swapchain_images_.data());
 
+    render_finished_semaphores_.resize(image_count);
+    VkSemaphoreCreateInfo semaphore_info{};
+    semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (auto& semaphore : render_finished_semaphores_) {
+        check(vkCreateSemaphore(device_, &semaphore_info, nullptr, &semaphore), "Failed to create present semaphore");
+    }
     swapchain_image_views_.resize(image_count);
     for (uint32_t i = 0; i < image_count; i++) {
         VkImageViewCreateInfo vi{};
@@ -215,12 +232,21 @@ void VulkanManager::create_render_pass() {
     sub.colorAttachmentCount = 1;
     sub.pColorAttachments = &ref;
 
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
     VkRenderPassCreateInfo rp{};
     rp.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rp.attachmentCount = 1;
     rp.pAttachments = &att;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
+    rp.dependencyCount = 1;
+    rp.pDependencies = &dependency;
 
     check(vkCreateRenderPass(device_, &rp, nullptr, &render_pass_),
           "vkCreateRenderPass failed");
@@ -295,8 +321,7 @@ void VulkanManager::create_sync_objects() {
 
     check(vkCreateSemaphore(device_, &si, nullptr, &image_available_semaphore_),
           "Failed to create semaphore");
-    check(vkCreateSemaphore(device_, &si, nullptr, &render_finished_semaphore_),
-          "Failed to create semaphore");
+
     check(vkCreateFence(device_, &fi, nullptr, &in_flight_fence_),
           "Failed to create fence");
 }
@@ -522,14 +547,20 @@ void VulkanManager::destroy_texture(Texture& texture) {
     texture.height = 0;
 }
 
-void VulkanManager::begin_frame() {
-    vkWaitForFences(device_, 1, &in_flight_fence_, VK_TRUE, UINT64_MAX);
-    vkResetFences(device_, 1, &in_flight_fence_);
-
-    check(vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
-                                image_available_semaphore_, VK_NULL_HANDLE,
-                                &current_image_index_),
-          "vkAcquireNextImageKHR failed");
+bool VulkanManager::begin_frame() {
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(window_, &width, &height);
+    if (width == 0 || height == 0) return false;
+    if (swapchain_dirty_) recreate_swapchain(window_);
+    check(vkWaitForFences(device_, 1, &in_flight_fence_, VK_TRUE, UINT64_MAX), "Fence wait failed");
+    const auto acquired = vkAcquireNextImageKHR(device_, swapchain_, UINT64_MAX,
+        image_available_semaphore_, VK_NULL_HANDLE, &current_image_index_);
+    if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+        swapchain_dirty_ = true;
+        return false;
+    }
+    if (acquired == VK_SUBOPTIMAL_KHR) swapchain_dirty_ = true;
+    else check(acquired, "vkAcquireNextImageKHR failed");
 
     VkCommandBuffer cmd = command_buffers_[current_image_index_];
     vkResetCommandBuffer(cmd, 0);
@@ -550,6 +581,7 @@ void VulkanManager::begin_frame() {
     rp.pClearValues = &clear;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    return true;
 }
 
 void VulkanManager::end_frame() {
@@ -560,7 +592,7 @@ void VulkanManager::end_frame() {
 
     VkSemaphore wait[] = { image_available_semaphore_ };
     VkPipelineStageFlags stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-    VkSemaphore signal[] = { render_finished_semaphore_ };
+    VkSemaphore signal[] = { render_finished_semaphores_[current_image_index_] };
 
     VkSubmitInfo si{};
     si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -572,6 +604,7 @@ void VulkanManager::end_frame() {
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = signal;
 
+    check(vkResetFences(device_, 1, &in_flight_fence_), "Fence reset failed");
     check(vkQueueSubmit(graphics_queue_, 1, &si, in_flight_fence_),
           "vkQueueSubmit failed");
 
@@ -583,7 +616,10 @@ void VulkanManager::end_frame() {
     pi.pSwapchains = &swapchain_;
     pi.pImageIndices = &current_image_index_;
 
-    vkQueuePresentKHR(graphics_queue_, &pi);
+    const auto presented = vkQueuePresentKHR(graphics_queue_, &pi);
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR)
+        swapchain_dirty_ = true;
+    else check(presented, "vkQueuePresentKHR failed");
 }
     void VulkanManager::wait_idle() {
     if (device_) {
@@ -595,13 +631,17 @@ void VulkanManager::end_frame() {
     int width = 0, height = 0;
     glfwGetFramebufferSize(window, &width, &height);
 
-    // Handle minimized window
-    while (width == 0 || height == 0) {
-        glfwGetFramebufferSize(window, &width, &height);
-        glfwWaitEvents();
+    if (width == 0 || height == 0) {
+        swapchain_dirty_ = true;
+        return;
     }
 
     vkDeviceWaitIdle(device_);
+
+    vkFreeCommandBuffers(device_, command_pool_, static_cast<uint32_t>(command_buffers_.size()), command_buffers_.data());
+    command_buffers_.clear();
+    for (auto semaphore : render_finished_semaphores_) vkDestroySemaphore(device_, semaphore, nullptr);
+    render_finished_semaphores_.clear();
 
     // Destroy old swapchain resources
     for (auto fb : framebuffers_) vkDestroyFramebuffer(device_, fb, nullptr);
@@ -615,5 +655,7 @@ void VulkanManager::end_frame() {
     // Recreate swapchain + framebuffers
     create_swapchain(window);
     create_framebuffers();
+    create_command_buffers();
+    swapchain_dirty_ = false;
 }
 } // namespace viewer

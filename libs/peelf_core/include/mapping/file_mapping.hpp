@@ -10,7 +10,6 @@
 #include <utility>
 #include <filesystem>
 
-#define NOMINMAX
 
 #include "mapping/map_errors.hpp"
 
@@ -82,8 +81,8 @@ public:
 
     explicit FileMapping(const std::filesystem::path& path, MapMode mode = MapMode::read_only)
     {
-        if (std::error_code ec = open(path.string(), mode); ec) {
-            throw std::system_error(ec, "FileMapping: failed to map '" + path.string() + "'");
+        if (std::error_code ec = open(path_utf8(path), mode); ec) {
+            throw std::system_error(ec, "FileMapping: failed to map '" + path_utf8(path) + "'");
         }
     }
 
@@ -172,6 +171,10 @@ public:
     }
 
 private:
+    static std::string path_utf8(const std::filesystem::path& path) {
+        const auto utf8 = path.u8string();
+        return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+    }
     Backend backend_{};
     T* data_ = nullptr;
     std::size_t byte_size_ = 0;

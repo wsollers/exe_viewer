@@ -1,6 +1,9 @@
 #ifdef _WIN32
 
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <new>
 
 #include "mapping/file_mapping_win32.hpp"
 #include "mapping/file_mapping.hpp"
@@ -21,8 +24,16 @@ std::error_code Win32FileMappingBackend::open_and_map(Win32FileMappingBackend& s
         ? GENERIC_READ
         : (GENERIC_READ | GENERIC_WRITE);
 
-    HANDLE hFile = ::CreateFileA(
-        path.c_str(),
+    if (path.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+        return make_error_code(MapErrc::open_failed);
+    const int length = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), nullptr, 0);
+    if (length == 0) return make_error_code(MapErrc::open_failed);
+    std::unique_ptr<wchar_t[]> wide(new (std::nothrow) wchar_t[static_cast<std::size_t>(length) + 1]);
+    if (!wide || ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), wide.get(), length) != length)
+        return make_error_code(MapErrc::open_failed);
+    wide[length] = L'\0';
+    HANDLE hFile = ::CreateFileW(
+        wide.get(),
         desiredAccess,
         FILE_SHARE_READ,       // share read; adjust if needed
         nullptr,

@@ -81,6 +81,8 @@ Result<PagedBinaryImage> PagedBinaryImage::open(std::filesystem::path path, std:
     image.path_ = std::move(path);
     image.size_ = static_cast<std::uint64_t>(size);
     image.page_size_ = page_size;
+    image.input_.open(image.path_, std::ios::binary);
+    if (!image.input_) return make_error("failed to open binary image file");
     return image;
 }
 
@@ -107,8 +109,9 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::load_page(std::uint64_t page
     const std::uint64_t remaining = size_ - offset;
     const std::uint64_t bytes_to_read = std::min(page_size_, remaining);
 
-    std::ifstream file(path_, std::ios::binary);
-    if (!file) {
+    auto& file = input_;
+    file.clear();
+    if (!file.is_open()) {
         return make_error("failed to open binary image file");
     }
     file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
@@ -122,6 +125,9 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::load_page(std::uint64_t page
         return make_error("failed to read binary image page");
     }
 
+    // Bound retained pages to approximately 16 MiB (at least one page).
+    const auto cache_limit = std::max<std::uint64_t>(1, (16u * 1024u * 1024u) / page_size_);
+    if (page_cache_.size() >= cache_limit) page_cache_.erase(page_cache_.begin());
     auto [it, inserted] = page_cache_.emplace(page_index, std::move(page));
     (void)inserted;
     return it->second;
@@ -311,86 +317,37 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
         return {};
     }
 
-    struct Range {
-        std::uint64_t begin{0};
-        std::uint64_t end{0};
-    };
-    std::vector<Range> ranges;
-    ranges.reserve(writes.size());
     for (const auto& write : writes) {
-        if (write.bytes.empty()) {
-            continue;
-        }
-        if (auto valid = validate_range(write.offset, static_cast<std::uint64_t>(write.bytes.size())); !valid) {
+        if (auto valid = validate_range(write.offset, write.bytes.size()); !valid)
             return std::unexpected(valid.error());
-        }
-        ranges.push_back(Range{
-            write.offset,
-            write.offset + static_cast<std::uint64_t>(write.bytes.size()),
-        });
-    }
-    if (ranges.empty()) {
-        return {};
     }
 
-    std::ranges::sort(ranges, [](const Range& a, const Range& b) {
-        return a.begin < b.begin;
-    });
-
-    std::vector<Range> merged;
-    merged.reserve(ranges.size());
-    for (const Range& r : ranges) {
-        if (merged.empty() || r.begin > merged.back().end) {
-            merged.push_back(r);
-        } else {
-            merged.back().end = std::max(merged.back().end, r.end);
+    // Retain sparse intervals for rollback; never snapshot gaps between writes.
+    auto saved = patches_;
+    std::vector<PatchEdit> edits;
+    try {
+        for (const auto& write : writes) {
+            auto before = read_effective(write.offset, write.bytes.size());
+            if (!before) {
+                patches_.swap(saved);
+                return std::unexpected(before.error());
+            }
+            if (*before == write.bytes) continue;
+            edits.push_back(PatchEdit{.offset = write.offset, .before = std::move(*before), .after = write.bytes, .label = label});
+            auto applied = apply_replacement_no_history(write.offset, write.bytes);
+            if (!applied) {
+                patches_.swap(saved);
+                return std::unexpected(applied.error());
+            }
         }
+        if (!edits.empty()) {
+            undo_stack_.push_back(std::move(edits));
+            redo_stack_.clear();
+        }
+    } catch (...) {
+        patches_.swap(saved);
+        throw;
     }
-
-    std::vector<PatchSpanSnapshot> snapshots;
-    snapshots.reserve(merged.size());
-    for (const Range& r : merged) {
-        auto before = read_effective(r.begin, r.end - r.begin);
-        if (!before) {
-            return std::unexpected(before.error());
-        }
-        snapshots.push_back(PatchSpanSnapshot{r.begin, std::move(*before), {}});
-    }
-
-    for (const auto& write : writes) {
-        auto applied = apply_replacement_no_history(write.offset, write.bytes);
-        if (!applied) {
-            return std::unexpected(applied.error());
-        }
-    }
-
-    std::vector<PatchSpanSnapshot> changed_spans;
-    changed_spans.reserve(snapshots.size());
-    for (PatchSpanSnapshot& snap : snapshots) {
-        const auto span_len = static_cast<std::uint64_t>(snap.before.size());
-        auto after = read_effective(snap.offset, span_len);
-        if (!after) {
-            return std::unexpected(after.error());
-        }
-        if (snap.before != *after) {
-            snap.after = std::move(*after);
-            changed_spans.push_back(std::move(snap));
-        }
-    }
-
-    if (!changed_spans.empty()) {
-        PatchEdit edit;
-        edit.label = std::move(label);
-        if (changed_spans.size() == 1) {
-            edit.offset = changed_spans.front().offset;
-            edit.before = changed_spans.front().before;
-            edit.after = changed_spans.front().after;
-        }
-        edit.spans = std::move(changed_spans);
-        undo_stack_.push_back(std::move(edit));
-        redo_stack_.clear();
-    }
-
     return {};
 }
 
@@ -409,42 +366,42 @@ Result<void> PagedBinaryImage::undo() {
         return make_error("no patch edit to undo");
     }
 
-    PatchEdit edit = std::move(undo_stack_.back());
-    undo_stack_.pop_back();
-    if (!edit.spans.empty()) {
-        for (const PatchSpanSnapshot& snap : edit.spans) {
-            if (auto applied = apply_replacement_no_history(snap.offset, snap.before); !applied) {
+    auto saved = patches_;
+    try {
+        // Reverse order is essential for overlapping writes in a transaction.
+        for (auto it = undo_stack_.back().rbegin(); it != undo_stack_.back().rend(); ++it) {
+            auto applied = apply_replacement_no_history(it->offset, it->before);
+            if (!applied) {
+                patches_.swap(saved);
                 return std::unexpected(applied.error());
             }
         }
-    } else {
-        if (auto applied = apply_replacement_no_history(edit.offset, edit.before); !applied) {
-            return std::unexpected(applied.error());
-        }
+        redo_stack_.push_back(undo_stack_.back());
+        undo_stack_.pop_back();
+    } catch (...) {
+        patches_.swap(saved);
+        throw;
     }
-    redo_stack_.push_back(std::move(edit));
     return {};
 }
 
 Result<void> PagedBinaryImage::redo() {
-    if (redo_stack_.empty()) {
-        return make_error("no patch edit to redo");
-    }
-
-    PatchEdit edit = std::move(redo_stack_.back());
-    redo_stack_.pop_back();
-    if (!edit.spans.empty()) {
-        for (const PatchSpanSnapshot& snap : edit.spans) {
-            if (auto applied = apply_replacement_no_history(snap.offset, snap.after); !applied) {
+    if (redo_stack_.empty()) return make_error("no patch edit to redo");
+    auto saved = patches_;
+    try {
+        for (const auto& edit : redo_stack_.back()) {
+            auto applied = apply_replacement_no_history(edit.offset, edit.after);
+            if (!applied) {
+                patches_.swap(saved);
                 return std::unexpected(applied.error());
             }
         }
-    } else {
-        if (auto applied = apply_replacement_no_history(edit.offset, edit.after); !applied) {
-            return std::unexpected(applied.error());
-        }
+        undo_stack_.push_back(redo_stack_.back());
+        redo_stack_.pop_back();
+    } catch (...) {
+        patches_.swap(saved);
+        throw;
     }
-    undo_stack_.push_back(std::move(edit));
     return {};
 }
 

@@ -1,6 +1,7 @@
 #include <peelf/binary_image.hpp>
 
 #include <algorithm>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -146,6 +147,15 @@ public:
     }
     [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept override {
+        if (format_ == Format::ELF) {
+            for (const auto& segment : segments_) {
+                if (segment.type == 1 && file_offset >= segment.file_offset &&
+                    file_offset - segment.file_offset < std::min(segment.file_size, segment.virtual_size))
+                    return checked_add_u64(segment.virtual_address, file_offset - segment.file_offset);
+            }
+            // Section headers are not a loader mapping (debug sections may have VA zero).
+            return std::nullopt;
+        }
         for (const Section& section : sections_) {
             if (section.file_size == 0) {
                 continue;
@@ -177,6 +187,14 @@ public:
 
     [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
         std::uint64_t virtual_address) const noexcept override {
+        if (format_ == Format::ELF) {
+            for (const auto& segment : segments_) {
+                if (segment.type == 1 && virtual_address >= segment.virtual_address &&
+                    virtual_address - segment.virtual_address < std::min(segment.file_size, segment.virtual_size))
+                    return checked_add_u64(segment.file_offset, virtual_address - segment.virtual_address);
+            }
+            return std::nullopt;
+        }
         for (const Section& section : sections_) {
             if (format_ == Format::ELF && !section.readable && !section.writable &&
                 !section.executable && section.virtual_address == 0) {
@@ -832,7 +850,7 @@ void parse_pe_tls_directory(std::span<const std::uint8_t> b,
                 sections, image_base, static_cast<std::uint32_t>(callbacks_rva64));
             if (callbacks_off) {
                 const std::uint64_t pointer_size = is64 ? 8u : 4u;
-                for (std::uint64_t callback_index = 0; callback_index < 4096; ++callback_index) {
+                for (std::uint64_t callback_index = 0; callback_index < b.size() / pointer_size; ++callback_index) {
                     const std::uint64_t callback_off = *callbacks_off + callback_index * pointer_size;
                     if (!fits_range(callback_off, pointer_size, static_cast<std::uint64_t>(b.size()))) {
                         break;
@@ -981,14 +999,14 @@ void parse_pe_import_thunks(std::span<const std::uint8_t> b,
                             std::uint32_t name_table_rva,
                             std::uint32_t address_table_rva,
                             bool delay_load,
-                            std::vector<ImportEntry>& imports_out) {
+                            std::vector<ImportEntry>& imports_out, bool thunk_values_are_va = false) {
     const auto thunk_off = pe_rva_to_file_offset(sections, image_base, name_table_rva);
     if (library.empty() || !thunk_off || address_table_rva == 0) {
         return;
     }
 
     const std::uint64_t thunk_size = is64 ? 8u : 4u;
-    for (std::uint64_t thunk_index = 0; thunk_index < 4096; ++thunk_index) {
+    for (std::uint64_t thunk_index = 0; thunk_index < b.size() / thunk_size; ++thunk_index) {
         const std::uint64_t entry_off = *thunk_off + thunk_index * thunk_size;
         if (!fits_range(entry_off, thunk_size, static_cast<std::uint64_t>(b.size()))) {
             break;
@@ -1013,8 +1031,11 @@ void parse_pe_import_thunks(std::span<const std::uint8_t> b,
             continue;
         }
 
+        if (thunk_values_are_va && thunk_value < image_base) continue;
+        const auto name_rva = thunk_values_are_va ? thunk_value - image_base : thunk_value;
+        if (name_rva > std::numeric_limits<std::uint32_t>::max()) continue;
         const auto hint_name_off = pe_rva_to_file_offset(
-            sections, image_base, static_cast<std::uint32_t>(thunk_value));
+            sections, image_base, static_cast<std::uint32_t>(name_rva));
         if (!hint_name_off || !fits_range(*hint_name_off, 2, static_cast<std::uint64_t>(b.size()))) {
             continue;
         }
@@ -1055,18 +1076,25 @@ void parse_pe_delay_load_imports(std::span<const std::uint8_t> b,
 
         const std::size_t desc = static_cast<std::size_t>(desc_off);
         const std::uint32_t attributes = rd32(b, desc + 0x00, false);
-        const std::uint32_t name_rva = rd32(b, desc + 0x04, false);
-        const std::uint32_t import_address_table_rva = rd32(b, desc + 0x0C, false);
-        const std::uint32_t import_name_table_rva = rd32(b, desc + 0x10, false);
+        std::uint32_t name_rva = rd32(b, desc + 0x04, false);
+        std::uint32_t import_address_table_rva = rd32(b, desc + 0x0C, false);
+        std::uint32_t import_name_table_rva = rd32(b, desc + 0x10, false);
         if (attributes == 0 && name_rva == 0 && import_address_table_rva == 0 &&
             import_name_table_rva == 0) {
             break;
         }
 
+        if ((attributes & 1u) == 0) {
+            if (name_rva < image_base || import_address_table_rva < image_base ||
+                import_name_table_rva < image_base) continue;
+            name_rva = static_cast<std::uint32_t>(name_rva - image_base);
+            import_address_table_rva = static_cast<std::uint32_t>(import_address_table_rva - image_base);
+            import_name_table_rva = static_cast<std::uint32_t>(import_name_table_rva - image_base);
+        }
         const auto dll_name_off = pe_rva_to_file_offset(sections, image_base, name_rva);
         const std::string library = dll_name_off ? read_c_string(b, *dll_name_off) : std::string{};
         parse_pe_import_thunks(b, sections, image_base, is64, library, import_name_table_rva,
-                               import_address_table_rva, true, imports_out);
+                               import_address_table_rva, true, imports_out, (attributes & 1u) == 0);
     }
 }
 
@@ -1727,6 +1755,23 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
                        img->gnu_hash_tables_, img->imports_);
+    if (img->elf_header_.type == 3 &&
+        (!img->interpreter_.empty() || std::any_of(img->dynamic_entries_.begin(), img->dynamic_entries_.end(),
+            [](const auto& entry) { return entry.tag == 0x6ffffffb && (entry.value & 0x08000000u) != 0; })))
+        img->kind_ = ImageKind::Executable;
+    for (const auto& symbol : img->elf_symbols_) {
+        if (!symbol.dynamic || symbol.name.empty() || (symbol.binding != 1 && symbol.binding != 2)) continue;
+        if (symbol.section_index == 0) {
+            ImportEntry entry;
+            entry.name = symbol.name;
+            img->imports_.push_back(std::move(entry));
+        } else if (symbol.visibility == 0 || symbol.visibility == 3) {
+            ExportEntry entry;
+            entry.name = symbol.name;
+            entry.virtual_address = symbol.value;
+            img->exports_.push_back(std::move(entry));
+        }
+    }
     if (img->arch_ == Architecture::PowerPC64 && img->endian_ == Endianness::Big) {
         resolve_powerpc64_function_descriptors(b, big, img->section_headers_, img->symbols_);
     }
@@ -1784,76 +1829,78 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         image_base = rd32(b, opt + 28, false);
     }
     const std::uint32_t entry_rva = rd32(b, opt + 16, false);
-    const std::uint32_t export_dir_rva = (size_of_opt >= (is64 ? 0x78 : 0x68))
+    const std::uint32_t directory_count = size_of_opt >= (is64 ? 0x70 : 0x60)
+        ? rd32(b, opt + (is64 ? 0x6C : 0x5C), false) : 0;
+    const std::uint32_t export_dir_rva = (directory_count > 0 && size_of_opt >= (is64 ? 0x78 : 0x68))
                                              ? rd32(b, opt + (is64 ? 0x70 : 0x60), false)
                                              : 0;
-    const std::uint32_t export_dir_size = (size_of_opt >= (is64 ? 0x78 : 0x68))
+    const std::uint32_t export_dir_size = (directory_count > 0 && size_of_opt >= (is64 ? 0x78 : 0x68))
                                               ? rd32(b, opt + (is64 ? 0x74 : 0x64), false)
                                               : 0;
-    const std::uint32_t import_dir_rva = (size_of_opt >= (is64 ? 0x80 : 0x70))
+    const std::uint32_t import_dir_rva = (directory_count > 1 && size_of_opt >= (is64 ? 0x80 : 0x70))
                                              ? rd32(b, opt + (is64 ? 0x78 : 0x68), false)
                                              : 0;
-    const std::uint32_t import_dir_size = (size_of_opt >= (is64 ? 0x80 : 0x70))
+    const std::uint32_t import_dir_size = (directory_count > 1 && size_of_opt >= (is64 ? 0x80 : 0x70))
                                               ? rd32(b, opt + (is64 ? 0x7C : 0x6C), false)
                                               : 0;
-    const std::uint32_t resource_dir_rva = (size_of_opt >= (is64 ? 0x88 : 0x78))
+    const std::uint32_t resource_dir_rva = (directory_count > 2 && size_of_opt >= (is64 ? 0x88 : 0x78))
                                                ? rd32(b, opt + (is64 ? 0x80 : 0x70), false)
                                                : 0;
-    const std::uint32_t resource_dir_size = (size_of_opt >= (is64 ? 0x88 : 0x78))
+    const std::uint32_t resource_dir_size = (directory_count > 2 && size_of_opt >= (is64 ? 0x88 : 0x78))
                                                 ? rd32(b, opt + (is64 ? 0x84 : 0x74), false)
                                                 : 0;
-    const std::uint32_t exception_dir_rva = (size_of_opt >= (is64 ? 0x90 : 0x80))
+    const std::uint32_t exception_dir_rva = (directory_count > 3 && size_of_opt >= (is64 ? 0x90 : 0x80))
                                                 ? rd32(b, opt + (is64 ? 0x88 : 0x78), false)
                                                 : 0;
-    const std::uint32_t exception_dir_size = (size_of_opt >= (is64 ? 0x90 : 0x80))
+    const std::uint32_t exception_dir_size = (directory_count > 3 && size_of_opt >= (is64 ? 0x90 : 0x80))
                                                  ? rd32(b, opt + (is64 ? 0x8C : 0x7C), false)
                                                  : 0;
-    const std::uint32_t certificate_table_file_offset = (size_of_opt >= (is64 ? 0x98 : 0x88))
+    const std::uint32_t certificate_table_file_offset = (directory_count > 4 && size_of_opt >= (is64 ? 0x98 : 0x88))
                                                             ? rd32(b, opt + (is64 ? 0x90 : 0x80), false)
                                                             : 0;
-    const std::uint32_t certificate_table_size = (size_of_opt >= (is64 ? 0x98 : 0x88))
+    const std::uint32_t certificate_table_size = (directory_count > 4 && size_of_opt >= (is64 ? 0x98 : 0x88))
                                                      ? rd32(b, opt + (is64 ? 0x94 : 0x84), false)
                                                      : 0;
-    const std::uint32_t tls_dir_rva = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
+    const std::uint32_t tls_dir_rva = (directory_count > 9 && size_of_opt >= (is64 ? 0xC0 : 0xB0))
         ? rd32(b, opt + (is64 ? 0xB8 : 0xA8), false)
         : 0;
-    const std::uint32_t tls_dir_size = (size_of_opt >= (is64 ? 0xC0 : 0xB0))
+    const std::uint32_t tls_dir_size = (directory_count > 9 && size_of_opt >= (is64 ? 0xC0 : 0xB0))
         ? rd32(b, opt + (is64 ? 0xBC : 0xAC), false)
         : 0;
-    const std::uint32_t load_config_dir_rva = (size_of_opt >= (is64 ? 0xC8 : 0xB8))
+    const std::uint32_t load_config_dir_rva = (directory_count > 10 && size_of_opt >= (is64 ? 0xC8 : 0xB8))
         ? rd32(b, opt + (is64 ? 0xC0 : 0xB0), false)
         : 0;
-    const std::uint32_t load_config_dir_size = (size_of_opt >= (is64 ? 0xC8 : 0xB8))
+    const std::uint32_t load_config_dir_size = (directory_count > 10 && size_of_opt >= (is64 ? 0xC8 : 0xB8))
         ? rd32(b, opt + (is64 ? 0xC4 : 0xB4), false)
         : 0;
-    const std::uint32_t bound_import_dir_rva = (size_of_opt >= (is64 ? 0xD0 : 0xC0))
+    const std::uint32_t bound_import_dir_rva = (directory_count > 11 && size_of_opt >= (is64 ? 0xD0 : 0xC0))
         ? rd32(b, opt + (is64 ? 0xC8 : 0xB8), false)
         : 0;
-    const std::uint32_t bound_import_dir_size = (size_of_opt >= (is64 ? 0xD0 : 0xC0))
+    const std::uint32_t bound_import_dir_size = (directory_count > 11 && size_of_opt >= (is64 ? 0xD0 : 0xC0))
         ? rd32(b, opt + (is64 ? 0xCC : 0xBC), false)
         : 0;
-    const std::uint32_t delay_import_dir_rva = (size_of_opt >= (is64 ? 0xE0 : 0xD0))
+    const std::uint32_t delay_import_dir_rva = (directory_count > 13 && size_of_opt >= (is64 ? 0xE0 : 0xD0))
         ? rd32(b, opt + (is64 ? 0xD8 : 0xC8), false)
         : 0;
-    const std::uint32_t delay_import_dir_size = (size_of_opt >= (is64 ? 0xE0 : 0xD0))
+    const std::uint32_t delay_import_dir_size = (directory_count > 13 && size_of_opt >= (is64 ? 0xE0 : 0xD0))
         ? rd32(b, opt + (is64 ? 0xDC : 0xCC), false)
         : 0;
-    const std::uint32_t clr_dir_rva = (size_of_opt >= (is64 ? 0xE8 : 0xD8))
+    const std::uint32_t clr_dir_rva = (directory_count > 14 && size_of_opt >= (is64 ? 0xE8 : 0xD8))
         ? rd32(b, opt + (is64 ? 0xE0 : 0xD0), false)
         : 0;
-    const std::uint32_t clr_dir_size = (size_of_opt >= (is64 ? 0xE8 : 0xD8))
+    const std::uint32_t clr_dir_size = (directory_count > 14 && size_of_opt >= (is64 ? 0xE8 : 0xD8))
         ? rd32(b, opt + (is64 ? 0xE4 : 0xD4), false)
         : 0;
-    const std::uint32_t base_reloc_dir_rva = (size_of_opt >= (is64 ? 0xA0 : 0x90))
+    const std::uint32_t base_reloc_dir_rva = (directory_count > 5 && size_of_opt >= (is64 ? 0xA0 : 0x90))
         ? rd32(b, opt + (is64 ? 0x98 : 0x88), false)
         : 0;
-    const std::uint32_t base_reloc_dir_size = (size_of_opt >= (is64 ? 0xA0 : 0x90))
+    const std::uint32_t base_reloc_dir_size = (directory_count > 5 && size_of_opt >= (is64 ? 0xA0 : 0x90))
                                                   ? rd32(b, opt + (is64 ? 0x9C : 0x8C), false)
                                                   : 0;
-    const std::uint32_t debug_dir_rva = (size_of_opt >= (is64 ? 0xA8 : 0x98))
+    const std::uint32_t debug_dir_rva = (directory_count > 6 && size_of_opt >= (is64 ? 0xA8 : 0x98))
                                             ? rd32(b, opt + (is64 ? 0xA0 : 0x90), false)
                                             : 0;
-    const std::uint32_t debug_dir_size = (size_of_opt >= (is64 ? 0xA8 : 0x98))
+    const std::uint32_t debug_dir_size = (directory_count > 6 && size_of_opt >= (is64 ? 0xA8 : 0x98))
                                              ? rd32(b, opt + (is64 ? 0xA4 : 0x94), false)
                                              : 0;
 
@@ -1865,7 +1912,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
     img->arch_   = pe_arch(machine);
     // IMAGE_FILE_DLL = 0x2000.
     img->kind_   = (characteristics & 0x2000) ? ImageKind::SharedLibrary : ImageKind::Executable;
-    img->entry_  = image_base + entry_rva;
+    img->entry_  = entry_rva == 0 ? 0 : checked_add_u64(image_base, entry_rva).value_or(0);
 
     // Sections (P2-1): the section table follows the optional header.
     const std::uint16_t num_sections = rd16(b, coff + 2, false);
@@ -1895,6 +1942,17 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         sec.virtual_size    = vsize;
         sec.file_offset     = rawptr;
         sec.file_size       = rawsize;
+        if (sec.name.starts_with('/')) {
+            std::uint32_t name_offset = 0;
+            const auto parsed = std::from_chars(sec.name.data() + 1, sec.name.data() + sec.name.size(), name_offset);
+            const std::uint64_t strings = static_cast<std::uint64_t>(symbol_table_offset) + static_cast<std::uint64_t>(symbol_count) * 18;
+            if (symbol_table_offset != 0 && parsed.ec == std::errc{} && parsed.ptr == sec.name.data() + sec.name.size() &&
+                fits_range(strings, 4, b.size())) {
+                const auto length = rd32(b, static_cast<std::size_t>(strings), false);
+                if (name_offset >= 4 && name_offset < length && fits_range(strings, length, b.size()))
+                    sec.name = read_c_string(b, strings + name_offset, length - name_offset);
+            }
+        }
         sec.executable = (chars & 0x20000000u) != 0;  // IMAGE_SCN_MEM_EXECUTE
         sec.readable   = (chars & 0x40000000u) != 0;  // IMAGE_SCN_MEM_READ
         sec.writable   = (chars & 0x80000000u) != 0;  // IMAGE_SCN_MEM_WRITE
@@ -1937,6 +1995,9 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
             const auto functions_off = pe_rva_to_file_offset(img->sections_, image_base, functions_rva);
             const auto names_off = pe_rva_to_file_offset(img->sections_, image_base, names_rva);
             const auto ordinals_off = pe_rva_to_file_offset(img->sections_, image_base, ordinals_rva);
+            std::vector<bool> named_functions;
+            if (functions_off && fits_range(*functions_off, static_cast<std::uint64_t>(number_of_functions) * 4, b.size()))
+                named_functions.resize(number_of_functions);
             if (functions_off && names_off && ordinals_off) {
                 for (std::uint32_t i = 0; i < number_of_names; ++i) {
                     const std::uint64_t name_ptr_off = *names_off + static_cast<std::uint64_t>(i) * 4;
@@ -1961,6 +2022,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                     }
 
                     const std::uint32_t function_rva = rd32(b, static_cast<std::size_t>(function_off), false);
+                    if (function_rva == 0) continue;
                     ExportEntry entry;
                     entry.name = read_c_string(b, *name_off);
                     entry.ordinal = ordinal_base + ordinal_index;
@@ -1973,9 +2035,23 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                         }
                     }
                     if (!entry.name.empty()) {
+                        if (ordinal_index < named_functions.size()) named_functions[ordinal_index] = true;
                         img->exports_.push_back(std::move(entry));
                     }
                 }
+            }
+            for (std::size_t i = 0; i < named_functions.size(); ++i) {
+                if (named_functions[i]) continue;
+                const auto rva = rd32(b, static_cast<std::size_t>(*functions_off) + i * 4, false);
+                if (rva == 0) continue;
+                ExportEntry entry;
+                entry.ordinal = ordinal_base + static_cast<std::uint32_t>(i);
+                entry.virtual_address = checked_add_u64(image_base, rva).value_or(0);
+                if (rva >= export_dir_rva && static_cast<std::uint64_t>(rva) - export_dir_rva < export_dir_size) {
+                    if (const auto off = pe_rva_to_file_offset(img->sections_, image_base, rva))
+                        entry.forwarder = read_c_string(b, *off);
+                }
+                img->exports_.push_back(std::move(entry));
             }
         }
     }

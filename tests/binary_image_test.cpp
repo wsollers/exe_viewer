@@ -115,7 +115,7 @@ TEST(BinaryImage, ParsesElfFixtureIdentity) {
     EXPECT_EQ(img.architecture(), peelf::Architecture::X86_64);
     EXPECT_TRUE(img.is_64bit());
     EXPECT_EQ(img.endianness(), peelf::Endianness::Little);
-    EXPECT_EQ(img.kind(), peelf::ImageKind::SharedLibrary);  // ET_DYN (PIE executable)
+    EXPECT_EQ(img.kind(), peelf::ImageKind::Executable);  // ET_DYN with PT_INTERP
     EXPECT_GT(img.entry_point(), 0u);
     EXPECT_FALSE(img.sections().empty());  // sections parsed in Phase 2 (P2-1)
 }
@@ -385,7 +385,9 @@ TEST(BinaryImage, IgnoresMalformedPeExportNameRva) {
 
     auto result = peelf::parse_image(bytes);
     ASSERT_TRUE(result.has_value());
-    EXPECT_TRUE((**result).exports().empty());
+    ASSERT_EQ((**result).exports().size(), 1u);
+    EXPECT_TRUE((**result).exports().front().name.empty());
+    EXPECT_EQ((**result).exports().front().ordinal, 1u);
 }
 
 TEST(BinaryImage, ParsesEndianAndClassCompatibilityFixtures) {
@@ -1548,4 +1550,117 @@ TEST(BinaryImage, IgnoresOverflowingElfSectionTable) {
     auto result = peelf::parse_image(b);
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE((**result).sections().empty());
+}
+
+TEST(BinaryImageReview, SectionlessElfUsesLoadSegments) {
+    auto bytes = read_all(fixture_path("known-linux-x64.elf"));
+    ASSERT_FALSE(bytes.empty());
+    put64(bytes, 0x28, 0);
+    put16(bytes, 0x3C, 0);
+    put16(bytes, 0x3E, 0);
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed);
+    EXPECT_TRUE((*parsed)->sections().empty());
+    for (const auto& segment : (*parsed)->segments()) {
+        if (segment.type != 1 || segment.file_size == 0) continue;
+        EXPECT_EQ((*parsed)->file_offset_to_virtual_address(segment.file_offset), segment.virtual_address);
+        EXPECT_EQ((*parsed)->virtual_address_to_file_offset(segment.virtual_address), segment.file_offset);
+        EXPECT_FALSE((*parsed)->virtual_address_to_file_offset(segment.virtual_address + segment.file_size));
+    }
+}
+
+TEST(BinaryImageReview, NonAllocatedElfSectionsDoNotMapToZero) {
+    auto bytes = read_all(fixture_path("known-linux-x64.elf"));
+    ASSERT_FALSE(bytes.empty());
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed);
+    EXPECT_FALSE((*parsed)->virtual_address_to_file_offset(0));
+    for (const auto& section : (*parsed)->elf_section_headers()) {
+        if ((section.flags & 2) == 0 && section.size && section.type != 0)
+            EXPECT_FALSE((*parsed)->file_offset_to_virtual_address(section.offset));
+    }
+}
+
+TEST(BinaryImageReview, PeZeroEntryAndDirectoryCountAreRespected) {
+    auto bytes = read_all(fixture_path("known-win-x64.exe"));
+    ASSERT_FALSE(bytes.empty());
+    // Fixture PE header starts at 0x80.
+    const std::size_t opt = 0x80 + 24;
+    put32(bytes, opt + 16, 0);
+    put32(bytes, opt + 0x6C, 0);
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed);
+    EXPECT_EQ((*parsed)->entry_point(), 0u);
+    EXPECT_TRUE((*parsed)->exports().empty());
+    EXPECT_TRUE((*parsed)->imports().empty());
+    EXPECT_TRUE((*parsed)->pe_base_relocations().empty());
+    EXPECT_EQ((*parsed)->pe_tls_directory(), nullptr);
+}
+
+
+TEST(BinaryImageReview, DynamicElfSymbolsProduceImportsAndExports) {
+    auto bytes = read_all(fixture_path("known-linux-x64.elf"));
+    auto original = peelf::parse_image(bytes);
+    ASSERT_TRUE(original);
+    const auto& headers = (*original)->elf_section_headers();
+    const auto symbols = std::ranges::find_if(headers, [](const auto& h) { return h.type == 2; });
+    ASSERT_NE(symbols, headers.end());
+    const auto header_offset = (*original)->elf_header()->section_header_offset +
+        static_cast<std::uint64_t>(symbols - headers.begin()) * 64;
+    put32(bytes, header_offset + 4, 11); // SHT_DYNSYM
+    auto exported = peelf::parse_image(bytes);
+    ASSERT_TRUE(exported);
+    ASSERT_EQ((*exported)->exports().size(), 1u);
+    EXPECT_EQ((*exported)->exports()[0].name, "_start");
+    put16(bytes, symbols->offset + 24 + 6, 0); // SHN_UNDEF
+    put64(bytes, symbols->offset + 24 + 8, 0);
+    auto imported = peelf::parse_image(bytes);
+    ASSERT_TRUE(imported);
+    EXPECT_TRUE((*imported)->exports().empty());
+    EXPECT_TRUE(std::ranges::any_of((*imported)->imports(), [](const auto& entry) { return entry.name == "_start"; }));
+}
+
+TEST(BinaryImageReview, PeOrdinalOnlyExportsSurviveMissingNameTables) {
+    auto bytes = read_all(fixture_path("known-win-x64.exe"));
+    ASSERT_FALSE(bytes.empty());
+    put32(bytes, 0x320 + 24, 0); // NumberOfNames
+    put32(bytes, 0x320 + 32, 0); // AddressOfNames
+    put32(bytes, 0x320 + 36, 0); // AddressOfNameOrdinals
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed);
+    ASSERT_EQ((*parsed)->exports().size(), 1u);
+    EXPECT_TRUE((*parsed)->exports()[0].name.empty());
+    EXPECT_EQ((*parsed)->exports()[0].ordinal, 1u);
+}
+
+TEST(BinaryImageReview, PeLegacyDelayImportAddressesAreVAs) {
+    auto bytes = read_all(fixture_path("known-win-x86.exe"));
+    ASSERT_FALSE(bytes.empty());
+    put32(bytes, 0x450, 0);
+    put32(bytes, 0x454, 0x403090);
+    put32(bytes, 0x45C, 0x4030C0);
+    put32(bytes, 0x460, 0x4030B0);
+    put32(bytes, 0x4B0, 0x4030A0);
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed);
+    EXPECT_TRUE(std::ranges::any_of((*parsed)->imports(), [](const auto& entry) {
+        return entry.delay_load && entry.library == "USER32.dll" && entry.name == "MessageBoxA";
+    }));
+}
+
+TEST(BinaryImageReview, PeResolvesCoffLongSectionNames) {
+    auto bytes = read_all(fixture_path("known-win-x64.exe"));
+    ASSERT_FALSE(bytes.empty());
+    const auto strings = static_cast<std::uint32_t>(bytes.size());
+    bytes.resize(bytes.size() + 32);
+    put32(bytes, 0x84 + 8, strings);
+    put32(bytes, 0x84 + 12, 0);
+    put32(bytes, strings, 32);
+    put_ascii(bytes, strings + 4, ".debug_long_name");
+    std::fill_n(bytes.begin() + 0x180, 8, 0);
+    put_ascii(bytes, 0x180, "/4");
+    auto parsed = peelf::parse_image(bytes);
+    ASSERT_TRUE(parsed);
+    ASSERT_FALSE((*parsed)->sections().empty());
+    EXPECT_EQ((*parsed)->sections()[0].name, ".debug_long_name");
 }

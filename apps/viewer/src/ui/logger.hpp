@@ -18,7 +18,7 @@ namespace viewer {
             return logger;
         }
 
-        void init(LogPanel* panel) { panel_ = panel; }
+        void init(LogPanel* panel) { std::lock_guard lock(mutex_); panel_ = panel; }
 
         // String overloads
         void info(const std::string& msg);

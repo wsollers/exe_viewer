@@ -171,11 +171,11 @@ namespace viewer {
         // =====================================================================
 
         [[nodiscard]] std::uint64_t entry_point_va() const {
-            return rva_to_va(entry_point_rva);
+            return entry_point_rva == 0 ? 0 : rva_to_va(entry_point_rva);
         }
 
         [[nodiscard]] std::optional<std::size_t> entry_point_offset() const {
-            return rva_to_offset(entry_point_rva);
+            return entry_point_rva == 0 ? std::nullopt : rva_to_offset(entry_point_rva);
         }
 
         // =====================================================================

@@ -1,8 +1,12 @@
 #pragma once
 
 #ifdef _WIN32
+#pragma push_macro("NOMINMAX")
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <Windows.h>
+#pragma pop_macro("NOMINMAX")
 
 #include <cstddef>
 #include <string>

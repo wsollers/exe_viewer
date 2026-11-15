@@ -40,7 +40,7 @@ public:
     void init(GLFWwindow* window, const VulkanConfig& config = {});
     void shutdown();
 
-    void begin_frame();
+    [[nodiscard]] bool begin_frame();
     void end_frame();
 
     void wait_idle();
@@ -104,7 +104,9 @@ private:
     uint32_t current_image_index_ = 0;
 
     VkSemaphore image_available_semaphore_ = VK_NULL_HANDLE;
-    VkSemaphore render_finished_semaphore_ = VK_NULL_HANDLE;
+    std::vector<VkSemaphore> render_finished_semaphores_;
+    GLFWwindow* window_ = nullptr;
+    bool swapchain_dirty_ = false;
     VkFence in_flight_fence_ = VK_NULL_HANDLE;
 
     bool initialized_ = false;
