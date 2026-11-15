@@ -69,6 +69,12 @@ public:
     [[nodiscard]] bool can_back() const noexcept { return !entries_.empty() && cursor_ > 0; }
     [[nodiscard]] bool can_forward() const noexcept { return cursor_ + 1 < entries_.size(); }
     void clear() noexcept { entries_.clear(); cursor_ = 0; }
+    [[nodiscard]] const std::vector<ViewerSelection>& entries() const noexcept { return entries_; }
+    [[nodiscard]] std::size_t cursor() const noexcept { return cursor_; }
+    bool restore(std::vector<ViewerSelection> entries, std::size_t cursor) {
+        if (entries.size() > 256 || (entries.empty() ? cursor != 0 : cursor >= entries.size())) return false;
+        entries_ = std::move(entries); cursor_ = cursor; return true;
+    }
 private:
     std::vector<ViewerSelection> entries_;
     std::size_t cursor_ = 0;

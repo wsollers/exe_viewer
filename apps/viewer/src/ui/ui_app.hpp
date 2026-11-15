@@ -11,6 +11,8 @@
 #include "model/binary_model.hpp"
 #include "ui_panels.hpp"
 #include "ui_panels_references.hpp"
+#include "decompile/decompiler.hpp"
+#include <future>
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
 #include "symbols/symbol_index.hpp"
@@ -30,6 +32,10 @@ namespace viewer {
         void set_open_debug_symbols_callback(std::function<void()> cb) { on_open_debug_symbols_ = std::move(cb); }
         void set_save_patched_as_callback(std::function<void()> cb) { on_save_patched_as_ = std::move(cb); }
         void set_exit_callback(std::function<void()> cb) { on_exit_ = std::move(cb); }
+        void set_analysis_file_callback(std::function<void(int)> cb) { on_analysis_file_ = std::move(cb); }
+        peelf::Result<void> save_project(const std::filesystem::path&);
+        peelf::Result<void> open_project(const std::filesystem::path&);
+        peelf::Result<void> save_patch_report(const std::filesystem::path&);
         void set_code_font(ImFont* font) { code_font_ = font; }
 
         LogPanel& log_panel() { return log_panel_; }
@@ -69,6 +75,14 @@ namespace viewer {
 
     private:
         ImFont* code_font_ = nullptr; // Owned by the ImGui font atlas.
+        bool show_decompiler_ = false;
+        bool focus_decompiler_ = false;
+        bool binary_ninja_ = false;
+        char decompiler_python_[1024] = "python";
+        DecompiledUnit decompiled_;
+        std::future<DecompiledUnit> decompile_job_;
+        std::stop_source decompile_stop_;
+        std::uint64_t decompile_revision_ = 0, file_generation_ = 0, decompile_generation_ = 0;
         bool show_about_ = false;
         std::uint64_t jump_address_ = 0;
         bool focus_graph_ = false;
@@ -112,6 +126,7 @@ namespace viewer {
         std::function<void()> on_open_debug_symbols_;
         std::function<void()> on_save_patched_as_;
         std::function<void()> on_exit_;
+        std::function<void(int)> on_analysis_file_;
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;
@@ -149,6 +164,8 @@ namespace viewer {
 
 
         void render_main_menu();
+        void request_decompile();
+        void render_decompiler();
         void rebuild_references();
         void open_references();
         void render_dockspace();

@@ -151,6 +151,19 @@ namespace viewer {
         return result;
     }
 
+    peelf::Result<void> BinaryModel::apply_patch_set(std::span<const peelf::PatchInterval> patches) {
+        if (!editable_image_) return peelf::make_error("No image loaded");
+        if (patches.empty()) return {};
+        auto transaction = editable_image_->begin_transaction("Restore project patches");
+        for (const auto& patch : patches) {
+            auto written = transaction.write(patch.offset, patch.patched);
+            if (!written) return written;
+        }
+        auto result = transaction.commit();
+        if (result) ++edit_revision_;
+        return result;
+    }
+
     peelf::Result<void> BinaryModel::undo_patch() {
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");

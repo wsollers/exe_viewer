@@ -65,6 +65,7 @@ namespace viewer {
                                               std::span<const std::uint8_t> bytes,
                                               std::string label);
         peelf::Result<void> undo_patch();
+        peelf::Result<void> apply_patch_set(std::span<const peelf::PatchInterval> patches);
         peelf::Result<void> redo_patch();
         peelf::Result<void> save_patched_as(const std::filesystem::path& output_path,
                                             bool overwrite = false) const;

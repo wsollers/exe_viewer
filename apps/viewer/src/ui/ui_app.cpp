@@ -1,5 +1,6 @@
 #include "ui_app.hpp"
 #include "theme.hpp"
+#include "analysis/project.hpp"
 #include <imgui.h>
 #include <imgui_internal.h>
 
@@ -288,6 +289,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , pe_exports_panel_(model)
 {
     references_panel_.set_visible(false);
+    patch_set_panel_.set_analysis_context(&symbol_index_, &thumb_mode_);
     references_panel_.set_navigate_callback([this](std::uint64_t address) {
         navigate_to_address(address, PreferredView::Disassembly);
     });
@@ -458,6 +460,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 }
 
 UiApp::~UiApp() {
+    decompile_stop_.request_stop();
     if (call_graph_texture_) {
         vulkan_.destroy_texture(*call_graph_texture_);
         call_graph_texture_.reset();
@@ -555,6 +558,7 @@ void UiApp::render() {
     exports_panel_.draw();
     symbols_panel_.draw();
     references_panel_.draw();
+    if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
         focus_references_ = false;
@@ -585,6 +589,56 @@ void UiApp::render() {
     }
 }
 
+peelf::Result<void> UiApp::save_project(const std::filesystem::path& path) {
+    if (!model_.image()) return peelf::make_error("No binary loaded");
+    std::error_code ec;
+    if (std::filesystem::equivalent(path, model_.file_info().path, ec)) return peelf::make_error("Project cannot replace the source binary");
+    AnalysisProject project;
+    project.source = std::filesystem::absolute(model_.file_info().path).string();
+    project.source_size = model_.bytes().size(); project.fingerprint = binary_fingerprint(model_.bytes());
+    project.patches = model_.changed_intervals(); project.annotations = annotations_.records(); project.thumb = thumb_mode_;
+    navigation_history_.visit(current_selection_);
+    project.history = navigation_history_.entries(); project.cursor = navigation_history_.cursor();
+    for (const auto& s : symbol_index_.records()) if (s.source == SymbolSource::DebugSymbol && s.virtual_address)
+        project.symbols.push_back({s.name, *s.virtual_address >= model_.image()->image_base() ? *s.virtual_address - model_.image()->image_base() : 0,
+            *s.virtual_address, s.size, s.function.value_or(false)});
+    std::size_t size = 0; const char* layout = ImGui::SaveIniSettingsToMemory(&size); project.layout.assign(layout,size);
+    return write_analysis_file(path, encode_project(project));
+}
+
+peelf::Result<void> UiApp::open_project(const std::filesystem::path& path) {
+    auto text = read_project_file(path); if (!text) return std::unexpected(text.error());
+    auto project = decode_project(*text); if (!project) return std::unexpected(project.error());
+    auto source = std::filesystem::path(project->source); if (source.is_relative()) source = path.parent_path() / source;
+    BinaryModel restored;
+    if (!restored.load_file(source.string())) return peelf::make_error("Cannot open project's source binary");
+    auto patches = restore_project_patches(restored,*project); if (!patches) return patches;
+    model_ = std::move(restored); on_file_loaded();
+    thumb_mode_ = project->thumb;
+    if (model_.image()->architecture() == peelf::Architecture::ARM) disasm_.set_thumb_mode(thumb_mode_);
+    symbol_index_.add_debug_symbols(*model_.image(),project->symbols);
+    for (auto& [address,note] : project->annotations) annotations_.set(address,std::move(note.name),std::move(note.comment));
+    navigation_history_.restore(project->history,project->cursor);
+    if (!project->history.empty()) {
+        current_selection_ = project->history[project->cursor];
+        if (current_selection_.virtual_address) {
+            auto selection = current_selection_; navigate_to_address(*selection.virtual_address,selection.preferred_view);
+            current_selection_ = selection; last_navigation_selection_ = selection;
+        } else { last_navigation_selection_.reset(); apply_structure_selection_navigation(); }
+        navigation_history_.restore(project->history,project->cursor);
+    }
+    if (!project->layout.empty()) ImGui::LoadIniSettingsFromMemory(project->layout.c_str(),project->layout.size());
+    focus_workspace_ = false; references_dirty_ = true;
+    return {};
+}
+
+peelf::Result<void> UiApp::save_patch_report(const std::filesystem::path& path) {
+    if (!model_.image()) return peelf::make_error("No binary loaded");
+    std::error_code ec;
+    if (std::filesystem::equivalent(path,model_.file_info().path,ec)) return peelf::make_error("Report cannot replace the source binary");
+    return write_analysis_file(path,patch_report(model_));
+}
+
 void UiApp::open_references() {
     references_panel_.set_visible(true);
     focus_references_ = true;
@@ -607,6 +661,7 @@ void UiApp::rebuild_references() {
 }
 
 void UiApp::render_main_menu() {
+    if (!ImGui::GetIO().WantTextInput && ImGui::IsKeyPressed(ImGuiKey_F5)) request_decompile();
     if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_X, ImGuiInputFlags_RouteGlobal)) open_references();
     if (!ImGui::GetIO().WantTextInput) {
         if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_LeftArrow) ||
@@ -623,6 +678,9 @@ void UiApp::render_main_menu() {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) {
             if (on_open_file_) { on_open_file_(); }
         }
+        if (ImGui::MenuItem("Open Analysis Project...", nullptr, false, static_cast<bool>(on_analysis_file_))) on_analysis_file_(0);
+        if (ImGui::MenuItem("Save Analysis Project...", nullptr, false, model_.has_file() && static_cast<bool>(on_analysis_file_))) on_analysis_file_(1);
+        if (ImGui::MenuItem("Export Patch Report...", nullptr, false, model_.has_file() && static_cast<bool>(on_analysis_file_))) on_analysis_file_(2);
         if (ImGui::MenuItem("Open Debug Symbols...", nullptr, false, model_.has_file())) {
             if (on_open_debug_symbols_) { on_open_debug_symbols_(); }
         }
@@ -659,6 +717,7 @@ void UiApp::render_main_menu() {
         }
         if (ImGui::MenuItem("Symbols")) symbols_panel_.set_visible(true);
         if (ImGui::MenuItem("References & Notes", "X", false, model_.has_file())) open_references();
+        if (ImGui::MenuItem("Decompile selection", "F5", false, model_.has_file())) request_decompile();
         if (ImGui::MenuItem("Structure")) structure_panel_.set_visible(true);
         ImGui::EndMenu();
     }
@@ -822,7 +881,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV4");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV5");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
@@ -863,6 +922,12 @@ void UiApp::queue_call_graph_sample(CallGraphSample sample) {
 }
 
 void UiApp::process_deferred_gpu_work() {
+    if (decompile_job_.valid() && decompile_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        try {
+            auto result = decompile_job_.get();
+            if (decompile_generation_ == file_generation_) decompiled_ = std::move(result);
+        } catch (const std::exception& error) { decompiled_ = {DecompileStatus::Failed,"Decompiler",error.what()}; }
+    }
     if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
         references_dirty_ = true;
     if (references_panel_.visible() && references_dirty_ && model_.image()) rebuild_references();
@@ -1367,6 +1432,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow("Disassembly", main_id);
     ImGui::DockBuilderDockWindow("Flow Graph", main_id);
+    ImGui::DockBuilderDockWindow("Decompiler", right_id);
     if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(symbols_panel_.name().c_str());
     if (auto* node = ImGui::DockBuilderGetNode(right_id)) node->SelectedTabId = ImHashStr(details_panel_.name().c_str());
     ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
@@ -1514,6 +1580,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 }
     // Called after a file (PE or ELF) is loaded into the model.
     void UiApp::on_file_loaded() {
+        patch_set_panel_.reset_preview();
+        decompile_stop_.request_stop(); ++file_generation_; decompiled_ = {};
         annotations_.clear();
         reference_index_ = {};
         references_dirty_ = true;

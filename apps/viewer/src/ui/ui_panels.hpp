@@ -12,6 +12,7 @@
 #include "navigation/viewer_navigation.hpp"
 #include "ui_panel.hpp"
 #include "symbols/symbol_index.hpp"
+#include "analysis/patch_preview.hpp"
 
 namespace viewer {
 
@@ -112,12 +113,18 @@ namespace viewer {
     class PatchSetPanel : public UiPanel {
     public:
         PatchSetPanel(BinaryModel& model, ViewerSelection& selection);
+        void set_analysis_context(const SymbolIndex* symbols, const bool* thumb) { symbols_ = symbols; thumb_ = thumb; }
+        void reset_preview() { preview_.reset(); replacement_[0] = 0; status_.clear(); }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         ViewerSelection& selection_;
         std::string status_;
+        const SymbolIndex* symbols_ = nullptr;
+        const bool* thumb_ = nullptr;
+        char replacement_[4096]{};
+        std::optional<PatchPreview> preview_;
     };
 
     class DisassemblyPanel : public UiPanel {

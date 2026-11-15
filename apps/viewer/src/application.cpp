@@ -74,6 +74,7 @@ namespace viewer {
         // Initialize model/UI
         ui_ = new UiApp(model_, vulkan_);
         ui_->set_exit_callback([this]() { glfwSetWindowShouldClose(window_, GLFW_TRUE); });
+        ui_->set_analysis_file_callback([this](int action) { analysis_file_dialog(action); });
         ui_->set_open_file_callback([this]() {
             open_file_dialog();
         });
@@ -345,6 +346,19 @@ namespace viewer {
         } else if (result == NFD_ERROR) {
             Log().error(std::string("Debug symbol dialog error: ") + NFD_GetError());
         }
+    }
+
+    void Application::analysis_file_dialog(int action) {
+        if (!nfd_initialized_) return;
+        nfdchar_t* path = nullptr;
+        nfdfilteritem_t filter{action == 2 ? "Patch report" : "Analysis project", action == 2 ? "txt" : "peproj"};
+        auto result = action == 0 ? NFD_OpenDialog(&path, &filter, 1, nullptr) : NFD_SaveDialog(&path, &filter, 1, nullptr, nullptr);
+        if (result == NFD_OKAY) {
+            std::filesystem::path selected(path); NFD_FreePath(path);
+            auto saved = action == 0 ? ui_->open_project(selected) : action == 1 ? ui_->save_project(selected) : ui_->save_patch_report(selected);
+            if (saved) Log().info("{}: {}", action == 0 ? "Project restored" : "Saved", selected.string());
+            else Log().error("Analysis file: {}", saved.error().message);
+        } else if (result == NFD_ERROR) Log().error("Analysis file dialog: {}", NFD_GetError());
     }
 
     void Application::save_patched_as_dialog() {

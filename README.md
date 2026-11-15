@@ -241,9 +241,27 @@ Thumb-mode changes while the panel is open. This is a conservative static scan:
 address constants are distinguished from memory references, and
 register-dependent targets are not guessed.
 
-Names and comments are currently session-only and cleared on loading a binary.
-They appear in the function list, graph, and listing; original symbols remain
-searchable. Project persistence is a separate planned feature.
+Names and comments appear in the function list, graph, and listing; original
+symbols remain searchable. Use **File > Save Analysis Project** to preserve
+annotations, imported symbol records, staged patches, navigation history, Thumb
+mode, and dock layout in a `.peproj` file. Open it with **Open Analysis Project**.
+The original binary must remain available. Restore checks its size and an FNV-1a
+change-detection fingerprint plus original patch bytes before applying the patch
+set as one undoable transaction. The fingerprint is not a cryptographic identity.
+
+The patch panel previews replacement bytes as before/after instructions and
+control-flow edges before applying them. Editing invalidates older previews.
+**File > Export Patch Report** writes offsets, mapped addresses, and original and
+replacement bytes. Exporting a patched binary remains a separate action.
+
+Press **F5** on a function to open the Decompiler panel. Its built-in view is
+explicitly labeled annotated code, not decompiled C. Enable **Binary Ninja HLIL**
+and supply a Python interpreter with your local Binary Ninja API installed for
+real HLIL output. See the [Binary Ninja API cookbook](https://docs.binary.ninja/dev/cookbook.html).
+The optional bridge runs on an effective-byte snapshot in a separate process,
+with cancellation and a 60-second deadline. CPU and HLIL availability depend on
+the installed backend. Click an address-bearing result line to return to assembly;
+HLIL address mappings are approximate. Byte edits mark the result stale.
 
 ## Notes
 
