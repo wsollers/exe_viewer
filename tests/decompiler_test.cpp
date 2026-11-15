@@ -140,6 +140,13 @@ TEST_P(GhidraIntegration, ProducesMappedCForCpuFixture) {
         const std::uint8_t code[]{0x13,0x05,0xA0,0x02,0x67,0x80,0,0};
         std::ranges::copy(code,request.image_bytes.begin()+static_cast<std::ptrdiff_t>(*offset));
     }
+    if (std::string_view(GetParam()) == "known-linux-arm-elf32-le.elf") {
+        request.thumb = true;
+        const auto offset=model.image()->virtual_address_to_file_offset(request.address);
+        ASSERT_TRUE(offset); ASSERT_LE(*offset+4,request.image_bytes.size());
+        const std::uint8_t code[]{0x2A,0x20,0x70,0x47}; // movs r0,#42; bx lr
+        std::ranges::copy(code,request.image_bytes.begin()+static_cast<std::ptrdiff_t>(*offset));
+    }
     BackendRunner runner;
     const auto scripts=std::filesystem::path(PEELF_TEST_FIXTURES_DIR).parent_path().parent_path()/"apps/viewer/resources";
     const auto result=GhidraDecompiler(settings,scripts,runner).decompile(request);
@@ -147,6 +154,8 @@ TEST_P(GhidraIntegration, ProducesMappedCForCpuFixture) {
     ASSERT_FALSE(result.lines.empty());
     EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return line.address.has_value();}));
     EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return line.text.find("return")!=std::string::npos;}));
+    if (request.thumb || request.architecture == peelf::Architecture::RISCV32)
+        EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return line.text.find("0x2a")!=std::string::npos || line.text.find("42")!=std::string::npos;}));
 }
 INSTANTIATE_TEST_SUITE_P(RealBackend,GhidraIntegration,::testing::Values(
     "elf-linux-x86-32-le-callgraph.elf", "elf-linux-x86_64-64-le-callgraph.elf",
@@ -154,4 +163,5 @@ INSTANTIATE_TEST_SUITE_P(RealBackend,GhidraIntegration,::testing::Values(
     "elf-linux-mips-32-be-callgraph.elf", "elf-linux-mips64-64-be-callgraph.elf",
     "elf-linux-ppc-32-be-callgraph.elf", "elf-linux-ppc64-64-be-callgraph.elf",
     "known-linux-riscv32-elf32-le.elf", "elf-linux-riscv64-64-le-callgraph.elf",
-    "pe-windows-x86-32-le-callgraph.dll", "pe-windows-x86_64-64-le-callgraph.dll"));
+    "pe-windows-x86-32-le-callgraph.dll", "pe-windows-x86_64-64-le-callgraph.dll",
+    "known-linux-arm-elf32-le.elf"));
