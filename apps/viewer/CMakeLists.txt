@@ -47,6 +47,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_exports.cpp
         src/ui/ui_panels_imports.cpp
         src/ui/ui_panels_symbols.cpp
+        src/ui/ui_panels_references.cpp
+        src/analysis/reference_index.cpp
         src/ui/ui_panels_log.cpp
         src/ui/ui_panels_shellcode.cpp
         src/ui/ui_panels_patch_set.cpp

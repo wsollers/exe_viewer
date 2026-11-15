@@ -49,6 +49,7 @@ add_executable(peelf_tests
   patch_navigation_test.cpp
   call_graph_test.cpp
   symbol_index_test.cpp
+  reference_index_test.cpp
   shellcode_converter_test.cpp
   assembler_dependency_test.cpp
   patching_test.cpp
@@ -56,6 +57,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/reference_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/binary_model.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/pe_parser.cpp
