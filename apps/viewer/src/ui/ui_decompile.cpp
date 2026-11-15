@@ -10,6 +10,15 @@
 #endif
 
 namespace viewer {
+namespace {
+[[nodiscard]] DecompiledUnit make_decompile_message(DecompileStatus status, std::string diagnostic) {
+    DecompiledUnit unit;
+    unit.status = status;
+    unit.provider = "Decompiler";
+    unit.diagnostic = std::move(diagnostic);
+    return unit;
+}
+}
 void UiApp::initialize_decompiler() {
 #ifdef _WIN32
     wchar_t executable[32768]{}; GetModuleFileNameW(nullptr, executable, 32768);
@@ -34,20 +43,38 @@ void UiApp::initialize_decompiler() {
     std::snprintf(decompiler_python_, sizeof(decompiler_python_), "%s", settings.python.string().c_str());
     std::snprintf(decompiler_retdec_, sizeof(decompiler_retdec_), "%s", settings.retdec.string().c_str());
 }
-void UiApp::request_decompile() {
+void UiApp::clear_decompiler_caches() {
+    decompile_cache_.clear();
+    clear_ghidra_workspace_cache(default_ghidra_cache_directory());
+    decompiler_settings_status_ = "Cleared decompiler result & workspace caches.";
+}
+
+void UiApp::request_decompile(bool force_reanalyze) {
     show_decompiler_ = true;
     focus_decompiler_ = true;
     if (decompile_job_.valid()) return;
     if (!current_selection_.virtual_address) {
-        decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Select a mapped function or executable address first", {}};
+        decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Select a mapped function or executable address first");
         return;
     }
 
     const std::uint64_t selected_va = *current_selection_.virtual_address;
     const auto* image = model_.image();
     DecompileRequest request;
+    request.binary_sha256 = model_.content_sha256();
+    request.patch_revision = model_.edit_revision();
+    request.symbol_revision = symbol_revision_ ^ (annotations_.revision() * 0x9E3779B97F4A7C15ULL);
+    request.force_reanalyze = force_reanalyze;
     selected_code_ranges_.clear();
     selected_code_address_.reset();
+
+    DecompilerSettings settings{};
+    settings.provider = static_cast<DecompilerProvider>(decompiler_provider_);
+    settings.ghidra_home = ghidra_home_;
+    settings.java = decompiler_java_;
+    settings.python = decompiler_python_;
+    settings.retdec = decompiler_retdec_;
+    settings.timeout_seconds = decompiler_timeout_;
 
     if (image != nullptr) {
         auto root = containing_function(*image, symbol_index_, selected_va, navigation_graph_root(selected_va));
@@ -63,7 +90,7 @@ void UiApp::request_decompile() {
             }
         }
         if (!root || !root->virtual_address) {
-            decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "No function selected", {}};
+            decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "No function selected");
             return;
         }
         SymbolRecord root_for_extent = *root;
@@ -71,16 +98,12 @@ void UiApp::request_decompile() {
         const std::size_t analysis_size = model_.analysis_image_size();
         const auto extent = discover_function_extent(*image, symbol_index_, root_for_extent, analysis_size);
         if (!extent) {
-            decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Selection is not executable", {}};
-            return;
-        }
-        auto bytes = model_.read_virtual_bytes(extent->virtual_address, static_cast<std::size_t>(extent->size));
-        if (!bytes) {
-            decompiled_ = {DecompileStatus::Failed, "Decompiler", bytes.error().message, {}};
+            decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Selection is not executable");
             return;
         }
         request.address = extent->virtual_address;
         request.architecture = image->architecture();
+        request.endianness = image->endianness();
         if (const auto full = discover_function_extent(
                 *image, symbol_index_, root_for_extent, analysis_size, std::numeric_limits<std::uint64_t>::max());
             full && (full->source == FunctionExtentSource::Symbol || full->source == FunctionExtentSource::RuntimeMetadata)) {
@@ -99,6 +122,25 @@ void UiApp::request_decompile() {
         request.types = debug_types_;
         decompiled_root_ = root;
         request.thumb = image->architecture() == peelf::Architecture::ARM && thumb_mode_;
+
+        const DecompileCacheKey cache_key = make_decompile_cache_key(request, settings);
+        if (force_reanalyze) {
+            decompile_cache_.invalidate_function(cache_key.binary_sha256, cache_key.function_address);
+        } else if (auto cached = decompile_cache_.get(cache_key)) {
+            decompile_revision_ = model_.edit_revision();
+            decompile_generation_ = file_generation_;
+            decompiler_thumb_ = thumb_mode_;
+            decompile_annotation_revision_ = annotations_.revision();
+            decompile_symbol_revision_ = symbol_revision_;
+            decompiled_ = std::move(*cached);
+            return;
+        }
+
+        auto bytes = model_.read_virtual_bytes(extent->virtual_address, static_cast<std::size_t>(extent->size));
+        if (!bytes) {
+            decompiled_ = make_decompile_message(DecompileStatus::Failed, bytes.error().message);
+            return;
+        }
         request.fallback_graph = build_function_cfg_call_graph(
             *bytes,
             extent->virtual_address,
@@ -117,22 +159,24 @@ void UiApp::request_decompile() {
             } else {
                 auto snapshot = model_.read_effective_bytes(0, model_.bytes().size());
                 if (!snapshot) {
-                    decompiled_ = {DecompileStatus::Failed, "Decompiler", snapshot.error().message, {}};
+                    decompiled_ = make_decompile_message(DecompileStatus::Failed, snapshot.error().message);
                     return;
                 }
                 request.image_bytes = std::move(*snapshot);
             }
         }
+        pending_decompile_cache_key_ = cache_key;
     } else if (model_.is_live_process()) {
         // Anonymous / JIT executable memory region without a backing module header.
         auto bytes = model_.read_virtual_bytes(selected_va, 4096);
         if (!bytes || bytes->empty()) {
-            decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Selected live address is not readable", {}};
+            decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Selected live address is not readable");
             return;
         }
         const std::string fn_name = std::format("live_sub_{:X}", selected_va);
         request.address = selected_va;
         request.architecture = model_.architecture();
+        request.endianness = model_.endianness();
         request.thumb = request.architecture == peelf::Architecture::ARM && thumb_mode_;
         const auto recs = symbol_index_.records();
         request.symbols.assign(recs.begin(), recs.end());
@@ -153,25 +197,30 @@ void UiApp::request_decompile() {
             .function = true,
             .library = {},
         };
+        const DecompileCacheKey cache_key = make_decompile_cache_key(request, settings);
+        if (force_reanalyze) {
+            decompile_cache_.invalidate_function(cache_key.binary_sha256, cache_key.function_address);
+        } else if (auto cached = decompile_cache_.get(cache_key)) {
+            decompile_revision_ = model_.edit_revision();
+            decompile_generation_ = file_generation_;
+            decompiler_thumb_ = thumb_mode_;
+            decompile_annotation_revision_ = annotations_.revision();
+            decompile_symbol_revision_ = symbol_revision_;
+            decompiled_ = std::move(*cached);
+            return;
+        }
+        pending_decompile_cache_key_ = cache_key;
     } else {
-        decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Select a mapped function first", {}};
+        decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Select a mapped function first");
         return;
     }
 
     const auto resources = decompiler_directory_ / "resources";
-    DecompilerSettings settings{
-        .provider = static_cast<DecompilerProvider>(decompiler_provider_),
-        .ghidra_home = ghidra_home_,
-        .java = decompiler_java_,
-        .python = decompiler_python_,
-        .retdec = decompiler_retdec_,
-        .timeout_seconds = decompiler_timeout_,
-    };
     decompile_stop_ = {}; const auto token = decompile_stop_.get_token();
     decompile_revision_ = model_.edit_revision(); decompile_generation_ = file_generation_;
     decompiler_thumb_ = thumb_mode_;
     decompile_annotation_revision_ = annotations_.revision(); decompile_symbol_revision_ = symbol_revision_;
-    decompiled_ = {DecompileStatus::Ready, "Decompiler", "Analyzing selected function...", {}};
+    decompiled_ = make_decompile_message(DecompileStatus::Ready, "Analyzing selected function...");
     decompile_job_ = std::async(std::launch::async, [request = std::move(request), settings, resources, token]() {
         BackendRunner runner;
         switch (settings.provider) {
@@ -222,14 +271,13 @@ void UiApp::render_decompiler() {
             ImGui::InputInt("Timeout (seconds)", &decompiler_timeout_);
         }
         if (ImGui::Button("Save settings")) {
-            const DecompilerSettings settings{
-                .provider = static_cast<DecompilerProvider>(decompiler_provider_),
-                .ghidra_home = ghidra_home_,
-                .java = decompiler_java_,
-                .python = decompiler_python_,
-                .retdec = decompiler_retdec_,
-                .timeout_seconds = decompiler_timeout_,
-            };
+            DecompilerSettings settings{};
+            settings.provider = static_cast<DecompilerProvider>(decompiler_provider_);
+            settings.ghidra_home = ghidra_home_;
+            settings.java = decompiler_java_;
+            settings.python = decompiler_python_;
+            settings.retdec = decompiler_retdec_;
+            settings.timeout_seconds = decompiler_timeout_;
             if (decompiler_timeout_ < 10 || decompiler_timeout_ > 3600) decompiler_settings_status_ = "Timeout must be 10 to 3600 seconds.";
             else {
                 const auto result = save_decompiler_settings(decompiler_directory_/"decompiler.ini", settings);
@@ -240,10 +288,20 @@ void UiApp::render_decompiler() {
     }
     ImGui::EndDisabled();
     ImGui::BeginDisabled(decompile_job_.valid());
-    if (ImGui::Button("Analyze selection (F5)")) request_decompile();
+    if (ImGui::Button("Analyze selection (F5)")) request_decompile(false);
+    ImGui::SameLine();
+    if (ImGui::Button("Re-analyze")) request_decompile(true);
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Cache")) clear_decompiler_caches();
     ImGui::EndDisabled();
     if (decompile_job_.valid()) { ImGui::SameLine(); if (ImGui::Button("Cancel")) decompile_stop_.request_stop(); }
-    ImGui::TextWrapped("%s",decompiled_.provider.c_str()); ImGui::TextWrapped("%s",decompiled_.diagnostic.c_str());
+    ImGui::TextWrapped("%s", decompiled_.provider.c_str());
+    if (!decompile_job_.valid() && decompiled_.status == DecompileStatus::Ready && !decompiled_.lines.empty()) {
+        ImGui::SameLine();
+        const std::string_view source_label = to_string(decompiled_.cache_source);
+        ImGui::TextDisabled("[%.*s]", static_cast<int>(source_label.size()), source_label.data());
+    }
+    ImGui::TextWrapped("%s", decompiled_.diagnostic.c_str());
     if (!decompile_job_.valid() && decompiled_.status != DecompileStatus::Ready && decompiler_provider_ != 3) {
         if (ImGui::Button("Decompile with Structured Pseudo-C")) {
             decompiler_provider_ = 3;

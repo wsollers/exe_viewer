@@ -4,6 +4,7 @@
 #include "symbols/debug_symbols.hpp"
 
 #include <peelf/error.hpp>
+#include <peelf/sha256.hpp>
 
 #include <algorithm>
 #include <array>
@@ -63,6 +64,10 @@ std::filesystem::path utf8_path(std::string_view text) {
 } // namespace
 
     void BinaryModel::reset_all() {
+        ++content_generation_;
+        cached_content_sha256_.clear();
+        cached_sha256_generation_ = std::numeric_limits<std::uint64_t>::max();
+        cached_sha256_revision_ = std::numeric_limits<std::uint64_t>::max();
         source_kind_ = BinarySourceKind::None;
         live_target_kind_ = LiveViewTargetKind::None;
         format_ = BinaryFormat::None;
@@ -237,6 +242,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         if (bytes_[0] == 'M' && bytes_[1] == 'Z') {
             const bool loaded = load_pe(path);
             if (loaded) {
+                ++content_generation_;
                 source_kind_ = BinarySourceKind::StaticFile;
                 if (architecture_ == peelf::Architecture::Unknown && pe_) {
                     architecture_ = pe_->is_pe32_plus ? peelf::Architecture::X86_64
@@ -254,6 +260,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         if (image_ && image_->format() == peelf::Format::ELF) {
             const bool loaded = load_elf(path);
             if (loaded) {
+                ++content_generation_;
                 source_kind_ = BinarySourceKind::StaticFile;
                 if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
@@ -491,6 +498,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         }
 
         live_target_kind_ = LiveViewTargetKind::Module;
+        ++content_generation_;
         pe_.reset();
         image_.reset();
         sections_.clear();
@@ -609,6 +617,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         active_module_index_.reset();
         active_region_index_ = region_index;
         live_target_kind_ = LiveViewTargetKind::Region;
+        ++content_generation_;
         live_window_base_ = reg.start_address;
         live_window_size_ = reg.size();
 
@@ -1202,6 +1211,65 @@ std::filesystem::path utf8_path(std::string_view text) {
             }
         }
         return BytePatchState::Unchanged;
+    }
+
+    const std::string& BinaryModel::content_sha256() const {
+        if (cached_sha256_generation_ == content_generation_ &&
+            cached_sha256_revision_ == edit_revision_) {
+            return cached_content_sha256_;
+        }
+
+        cached_sha256_generation_ = content_generation_;
+        cached_sha256_revision_ = edit_revision_;
+        cached_content_sha256_.clear();
+
+        if (!has_file()) {
+            return cached_content_sha256_;
+        }
+
+        if (!is_live_process()) {
+            if (!editable_image_ || editable_image_->changed_intervals().empty()) {
+                cached_content_sha256_ = peelf::sha256_hex(bytes_);
+                return cached_content_sha256_;
+            }
+
+            peelf::Sha256Hasher hasher;
+            constexpr std::uint64_t kChunkSize = 64ull * 1024ull;
+            const auto total = static_cast<std::uint64_t>(bytes_.size());
+            for (std::uint64_t offset = 0; offset < total; offset += kChunkSize) {
+                const std::uint64_t len = std::min(kChunkSize, total - offset);
+                if (auto chunk = read_effective_bytes(offset, len)) {
+                    hasher.update(*chunk);
+                } else {
+                    const auto start = static_cast<std::size_t>(offset);
+                    const auto count = static_cast<std::size_t>(len);
+                    hasher.update(std::span<const std::uint8_t>(bytes_).subspan(start, count));
+                }
+            }
+            cached_content_sha256_ = hasher.finalize_hex();
+            return cached_content_sha256_;
+        }
+
+        peelf::Sha256Hasher hasher;
+        const std::uint64_t pid = session_ ? session_->pid() : 0u;
+        hasher.update(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&pid), sizeof(pid)));
+        hasher.update(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&live_window_base_), sizeof(live_window_base_)));
+        hasher.update(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&live_window_size_), sizeof(live_window_size_)));
+
+        const std::span<const std::uint8_t> analysis_bytes = analysis_image_bytes();
+        if (!analysis_bytes.empty()) {
+            hasher.update(analysis_bytes);
+        } else if (live_window_size_ > 0) {
+            const std::uint64_t probe = std::min<std::uint64_t>(live_window_size_, 64ull * 1024ull);
+            if (auto sample = read_window_sample(0, probe)) {
+                hasher.update(sample->bytes);
+            }
+        }
+        cached_content_sha256_ = hasher.finalize_hex();
+        return cached_content_sha256_;
     }
 
     bool BinaryModel::is_process_suspended() const noexcept {

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -217,12 +218,14 @@ namespace viewer {
         [[nodiscard]] BytePatchState byte_patch_state_at_offset(std::uint64_t offset) const noexcept;
         peelf::Result<void> apply_patch_set(std::span<const peelf::PatchInterval> patches);
         [[nodiscard]] std::uint64_t edit_revision() const noexcept { return edit_revision_; }
+        [[nodiscard]] const std::string& content_sha256() const;
 
     private:
         BinarySourceKind source_kind_ = BinarySourceKind::None;
         LiveViewTargetKind live_target_kind_ = LiveViewTargetKind::None;
         BinaryFormat format_ = BinaryFormat::None;
         std::uint64_t edit_revision_ = 0;
+        std::uint64_t content_generation_ = 0;
         peelf::Architecture architecture_ = peelf::Architecture::Unknown;
         peelf::Endianness endianness_ = peelf::Endianness::Little;
 
@@ -264,6 +267,9 @@ namespace viewer {
         peelf::HandlersReport handlers_report_;
 
         mutable std::string last_diagnostic_;
+        mutable std::string cached_content_sha256_;
+        mutable std::uint64_t cached_sha256_generation_ = std::numeric_limits<std::uint64_t>::max();
+        mutable std::uint64_t cached_sha256_revision_ = std::numeric_limits<std::uint64_t>::max();
 
         void reset_all();
         [[nodiscard]] std::string current_debug_symbol_key() const;

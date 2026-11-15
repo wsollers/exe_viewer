@@ -1434,8 +1434,17 @@ void UiApp::process_deferred_gpu_work() {
     if (decompile_job_.valid() && decompile_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
         try {
             auto result = decompile_job_.get();
-            if (decompile_generation_ == file_generation_) decompiled_ = std::move(result);
-        } catch (const std::exception& error) { decompiled_ = {DecompileStatus::Failed,"Decompiler",error.what()}; }
+            if (decompile_generation_ == file_generation_) {
+                if (pending_decompile_cache_key_ && result.status == DecompileStatus::Ready) {
+                    decompile_cache_.put(*pending_decompile_cache_key_, result);
+                }
+                decompiled_ = std::move(result);
+            }
+            pending_decompile_cache_key_.reset();
+        } catch (const std::exception& error) {
+            pending_decompile_cache_key_.reset();
+            decompiled_ = {DecompileStatus::Failed,"Decompiler",error.what()};
+        }
     }
     if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
         references_dirty_ = true;

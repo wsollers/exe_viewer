@@ -1,4 +1,5 @@
 #include "decompiler.hpp"
+#include <peelf/sha256.hpp>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
@@ -172,5 +173,121 @@ DecompiledUnit BinaryNinjaDecompiler::decompile(const DecompileRequest& request,
     std::ifstream file(output,std::ios::binary); std::string text(static_cast<std::size_t>(size),'\0');
     if(!file.read(text.data(),static_cast<std::streamsize>(size))) return failure(DecompileStatus::Failed,"Cannot read backend output");
     return parse_decompiler_output(text);
+}
+
+std::string compute_decompiler_settings_fingerprint(const DecompilerSettings& settings) {
+    peelf::Sha256Hasher hasher;
+    const auto feed = [&hasher](std::string_view sv) {
+        hasher.update(sv);
+        hasher.update(std::string_view{"\0", 1});
+    };
+    feed(std::to_string(static_cast<int>(settings.provider)));
+    switch (settings.provider) {
+        case DecompilerProvider::Ghidra:
+            feed(settings.ghidra_home.string());
+            feed(settings.java.string());
+            break;
+        case DecompilerProvider::BinaryNinja:
+            feed(settings.python.string());
+            break;
+        case DecompilerProvider::RetDec:
+            feed(settings.retdec.string());
+            break;
+        case DecompilerProvider::AnnotatedCode:
+        case DecompilerProvider::StructuredPseudoC:
+            break;
+    }
+    return hasher.finalize_hex();
+}
+
+DecompileCacheKey make_decompile_cache_key(const DecompileRequest& request,
+                                           const DecompilerSettings& settings) {
+    std::string sha = request.binary_sha256;
+    if (sha.empty() && !request.image_bytes.empty()) {
+        sha = peelf::sha256_hex(request.image_bytes);
+    }
+    return DecompileCacheKey{
+        .binary_sha256 = std::move(sha),
+        .patch_revision = request.patch_revision,
+        .symbol_revision = request.symbol_revision,
+        .symbols_sha256 = compute_decompiler_symbols_digest(request.symbols, request.types),
+        .provider = settings.provider,
+        .settings_fingerprint = compute_decompiler_settings_fingerprint(settings),
+        .architecture = request.architecture,
+        .endianness = request.endianness,
+        .thumb = request.thumb,
+        .function_address = request.address,
+        .function_size = request.function_size,
+    };
+}
+
+std::optional<DecompiledUnit> DecompileCache::get(const DecompileCacheKey& key) const {
+    if (key.binary_sha256.empty()) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock(mutex_);
+    const auto it = index_.find(key);
+    if (it == index_.end()) {
+        return std::nullopt;
+    }
+    lru_.splice(lru_.begin(), lru_, it->second);
+    DecompiledUnit copy = it->second->unit;
+    copy.cache_source = DecompileCacheSource::MemoryCacheHit;
+    return copy;
+}
+
+void DecompileCache::put(const DecompileCacheKey& key, DecompiledUnit unit) {
+    if (key.binary_sha256.empty() || unit.status != DecompileStatus::Ready) {
+        return;
+    }
+    std::scoped_lock lock(mutex_);
+    if (const auto it = index_.find(key); it != index_.end()) {
+        it->second->unit = std::move(unit);
+        lru_.splice(lru_.begin(), lru_, it->second);
+        return;
+    }
+    while (lru_.size() >= max_entries_) {
+        index_.erase(lru_.back().key);
+        lru_.pop_back();
+    }
+    lru_.push_front(Entry{.key = key, .unit = std::move(unit)});
+    index_.emplace(lru_.front().key, lru_.begin());
+}
+
+void DecompileCache::invalidate_function(std::string_view binary_sha256,
+                                         std::uint64_t function_address) {
+    std::scoped_lock lock(mutex_);
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        if (it->key.binary_sha256 == binary_sha256 &&
+            it->key.function_address == function_address) {
+            index_.erase(it->key);
+            it = lru_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void DecompileCache::invalidate_binary(std::string_view binary_sha256) {
+    std::scoped_lock lock(mutex_);
+    for (auto it = lru_.begin(); it != lru_.end();) {
+        if (it->key.binary_sha256 == binary_sha256) {
+            index_.erase(it->key);
+            it = lru_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void DecompileCache::clear() {
+    std::scoped_lock lock(mutex_);
+    index_.clear();
+    lru_.clear();
+}
+
+std::size_t DecompileCache::size() const {
+    std::scoped_lock lock(mutex_);
+    return lru_.size();
 }
 }

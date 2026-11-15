@@ -1,8 +1,11 @@
 #include "decompile/decompiler.hpp"
+#include <peelf/sha256.hpp>
 #include <gtest/gtest.h>
 #include <fstream>
 #include "model/binary_model.hpp"
 #include <algorithm>
+#include <cctype>
+#include <sstream>
 #include <thread>
 #include "symbols/debug_symbols.hpp"
 using namespace viewer;
@@ -256,4 +259,420 @@ TEST(Decompiler, ViewerPdbSymbolCollisionsDoNotAbortDecompilation) {
     ASSERT_EQ(result.status,DecompileStatus::Ready)<<result.diagnostic;
     EXPECT_TRUE(std::ranges::any_of(result.lines,[](const auto& line){return line.address.has_value();}));
 #endif
+}
+
+TEST(Decompiler, BinaryModelContentSha256TracksPatchesAndUndo) {
+    BinaryModel model;
+    EXPECT_TRUE(model.content_sha256().empty());
+    ASSERT_TRUE(model.load_file(PEELF_CALLGRAPH_FIXTURE_EXE));
+
+    const std::string original_sha = model.content_sha256();
+    ASSERT_EQ(original_sha.size(), 64u);
+    EXPECT_EQ(original_sha, peelf::sha256_hex(model.bytes()));
+    // Cached lookup returns identical digest without recomputing mismatch.
+    EXPECT_EQ(model.content_sha256(), original_sha);
+
+    ASSERT_GT(model.bytes().size(), 64u);
+    const std::uint8_t flipped = static_cast<std::uint8_t>(model.bytes()[64] ^ 0xFFu);
+    const std::array<std::uint8_t, 1> patch{flipped};
+    ASSERT_TRUE(model.apply_patch_bytes(64, patch, "flip byte").has_value());
+
+    const std::string patched_sha = model.content_sha256();
+    EXPECT_NE(patched_sha, original_sha);
+    auto effective = model.read_effective_bytes(0, model.bytes().size());
+    ASSERT_TRUE(effective.has_value());
+    EXPECT_EQ(patched_sha, peelf::sha256_hex(*effective));
+
+    ASSERT_TRUE(model.undo_patch().has_value());
+    EXPECT_EQ(model.content_sha256(), original_sha);
+}
+
+TEST(Decompiler, DecompileCacheHitInvalidationAndLruEviction) {
+    DecompileCache cache(2);
+
+    DecompileRequest req_a;
+    req_a.binary_sha256 = std::string(64, 'a');
+    req_a.patch_revision = 0;
+    req_a.symbol_revision = 1;
+    req_a.architecture = peelf::Architecture::X86_64;
+    req_a.address = 0x401000;
+    req_a.function_size = 64;
+    req_a.symbols = {{.name = "func_a", .virtual_address = 0x401000, .size = 64, .function = true}};
+
+    DecompilerSettings settings;
+    settings.provider = DecompilerProvider::Ghidra;
+    settings.ghidra_home = "/opt/ghidra";
+
+    const auto key_a = make_decompile_cache_key(req_a, settings);
+    EXPECT_FALSE(cache.get(key_a).has_value());
+
+    // Non-Ready statuses are never cached.
+    DecompiledUnit timeout_unit;
+    timeout_unit.status = DecompileStatus::Timeout;
+    timeout_unit.provider = "Ghidra";
+    timeout_unit.diagnostic = "timed out";
+    cache.put(key_a, timeout_unit);
+    EXPECT_EQ(cache.size(), 0u);
+
+    DecompiledUnit ready_a;
+    ready_a.status = DecompileStatus::Ready;
+    ready_a.provider = "Ghidra";
+    ready_a.diagnostic = "ok";
+    ready_a.lines.push_back(DecompiledLine{0x401000, "int func_a(void)", {}});
+    cache.put(key_a, ready_a);
+    EXPECT_EQ(cache.size(), 1u);
+
+    auto hit_a = cache.get(key_a);
+    ASSERT_TRUE(hit_a.has_value());
+    EXPECT_EQ(hit_a->cache_source, DecompileCacheSource::MemoryCacheHit);
+    ASSERT_EQ(hit_a->lines.size(), 1u);
+    EXPECT_EQ(hit_a->lines[0].text, "int func_a(void)");
+
+    // Patch revision invalidates key.
+    auto patched_req = req_a;
+    patched_req.patch_revision = 1;
+    EXPECT_FALSE(cache.get(make_decompile_cache_key(patched_req, settings)).has_value());
+
+    // Symbol rename invalidates key automatically via symbols_sha256.
+    auto renamed_req = req_a;
+    renamed_req.symbols[0].name = "renamed_func_a";
+    EXPECT_FALSE(cache.get(make_decompile_cache_key(renamed_req, settings)).has_value());
+
+    // Provider/settings change invalidates key.
+    auto other_settings = settings;
+    other_settings.ghidra_home = "/opt/ghidra-custom";
+    EXPECT_FALSE(cache.get(make_decompile_cache_key(req_a, other_settings)).has_value());
+
+    // LRU capacity = 2: insert B, touch A, insert C -> B is evicted, A and C remain.
+    auto req_b = req_a;
+    req_b.address = 0x401080;
+    const auto key_b = make_decompile_cache_key(req_b, settings);
+    DecompiledUnit ready_b = ready_a;
+    ready_b.lines = {DecompiledLine{0x401080, "int func_b(void)", {}}};
+    cache.put(key_b, ready_b);
+    EXPECT_TRUE(cache.get(key_a).has_value()); // refresh A as MRU
+
+    auto req_c = req_a;
+    req_c.address = 0x401100;
+    const auto key_c = make_decompile_cache_key(req_c, settings);
+    DecompiledUnit ready_c = ready_a;
+    ready_c.lines = {DecompiledLine{0x401100, "int func_c(void)", {}}};
+    cache.put(key_c, ready_c);
+
+    EXPECT_EQ(cache.size(), 2u);
+    EXPECT_TRUE(cache.get(key_a).has_value());
+    EXPECT_FALSE(cache.get(key_b).has_value());
+    EXPECT_TRUE(cache.get(key_c).has_value());
+
+    cache.invalidate_function(req_a.binary_sha256, 0x401000);
+    EXPECT_FALSE(cache.get(key_a).has_value());
+    EXPECT_TRUE(cache.get(key_c).has_value());
+}
+
+TEST(Decompiler, GhidraWorkspaceColdImportThenWarmProcessReuseAndInvalidation) {
+    struct TempDir {
+        std::filesystem::path path;
+        ~TempDir() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } temp{std::filesystem::temp_directory_path() / "peelf-ghidra-wu02-reuse-test"};
+    std::filesystem::remove_all(temp.path);
+
+    const auto ghidra_home = temp.path / "ghidra_install";
+    const auto scripts_dir = temp.path / "scripts";
+    const auto cache_dir = temp.path / "cache";
+    std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
+    std::filesystem::create_directories(scripts_dir);
+    std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
+    std::ofstream(scripts_dir / "PeelfDecompile.java").put('/');
+
+    struct InvocationRecord {
+        bool had_import = false;
+        bool had_process = false;
+        bool had_noanalysis = false;
+        bool had_delete_project = false;
+        bool had_prescript = false;
+        std::string post_phase;
+        std::filesystem::path project_dir;
+        std::string symbols_manifest;
+    };
+
+    struct StatefulGhidraRunner final : IBackendRunner {
+        mutable std::vector<InvocationRecord> calls;
+        BackendProcessResult run(const std::filesystem::path&,
+                                 const std::vector<std::string>& args,
+                                 std::chrono::milliseconds,
+                                 std::stop_token) const override {
+            InvocationRecord rec;
+            const auto headless = std::ranges::find(args, "ghidra.app.util.headless.AnalyzeHeadless");
+            if (headless != args.end() && std::next(headless) != args.end()) {
+                rec.project_dir = *std::next(headless);
+            }
+            rec.had_import = std::ranges::find(args, "-import") != args.end();
+            const auto proc_it = std::ranges::find(args, "-process");
+            rec.had_process = proc_it != args.end() && std::next(proc_it) != args.end() &&
+                              *std::next(proc_it) == "input.bin";
+            rec.had_noanalysis = std::ranges::find(args, "-noanalysis") != args.end();
+            rec.had_delete_project = std::ranges::find(args, "-deleteProject") != args.end();
+            rec.had_prescript = std::ranges::find(args, "-preScript") != args.end();
+
+            const auto post = std::ranges::find(args, "-postScript");
+            if (post != args.end() && std::distance(post, args.end()) > 6) {
+                rec.post_phase = *std::next(post, 2);
+                const std::filesystem::path output(*std::next(post, 3));
+                const std::string addr_str = *std::next(post, 4);
+                const std::filesystem::path sym_path(*std::next(post, 6));
+                std::ifstream sym_in(sym_path, std::ios::binary);
+                std::ostringstream ss;
+                ss << sym_in.rdbuf();
+                rec.symbols_manifest = ss.str();
+
+                if (rec.had_import && !rec.project_dir.empty()) {
+                    std::ofstream(rec.project_dir / "analysis.gpr") << "project";
+                }
+                std::ofstream(output) << "PEELF_DECOMPILE 2 ready \"Ghidra\" 1 " << addr_str
+                                      << " \"return 0;\"";
+            }
+            calls.push_back(std::move(rec));
+            return {0};
+        }
+    } runner;
+
+    DecompilerSettings settings;
+    settings.ghidra_home = ghidra_home;
+    settings.cache_directory = cache_dir;
+    settings.max_cached_workspaces = 3;
+    settings.reuse_analysis = true;
+
+    GhidraDecompiler backend(settings, scripts_dir, runner);
+
+    DecompileRequest req;
+    req.address = 0x401000;
+    req.architecture = peelf::Architecture::X86_64;
+    req.image_bytes = {0x7Fu, 'E', 'L', 'F', 0x90u, 0xC3u};
+    req.binary_sha256 = peelf::sha256_hex(req.image_bytes);
+    req.symbols = {
+        {.name = "func_alpha", .virtual_address = 0x401000, .size = 16, .function = true},
+        {.name = "func_beta", .virtual_address = 0x401080, .size = 16, .function = true},
+    };
+
+    // 1. Cold miss on func_alpha -> uses -import without -deleteProject.
+    const auto res1 = backend.decompile(req);
+    ASSERT_EQ(res1.status, DecompileStatus::Ready) << res1.diagnostic;
+    EXPECT_EQ(res1.cache_source, DecompileCacheSource::FreshAnalysis);
+    ASSERT_EQ(runner.calls.size(), 1u);
+    EXPECT_TRUE(runner.calls[0].had_import);
+    EXPECT_FALSE(runner.calls[0].had_process);
+    EXPECT_FALSE(runner.calls[0].had_delete_project);
+    EXPECT_TRUE(runner.calls[0].had_prescript);
+    EXPECT_EQ(runner.calls[0].post_phase, "export");
+    const auto first_project_dir = runner.calls[0].project_dir;
+    EXPECT_TRUE(std::filesystem::exists(first_project_dir / "analysis.gpr"));
+
+    // 2. Warm switch to func_beta in same binary -> uses -process input.bin -noanalysis!
+    req.address = 0x401080;
+    const auto res2 = backend.decompile(req);
+    ASSERT_EQ(res2.status, DecompileStatus::Ready) << res2.diagnostic;
+    EXPECT_EQ(res2.cache_source, DecompileCacheSource::ReusedWorkspace);
+    ASSERT_EQ(runner.calls.size(), 2u);
+    EXPECT_FALSE(runner.calls[1].had_import);
+    EXPECT_TRUE(runner.calls[1].had_process);
+    EXPECT_TRUE(runner.calls[1].had_noanalysis);
+    EXPECT_FALSE(runner.calls[1].had_prescript);
+    EXPECT_EQ(runner.calls[1].post_phase, "export_warm");
+    EXPECT_EQ(runner.calls[1].project_dir, first_project_dir);
+
+    // 3. Symbol rename without byte edits -> warm -process with incremental export_sync!
+    req.symbols[1].name = "authenticate_user";
+    const auto res3 = backend.decompile(req);
+    ASSERT_EQ(res3.status, DecompileStatus::Ready);
+    EXPECT_EQ(res3.cache_source, DecompileCacheSource::ReusedWorkspace);
+    ASSERT_EQ(runner.calls.size(), 3u);
+    EXPECT_FALSE(runner.calls[2].had_import);
+    EXPECT_TRUE(runner.calls[2].had_process);
+    EXPECT_TRUE(runner.calls[2].had_noanalysis);
+    EXPECT_EQ(runner.calls[2].post_phase, "export_sync");
+    // Hex encoding of "authenticate_user" appears in symbol manifest.
+    EXPECT_NE(runner.calls[2].symbols_manifest.find("61757468656e7469636174655f75736572"),
+              std::string::npos);
+
+    // 4. Subsequent function switch with already-synced symbols returns to export_warm.
+    req.address = 0x401000;
+    const auto res4 = backend.decompile(req);
+    ASSERT_EQ(res4.status, DecompileStatus::Ready);
+    ASSERT_EQ(runner.calls.size(), 4u);
+    EXPECT_EQ(runner.calls[3].post_phase, "export_warm");
+
+    // 5. Byte patch / SHA-256 change invalidates cached project and runs fresh -import.
+    req.image_bytes[4] = 0xCCu;
+    req.patch_revision = 1;
+    req.binary_sha256 = peelf::sha256_hex(req.image_bytes);
+    const auto res5 = backend.decompile(req);
+    ASSERT_EQ(res5.status, DecompileStatus::Ready);
+    EXPECT_EQ(res5.cache_source, DecompileCacheSource::FreshAnalysis);
+    ASSERT_EQ(runner.calls.size(), 5u);
+    EXPECT_TRUE(runner.calls[4].had_import);
+    EXPECT_NE(runner.calls[4].project_dir, first_project_dir);
+
+    // 6. Explicit force_reanalyze rebuilds even an already-warm workspace via -import.
+    req.force_reanalyze = true;
+    const auto res6 = backend.decompile(req);
+    ASSERT_EQ(res6.status, DecompileStatus::Ready);
+    EXPECT_EQ(res6.cache_source, DecompileCacheSource::FreshAnalysis);
+    ASSERT_EQ(runner.calls.size(), 6u);
+    EXPECT_TRUE(runner.calls[5].had_import);
+    EXPECT_EQ(runner.calls[5].project_dir, runner.calls[4].project_dir);
+}
+
+TEST(Decompiler, GhidraWarmFailureRecoversViaCleanColdReimport) {
+    struct TempDir {
+        std::filesystem::path path;
+        ~TempDir() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } temp{std::filesystem::temp_directory_path() / "peelf-ghidra-wu02-recovery-test"};
+    std::filesystem::remove_all(temp.path);
+
+    const auto ghidra_home = temp.path / "ghidra_install";
+    const auto scripts_dir = temp.path / "scripts";
+    const auto cache_dir = temp.path / "cache";
+    std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
+    std::filesystem::create_directories(scripts_dir);
+    std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
+    std::ofstream(scripts_dir / "PeelfDecompile.java").put('/');
+
+    struct CorruptProcessRunner final : IBackendRunner {
+        mutable std::vector<std::string> modes;
+        mutable bool fail_warm_process = false;
+        BackendProcessResult run(const std::filesystem::path&,
+                                 const std::vector<std::string>& args,
+                                 std::chrono::milliseconds,
+                                 std::stop_token) const override {
+            const bool is_import = std::ranges::find(args, "-import") != args.end();
+            modes.push_back(is_import ? "import" : "process");
+            if (!is_import && fail_warm_process) {
+                return {1};
+            }
+            const auto headless = std::ranges::find(args, "ghidra.app.util.headless.AnalyzeHeadless");
+            if (is_import && headless != args.end() && std::next(headless) != args.end()) {
+                std::ofstream(std::filesystem::path(*std::next(headless)) / "analysis.gpr") << "ok";
+            }
+            const auto post = std::ranges::find(args, "-postScript");
+            if (post != args.end() && std::distance(post, args.end()) > 4) {
+                const std::filesystem::path output(*std::next(post, 3));
+                std::ofstream(output) << "PEELF_DECOMPILE 2 ready \"Ghidra\" 1 4096 \"recovered();\"";
+            }
+            return {0};
+        }
+    } runner;
+
+    DecompilerSettings settings;
+    settings.ghidra_home = ghidra_home;
+    settings.cache_directory = cache_dir;
+    GhidraDecompiler backend(settings, scripts_dir, runner);
+
+    DecompileRequest req;
+    req.address = 4096;
+    req.architecture = peelf::Architecture::X86_64;
+    req.image_bytes = {1, 2, 3, 4};
+
+    ASSERT_EQ(backend.decompile(req).status, DecompileStatus::Ready);
+    ASSERT_EQ(runner.modes, (std::vector<std::string>{"import"}));
+
+    // Corrupt warm run fails -> backend wipes cached workspace and retries cold import once.
+    runner.fail_warm_process = true;
+    req.address = 4128;
+    const auto recovered = backend.decompile(req);
+    ASSERT_EQ(recovered.status, DecompileStatus::Ready) << recovered.diagnostic;
+    EXPECT_EQ(recovered.cache_source, DecompileCacheSource::FreshAnalysis);
+    EXPECT_EQ(runner.modes, (std::vector<std::string>{"import", "process", "import"}));
+}
+
+TEST(Decompiler, GhidraWorkspaceLruEvictionAndCacheRootOffMntC) {
+    const auto default_root = default_ghidra_cache_directory().generic_string();
+    EXPECT_FALSE(default_root.empty());
+#ifndef _WIN32
+    std::string lowered = default_root;
+    std::ranges::transform(lowered, lowered.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    EXPECT_FALSE(lowered == "/mnt/c" || lowered.starts_with("/mnt/c/")) << default_root;
+#endif
+
+    struct TempDir {
+        std::filesystem::path path;
+        ~TempDir() {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } temp{std::filesystem::temp_directory_path() / "peelf-ghidra-wu02-lru-test"};
+    std::filesystem::remove_all(temp.path);
+
+    const auto ghidra_home = temp.path / "ghidra_install";
+    const auto scripts_dir = temp.path / "scripts";
+    const auto cache_dir = temp.path / "cache";
+    std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
+    std::filesystem::create_directories(scripts_dir);
+    std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
+    std::ofstream(scripts_dir / "PeelfDecompile.java").put('/');
+
+    struct SimpleRunner final : IBackendRunner {
+        mutable std::vector<std::filesystem::path> projects;
+        BackendProcessResult run(const std::filesystem::path&,
+                                 const std::vector<std::string>& args,
+                                 std::chrono::milliseconds,
+                                 std::stop_token) const override {
+            const auto headless = std::ranges::find(args, "ghidra.app.util.headless.AnalyzeHeadless");
+            std::filesystem::path proj;
+            if (headless != args.end() && std::next(headless) != args.end()) {
+                proj = *std::next(headless);
+                projects.push_back(proj);
+                if (std::ranges::find(args, "-import") != args.end()) {
+                    std::ofstream(proj / "analysis.gpr") << "ok";
+                }
+            }
+            const auto post = std::ranges::find(args, "-postScript");
+            if (post != args.end() && std::distance(post, args.end()) > 4) {
+                std::ofstream(std::filesystem::path(*std::next(post, 3)))
+                    << "PEELF_DECOMPILE 2 ready \"Ghidra\" 1 4096 \"ok();\"";
+            }
+            return {0};
+        }
+    } runner;
+
+    DecompilerSettings settings;
+    settings.ghidra_home = ghidra_home;
+    settings.cache_directory = cache_dir;
+    settings.max_cached_workspaces = 2;
+    GhidraDecompiler backend(settings, scripts_dir, runner);
+
+    DecompileRequest req1;
+    req1.address = 4096;
+    req1.architecture = peelf::Architecture::X86_64;
+    req1.image_bytes = {1, 0, 0};
+    DecompileRequest req2 = req1;
+    req2.image_bytes = {2, 0, 0};
+    DecompileRequest req3 = req1;
+    req3.image_bytes = {3, 0, 0};
+
+    ASSERT_EQ(backend.decompile(req1).status, DecompileStatus::Ready);
+    const auto ws1 = runner.projects.back();
+    ASSERT_EQ(backend.decompile(req2).status, DecompileStatus::Ready);
+    const auto ws2 = runner.projects.back();
+
+    // Touch ws1 via warm reuse so ws2 becomes LRU victim when ws3 arrives.
+    req1.address = 4112;
+    ASSERT_EQ(backend.decompile(req1).cache_source, DecompileCacheSource::ReusedWorkspace);
+
+    ASSERT_EQ(backend.decompile(req3).status, DecompileStatus::Ready);
+    const auto ws3 = runner.projects.back();
+
+    EXPECT_TRUE(std::filesystem::exists(ws1));
+    EXPECT_FALSE(std::filesystem::exists(ws2));
+    EXPECT_TRUE(std::filesystem::exists(ws3));
+
+    backend.clear_cached_workspaces();
+    EXPECT_FALSE(std::filesystem::exists(ws1));
+    EXPECT_FALSE(std::filesystem::exists(ws3));
 }

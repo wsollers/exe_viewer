@@ -1,4 +1,5 @@
 #include "decompiler.hpp"
+#include <peelf/sha256.hpp>
 #include <map>
 #include <format>
 #include <sstream>
@@ -54,5 +55,53 @@ std::string encode_decompiler_symbols(const DecompileRequest& request) {
             out << member.offset << ' ' << member.size << ' ' << hex(member.name) << ' ' << hex(member.type) << '\n';
     }
     return out.str();
+}
+
+std::string compute_decompiler_symbols_digest(std::span<const SymbolRecord> symbols,
+                                              std::span<const DataTypeRecord> types) {
+    std::map<std::uint64_t, const SymbolRecord*> unique;
+    for (const auto& symbol : symbols) {
+        if (!symbol.virtual_address || symbol.name.empty() || symbol.external) continue;
+        auto [it, inserted] = unique.emplace(*symbol.virtual_address, &symbol);
+        if (!inserted && (symbol.source == SymbolSource::DebugSymbol ||
+                          it->second->source == SymbolSource::EntryPoint)) {
+            it->second = &symbol;
+        }
+    }
+
+    peelf::Sha256Hasher hasher;
+    const auto feed_str = [&hasher](std::string_view sv) {
+        const auto len = static_cast<std::uint64_t>(sv.size());
+        hasher.update(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&len), sizeof(len)));
+        hasher.update(sv);
+    };
+    const auto feed_u64 = [&hasher](std::uint64_t val) {
+        hasher.update(std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&val), sizeof(val)));
+    };
+
+    feed_u64(unique.size());
+    for (const auto& [address, symbol] : unique) {
+        feed_u64(address);
+        feed_u64(symbol->size);
+        feed_u64(symbol->function.value_or(false) ? 1u : 0u);
+        feed_str(symbol->name);
+    }
+
+    feed_u64(types.size());
+    for (const auto& type : types) {
+        feed_str(type.name);
+        feed_u64(type.size);
+        feed_u64(type.is_union ? 1u : 0u);
+        feed_u64(type.members.size());
+        for (const auto& member : type.members) {
+            feed_u64(member.offset);
+            feed_u64(member.size);
+            feed_str(member.name);
+            feed_str(member.type);
+        }
+    }
+    return hasher.finalize_hex();
 }
 }

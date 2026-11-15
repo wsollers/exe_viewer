@@ -105,6 +105,8 @@ namespace viewer {
         char decompiler_python_[1024] = "python";
         char decompiler_retdec_[1024] = "retdec-decompiler";
         DecompiledUnit decompiled_;
+        DecompileCache decompile_cache_;
+        std::optional<DecompileCacheKey> pending_decompile_cache_key_;
         std::future<DecompiledUnit> decompile_job_;
         std::stop_source decompile_stop_;
         std::uint64_t decompile_revision_ = 0, file_generation_ = 0, decompile_generation_ = 0;
@@ -216,7 +218,8 @@ namespace viewer {
 
 
         void render_main_menu();
-        void request_decompile();
+        void request_decompile(bool force_reanalyze = false);
+        void clear_decompiler_caches();
         void render_decompiler();
         void rebuild_references();
         void open_references();

@@ -23,8 +23,12 @@ public class PeelfDecompile extends HeadlessScript {
                 if (!function.getName().equals(name)) function.setName(name,SourceType.USER_DEFINED);
             } else {
                 // The loader, PDB analyzer, or prepare pass may already own this label.
-                for (var existing : currentProgram.getSymbolTable().getSymbols(symbol.address()))
-                    if (existing.getName().equals(name)) return;
+                for (var existing : currentProgram.getSymbolTable().getSymbols(symbol.address())) {
+                    if (existing.getName().equals(name)) {
+                        existing.setPrimary();
+                        return;
+                    }
+                }
                 createLabel(symbol.address(),name,true,SourceType.USER_DEFINED);
             }
         } catch (ghidra.util.exception.DuplicateNameException | ghidra.util.exception.InvalidInputException ignored) {
@@ -35,7 +39,7 @@ public class PeelfDecompile extends HeadlessScript {
     private String decode(String value) {
         return value.equals("-") ? "" : new String(HexFormat.of().parseHex(value), StandardCharsets.UTF_8);
     }
-    private void readSymbols(Path path, boolean prepare) throws Exception {
+    private void readSymbols(Path path, boolean applyTypes, boolean applyAllSymbols, Address targetAddress) throws Exception {
         try (var input = new Scanner(path, StandardCharsets.UTF_8)) {
             if (!input.next().equals("PEELF_SYMBOLS") || input.nextInt()!=1) throw new IllegalArgumentException("Invalid symbol metadata");
             input.next(); functionSize=input.nextLong();
@@ -54,7 +58,7 @@ public class PeelfDecompile extends HeadlessScript {
                 Composite type=union ? new UnionDataType(name) : new StructureDataType(name,size);
                 for (int m=0;m<members;m++) {
                     int offset=input.nextInt(), length=input.nextInt(); String field=decode(input.next()), display=decode(input.next());
-                    if (!prepare || length<=0 || offset<0 || offset>size || length>size-offset || display.contains("bit field")) continue;
+                    if (!applyTypes || length<=0 || offset<0 || offset>size || length>size-offset || display.contains("bit field")) continue;
                     // Preserve known layout without inventing semantics for unknown member types.
                     DataType data=Undefined.getUndefinedDataType(length);
                     if (display.equals("int32_t") && length==4) data=IntegerDataType.dataType;
@@ -69,10 +73,16 @@ public class PeelfDecompile extends HeadlessScript {
                         // Retain the representable layout instead of aborting analysis.
                     }
                 }
-                if (prepare) currentProgram.getDataTypeManager().addDataType(type,DataTypeConflictHandler.KEEP_HANDLER);
+                if (applyTypes) currentProgram.getDataTypeManager().addDataType(type,DataTypeConflictHandler.KEEP_HANDLER);
             }
         }
-        for (var symbol : symbols) applySymbol(symbol);
+        if (applyAllSymbols) {
+            for (var symbol : symbols) applySymbol(symbol);
+        } else if (targetAddress != null) {
+            for (var symbol : symbols) {
+                if (symbol.address().equals(targetAddress)) applySymbol(symbol);
+            }
+        }
     }
     private String exportTypes() {
         var records=new ArrayList<String>();
@@ -104,17 +114,21 @@ public class PeelfDecompile extends HeadlessScript {
     @Override public void run() throws Exception {
         String[] args = getScriptArgs();
         if (args.length != 5) throw new IllegalArgumentException("Expected phase, output, address, Thumb mode, symbol metadata");
+        String phase = args[0];
+        boolean isPrepare = phase.equals("prepare");
+        boolean applyTypes = isPrepare || phase.equals("export_sync");
+        boolean applyAllSymbols = isPrepare || phase.equals("export") || phase.equals("export_sync");
         Path destination = Path.of(args[1]);
         try {
             Address address = currentProgram.getAddressFactory().getDefaultAddressSpace()
                 .getAddress(Long.parseUnsignedLong(args[2]));
-            readSymbols(Path.of(args[4]), args[0].equals("prepare"));
-            if (args[0].equals("prepare")) {
-                if (Boolean.parseBoolean(args[3])) {
-                    var register = currentProgram.getRegister("TMode");
-                    if (register == null) throw new IllegalArgumentException("Thumb mode is unavailable for this processor");
-                    currentProgram.getProgramContext().setValue(register, address, address, BigInteger.ONE);
-                }
+            readSymbols(Path.of(args[4]), applyTypes, applyAllSymbols, address);
+            if (Boolean.parseBoolean(args[3]) && (isPrepare || getInstructionAt(address) == null)) {
+                var register = currentProgram.getRegister("TMode");
+                if (register == null) throw new IllegalArgumentException("Thumb mode is unavailable for this processor");
+                currentProgram.getProgramContext().setValue(register, address, address, BigInteger.ONE);
+            }
+            if (isPrepare) {
                 return;
             }
             if (Files.exists(destination)) return;
