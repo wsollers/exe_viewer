@@ -290,6 +290,13 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 {
     references_panel_.set_visible(false);
     initialize_decompiler();
+    recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
+#ifdef _WIN32
+    recent_binaries_.load(recent_binaries_path_, decompiler_directory_ / "peelf_viewer.exe");
+#else
+    recent_binaries_.load(recent_binaries_path_, decompiler_directory_ / "peelf_viewer");
+#endif
+    if (!recent_binaries_.save(recent_binaries_path_)) Log().error("Could not save recent binary history");
     patch_set_panel_.set_analysis_context(&symbol_index_, &thumb_mode_);
     references_panel_.set_navigate_callback([this](std::uint64_t address) {
         navigate_to_address(address, PreferredView::Disassembly);
@@ -679,6 +686,24 @@ void UiApp::render_main_menu() {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Open...", "Ctrl+O")) {
             if (on_open_file_) { on_open_file_(); }
+        }
+        if (ImGui::BeginMenu("Recent Binaries")) {
+            std::optional<std::filesystem::path> selected;
+            for (const auto& path : recent_binaries_.paths()) {
+                const auto utf8 = path.generic_u8string();
+                const std::string label(utf8.begin(), utf8.end());
+                ImGui::PushID(label.c_str());
+                if (ImGui::MenuItem(label.c_str())) selected = path;
+                ImGui::PopID();
+            }
+            ImGui::EndMenu();
+            if (selected) {
+                BinaryModel opened;
+                if (opened.load_file(selected->string())) {
+                    model_ = std::move(opened);
+                    on_file_loaded();
+                } else Log().error("Cannot open recent binary: {}", selected->string());
+            }
         }
         if (ImGui::MenuItem("Open Analysis Project...", nullptr, false, static_cast<bool>(on_analysis_file_))) on_analysis_file_(0);
         if (ImGui::MenuItem("Save Analysis Project...", nullptr, false, model_.has_file() && static_cast<bool>(on_analysis_file_))) on_analysis_file_(1);
@@ -1612,6 +1637,8 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         }
 
         structure_tree_ = build_structure_tree(*img);
+        recent_binaries_.remember(model_.file_info().path);
+        if (!recent_binaries_.save(recent_binaries_path_)) Log().error("Could not save recent binary history");
         symbol_index_ = SymbolIndex::build(*img);
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;

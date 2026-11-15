@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "model/binary_model.hpp"
+#include "model/recent_binaries.hpp"
 #include "ui_panels.hpp"
 #include "ui_panels_references.hpp"
 #include "decompile/decompiler.hpp"
@@ -83,6 +84,8 @@ namespace viewer {
         int decompiler_timeout_ = 180;
         bool decompiler_thumb_ = false;
         std::filesystem::path decompiler_directory_;
+        RecentBinaries recent_binaries_;
+        std::filesystem::path recent_binaries_path_;
         std::string decompiler_settings_status_;
         void initialize_decompiler();
         void render_data_types();

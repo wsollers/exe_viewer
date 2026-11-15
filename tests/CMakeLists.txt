@@ -52,6 +52,7 @@ add_executable(peelf_tests
   reference_index_test.cpp
   analysis_project_test.cpp
   decompiler_test.cpp
+  recent_binaries_test.cpp
   shellcode_converter_test.cpp
   assembler_dependency_test.cpp
   patching_test.cpp
