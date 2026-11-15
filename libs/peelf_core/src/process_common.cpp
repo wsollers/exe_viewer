@@ -4,6 +4,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <unordered_map>
@@ -240,6 +241,548 @@ std::string strip_deleted_proc_suffix(std::string_view pathname) {
         pathname.remove_suffix(kDeleted.size());
     }
     return std::string(pathname);
+}
+
+namespace {
+
+[[nodiscard]] constexpr bool is_cmd_whitespace(char ch) noexcept {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+[[nodiscard]] bool has_windows_drive_prefix(std::string_view s) noexcept {
+    return s.size() >= 3 && std::isalpha(static_cast<unsigned char>(s[0])) != 0 && s[1] == ':' &&
+           (s[2] == '\\' || s[2] == '/');
+}
+
+[[nodiscard]] bool is_explicit_absolute_path(std::string_view s, bool windows_rules) noexcept {
+    if (s.empty()) {
+        return false;
+    }
+    if (s.front() == '/') {
+        return true;
+    }
+    if (windows_rules) {
+        if (has_windows_drive_prefix(s) || s.starts_with("\\\\") || s.front() == '\\') {
+            return true;
+        }
+    }
+    return std::filesystem::path(s).is_absolute();
+}
+
+[[nodiscard]] bool contains_path_separator(std::string_view s, bool windows_rules) noexcept {
+    if (s.find('/') != std::string_view::npos) {
+        return true;
+    }
+    if (windows_rules && s.find('\\') != std::string_view::npos) {
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] bool uses_windows_style_separators(std::string_view s) noexcept {
+    return has_windows_drive_prefix(s) || s.starts_with("\\\\") ||
+           (s.find('\\') != std::string_view::npos && !s.starts_with('/'));
+}
+
+[[nodiscard]] std::string normalize_windows_path_string(std::string_view raw) {
+    std::string prefix;
+    std::size_t idx = 0;
+    bool rooted = false;
+
+    if (raw.size() >= 2 &&
+        ((raw[0] == '\\' && raw[1] == '\\') || (raw[0] == '/' && raw[1] == '/'))) {
+        prefix = "\\\\";
+        idx = 2;
+        rooted = true;
+        // Preserve \\server\share UNC root components so ".." cannot climb past share root.
+        int unc_parts = 0;
+        while (idx < raw.size() && unc_parts < 2) {
+            while (idx < raw.size() && (raw[idx] == '\\' || raw[idx] == '/')) {
+                ++idx;
+            }
+            const std::size_t start = idx;
+            while (idx < raw.size() && raw[idx] != '\\' && raw[idx] != '/') {
+                ++idx;
+            }
+            if (idx > start) {
+                if (unc_parts > 0) {
+                    prefix.push_back('\\');
+                }
+                prefix.append(raw.substr(start, idx - start));
+                ++unc_parts;
+            }
+        }
+        prefix.push_back('\\');
+    } else if (has_windows_drive_prefix(raw)) {
+        prefix.push_back(raw[0]);
+        prefix.push_back(':');
+        prefix.push_back('\\');
+        idx = 3;
+        rooted = true;
+    } else if (!raw.empty() && (raw[0] == '\\' || raw[0] == '/')) {
+        prefix = "\\";
+        idx = 1;
+        rooted = true;
+    }
+
+    std::vector<std::string_view> stack;
+    while (idx < raw.size()) {
+        while (idx < raw.size() && (raw[idx] == '\\' || raw[idx] == '/')) {
+            ++idx;
+        }
+        const std::size_t start = idx;
+        while (idx < raw.size() && raw[idx] != '\\' && raw[idx] != '/') {
+            ++idx;
+        }
+        if (idx == start) {
+            break;
+        }
+        const std::string_view part = raw.substr(start, idx - start);
+        if (part == ".") {
+            continue;
+        }
+        if (part == "..") {
+            if (!stack.empty() && stack.back() != "..") {
+                stack.pop_back();
+            } else if (!rooted) {
+                stack.push_back(part);
+            }
+            continue;
+        }
+        stack.push_back(part);
+    }
+
+    std::string out = prefix;
+    for (std::size_t i = 0; i < stack.size(); ++i) {
+        if (i > 0) {
+            out.push_back('\\');
+        }
+        out.append(stack[i]);
+    }
+    if (out.empty()) {
+        return ".";
+    }
+    return out;
+}
+
+[[nodiscard]] std::filesystem::path normalize_candidate_path(std::string_view raw,
+                                                             bool windows_rules) {
+    if (windows_rules && uses_windows_style_separators(raw)) {
+        return std::filesystem::path(normalize_windows_path_string(raw));
+    }
+    return std::filesystem::path(raw).lexically_normal();
+}
+
+[[nodiscard]] std::filesystem::path join_and_normalize_candidate(
+    const std::filesystem::path& base,
+    std::string_view rel,
+    bool windows_rules) {
+    const std::string base_str = base.string();
+    if (windows_rules && (uses_windows_style_separators(base_str) ||
+                          uses_windows_style_separators(rel))) {
+        std::string combined = base_str;
+        if (!combined.empty() && combined.back() != '\\' && combined.back() != '/') {
+            combined.push_back('\\');
+        }
+        combined.append(rel);
+        return std::filesystem::path(normalize_windows_path_string(combined));
+    }
+    return (base / std::filesystem::path(rel)).lexically_normal();
+}
+
+[[nodiscard]] bool has_windows_exec_extension(std::string_view path_str) noexcept {
+    const std::size_t sep = path_str.find_last_of("/\\");
+    const std::string_view fname =
+        (sep == std::string_view::npos) ? path_str : path_str.substr(sep + 1);
+    const std::size_t dot = fname.rfind('.');
+    if (dot == std::string_view::npos) {
+        return false;
+    }
+    const std::string_view ext = fname.substr(dot);
+    return iequals_ascii(ext, ".exe") || iequals_ascii(ext, ".com") ||
+           iequals_ascii(ext, ".bat") || iequals_ascii(ext, ".cmd");
+}
+
+}  // namespace
+
+std::vector<std::string> split_command_line_args(std::string_view command_line,
+                                                 bool windows_rules) {
+    std::vector<std::string> args;
+    if (command_line.empty()) {
+        return args;
+    }
+
+    if (command_line.find('\0') != std::string_view::npos) {
+        std::string_view trimmed = command_line;
+        while (!trimmed.empty() && trimmed.back() == '\0') {
+            trimmed.remove_suffix(1);
+        }
+        if (trimmed.empty()) {
+            return args;
+        }
+        if (trimmed.find('\0') != std::string_view::npos) {
+            std::size_t pos = 0;
+            while (pos <= trimmed.size()) {
+                const std::size_t nul = trimmed.find('\0', pos);
+                if (nul == std::string_view::npos) {
+                    args.emplace_back(trimmed.substr(pos));
+                    break;
+                }
+                args.emplace_back(trimmed.substr(pos, nul - pos));
+                pos = nul + 1;
+            }
+            while (!args.empty() && args.back().empty()) {
+                args.pop_back();
+            }
+            return args;
+        }
+        // Only 1 NUL-free string exists (e.g., setproctitle or single C-string buffer);
+        // fall through and parse it with quoting rules.
+        command_line = trimmed;
+    }
+
+    if (windows_rules) {
+        std::size_t i = 0;
+        while (i < command_line.size()) {
+            while (i < command_line.size() && is_cmd_whitespace(command_line[i])) {
+                ++i;
+            }
+            if (i >= command_line.size()) {
+                break;
+            }
+
+            std::string current;
+            bool in_quotes = false;
+            bool has_token = false;
+
+            while (i < command_line.size()) {
+                if (!in_quotes && is_cmd_whitespace(command_line[i])) {
+                    break;
+                }
+                if (command_line[i] == '\\') {
+                    std::size_t backslashes = 0;
+                    while (i < command_line.size() && command_line[i] == '\\') {
+                        ++backslashes;
+                        ++i;
+                    }
+                    if (i < command_line.size() && command_line[i] == '"') {
+                        current.append(backslashes / 2u, '\\');
+                        has_token = true;
+                        if ((backslashes % 2u) == 0) {
+                            if (in_quotes && (i + 1) < command_line.size() &&
+                                command_line[i + 1] == '"') {
+                                current.push_back('"');
+                                i += 2;
+                            } else {
+                                in_quotes = !in_quotes;
+                                ++i;
+                            }
+                        } else {
+                            current.push_back('"');
+                            ++i;
+                        }
+                    } else {
+                        current.append(backslashes, '\\');
+                        has_token = true;
+                    }
+                } else if (command_line[i] == '"') {
+                    has_token = true;
+                    if (in_quotes && (i + 1) < command_line.size() && command_line[i + 1] == '"') {
+                        current.push_back('"');
+                        i += 2;
+                    } else {
+                        in_quotes = !in_quotes;
+                        ++i;
+                    }
+                } else {
+                    current.push_back(command_line[i]);
+                    has_token = true;
+                    ++i;
+                }
+            }
+
+            if (has_token) {
+                args.push_back(std::move(current));
+            }
+        }
+        return args;
+    }
+
+    // POSIX quoting/escaping rules.
+    std::size_t i = 0;
+    while (i < command_line.size()) {
+        while (i < command_line.size() && is_cmd_whitespace(command_line[i])) {
+            ++i;
+        }
+        if (i >= command_line.size()) {
+            break;
+        }
+
+        std::string current;
+        bool in_single = false;
+        bool in_double = false;
+        bool has_token = false;
+
+        while (i < command_line.size()) {
+            const char ch = command_line[i];
+            if (in_single) {
+                if (ch == '\'') {
+                    in_single = false;
+                } else {
+                    current.push_back(ch);
+                }
+                ++i;
+                continue;
+            }
+            if (in_double) {
+                if (ch == '"') {
+                    in_double = false;
+                    ++i;
+                } else if (ch == '\\' && (i + 1) < command_line.size()) {
+                    const char next = command_line[i + 1];
+                    if (next == '"' || next == '\\' || next == '$' || next == '`') {
+                        current.push_back(next);
+                        i += 2;
+                    } else {
+                        current.push_back(ch);
+                        ++i;
+                    }
+                } else {
+                    current.push_back(ch);
+                    ++i;
+                }
+                continue;
+            }
+
+            if (is_cmd_whitespace(ch)) {
+                break;
+            }
+            if (ch == '\'') {
+                in_single = true;
+                has_token = true;
+                ++i;
+            } else if (ch == '"') {
+                in_double = true;
+                has_token = true;
+                ++i;
+            } else if (ch == '\\') {
+                has_token = true;
+                if ((i + 1) < command_line.size()) {
+                    current.push_back(command_line[i + 1]);
+                    i += 2;
+                } else {
+                    ++i;
+                }
+            } else {
+                current.push_back(ch);
+                has_token = true;
+                ++i;
+            }
+        }
+
+        if (has_token) {
+            args.push_back(std::move(current));
+        }
+    }
+    return args;
+}
+
+std::optional<std::filesystem::path> resolve_executable_from_command_line(
+    std::string_view command_line,
+    const std::filesystem::path& working_directory,
+    std::string_view env_path,
+    bool windows_rules,
+    std::function<bool(const std::filesystem::path&)> file_exists_fn) {
+    if (command_line.empty()) {
+        return std::nullopt;
+    }
+
+    const bool using_default_exists = !static_cast<bool>(file_exists_fn);
+    if (!file_exists_fn) {
+        file_exists_fn = [](const std::filesystem::path& p) -> bool {
+            std::error_code ec;
+            return !p.empty() && std::filesystem::is_regular_file(p, ec) && !ec;
+        };
+    }
+
+    std::string sys_path_storage;
+    std::string_view effective_env_path = env_path;
+    if (effective_env_path.empty() && using_default_exists) {
+#ifdef _WIN32
+        char* raw_env = nullptr;
+        std::size_t raw_len = 0;
+        if (_dupenv_s(&raw_env, &raw_len, "PATH") == 0 && raw_env != nullptr) {
+            sys_path_storage.assign(raw_env);
+            std::free(raw_env);
+            effective_env_path = sys_path_storage;
+        }
+#else
+        if (const char* raw_env = std::getenv("PATH"); raw_env != nullptr) {
+            sys_path_storage = raw_env;
+            effective_env_path = sys_path_storage;
+        }
+#endif
+    }
+
+    const auto probe_path_with_extensions =
+        [&](const std::filesystem::path& candidate) -> std::optional<std::filesystem::path> {
+        if (candidate.empty()) {
+            return std::nullopt;
+        }
+        if (file_exists_fn(candidate)) {
+            return candidate;
+        }
+        const std::string cand_str = candidate.string();
+        if (windows_rules && !has_windows_exec_extension(cand_str)) {
+            const std::filesystem::path with_exe(cand_str + ".exe");
+            if (file_exists_fn(with_exe)) {
+                return with_exe;
+            }
+            const std::filesystem::path with_com(cand_str + ".com");
+            if (file_exists_fn(with_com)) {
+                return with_com;
+            }
+        }
+        return std::nullopt;
+    };
+
+    const auto resolve_argv0 =
+        [&](std::string_view raw_tok) -> std::optional<std::filesystem::path> {
+        std::string_view tok = trim_ascii(raw_tok);
+        if (tok.size() >= 2 &&
+            ((tok.front() == '"' && tok.back() == '"') ||
+             (tok.front() == '\'' && tok.back() == '\''))) {
+            tok = tok.substr(1, tok.size() - 2);
+        }
+        if (tok.empty()) {
+            return std::nullopt;
+        }
+
+        // 1. Direct path if argv[0] is absolute (or drive letter / UNC / root).
+        if (is_explicit_absolute_path(tok, windows_rules)) {
+            if (auto direct = probe_path_with_extensions(std::filesystem::path(tok))) {
+                return direct;
+            }
+            const std::filesystem::path norm = normalize_candidate_path(tok, windows_rules);
+            if (norm.string() != tok) {
+                if (auto norm_hit = probe_path_with_extensions(norm)) {
+                    return norm_hit;
+                }
+            }
+            return std::nullopt;
+        }
+
+        // 2. Relative path containing '/' or '\' resolved against working_directory.
+        if (contains_path_separator(tok, windows_rules)) {
+            if (!working_directory.empty()) {
+                const std::filesystem::path joined =
+                    join_and_normalize_candidate(working_directory, tok, windows_rules);
+                if (auto rel_hit = probe_path_with_extensions(joined)) {
+                    return rel_hit;
+                }
+            } else {
+                const std::filesystem::path norm = normalize_candidate_path(tok, windows_rules);
+                if (auto rel_hit = probe_path_with_extensions(norm)) {
+                    return rel_hit;
+                }
+            }
+            return std::nullopt;
+        }
+
+        // 3. Bare command name searched across env_path.
+        if (!effective_env_path.empty()) {
+            const char delim = windows_rules ? ';' : ':';
+            std::size_t start = 0;
+            while (start <= effective_env_path.size()) {
+                const std::size_t next = effective_env_path.find(delim, start);
+                std::string_view dir_entry =
+                    (next == std::string_view::npos)
+                        ? effective_env_path.substr(start)
+                        : effective_env_path.substr(start, next - start);
+                dir_entry = trim_ascii(dir_entry);
+                if (windows_rules && dir_entry.size() >= 2 &&
+                    dir_entry.front() == '"' && dir_entry.back() == '"') {
+                    dir_entry = dir_entry.substr(1, dir_entry.size() - 2);
+                }
+                if (!dir_entry.empty()) {
+                    const std::filesystem::path joined = join_and_normalize_candidate(
+                        std::filesystem::path(dir_entry), tok, windows_rules);
+                    if (auto path_hit = probe_path_with_extensions(joined)) {
+                        return path_hit;
+                    }
+                }
+                if (next == std::string_view::npos) {
+                    break;
+                }
+                start = next + 1;
+            }
+        }
+
+        return std::nullopt;
+    };
+
+    const std::vector<std::string> tokens = split_command_line_args(command_line, windows_rules);
+    if (tokens.empty()) {
+        return std::nullopt;
+    }
+
+    if (auto resolved = resolve_argv0(tokens.front())) {
+        return resolved;
+    }
+
+    // Handle unquoted paths containing spaces (e.g. "C:\Program Files\App\foo.exe --arg"
+    // or single NUL-terminated "/opt/My App/daemon\0").
+    std::string_view raw_trimmed = command_line;
+    while (!raw_trimmed.empty() && raw_trimmed.back() == '\0') {
+        raw_trimmed.remove_suffix(1);
+    }
+    raw_trimmed = trim_ascii(raw_trimmed);
+    if (!raw_trimmed.empty() && raw_trimmed.find('\0') == std::string_view::npos &&
+        raw_trimmed.front() != '"' && raw_trimmed.front() != '\'') {
+        std::vector<std::string_view> space_prefixes;
+        for (std::size_t i = 0; i < raw_trimmed.size(); ++i) {
+            if (is_cmd_whitespace(raw_trimmed[i])) {
+                const std::string_view prefix = trim_ascii(raw_trimmed.substr(0, i));
+                if (!prefix.empty() && prefix != tokens.front()) {
+                    space_prefixes.push_back(prefix);
+                }
+                while (i + 1 < raw_trimmed.size() && is_cmd_whitespace(raw_trimmed[i + 1])) {
+                    ++i;
+                }
+            }
+        }
+        if (raw_trimmed != tokens.front()) {
+            space_prefixes.push_back(raw_trimmed);
+        }
+
+        if (windows_rules) {
+            // Prioritize prefixes explicitly ending in .exe/.com first.
+            for (const std::string_view prefix : space_prefixes) {
+                if (has_windows_exec_extension(prefix)) {
+                    if (auto hit = resolve_argv0(prefix)) {
+                        return hit;
+                    }
+                }
+            }
+        }
+        for (const std::string_view prefix : space_prefixes) {
+            if (is_explicit_absolute_path(prefix, windows_rules) ||
+                contains_path_separator(prefix, windows_rules)) {
+                if (auto hit = resolve_argv0(prefix)) {
+                    return hit;
+                }
+            }
+        }
+    }
+
+    // Fallback for Unix login shells where argv[0] has a leading '-' (e.g. "-bash", "-/bin/zsh").
+    if (!windows_rules && tokens.front().size() > 1 && tokens.front().front() == '-') {
+        if (auto login_hit = resolve_argv0( std::string_view(tokens.front()).substr(1))) {
+            return login_hit;
+        }
+    }
+
+    return std::nullopt;
 }
 
 Result<std::vector<MemoryRegion>> parse_proc_maps(std::string_view maps_text,
@@ -551,7 +1094,27 @@ Result<std::unique_ptr<IBinaryImage>> load_live_module_image(
     // Prefer on-disk backing PE/ELF when readable so unmapped sections (such as ELF
     // .symtab/.strtab) and original import lookup tables are preserved and rebased to
     // the module's live runtime base.
-    if (auto disk_bytes = try_read_disk_file(module.path)) {
+    std::optional<std::vector<std::uint8_t>> disk_bytes = try_read_disk_file(module.path);
+    if (!disk_bytes && module.is_main_module) {
+        const ProcessInfo& proc_info = session.info();
+        if (!proc_info.executable_path.empty() && proc_info.executable_path != module.path) {
+            disk_bytes = try_read_disk_file(proc_info.executable_path);
+        }
+        if (!disk_bytes && !proc_info.command_line.empty()) {
+            const bool win_rules =
+#ifdef _WIN32
+                true;
+#else
+                (module.format == Format::PE &&
+                 uses_windows_style_separators(proc_info.command_line));
+#endif
+            if (const auto resolved = resolve_executable_from_command_line(
+                    proc_info.command_line, proc_info.working_directory, {}, win_rules)) {
+                disk_bytes = try_read_disk_file(*resolved);
+            }
+        }
+    }
+    if (disk_bytes) {
         auto rebased = parse_rebased_image(*disk_bytes, module.base_address);
         if (rebased) {
             return rebased;

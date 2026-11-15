@@ -125,14 +125,62 @@ namespace {
     return nearest_after > virtual_address ? nearest_after - virtual_address : fallback_size;
 }
 
-void add_record(std::vector<SymbolRecord>& records, SymbolRecord record) {
-    if (record.name.empty() || is_elf_mapping_symbol(record.name)) {
-        return;
+[[nodiscard]] std::uint64_t exclusive_end(std::uint64_t start, std::uint64_t size) noexcept {
+    const std::uint64_t norm = normalized_size(size);
+    if (start > std::numeric_limits<std::uint64_t>::max() - norm) {
+        return std::numeric_limits<std::uint64_t>::max();
     }
-    records.push_back(std::move(record));
+    return start + norm;
 }
 
 } // namespace
+
+void SymbolIndex::push_record(SymbolRecord record) {
+    if (record.name.empty() || is_elf_mapping_symbol(record.name)) {
+        return;
+    }
+    const std::size_t idx = records_.size();
+    if (record.virtual_address.has_value()) {
+        first_by_exact_va_.try_emplace(*record.virtual_address, idx);
+    }
+    records_.push_back(std::move(record));
+    spans_dirty_ = true;
+}
+
+void SymbolIndex::ensure_address_spans() const {
+    if (!spans_dirty_) {
+        return;
+    }
+    sorted_spans_.clear();
+    sorted_spans_.reserve(records_.size());
+    for (std::size_t i = 0; i < records_.size(); ++i) {
+        const SymbolRecord& rec = records_[i];
+        if (!rec.virtual_address.has_value()) {
+            continue;
+        }
+        const std::uint64_t s = *rec.virtual_address;
+        sorted_spans_.push_back(AddressSpan{
+            .start = s,
+            .end = exclusive_end(s, rec.size),
+            .max_end_prefix = 0,
+            .record_index = i,
+        });
+    }
+    std::ranges::sort(sorted_spans_, [](const AddressSpan& a, const AddressSpan& b) noexcept {
+        if (a.start != b.start) {
+            return a.start < b.start;
+        }
+        return a.record_index < b.record_index;
+    });
+    std::uint64_t running_max = 0;
+    for (AddressSpan& sp : sorted_spans_) {
+        if (sp.end > running_max) {
+            running_max = sp.end;
+        }
+        sp.max_end_prefix = running_max;
+    }
+    spans_dirty_ = false;
+}
 
 std::string import_symbol_name(const peelf::ImportEntry& entry) {
     const std::string import_name = entry.import_by_ordinal
@@ -167,20 +215,24 @@ const char* to_string(SymbolSource source) noexcept {
 
 SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
     SymbolIndex index;
-    index.records_.reserve(1u + image.symbols().size() + image.imports().size() + image.exports().size());
+    const std::size_t est = 1u + image.symbols().size() + image.imports().size() + image.exports().size();
+    index.records_.reserve(est);
+    index.first_by_exact_va_.reserve(est);
 
     const std::uint64_t entry = image.entry_point();
-    add_record(index.records_, SymbolRecord{
+    index.push_record(SymbolRecord{
         .name = "Entry Point",
         .source = SymbolSource::EntryPoint,
         .virtual_address = entry,
         .file_offset = image.virtual_address_to_file_offset(entry),
         .size = 1,
+        .function = std::nullopt,
+        .library = {},
     });
 
     for (std::uint64_t i = 0; i < image.symbols().size(); ++i) {
         const peelf::Symbol& symbol = image.symbols()[static_cast<std::size_t>(i)];
-        add_record(index.records_, SymbolRecord{
+        index.push_record(SymbolRecord{
             .name = symbol.name,
             .source = SymbolSource::ImageSymbol,
             .source_index = i,
@@ -191,12 +243,14 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
             .size = symbol.size,
             .dynamic = symbol.dynamic,
             .external = symbol.virtual_address == 0,
+            .function = std::nullopt,
+            .library = {},
         });
     }
 
     for (std::uint64_t i = 0; i < image.exports().size(); ++i) {
         const peelf::ExportEntry& entry_record = image.exports()[static_cast<std::size_t>(i)];
-        add_record(index.records_, SymbolRecord{
+        index.push_record(SymbolRecord{
             .name = entry_record.name.empty() ? "<export>" : entry_record.name,
             .source = SymbolSource::Export,
             .source_index = i,
@@ -205,12 +259,14 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
             .file_offset = entry_record.virtual_address == 0 ? std::optional<std::uint64_t>{}
                                                             : image.virtual_address_to_file_offset(entry_record.virtual_address),
             .size = entry_record.virtual_address == 0 ? 0 : recover_pe_function_size(image, entry_record.virtual_address),
+            .function = std::nullopt,
+            .library = {},
         });
     }
 
     for (std::uint64_t i = 0; i < image.imports().size(); ++i) {
         const peelf::ImportEntry& import = image.imports()[static_cast<std::size_t>(i)];
-        add_record(index.records_, SymbolRecord{
+        index.push_record(SymbolRecord{
             .name = import_symbol_name(import),
             .source = SymbolSource::Import,
             .source_index = i,
@@ -220,6 +276,7 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
             .size = image.is_64bit() ? 8u : 4u,
             .dynamic = true,
             .external = true,
+            .function = std::nullopt,
             .library = import.library,
         });
     }
@@ -247,7 +304,7 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
                 if (index.find_exact_address(rel.offset) != nullptr) {
                     continue;
                 }
-                add_record(index.records_, SymbolRecord{
+                index.push_record(SymbolRecord{
                     .name = sym.name,
                     .source = SymbolSource::Import,
                     .source_index = image.imports().size() + rel_idx,
@@ -256,6 +313,8 @@ SymbolIndex SymbolIndex::build(const peelf::IBinaryImage& image) {
                     .size = slot_size,
                     .dynamic = true,
                     .external = true,
+                    .function = std::nullopt,
+                    .library = {},
                 });
             }
         }
@@ -268,7 +327,7 @@ void SymbolIndex::add_debug_symbols(const peelf::IBinaryImage& image, std::span<
     records_.reserve(records_.size() + symbols.size());
     for (std::uint64_t i = 0; i < symbols.size(); ++i) {
         const DebugSymbol& symbol = symbols[static_cast<std::size_t>(i)];
-        add_record(records_, SymbolRecord{
+        push_record(SymbolRecord{
             .name = symbol.name,
             .source = SymbolSource::DebugSymbol,
             .source_index = i,
@@ -287,6 +346,13 @@ void SymbolIndex::add_debug_symbols(const peelf::IBinaryImage& image, std::span<
     }
 }
 
+void SymbolIndex::add_discovered_symbol(SymbolRecord record) {
+    if (record.virtual_address && find_exact_address(*record.virtual_address) != nullptr) {
+        return;
+    }
+    push_record(std::move(record));
+}
+
 std::vector<std::string> SymbolIndex::libraries() const {
     std::vector<std::string> result;
     for (const auto& record : records_) if (!record.library.empty()) result.push_back(record.library);
@@ -303,18 +369,39 @@ const SymbolRecord* SymbolIndex::find_by_name(std::string_view name) const noexc
 }
 
 const SymbolRecord* SymbolIndex::find_exact_address(std::uint64_t virtual_address) const noexcept {
-    const auto it = std::ranges::find_if(records_, [&](const SymbolRecord& record) {
-        return record.virtual_address && *record.virtual_address == virtual_address;
-    });
-    return it == records_.end() ? nullptr : &*it;
+    const auto it = first_by_exact_va_.find(virtual_address);
+    if (it == first_by_exact_va_.end() || it->second >= records_.size()) {
+        return nullptr;
+    }
+    return &records_[it->second];
 }
 
 const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_address) const noexcept {
-    const SymbolRecord* best = nullptr;
-    for (const SymbolRecord& record : records_) {
-        if (!contains_address(record, virtual_address)) {
-            continue;
+    ensure_address_spans();
+    if (sorted_spans_.empty()) {
+        return nullptr;
+    }
+
+    const auto hi = std::ranges::upper_bound(sorted_spans_, virtual_address, {}, &AddressSpan::start);
+    std::size_t idx = static_cast<std::size_t>(hi - sorted_spans_.begin());
+    std::vector<std::size_t> candidates;
+    while (idx > 0) {
+        --idx;
+        const AddressSpan& sp = sorted_spans_[idx];
+        if (sp.max_end_prefix <= virtual_address) {
+            break;
         }
+        if (contains_address(records_[sp.record_index], virtual_address)) {
+            candidates.push_back(sp.record_index);
+        }
+    }
+    if (candidates.empty()) {
+        return nullptr;
+    }
+    std::ranges::sort(candidates);
+    const SymbolRecord* best = nullptr;
+    for (const std::size_t rec_idx : candidates) {
+        const SymbolRecord& record = records_[rec_idx];
         if (best == nullptr || is_better_address_match(record, *best)) {
             best = &record;
         }
@@ -324,20 +411,40 @@ const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_a
 
 const SymbolRecord* SymbolIndex::find_nearest_preceding_address(std::uint64_t virtual_address,
                                                                 std::uint64_t max_distance) const noexcept {
+    ensure_address_spans();
+    if (sorted_spans_.empty()) {
+        return nullptr;
+    }
+
+    const auto hi = std::ranges::upper_bound(sorted_spans_, virtual_address, {}, &AddressSpan::start);
+    if (hi == sorted_spans_.begin()) {
+        return nullptr;
+    }
+
+    std::size_t idx = static_cast<std::size_t>(hi - sorted_spans_.begin()) - 1u;
+    const std::uint64_t nearest_start = sorted_spans_[idx].start;
+    const std::uint64_t best_distance = virtual_address - nearest_start;
+    if (best_distance > max_distance) {
+        return nullptr;
+    }
+
+    std::vector<std::size_t> candidates;
+    while (true) {
+        if (sorted_spans_[idx].start != nearest_start) {
+            break;
+        }
+        candidates.push_back(sorted_spans_[idx].record_index);
+        if (idx == 0) {
+            break;
+        }
+        --idx;
+    }
+    std::ranges::sort(candidates);
     const SymbolRecord* best = nullptr;
-    std::uint64_t best_distance = max_distance + (max_distance == std::numeric_limits<std::uint64_t>::max() ? 0u : 1u);
-    for (const SymbolRecord& record : records_) {
-        if (!record.virtual_address || *record.virtual_address > virtual_address) {
-            continue;
-        }
-        const std::uint64_t distance = virtual_address - *record.virtual_address;
-        if (distance > max_distance) {
-            continue;
-        }
-        if (best == nullptr || distance < best_distance ||
-            (distance == best_distance && is_better_address_match(record, *best))) {
+    for (const std::size_t rec_idx : candidates) {
+        const SymbolRecord& record = records_[rec_idx];
+        if (best == nullptr || is_better_address_match(record, *best)) {
             best = &record;
-            best_distance = distance;
         }
     }
     return best;

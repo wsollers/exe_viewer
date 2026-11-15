@@ -52,6 +52,7 @@ struct Section {
     std::uint64_t virtual_size    = 0;
     std::uint64_t file_offset     = 0;
     std::uint64_t file_size       = 0;
+    std::uint64_t raw_flags       = 0;
     bool          readable        = false;
     bool          writable        = false;
     bool          executable      = false;
@@ -207,6 +208,28 @@ struct PeLoadConfigDirectory {
     std::uint64_t guard_cf_function_table = 0;
     std::uint64_t guard_cf_function_count = 0;
     std::uint32_t guard_flags = 0;
+    std::uint64_t guard_eh_continuation_table = 0;
+    std::uint64_t guard_eh_continuation_count = 0;
+};
+
+struct PeHeader {
+    std::uint16_t machine = 0;
+    std::uint16_t number_of_sections = 0;
+    std::uint32_t time_date_stamp = 0;
+    std::uint32_t symbol_table_offset = 0;
+    std::uint32_t number_of_symbols = 0;
+    std::uint16_t optional_header_size = 0;
+    std::uint16_t characteristics = 0;
+    std::uint16_t optional_magic = 0;
+    std::uint32_t size_of_image = 0;
+    std::uint32_t size_of_headers = 0;
+    std::uint32_t checksum = 0;
+    std::uint16_t subsystem = 0;
+    std::uint16_t dll_characteristics = 0;
+    std::uint64_t stack_reserve = 0;
+    std::uint64_t stack_commit = 0;
+    std::uint64_t heap_reserve = 0;
+    std::uint64_t heap_commit = 0;
 };
 
 struct PeRuntimeFunction {
@@ -361,6 +384,7 @@ public:
     [[nodiscard]] virtual const std::vector<Symbol>& symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
+    [[nodiscard]] virtual const PeHeader* pe_header() const noexcept { return nullptr; }
     [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;
     [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept = 0;

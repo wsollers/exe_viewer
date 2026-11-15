@@ -314,6 +314,12 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , imports_panel_(model)
     , exports_panel_(model)
     , symbols_panel_(symbol_index_, current_selection_, model)
+    , functions_panel_(model, current_selection_)
+    , threads_panel_(model)
+    , thread_locals_panel_(model)
+    , memory_search_panel_(model)
+    , runtime_flags_panel_(model)
+    , handlers_panel_(model)
     , references_panel_(reference_index_, annotations_, symbol_index_, current_selection_)
     , log_panel_()
     , pe_headers_panel_(model)
@@ -371,15 +377,31 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         Log().info("Detached from live process");
     };
 
+    auto on_toggle_pause = [this]() {
+        if (!model_.is_live_process()) {
+            return;
+        }
+        const peelf::SubsystemStatus st = model_.is_process_suspended()
+            ? model_.resume_process()
+            : model_.suspend_process();
+        if (st.availability == peelf::Availability::Unavailable) {
+            Log().warn("Process pause/resume: {}", st.detail);
+        } else {
+            Log().info("{}", st.detail);
+        }
+    };
+
     file_panel_.set_attach_requested_callback([this]() { open_attach_process_modal(); });
     file_panel_.set_refresh_requested_callback(on_refresh_map);
     file_panel_.set_detach_requested_callback(on_detach_proc);
+    file_panel_.set_pause_toggle_callback(on_toggle_pause);
 
     memory_map_panel_.set_attach_requested_callback([this]() {
         open_attach_process_modal();
     });
     memory_map_panel_.set_refresh_requested_callback(on_refresh_map);
     memory_map_panel_.set_detach_requested_callback(on_detach_proc);
+    memory_map_panel_.set_pause_toggle_callback(on_toggle_pause);
     memory_map_panel_.set_module_selected_callback([this](std::size_t module_index) {
         auto res = model_.select_process_module(module_index);
         if (!res) {
@@ -404,9 +426,41 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         hex_panel_.navigate_to_range(clamp_to_size_t(offset),
                                      clamp_to_size_t(std::min<std::uint64_t>(reg_copy.size(), 16u)));
         if (reg_copy.protection.executable) {
-            disassemble_at_offset(offset, reg_copy.start_address);
+            const auto disasm_win = static_cast<std::size_t>(
+                std::clamp<std::uint64_t>(reg_copy.size(), 4096u, 65536u));
+            disassemble_at_offset(offset, reg_copy.start_address, disasm_win);
+            show_disassembly_panel_ = true;
+            focus_listing_ = true;
         }
         last_navigation_selection_ = current_selection_;
+    });
+
+    functions_panel_.set_function_activated_callback([this](std::uint64_t va, bool want_decompile) {
+        navigate_to_address(va, PreferredView::Disassembly);
+        if (want_decompile) {
+            request_decompile();
+        }
+    });
+    threads_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv, bool want_decompile) {
+        navigate_to_address(va, pv);
+        if (want_decompile) {
+            request_decompile();
+        }
+    });
+    thread_locals_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
+        navigate_to_address(va, pv);
+    });
+    memory_search_panel_.set_address_activated_callback([this](std::uint64_t va, std::size_t match_size) {
+        navigate_to_address(va, PreferredView::Hex);
+        if (const auto off = model_.virtual_address_to_offset(va)) {
+            hex_panel_.navigate_to_range(clamp_to_size_t(*off), std::max<std::size_t>(1u, match_size));
+        }
+    });
+    runtime_flags_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
+        navigate_to_address(va, pv);
+    });
+    handlers_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
+        navigate_to_address(va, pv);
     });
 
     patch_set_panel_.set_patch_activated_callback([this](const ViewerSelection& sel) {
@@ -458,7 +512,9 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset),
                                          clamp_to_size_t(std::max<std::uint64_t>(range_size, 1u)));
             if (section.executable) {
-                disassemble_at_offset(*nav_offset, section.virtual_address);
+                const auto disasm_win = static_cast<std::size_t>(
+                    std::clamp<std::uint64_t>(range_size, 4096u, 65536u));
+                disassemble_at_offset(*nav_offset, section.virtual_address, disasm_win);
             }
             last_navigation_selection_ = current_selection_;
         });
@@ -612,8 +668,32 @@ void UiApp::render() {
         ImGui::SameLine(0, 24);
         if (ImGui::Button("Open binary") && on_open_file_) on_open_file_();
         ImGui::SameLine();
+        if (ImGui::Button("Attach process")) open_attach_process_modal();
+        ImGui::SameLine();
         ImGui::BeginDisabled(!model_.has_file());
-        if (ImGui::Button("Functions")) { symbols_panel_.set_visible(true); activate_panel(symbols_panel_.name().c_str()); }
+        if (ImGui::Button("Functions")) {
+            functions_panel_.set_visible(true);
+            activate_panel(functions_panel_.name().c_str());
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Decompile")) request_decompile();
+        ImGui::SameLine();
+        if (ImGui::Button("Search")) {
+            memory_search_panel_.set_visible(true);
+            activate_panel(memory_search_panel_.name().c_str());
+        }
+        if (model_.is_live_process()) {
+            ImGui::SameLine();
+            if (ImGui::Button(model_.is_process_suspended() ? "Resume" : "Pause")) {
+                const auto st = model_.is_process_suspended() ? model_.resume_process() : model_.suspend_process();
+                Log().info("{}", st.detail);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Threads")) {
+                threads_panel_.set_visible(true);
+                activate_panel(threads_panel_.name().c_str());
+            }
+        }
         ImGui::SameLine();
         ImGui::BeginDisabled(!navigation_history_.can_back());
         if (ImGui::Button("Back")) navigate_history(false);
@@ -633,15 +713,17 @@ void UiApp::render() {
         ImGui::InputScalar("##JumpVA", ImGuiDataType_U64, &jump_address_, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to virtual address (hexadecimal)");
         ImGui::SameLine();
-        if (ImGui::Button("Jump") && model_.image()) {
+        if (ImGui::Button("Jump") && model_.has_file()) {
             navigate_to_address(jump_address_);
         }
         ImGui::SameLine();
         if (ImGui::Button("References")) open_references();
-        ImGui::SameLine();
-        if (ImGui::Button("Patches")) patch_set_panel_.set_visible(true);
-        ImGui::SameLine();
-        if (ImGui::Button("Export copy") && on_save_patched_as_) on_save_patched_as_();
+        if (!model_.is_live_process()) {
+            ImGui::SameLine();
+            if (ImGui::Button("Patches")) patch_set_panel_.set_visible(true);
+            ImGui::SameLine();
+            if (ImGui::Button("Export copy") && on_save_patched_as_) on_save_patched_as_();
+        }
         ImGui::EndDisabled();
         ImGui::SameLine(0, 24);
         ImGui::TextDisabled("%s", model_.has_file()
@@ -656,20 +738,35 @@ void UiApp::render() {
         ImGui::TextDisabled("SEGMENTS");
         if (const auto* image = model_.image()) {
             for (const auto& section : image->sections()) {
-                if (section.file_size == 0) continue;
+                const std::uint64_t sec_size = std::max(section.file_size, section.virtual_size);
+                if (sec_size == 0) continue;
                 ImGui::SameLine();
-                ImGui::PushID(static_cast<int>(section.file_offset));
+                ImGui::PushID(static_cast<int>((section.virtual_address ^ section.file_offset) & 0x7FFFFFFFu));
                 ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(section.executable ? ImGuiCol_HeaderActive : ImGuiCol_FrameBg));
                 if (ImGui::Button(section.name.c_str())) {
-                    hex_panel_.navigate_to_range(static_cast<std::size_t>(section.file_offset), 1);
-                    if (section.executable) disassemble_at_offset(static_cast<std::size_t>(section.file_offset), section.virtual_address);
-                    current_selection_ = ViewerSelection{.kind = SelectionKind::Section, .label = section.name,
-                        .file_offset = section.file_offset, .virtual_address = section.virtual_address,
-                        .size = section.file_size, .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex};
+                    const auto nav_off = model_.is_live_process()
+                        ? model_.virtual_address_to_offset(section.virtual_address)
+                        : std::optional<std::uint64_t>(section.file_offset);
+                    if (nav_off) {
+                        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_off), 1);
+                        if (section.executable) {
+                            const auto disasm_win = static_cast<std::size_t>(
+                                std::clamp<std::uint64_t>(sec_size, 4096u, 65536u));
+                            disassemble_at_offset(*nav_off, section.virtual_address, disasm_win);
+                        }
+                        current_selection_ = ViewerSelection{
+                            .kind = SelectionKind::Section,
+                            .label = section.name,
+                            .file_offset = *nav_off,
+                            .virtual_address = section.virtual_address,
+                            .size = sec_size,
+                            .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex
+                        };
+                    }
                 }
                 ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("VA 0x%llX | %llu file bytes%s",
-                    static_cast<unsigned long long>(section.virtual_address), static_cast<unsigned long long>(section.file_size),
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("VA 0x%llX | %llu bytes%s",
+                    static_cast<unsigned long long>(section.virtual_address), static_cast<unsigned long long>(sec_size),
                     section.executable ? " | executable" : "");
                 ImGui::PopID();
             }
@@ -693,6 +790,12 @@ void UiApp::render() {
     imports_panel_.draw();
     exports_panel_.draw();
     symbols_panel_.draw();
+    functions_panel_.draw();
+    threads_panel_.draw();
+    thread_locals_panel_.draw();
+    memory_search_panel_.draw();
+    runtime_flags_panel_.draw();
+    handlers_panel_.draw();
     if (show_data_types_) render_data_types();
     references_panel_.draw();
     if (show_decompiler_) render_decompiler();
@@ -786,7 +889,7 @@ void UiApp::rebuild_references() {
     const auto* image = model_.image();
     if (!image) return;
     if (model_.changed_intervals().empty()) {
-        reference_index_ = ReferenceIndex::build(*image, model_.bytes(), thumb_mode_);
+        reference_index_ = ReferenceIndex::build(*image, model_.analysis_image_bytes(), thumb_mode_);
     } else if (const auto bytes = model_.read_effective_bytes(0, model_.bytes().size())) {
         reference_index_ = ReferenceIndex::build(*image, *bytes, thumb_mode_);
     } else {
@@ -854,6 +957,13 @@ void UiApp::render_main_menu() {
                 Log().error("Refresh failed: {}", res.error().message);
             }
         }
+        if (ImGui::MenuItem(model_.is_process_suspended() ? "Resume Process" : "Pause Process",
+                            nullptr,
+                            false,
+                            model_.is_live_process())) {
+            const auto st = model_.is_process_suspended() ? model_.resume_process() : model_.suspend_process();
+            Log().info("{}", st.detail);
+        }
         if (ImGui::MenuItem("Detach from Process", nullptr, false, model_.is_live_process())) {
             model_.detach_process();
             on_file_loaded();
@@ -869,40 +979,6 @@ void UiApp::render_main_menu() {
                             !model_.is_live_process() && model_.editable_image() != nullptr)) {
             if (on_save_patched_as_) { on_save_patched_as_(); }
         }
-        if (ImGui::MenuItem("Commit Patches to Process",
-                            nullptr,
-                            false,
-                            model_.is_live_process() && !model_.staged_live_patches().empty())) {
-            auto res = model_.commit_patches_to_process(
-                peelf::MemoryWriteOptions{.allow_protection_override = true});
-            if (res) {
-                Log().info("Committed {} staged patch range(s) to live process RAM", *res);
-                refresh_disassembly();
-            } else {
-                Log().error("Commit to RAM failed: {}", res.error().message);
-            }
-        }
-        if (ImGui::MenuItem("Discard Staged Patches",
-                            nullptr,
-                            false,
-                            model_.is_live_process() && !model_.staged_live_patches().empty())) {
-            model_.discard_staged_patches();
-            refresh_disassembly();
-            Log().info("Discarded staged live patches");
-        }
-        if (ImGui::MenuItem("Revert Committed RAM Patches",
-                            nullptr,
-                            false,
-                            model_.is_live_process() && !model_.committed_live_patches().empty())) {
-            auto res = model_.revert_committed_patches(
-                peelf::MemoryWriteOptions{.allow_protection_override = true});
-            if (res) {
-                Log().info("Reverted {} committed patch range(s) in process RAM", *res);
-                refresh_disassembly();
-            } else {
-                Log().error("Revert committed RAM patches failed: {}", res.error().message);
-            }
-        }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Alt+F4")) {
             if (on_exit_) on_exit_();
@@ -912,15 +988,19 @@ void UiApp::render_main_menu() {
 
     if (ImGui::BeginMenu("Edit")) {
         const auto* image = model_.editable_image();
-        if (ImGui::MenuItem("Undo patch", nullptr, false, image && image->can_undo())) {
+        if (ImGui::MenuItem("Undo patch", nullptr, false, !model_.is_live_process() && image && image->can_undo())) {
             if (auto result = model_.undo_patch(); !result) Log().error("{}", result.error().message);
         }
-        if (ImGui::MenuItem("Redo patch", nullptr, false, image && image->can_redo())) {
+        if (ImGui::MenuItem("Redo patch", nullptr, false, !model_.is_live_process() && image && image->can_redo())) {
             if (auto result = model_.redo_patch(); !result) Log().error("{}", result.error().message);
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Patch workspace")) patch_set_panel_.set_visible(true);
-        if (ImGui::MenuItem("Byte input workspace")) shellcode_panel_.set_visible(true);
+        if (ImGui::MenuItem("Memory Search", nullptr, false, model_.has_file())) {
+            memory_search_panel_.set_visible(true);
+            activate_panel(memory_search_panel_.name().c_str());
+        }
+        if (ImGui::MenuItem("Patch workspace", nullptr, false, !model_.is_live_process())) patch_set_panel_.set_visible(true);
+        if (ImGui::MenuItem("Byte input workspace", nullptr, false, !model_.is_live_process())) shellcode_panel_.set_visible(true);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Navigate")) {
@@ -931,7 +1011,31 @@ void UiApp::render_main_menu() {
             const auto* image = model_.image();
             navigate_to_address(image->entry_point());
         }
+        if (ImGui::MenuItem("Functions")) {
+            functions_panel_.set_visible(true);
+            activate_panel(functions_panel_.name().c_str());
+        }
         if (ImGui::MenuItem("Symbols")) symbols_panel_.set_visible(true);
+        if (ImGui::MenuItem("Threads & Stack", nullptr, false, model_.is_live_process())) {
+            threads_panel_.set_visible(true);
+            activate_panel(threads_panel_.name().c_str());
+        }
+        if (ImGui::MenuItem("Thread Locals", nullptr, false, model_.has_file())) {
+            thread_locals_panel_.set_visible(true);
+            activate_panel(thread_locals_panel_.name().c_str());
+        }
+        if (ImGui::MenuItem("Memory Search", nullptr, false, model_.has_file())) {
+            memory_search_panel_.set_visible(true);
+            activate_panel(memory_search_panel_.name().c_str());
+        }
+        if (ImGui::MenuItem("PEB / TEB & Flags", nullptr, false, model_.has_file())) {
+            runtime_flags_panel_.set_visible(true);
+            activate_panel(runtime_flags_panel_.name().c_str());
+        }
+        if (ImGui::MenuItem("Handlers (VEH / SEH / atexit)", nullptr, false, model_.has_file())) {
+            handlers_panel_.set_visible(true);
+            activate_panel(handlers_panel_.name().c_str());
+        }
         if (ImGui::MenuItem("References & Notes", "X", false, model_.has_file())) open_references();
         if (ImGui::MenuItem("Decompile selection", "F5", false, model_.has_file())) request_decompile();
         if (ImGui::MenuItem("Structure")) structure_panel_.set_visible(true);
@@ -1025,6 +1129,18 @@ void UiApp::render_main_menu() {
                 symbols_panel_.set_visible(v);
         }
 
+        for (UiPanel* extra : {static_cast<UiPanel*>(&functions_panel_),
+                               static_cast<UiPanel*>(&threads_panel_),
+                               static_cast<UiPanel*>(&thread_locals_panel_),
+                               static_cast<UiPanel*>(&memory_search_panel_),
+                               static_cast<UiPanel*>(&runtime_flags_panel_),
+                               static_cast<UiPanel*>(&handlers_panel_)}) {
+            bool v = extra->visible();
+            if (ImGui::MenuItem(extra->name().c_str(), nullptr, &v)) {
+                extra->set_visible(v);
+            }
+        }
+
         {
             bool v = pe_headers_panel_.visible();
             if (ImGui::MenuItem(pe_headers_panel_.name().c_str(), nullptr, &v))
@@ -1104,7 +1220,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV6");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV7");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
@@ -1351,49 +1467,78 @@ void UiApp::process_deferred_gpu_work() {
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         if (img != nullptr) {
-            if (model_.is_live_process()) {
-            const GraphByteReader reader = [this](std::uint64_t offset, std::size_t length)
-                -> std::vector<std::uint8_t> {
-                auto sample = model_.read_window_sample(offset, length);
-                if (!sample || sample->bytes.empty()) {
-                    return {};
-                }
-                std::size_t readable_prefix = 0;
-                while (readable_prefix < sample->valid.size() && sample->valid[readable_prefix] != 0) {
-                    ++readable_prefix;
-                }
-                sample->bytes.resize(readable_prefix);
-                return std::move(sample->bytes);
-            };
-            load_call_graph_from_graph(
-                build_symbol_fanout_call_graph(*img,
-                                               reader,
-                                               model_.symbol_index(),
-                                               root),
-                "loaded_symbol_fanout_call_graph.bmp");
-            call_graph_status_ = "Loaded fan-out from " + root.name;
-            } else {
             active_graph_root_ = root;
             graph_revision_ = model_.edit_revision();
             graph_pan_ = {};
             graph_zoom_ = 1.0f;
-            if (function_cfg_ && root.file_offset && root.virtual_address && *root.file_offset < model_.bytes().size()) {
-                const auto extent = discover_function_extent(*img, symbol_index_, root, model_.bytes().size());
-                if (!extent) { call_graph_status_ = "No executable extent available for " + root.name; return; }
-                const auto offset = static_cast<std::size_t>(extent->file_offset);
+            SymbolRecord root_for_extent = root;
+            if (root.virtual_address) {
+                root_for_extent.file_offset = img->virtual_address_to_file_offset(*root.virtual_address);
+            }
+            const std::size_t analysis_size = model_.analysis_image_size();
+            if (function_cfg_ && root_for_extent.file_offset && root_for_extent.virtual_address &&
+                *root_for_extent.file_offset < analysis_size) {
+                const auto extent = discover_function_extent(*img, symbol_index_, root_for_extent, analysis_size);
+                if (!extent) {
+                    call_graph_status_ = "No executable extent available for " + root.name;
+                    return;
+                }
                 const auto size = static_cast<std::size_t>(extent->size);
-                if (const auto bytes = model_.read_effective_bytes(offset, size)) {
-                    load_call_graph_from_graph(build_function_cfg_call_graph(*bytes, *root.virtual_address,
-                        img->architecture(), img->endianness(), offset, root.name, thumb_mode_,
-                        extent->source == FunctionExtentSource::ExecutableRegion ||
-                        extent->source == FunctionExtentSource::NextSymbol), "function_cfg");
-                    if (current_call_graph_) call_graph_status_ = root.name + std::format("  |  {} bytes  |  {}{}", size,
-                        function_extent_source_name(extent->source), extent->truncated ? " (limited)" : "");
+                if (const auto bytes = model_.read_virtual_bytes(extent->virtual_address, size)) {
+                    const auto window_off = model_.virtual_address_to_offset(extent->virtual_address)
+                        .value_or(extent->file_offset);
+                    load_call_graph_from_graph(
+                        build_function_cfg_call_graph(
+                            *bytes,
+                            *root_for_extent.virtual_address,
+                            img->architecture(),
+                            img->endianness(),
+                            static_cast<std::size_t>(window_off),
+                            root.name,
+                            thumb_mode_,
+                            extent->source == FunctionExtentSource::ExecutableRegion ||
+                                extent->source == FunctionExtentSource::NextSymbol),
+                        "function_cfg");
+                    if (current_call_graph_) {
+                        call_graph_status_ = root.name + std::format(
+                            "  |  {} bytes  |  {}{}",
+                            size,
+                            function_extent_source_name(extent->source),
+                            extent->truncated ? " (limited)" : "");
+                    }
+                }
+            } else if (model_.is_live_process()) {
+                const GraphByteReader reader = [this](std::uint64_t offset, std::size_t length)
+                    -> std::vector<std::uint8_t> {
+                    if (const auto va = model_.offset_to_virtual_address(offset)) {
+                        if (auto vbytes = model_.read_virtual_bytes(*va, length)) {
+                            return std::move(*vbytes);
+                        }
+                    }
+                    auto sample = model_.read_window_sample(offset, length);
+                    if (!sample || sample->bytes.empty()) {
+                        return {};
+                    }
+                    std::size_t readable_prefix = 0;
+                    while (readable_prefix < sample->valid.size() && sample->valid[readable_prefix] != 0) {
+                        ++readable_prefix;
+                    }
+                    sample->bytes.resize(readable_prefix);
+                    return std::move(sample->bytes);
+                };
+                load_call_graph_from_graph(
+                    build_symbol_fanout_call_graph(*img, reader, symbol_index_, root),
+                    "function_calls");
+                if (current_call_graph_) {
+                    call_graph_status_ = root.name + "  |  Calls";
                 }
             } else {
-                load_call_graph_from_graph(build_symbol_fanout_call_graph(*img, model_.bytes(), symbol_index_, root), "function_calls");
-                if (current_call_graph_) call_graph_status_ = root.name + "  |  Calls";
-            }
+                load_call_graph_from_graph(
+                    build_symbol_fanout_call_graph(*img, model_.bytes(), symbol_index_, root),
+                    "function_calls");
+                if (current_call_graph_) {
+                    call_graph_status_ = root.name + "  |  Calls";
+                }
             }
         }
     }
@@ -1880,26 +2025,32 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(memory_map_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(functions_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
+    ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
     ImGui::DockBuilderDockWindow("Data Structures", left_id);
-    ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
 
+    ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(threads_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(thread_locals_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(runtime_flags_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(handlers_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(references_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(pe_headers_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(pe_imports_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(pe_exports_panel_.name().c_str(), right_id);
 
     ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), center_bottom_id);
+    ImGui::DockBuilderDockWindow(memory_search_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow("Disassembly", main_id);
     ImGui::DockBuilderDockWindow("Flow Graph", main_id);
     ImGui::DockBuilderDockWindow("Decompiler", right_id);
-    if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(symbols_panel_.name().c_str());
+    if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(functions_panel_.name().c_str());
     if (auto* node = ImGui::DockBuilderGetNode(right_id)) node->SelectedTabId = ImHashStr(details_panel_.name().c_str());
     ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
 
@@ -2176,7 +2327,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         structure_tree_ = build_structure_tree(*img);
         recent_binaries_.remember(model_.file_info().path);
         if (!recent_binaries_.save(recent_binaries_path_)) Log().error("Could not save recent binary history");
-        symbol_index_ = SymbolIndex::build(*img);
+        symbol_index_ = model_.symbol_index();
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         pending_call_graph_request_.reset();
@@ -2296,24 +2447,47 @@ std::optional<SymbolRecord> UiApp::navigation_graph_root(std::uint64_t address) 
 }
 
 void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
-    const auto* image = model_.image();
-    if (!image) return;
-    const auto offset = image->virtual_address_to_file_offset(address);
-    if (!offset || *offset >= model_.bytes().size()) {
-        Log().warn("Address 0x{:X} is not backed by file bytes", address);
+    if (!model_.has_file()) {
         return;
     }
+
+    std::optional<std::uint64_t> offset = model_.virtual_address_to_offset(address);
+    if (!offset && model_.is_live_process()) {
+        if (model_.navigate_to_virtual_address(address)) {
+            sync_live_process_view(false);
+            offset = model_.virtual_address_to_offset(address);
+        }
+    }
+    if (!offset || *offset >= model_.view_size()) {
+        Log().warn("Address 0x{:X} is not mapped in the active image or memory map", address);
+        return;
+    }
+
     navigation_history_.visit(current_selection_);
     const auto* symbol = symbol_index_.find_containing_address(address);
     auto root = navigation_graph_root(address);
-    if (!root) root = SymbolRecord{.name = std::format("loc_{:X}", address), .virtual_address = address, .file_offset = *offset};
-    current_selection_ = {.kind = SelectionKind::ByteRange,
+    const std::optional<std::uint64_t> static_file_off =
+        model_.image() != nullptr ? model_.image()->virtual_address_to_file_offset(address) : offset;
+    if (!root) {
+        root = SymbolRecord{
+            .name = std::format("loc_{:X}", address),
+            .virtual_address = address,
+            .file_offset = static_file_off.value_or(*offset),
+        };
+    }
+    current_selection_ = {
+        .kind = SelectionKind::ByteRange,
         .label = symbol ? symbol->name : std::format("loc_{:X}", address),
-        .file_offset = *offset, .virtual_address = address, .size = 1, .preferred_view = view, .graph_root = root};
-    hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), 1);
-    disassemble_at_offset(static_cast<std::size_t>(*offset), address);
+        .file_offset = *offset,
+        .virtual_address = address,
+        .size = 1,
+        .preferred_view = view,
+        .graph_root = root,
+    };
+    hex_panel_.navigate_to_range(clamp_to_size_t(*offset), 1);
+    disassemble_at_offset(*offset, address);
     last_navigation_selection_ = current_selection_;
-    if (view == PreferredView::Graph) {
+    if (view == PreferredView::Graph && model_.image() != nullptr) {
         if (!active_graph_root_ || active_graph_root_->virtual_address != root->virtual_address) {
             pending_call_graph_root_ = *root;
             pending_call_graph_delay_frames_ = 0;
@@ -2397,7 +2571,9 @@ void UiApp::switch_analysis_view(bool graph) {
                     hex_panel_.navigate_to_range(clamp_to_size_t(off),
                                                  clamp_to_size_t(std::min<std::uint64_t>(reg_copy.size(), 16u)));
                     if (reg_copy.protection.executable) {
-                        disassemble_at_offset(off, reg_copy.start_address);
+                        const auto disasm_win = static_cast<std::size_t>(
+                            std::clamp<std::uint64_t>(reg_copy.size(), 4096u, 65536u));
+                        disassemble_at_offset(off, reg_copy.start_address, disasm_win);
                     }
                 }
             }
@@ -2515,11 +2691,17 @@ void UiApp::switch_analysis_view(bool graph) {
     void UiApp::disassemble_at_offset(std::uint64_t file_offset) {
         const std::uint64_t display_address =
             model_.offset_to_virtual_address(file_offset).value_or(file_offset);
-        disassemble_at_offset(file_offset, display_address);
+        disassemble_at_offset(file_offset, display_address, 4096u);
     }
 
     void UiApp::disassemble_at_offset(std::uint64_t file_offset, std::uint64_t display_address) {
-        disassembly_location_ = DisassemblyLocation{file_offset, display_address};
+        disassemble_at_offset(file_offset, display_address, 4096u);
+    }
+
+    void UiApp::disassemble_at_offset(std::uint64_t file_offset,
+                                      std::uint64_t display_address,
+                                      std::size_t max_window_bytes) {
+        disassembly_location_ = DisassemblyLocation{clamp_to_size_t(file_offset), display_address};
         if (!file_loaded_ || !disasm_.is_initialized()) {
             return;
         }
@@ -2529,9 +2711,9 @@ void UiApp::switch_analysis_view(bool graph) {
         }
         last_disasm_offset_ = file_offset;
         last_disasm_address_ = display_address;
+        last_disasm_window_ = std::clamp<std::size_t>(max_window_bytes, 256u, 65536u);
 
-        constexpr std::size_t kWindow = 256;
-        const auto sample = model_.read_window_sample(file_offset, kWindow);
+        const auto sample = model_.read_window_sample(file_offset, last_disasm_window_);
         std::size_t readable_len = 0;
         if (sample) {
             while (readable_len < sample->valid.size() && sample->valid[readable_len] != 0) {
@@ -2551,7 +2733,7 @@ void UiApp::switch_analysis_view(bool graph) {
 
     void UiApp::refresh_disassembly() {
         if (last_disasm_offset_) {
-            disassemble_at_offset(*last_disasm_offset_, last_disasm_address_);
+            disassemble_at_offset(*last_disasm_offset_, last_disasm_address_, last_disasm_window_);
         }
     }
 

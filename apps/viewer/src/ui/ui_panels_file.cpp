@@ -22,10 +22,19 @@ namespace viewer {
 
         if (model_.is_live_process()) {
             if (const peelf::IProcessSession* sess = model_.process_session()) {
-                ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
-                                   "LIVE PROCESS: %s (PID %llu)",
+                const bool paused = model_.is_process_suspended();
+                ImGui::TextColored(paused ? ImVec4(1.0f, 0.78f, 0.25f, 1.0f)
+                                          : ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
+                                   "%s LIVE PROCESS: %s (PID %llu) [Read-Only]",
+                                   paused ? "[PAUSED]" : "[RUNNING]",
                                    sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
                                    static_cast<unsigned long long>(sess->pid()));
+                if (ImGui::SmallButton(paused ? "Resume Process" : "Pause Process")) {
+                    if (on_pause_toggle_) {
+                        on_pause_toggle_();
+                    }
+                }
+                ImGui::SameLine();
                 if (ImGui::SmallButton("Refresh Map")) {
                     if (on_refresh_requested_) {
                         on_refresh_requested_();
@@ -43,9 +52,10 @@ namespace viewer {
                         on_detach_requested_();
                     }
                 }
-                ImGui::Text("Staged RAM patches: %zu | Committed: %zu",
-                            model_.staged_live_patches().size(),
-                            model_.committed_live_patches().size());
+                if (model_.resolved_executable_path()) {
+                    ImGui::TextDisabled("Backing binary: %s",
+                                        model_.resolved_executable_path()->string().c_str());
+                }
                 ImGui::Separator();
             }
         }

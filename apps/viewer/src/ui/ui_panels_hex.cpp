@@ -80,28 +80,32 @@ void HexViewPanel::draw_contents() {
             edit_status_.clear();
         } else edit_status_ = "Offset is outside the file.";
     }
-    ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Apply bytes").x - 28.0f));
-    ImGui::InputTextWithHint("##Replacement", "Replacement hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
-    ImGui::SameLine();
-    ImGui::BeginDisabled(highlighted_size_ == 0 || mapped_ranges_.size()>1);
-    if (ImGui::Button("Apply bytes")) {
-        const auto parsed = parse_hex_shellcode(edit_bytes_);
-        if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
-        else {
-            if (highlighted_size_ > 1 && parsed.bytes.size() != highlighted_size_) {
-                edit_status_ = "Replacement length must match the selected range.";
-            } else {
-            const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
-            edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
-            if (applied) {
-                highlighted_size_ = parsed.bytes.size();
-                if (on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
-            }
+    if (!is_live) {
+        ImGui::SetNextItemWidth(std::max(100.0f, ImGui::GetContentRegionAvail().x - ImGui::CalcTextSize("Apply bytes").x - 28.0f));
+        ImGui::InputTextWithHint("##Replacement", "Replacement hex bytes, e.g. 00 FF", edit_bytes_, sizeof(edit_bytes_));
+        ImGui::SameLine();
+        ImGui::BeginDisabled(highlighted_size_ == 0 || mapped_ranges_.size() > 1);
+        if (ImGui::Button("Apply bytes")) {
+            const auto parsed = parse_hex_shellcode(edit_bytes_);
+            if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
+            else {
+                if (highlighted_size_ > 1 && parsed.bytes.size() != highlighted_size_) {
+                    edit_status_ = "Replacement length must match the selected range.";
+                } else {
+                    const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
+                    edit_status_ = applied ? std::format("Applied {} bytes.", parsed.bytes.size()) : applied.error().message;
+                    if (applied) {
+                        highlighted_size_ = parsed.bytes.size();
+                        if (on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
+                    }
+                }
             }
         }
+        ImGui::EndDisabled();
+        if (mapped_ranges_.size() > 1) {
+            ImGui::TextDisabled("%zu mapped instruction ranges. Select a contiguous range to edit.", mapped_ranges_.size());
+        }
     }
-    ImGui::EndDisabled();
-    if (mapped_ranges_.size()>1) ImGui::TextDisabled("%zu mapped instruction ranges. Select a contiguous range to edit.",mapped_ranges_.size());
     if (ImGui::Button(mapped_ranges_.size()>1 ? "Copy primary range" : "Copy hex")) {
         const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);
         if (selected) {
@@ -117,7 +121,7 @@ void HexViewPanel::draw_contents() {
     ImGui::Separator();
 
     if (is_live) {
-        ImGui::TextDisabled("Live Window: 0x%016" PRIX64 " .. 0x%016" PRIX64 "  (double-click/right-click byte to stage patch)",
+        ImGui::TextDisabled("Live Window (Read-Only): 0x%016" PRIX64 " .. 0x%016" PRIX64,
                             base_va,
                             base_va + total64);
     } else {
@@ -199,14 +203,14 @@ void HexViewPanel::draw_contents() {
                     if (on_byte_activated_) {
                         on_byte_activated_(highlighted_offset_, highlighted_size_);
                     }
-                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && valid) {
+                    if (!is_live && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && valid) {
                         quick_patch_offset_ = i;
                         std::snprintf(quick_patch_buf_, sizeof(quick_patch_buf_), "%02X", row_data[k]);
                         quick_patch_status_.clear();
                         ImGui::OpenPopup("HexQuickPatchPopup");
                     }
                 }
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                if (!is_live && ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
                     selected_offset_ = i;
                     highlighted_offset_ = i;
                     highlighted_size_ = 1;

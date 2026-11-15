@@ -1,4 +1,5 @@
 #include "ui_app.hpp"
+#include "decompile/structured_decompiler.hpp"
 #include <format>
 #include <cstdio>
 #include <algorithm>
@@ -23,61 +24,176 @@ void UiApp::initialize_decompiler() {
         auto saved = read_decompiler_settings(path);
         if (saved) settings = *saved;
         else decompiler_settings_status_ = saved.error().message;
+    } else if (settings.ghidra_home.empty()) {
+        settings.provider = DecompilerProvider::StructuredPseudoC;
     }
     decompiler_provider_ = static_cast<int>(settings.provider);
     decompiler_timeout_ = settings.timeout_seconds;
     std::snprintf(ghidra_home_, sizeof(ghidra_home_), "%s", settings.ghidra_home.string().c_str());
     std::snprintf(decompiler_java_, sizeof(decompiler_java_), "%s", settings.java.string().c_str());
     std::snprintf(decompiler_python_, sizeof(decompiler_python_), "%s", settings.python.string().c_str());
+    std::snprintf(decompiler_retdec_, sizeof(decompiler_retdec_), "%s", settings.retdec.string().c_str());
 }
 void UiApp::request_decompile() {
     show_decompiler_ = true;
     focus_decompiler_ = true;
     if (decompile_job_.valid()) return;
+    if (!current_selection_.virtual_address) {
+        decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Select a mapped function or executable address first", {}};
+        return;
+    }
+
+    const std::uint64_t selected_va = *current_selection_.virtual_address;
     const auto* image = model_.image();
-    if (!image || !current_selection_.virtual_address) {
-        decompiled_ = {DecompileStatus::NoFunction,"Decompiler","Select a mapped function first"}; return;
-    }
-    auto root = containing_function(*image, symbol_index_, *current_selection_.virtual_address,
-        navigation_graph_root(*current_selection_.virtual_address));
-    if (!root) { decompiled_ = {DecompileStatus::NoFunction,"Decompiler","No function selected"}; return; }
-    const auto extent = discover_function_extent(*image,symbol_index_,*root,model_.bytes().size());
-    if (!extent) { decompiled_ = {DecompileStatus::NoFunction,"Decompiler","Selection is not executable"}; return; }
-    auto bytes = model_.read_effective_bytes(extent->file_offset,extent->size);
-    if (!bytes) { decompiled_ = {DecompileStatus::Failed,"Decompiler",bytes.error().message}; return; }
-    DecompileRequest request; request.address = extent->virtual_address; request.architecture = image->architecture();
-    if (const auto full = discover_function_extent(*image,symbol_index_,*root,model_.bytes().size(),std::numeric_limits<std::uint64_t>::max());
-        full && (full->source == FunctionExtentSource::Symbol || full->source == FunctionExtentSource::RuntimeMetadata))
-        request.function_size = full->size;
-    for (auto symbol : symbol_index_.records()) {
-        symbol.function = symbol_has_code(*image,symbol);
-        if (symbol.virtual_address) if (const auto* note = annotations_.find(*symbol.virtual_address); note && !note->name.empty()) {
-            symbol.name = note->name; symbol.source = SymbolSource::DebugSymbol;
+    DecompileRequest request;
+    selected_code_ranges_.clear();
+    selected_code_address_.reset();
+
+    if (image != nullptr) {
+        auto root = containing_function(*image, symbol_index_, selected_va, navigation_graph_root(selected_va));
+        if (!root) {
+            if (const auto mapped = image->virtual_address_to_file_offset(selected_va)) {
+                root = SymbolRecord{
+                    .name = std::format("sub_{:X}", selected_va),
+                    .virtual_address = selected_va,
+                    .file_offset = *mapped,
+                    .function = true,
+                    .library = {},
+                };
+            }
         }
-        request.symbols.push_back(std::move(symbol));
+        if (!root || !root->virtual_address) {
+            decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "No function selected", {}};
+            return;
+        }
+        SymbolRecord root_for_extent = *root;
+        root_for_extent.file_offset = image->virtual_address_to_file_offset(*root->virtual_address);
+        const std::size_t analysis_size = model_.analysis_image_size();
+        const auto extent = discover_function_extent(*image, symbol_index_, root_for_extent, analysis_size);
+        if (!extent) {
+            decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Selection is not executable", {}};
+            return;
+        }
+        auto bytes = model_.read_virtual_bytes(extent->virtual_address, static_cast<std::size_t>(extent->size));
+        if (!bytes) {
+            decompiled_ = {DecompileStatus::Failed, "Decompiler", bytes.error().message, {}};
+            return;
+        }
+        request.address = extent->virtual_address;
+        request.architecture = image->architecture();
+        if (const auto full = discover_function_extent(
+                *image, symbol_index_, root_for_extent, analysis_size, std::numeric_limits<std::uint64_t>::max());
+            full && (full->source == FunctionExtentSource::Symbol || full->source == FunctionExtentSource::RuntimeMetadata)) {
+            request.function_size = full->size;
+        }
+        for (auto symbol : symbol_index_.records()) {
+            symbol.function = symbol_has_code(*image, symbol);
+            if (symbol.virtual_address) {
+                if (const auto* note = annotations_.find(*symbol.virtual_address); note && !note->name.empty()) {
+                    symbol.name = note->name;
+                    symbol.source = SymbolSource::DebugSymbol;
+                }
+            }
+            request.symbols.push_back(std::move(symbol));
+        }
+        request.types = debug_types_;
+        decompiled_root_ = root;
+        request.thumb = image->architecture() == peelf::Architecture::ARM && thumb_mode_;
+        request.fallback_graph = build_function_cfg_call_graph(
+            *bytes,
+            extent->virtual_address,
+            image->architecture(),
+            image->endianness(),
+            static_cast<std::size_t>(extent->file_offset),
+            root->name,
+            thumb_mode_,
+            true);
+        const auto chosen_provider = static_cast<DecompilerProvider>(decompiler_provider_);
+        if (chosen_provider != DecompilerProvider::AnnotatedCode &&
+            chosen_provider != DecompilerProvider::StructuredPseudoC) {
+            if (model_.is_live_process()) {
+                const auto span = model_.analysis_image_bytes();
+                request.image_bytes.assign(span.begin(), span.end());
+            } else {
+                auto snapshot = model_.read_effective_bytes(0, model_.bytes().size());
+                if (!snapshot) {
+                    decompiled_ = {DecompileStatus::Failed, "Decompiler", snapshot.error().message, {}};
+                    return;
+                }
+                request.image_bytes = std::move(*snapshot);
+            }
+        }
+    } else if (model_.is_live_process()) {
+        // Anonymous / JIT executable memory region without a backing module header.
+        auto bytes = model_.read_virtual_bytes(selected_va, 4096);
+        if (!bytes || bytes->empty()) {
+            decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Selected live address is not readable", {}};
+            return;
+        }
+        const std::string fn_name = std::format("live_sub_{:X}", selected_va);
+        request.address = selected_va;
+        request.architecture = model_.architecture();
+        request.thumb = request.architecture == peelf::Architecture::ARM && thumb_mode_;
+        const auto recs = symbol_index_.records();
+        request.symbols.assign(recs.begin(), recs.end());
+        request.fallback_graph = build_function_cfg_call_graph(
+            *bytes,
+            selected_va,
+            model_.architecture(),
+            model_.endianness(),
+            0,
+            fn_name,
+            thumb_mode_,
+            true);
+        request.image_bytes = std::move(*bytes);
+        decompiled_root_ = SymbolRecord{
+            .name = fn_name,
+            .virtual_address = selected_va,
+            .file_offset = model_.virtual_address_to_offset(selected_va),
+            .function = true,
+            .library = {},
+        };
+    } else {
+        decompiled_ = {DecompileStatus::NoFunction, "Decompiler", "Select a mapped function first", {}};
+        return;
     }
-    request.types = debug_types_;
-    decompiled_root_ = root; selected_code_ranges_.clear(); selected_code_address_.reset();
-    request.thumb = image->architecture() == peelf::Architecture::ARM && thumb_mode_;
-    request.fallback_graph = build_function_cfg_call_graph(*bytes,extent->virtual_address,image->architecture(),image->endianness(),extent->file_offset,root->name,thumb_mode_,true);
-    if (decompiler_provider_ != 2) {
-        auto snapshot = model_.read_effective_bytes(0,model_.bytes().size());
-        if (!snapshot) { decompiled_ = {DecompileStatus::Failed,"Decompiler",snapshot.error().message}; return; }
-        request.image_bytes = std::move(*snapshot);
-    }
+
     const auto resources = decompiler_directory_ / "resources";
-    DecompilerSettings settings{static_cast<DecompilerProvider>(decompiler_provider_), ghidra_home_, decompiler_java_, decompiler_python_, decompiler_timeout_};
+    DecompilerSettings settings{
+        .provider = static_cast<DecompilerProvider>(decompiler_provider_),
+        .ghidra_home = ghidra_home_,
+        .java = decompiler_java_,
+        .python = decompiler_python_,
+        .retdec = decompiler_retdec_,
+        .timeout_seconds = decompiler_timeout_,
+    };
     decompile_stop_ = {}; const auto token = decompile_stop_.get_token();
     decompile_revision_ = model_.edit_revision(); decompile_generation_ = file_generation_;
     decompiler_thumb_ = thumb_mode_;
     decompile_annotation_revision_ = annotations_.revision(); decompile_symbol_revision_ = symbol_revision_;
-    decompiled_ = {DecompileStatus::Ready,"Decompiler","Analyzing selected function..."};
-    decompile_job_ = std::async(std::launch::async,[request=std::move(request),settings,resources,token]() {
+    decompiled_ = {DecompileStatus::Ready, "Decompiler", "Analyzing selected function...", {}};
+    decompile_job_ = std::async(std::launch::async, [request = std::move(request), settings, resources, token]() {
         BackendRunner runner;
         switch (settings.provider) {
-        case DecompilerProvider::Ghidra: return GhidraDecompiler(settings, resources, runner).decompile(request,token);
-        case DecompilerProvider::BinaryNinja: return BinaryNinjaDecompiler(settings.python,resources/"bn_decompile.py",runner).decompile(request,token);
-        default: return AnnotatedCodeDecompiler{}.decompile(request,token);
+        case DecompilerProvider::Ghidra: {
+            auto unit = GhidraDecompiler(settings, resources, runner).decompile(request, token);
+            if (unit.status == DecompileStatus::Unavailable && settings.ghidra_home.empty()) {
+                auto fallback = StructuredPseudoCDecompiler{}.decompile(request, token);
+                if (fallback.status == DecompileStatus::Ready) {
+                    fallback.diagnostic = "Ghidra is not configured; decompiled with built-in Structured Pseudo-C.";
+                    return fallback;
+                }
+            }
+            return unit;
+        }
+        case DecompilerProvider::BinaryNinja:
+            return BinaryNinjaDecompiler(settings.python, resources / "bn_decompile.py", runner).decompile(request, token);
+        case DecompilerProvider::StructuredPseudoC:
+            return StructuredPseudoCDecompiler{}.decompile(request, token);
+        case DecompilerProvider::RetDec:
+            return RetDecDecompiler(settings.retdec, runner, settings.timeout_seconds).decompile(request, token);
+        default:
+            return AnnotatedCodeDecompiler{}.decompile(request, token);
         }
     });
 }
@@ -86,7 +202,9 @@ void UiApp::render_decompiler() {
     if (!ImGui::Begin("Decompiler",&show_decompiler_)) { ImGui::End(); return; }
     ImGui::BeginDisabled(decompile_job_.valid());
     ImGui::SetNextItemWidth(-1);
-    ImGui::Combo("##provider", &decompiler_provider_, "Ghidra (default)\0Binary Ninja HLIL\0Annotated assembly\0");
+    ImGui::Combo("##provider",
+                 &decompiler_provider_,
+                 "Ghidra\0Binary Ninja HLIL\0Annotated assembly\0Structured Pseudo-C (built-in)\0RetDec CLI\0");
     if (ImGui::CollapsingHeader("Backend settings")) {
         if (decompiler_provider_ == 0) {
             ImGui::TextUnformatted("Ghidra installation folder"); ImGui::SetNextItemWidth(-1);
@@ -97,9 +215,21 @@ void UiApp::render_decompiler() {
         } else if (decompiler_provider_ == 1) {
             ImGui::TextWrapped("Headless API requires Binary Ninja Commercial or above. Personal is not supported by this adapter.");
             ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##python", "Python with Binary Ninja API",decompiler_python_,sizeof(decompiler_python_));
+        } else if (decompiler_provider_ == 4) {
+            ImGui::TextUnformatted("RetDec CLI executable");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##retdec", "retdec-decompiler", decompiler_retdec_, sizeof(decompiler_retdec_));
+            ImGui::InputInt("Timeout (seconds)", &decompiler_timeout_);
         }
         if (ImGui::Button("Save settings")) {
-            const DecompilerSettings settings{static_cast<DecompilerProvider>(decompiler_provider_), ghidra_home_, decompiler_java_, decompiler_python_, decompiler_timeout_};
+            const DecompilerSettings settings{
+                .provider = static_cast<DecompilerProvider>(decompiler_provider_),
+                .ghidra_home = ghidra_home_,
+                .java = decompiler_java_,
+                .python = decompiler_python_,
+                .retdec = decompiler_retdec_,
+                .timeout_seconds = decompiler_timeout_,
+            };
             if (decompiler_timeout_ < 10 || decompiler_timeout_ > 3600) decompiler_settings_status_ = "Timeout must be 10 to 3600 seconds.";
             else {
                 const auto result = save_decompiler_settings(decompiler_directory_/"decompiler.ini", settings);
@@ -114,7 +244,12 @@ void UiApp::render_decompiler() {
     ImGui::EndDisabled();
     if (decompile_job_.valid()) { ImGui::SameLine(); if (ImGui::Button("Cancel")) decompile_stop_.request_stop(); }
     ImGui::TextWrapped("%s",decompiled_.provider.c_str()); ImGui::TextWrapped("%s",decompiled_.diagnostic.c_str());
-    if (!decompile_job_.valid() && decompiled_.status != DecompileStatus::Ready && decompiler_provider_ != 2 && ImGui::Button("Show annotated code instead")) { decompiler_provider_=2; request_decompile(); }
+    if (!decompile_job_.valid() && decompiled_.status != DecompileStatus::Ready && decompiler_provider_ != 3) {
+        if (ImGui::Button("Decompile with Structured Pseudo-C")) {
+            decompiler_provider_ = 3;
+            request_decompile();
+        }
+    }
     const bool stale = decompile_revision_ != model_.edit_revision() || decompiler_thumb_ != thumb_mode_ ||
         decompile_annotation_revision_ != annotations_.revision() || decompile_symbol_revision_ != symbol_revision_;
     if (stale) ImGui::TextWrapped("Bytes or symbols changed. Analyze again to refresh this snapshot.");
@@ -145,32 +280,33 @@ void UiApp::render_decompiler() {
     if (navigate) select_decompiled_line(*navigate);
 }
 void UiApp::select_decompiled_line(std::size_t index) {
-    const auto& line=decompiled_.lines.at(index);
-    if (!line.address || !model_.image()) return;
-    current_selection_.graph_root=decompiled_root_;
-    navigate_to_address(*line.address,PreferredView::Graph);
+    const auto& line = decompiled_.lines.at(index);
+    if (!line.address || !model_.has_file()) return;
+    current_selection_.graph_root = decompiled_root_;
+    navigate_to_address(*line.address, model_.image() != nullptr ? PreferredView::Graph : PreferredView::Disassembly);
     if (current_selection_.virtual_address != line.address) return;
-    current_selection_.graph_root=decompiled_root_;
-    selected_code_ranges_=line.ranges;
+    current_selection_.graph_root = decompiled_root_;
+    selected_code_ranges_ = line.ranges;
     if (selected_code_ranges_.empty()) {
-        auto instruction=std::ranges::find(current_instructions_,*line.address,&Instruction::address);
-        selected_code_ranges_.push_back({*line.address,instruction==current_instructions_.end() ? 1 : instruction->bytes.size()});
+        auto instruction = std::ranges::find(current_instructions_, *line.address, &Instruction::address);
+        selected_code_ranges_.push_back({*line.address, instruction == current_instructions_.end() ? 1 : instruction->bytes.size()});
     }
     std::vector<ByteRange> bytes;
+    const std::uint64_t total_view = model_.view_size();
     for (const auto& range : selected_code_ranges_) {
-        const auto offset=model_.image()->virtual_address_to_file_offset(range.address);
-        if (!offset || !range.size || *offset>=model_.bytes().size() || range.size>model_.bytes().size()-*offset) continue;
-        const auto last=model_.image()->virtual_address_to_file_offset(range.address+range.size-1);
-        if (!last || *last!=*offset+range.size-1) continue;
-        bytes.push_back({static_cast<std::size_t>(*offset),static_cast<std::size_t>(range.size)});
+        const auto offset = model_.virtual_address_to_offset(range.address);
+        if (!offset || !range.size || *offset >= total_view || range.size > total_view - *offset) continue;
+        const auto last = model_.virtual_address_to_offset(range.address + range.size - 1);
+        if (!last || *last != *offset + range.size - 1) continue;
+        bytes.push_back({static_cast<std::size_t>(*offset), static_cast<std::size_t>(range.size)});
     }
     if (!bytes.empty()) {
         hex_panel_.navigate_to_ranges(bytes); hex_panel_.set_visible(true);
-        current_selection_.size=bytes.front().size; last_navigation_selection_=current_selection_;
+        current_selection_.size = bytes.front().size; last_navigation_selection_ = current_selection_;
     }
-    selected_code_address_=line.address;
-    if (decompiled_root_ && (!active_graph_root_ || active_graph_root_->virtual_address!=decompiled_root_->virtual_address)) {
-        pending_call_graph_root_=decompiled_root_; pending_call_graph_delay_frames_=0;
+    selected_code_address_ = line.address;
+    if (decompiled_root_ && (!active_graph_root_ || active_graph_root_->virtual_address != decompiled_root_->virtual_address)) {
+        pending_call_graph_root_ = decompiled_root_; pending_call_graph_delay_frames_ = 0;
     }
 }
 void UiApp::render_data_types() {

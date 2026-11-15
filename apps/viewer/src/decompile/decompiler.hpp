@@ -62,12 +62,19 @@ private:
 [[nodiscard]] std::optional<SymbolRecord> containing_function(const peelf::IBinaryImage&, const SymbolIndex&,
     std::uint64_t address, const std::optional<SymbolRecord>& fallback = {});
 [[nodiscard]] std::string encode_decompiler_symbols(const DecompileRequest&);
-enum class DecompilerProvider { Ghidra, BinaryNinja, AnnotatedCode };
+enum class DecompilerProvider {
+    Ghidra = 0,
+    BinaryNinja = 1,
+    AnnotatedCode = 2,
+    StructuredPseudoC = 3,
+    RetDec = 4,
+};
 struct DecompilerSettings {
     DecompilerProvider provider = DecompilerProvider::Ghidra;
     std::filesystem::path ghidra_home;
     std::filesystem::path java = "java";
     std::filesystem::path python = "python";
+    std::filesystem::path retdec = "retdec-decompiler";
     int timeout_seconds = 180;
 };
 [[nodiscard]] DecompilerSettings discover_decompilers(const std::filesystem::path& executable_directory);

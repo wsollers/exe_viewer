@@ -128,7 +128,8 @@ void ShellcodeScratchPanel::draw_contents() {
             rebuild_output();
         }
         ImGui::SameLine();
-        if (ImGui::Button(model_.is_live_process() ? "Stage" : "Apply")) {
+        ImGui::BeginDisabled(model_.is_live_process());
+        if (ImGui::Button("Apply")) {
             apply_to_selection();
         }
         ImGui::SameLine();
@@ -147,22 +148,7 @@ void ShellcodeScratchPanel::draw_contents() {
                 on_patch_changed_();
             }
         }
-        if (model_.is_live_process()) {
-            ImGui::SameLine();
-            const bool has_staged = !model_.staged_live_patches().empty();
-            ImGui::BeginDisabled(!has_staged);
-            if (ImGui::Button("Commit to RAM")) {
-                auto committed = model_.commit_patches_to_process(
-                    peelf::MemoryWriteOptions{.allow_protection_override = override_protection_});
-                diagnostic_ = committed
-                    ? std::format("Committed {} patch range(s) to live process RAM.", *committed)
-                    : std::format("Commit failed: {}", committed.error().message);
-                if (committed && on_patch_changed_) {
-                    on_patch_changed_();
-                }
-            }
-            ImGui::EndDisabled();
-        }
+        ImGui::EndDisabled();
         ImGui::SameLine();
         if (ImGui::Button("Clear")) {
             input_buf_[0] = '\0';
@@ -172,9 +158,7 @@ void ShellcodeScratchPanel::draw_contents() {
         ImGui::TextDisabled("%s", assembly_mode_ ? "Assembly -> hex" : "Hex/shellcode -> hex");
         ImGui::SameLine();
         if (model_.is_live_process()) {
-            ImGui::TextDisabled("Staged: %zu | Committed: %zu",
-                                model_.staged_live_patches().size(),
-                                model_.committed_live_patches().size());
+            ImGui::TextDisabled("Live mode is read-only (scratch pad only)");
         } else {
             ImGui::TextDisabled("Dirty ranges: %zu", model_.changed_intervals().size());
         }

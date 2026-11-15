@@ -54,11 +54,20 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_exports.cpp
         src/ui/ui_panels_imports.cpp
         src/ui/ui_panels_symbols.cpp
+        src/ui/ui_panels_functions.cpp
+        src/ui/ui_panels_threads.cpp
+        src/ui/ui_panels_search.cpp
+        src/ui/ui_panels_runtime.cpp
+        src/ui/ui_panels_handlers.cpp
         src/ui/ui_panels_references.cpp
+        src/analysis/function_index.hpp
+        src/analysis/function_index.cpp
         src/analysis/reference_index.cpp
         src/analysis/patch_preview.cpp
         src/analysis/project.cpp
         src/decompile/decompiler.cpp
+        src/decompile/structured_decompiler.hpp
+        src/decompile/structured_decompiler.cpp
         src/decompile/ghidra_decompiler.cpp
         src/decompile/decompiler_symbols.cpp
         src/ui/ui_decompile.cpp

@@ -47,10 +47,12 @@ namespace {
 
 [[nodiscard]] std::string format_size_short(std::uint64_t bytes) {
     std::array<char, 32> buf{};
-    if (bytes >= 1024ull * 1024ull && (bytes % (1024ull * 1024ull)) == 0) {
-        std::snprintf(buf.data(), buf.size(), "%" PRIu64 " MiB", bytes / (1024ull * 1024ull));
-    } else if (bytes >= 1024ull && (bytes % 1024ull) == 0) {
-        std::snprintf(buf.data(), buf.size(), "%" PRIu64 " KiB", bytes / 1024ull);
+    constexpr std::uint64_t kKiB = 1024u;
+    constexpr std::uint64_t kMiB = 1024u * 1024u;
+    if (bytes >= kMiB && (bytes % kMiB) == 0) {
+        std::snprintf(buf.data(), buf.size(), "%" PRIu64 " MiB", bytes / kMiB);
+    } else if (bytes >= kKiB && (bytes % kKiB) == 0) {
+        std::snprintf(buf.data(), buf.size(), "%" PRIu64 " KiB", bytes / kKiB);
     } else {
         std::snprintf(buf.data(), buf.size(), "0x%" PRIX64, bytes);
     }
@@ -71,7 +73,7 @@ void MemoryMapPanel::draw_contents() {
     if (!model_.is_live_process()) {
         ImGui::TextDisabled("Not attached to a running process.");
         ImGui::Spacing();
-        ImGui::TextWrapped("Attach to a running process to explore its virtual memory map, inspect mapped PE/ELF modules with live ASLR symbols, and stage/commit patches in RAM.");
+        ImGui::TextWrapped("Attach to a running process (strictly read-only) to explore its virtual memory map, resolve executable paths and symbols, disassemble & decompile live code regions, pause threads, inspect highlighted stack frames & TLS, search heaps, and examine PEB/TEB/auxv & handlers.");
         ImGui::Spacing();
         if (on_attach_requested_ && ImGui::Button("Attach to Process...")) {
             on_attach_requested_();
@@ -85,15 +87,23 @@ void MemoryMapPanel::draw_contents() {
 
     if (sess != nullptr) {
         const bool alive = sess->is_alive();
-        ImGui::TextColored(alive ? ImVec4(0.35f, 0.90f, 0.55f, 1.0f)
-                                 : ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
-                           "%s PID %llu: %s (%s)",
-                           alive ? "[LIVE]" : "[EXITED]",
+        const bool paused = model_.is_process_suspended();
+        ImGui::TextColored(!alive ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
+                                  : (paused ? ImVec4(1.0f, 0.78f, 0.25f, 1.0f)
+                                            : ImVec4(0.35f, 0.90f, 0.55f, 1.0f)),
+                           "%s PID %llu: %s (%s, Read-Only)",
+                           !alive ? "[EXITED]" : (paused ? "[PAUSED]" : "[LIVE]"),
                            static_cast<unsigned long long>(sess->pid()),
                            sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
                            std::string(peelf::to_string(sess->info().architecture)).c_str());
     }
 
+    if (ImGui::SmallButton(model_.is_process_suspended() ? "Resume" : "Pause")) {
+        if (on_pause_toggle_) {
+            on_pause_toggle_();
+        }
+    }
+    ImGui::SameLine();
     if (ImGui::SmallButton("Refresh")) {
         if (on_refresh_requested_) {
             on_refresh_requested_();

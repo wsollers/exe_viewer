@@ -142,33 +142,10 @@ public:
     }
 
     [[nodiscard]] peelf::Result<std::size_t> write_memory(
-        std::uint64_t address,
-        std::span<const std::uint8_t> data,
-        peelf::MemoryWriteOptions options) override {
-        if (!alive_) {
-            return peelf::make_error("target process exited");
-        }
-        if (data.empty()) {
-            return std::size_t{0};
-        }
-        for (BackingSpan& span : spans_) {
-            if (!span.region.contains(address)) {
-                continue;
-            }
-            if (span.region.protection.guarded || span.data.empty()) {
-                return peelf::make_error("cannot write guarded or unbacked region");
-            }
-            if (!span.region.protection.writable && !options.allow_protection_override) {
-                return peelf::make_error("target region is read-only and protection override is disabled");
-            }
-            const auto rel = static_cast<std::size_t>(address - span.region.start_address);
-            if (rel + data.size() > span.data.size()) {
-                return peelf::make_error("write crosses region boundary");
-            }
-            std::memcpy(span.data.data() + rel, data.data(), data.size());
-            return data.size();
-        }
-        return peelf::make_error("unmapped virtual address");
+        std::uint64_t /*address*/,
+        std::span<const std::uint8_t> /*data*/,
+        peelf::MemoryWriteOptions /*options*/) override {
+        return peelf::make_error("live process session is strictly read-only");
     }
 
     void set_alive(bool alive) noexcept { alive_ = alive; }
@@ -547,7 +524,7 @@ TEST(LiveMemoryTolerantRead, HandlesGuardPagesAndUnmappedHolesGracefully) {
     }
 }
 
-TEST(BinaryModelLiveProcess, StagesSparsePatchesCommitsWithRollbackAndRevertsInRam) {
+TEST(BinaryModelLiveProcess, EnforcesReadOnlyPolicyResolvesCommandLineAndPopulatesStaticMetadata) {
     const std::filesystem::path elf_path = fixture_path("hello.elf");
     const std::vector<std::uint8_t> elf_bytes = read_binary_file(elf_path);
     auto static_img = peelf::parse_image(elf_bytes);
@@ -556,28 +533,23 @@ TEST(BinaryModelLiveProcess, StagesSparsePatchesCommitsWithRollbackAndRevertsInR
     constexpr std::uint64_t kLiveBase = 0x0000555555554000ull;
     constexpr std::uint64_t kHeapBase = 0x00007FFF10000000ull;  // >46 TiB away from kLiveBase!
 
+    // Deliberately leave `executable_path` empty so `attach_process` must resolve it from `command_line`!
     peelf::ProcessInfo pinfo{
         .pid = 5150,
         .name = "hello.elf",
-        .executable_path = elf_path,
+        .executable_path = {},
+        .command_line = "\"" + elf_path.string() + "\" --inspect --port 8080",
         .architecture = peelf::Architecture::X86_64,
         .is_64bit = true,
-        .access = peelf::ProcessAccessStatus::Accessible,
+        .access = peelf::ProcessAccessStatus::ReadOnly,
     };
 
     FakeProcessSession* raw_session = nullptr;
     auto backend = std::make_shared<FakeProcessBackend>();
     backend->register_process(pinfo, [&]() {
         auto sess = std::make_unique<FakeProcessSession>(pinfo);
-        map_elf_segments_into_fake_process(*sess, **static_img, elf_bytes, kLiveBase, elf_path.string());
-
-        peelf::MemoryRegion low_rw_reg{
-            .start_address = 0x10000ull,
-            .end_address = 0x11000ull,
-            .protection = {.readable = true, .writable = true},
-            .kind = peelf::MemoryRegionKind::Anonymous,
-        };
-        sess->add_mapped_span(low_rw_reg, std::vector<std::uint8_t>(0x1000, 0x33));
+        // Map ELF segments WITHOUT pathname on regions so backing path MUST come from command_line!
+        map_elf_segments_into_fake_process(*sess, **static_img, elf_bytes, kLiveBase, "");
 
         peelf::MemoryRegion heap_reg{
             .start_address = kHeapBase,
@@ -601,10 +573,12 @@ TEST(BinaryModelLiveProcess, StagesSparsePatchesCommitsWithRollbackAndRevertsInR
 
     ASSERT_TRUE(model.attach_process(5150).has_value());
     ASSERT_TRUE(model.is_live_process());
+    EXPECT_TRUE(model.is_read_only());
     ASSERT_NE(raw_session, nullptr);
     ASSERT_NE(model.image(), nullptr);
     EXPECT_EQ(model.view_base_address(), kLiveBase);
 
+    // Command-line path resolution hydrated non-SHF_ALLOC `.symtab` (`main`) AND FunctionIndex!
     const viewer::SymbolRecord* main_sym = model.symbol_index().find_by_name("main");
     ASSERT_NE(main_sym, nullptr);
     ASSERT_TRUE(main_sym->virtual_address.has_value());
@@ -612,87 +586,24 @@ TEST(BinaryModelLiveProcess, StagesSparsePatchesCommitsWithRollbackAndRevertsInR
     const std::vector<std::uint8_t> orig_main_bytes = raw_session->raw_ram_slice(main_va, 4);
     ASSERT_EQ(orig_main_bytes.size(), 4u);
 
-    // Stage 1st patch in heap (writable) and 2nd patch in main (.text, RX read-only).
-    // Heap VA (0x7FFF10000010) is > kLiveBase, so commit order visits main_va (RX) or heap_va (RW)
-    // depending on address order; let's also add a low RW page below kLiveBase so RW writes FIRST
-    // and RX fails SECOND when protection override is disabled â€” testing transactional rollback!
-    const std::vector<std::uint8_t> patch_low_rw{0x12, 0x34};
-    const std::vector<std::uint8_t> patch_main{0x90, 0x90, 0x90, 0xC3};
-    const std::vector<std::uint8_t> patch_heap{0xDE, 0xAD, 0xBE, 0xEF};
+    EXPECT_FALSE(model.function_index().entries().empty());
+    EXPECT_NE(model.function_index().find_containing(main_va), nullptr);
+    EXPECT_FALSE(model.header_flags().flags.empty());
+    EXPECT_GT(model.analysis_image_size(), 0u);
 
-    const auto before_stage_revision = model.edit_revision();
-    ASSERT_TRUE(model.stage_patch_at_va(0x10008ull, patch_low_rw, "stage low rw").has_value());
-    ASSERT_TRUE(model.stage_patch_at_va(kHeapBase + 0x10, patch_heap, "stage heap").has_value());
-    ASSERT_TRUE(model.stage_patch_at_va(main_va, patch_main, "stage main rx").has_value());
+    // Live virtual read returns exact code bytes at `main_va`.
+    auto main_read = model.read_virtual_bytes(main_va, 4);
+    ASSERT_TRUE(main_read.has_value()) << main_read.error().message;
+    EXPECT_EQ(*main_read, orig_main_bytes);
 
-    EXPECT_GT(model.edit_revision(), before_stage_revision);
-    EXPECT_EQ(model.staged_live_patches().size(), 3u);
-    EXPECT_TRUE(model.committed_live_patches().empty());
-    // Active window is `hello.elf`, so window-relative `changed_intervals()` exposes the 1 in-module patch.
-    EXPECT_EQ(model.changed_intervals().size(), 1u);
-
-    // Stage-first guarantee: live process RAM is STILL untouched before explicit Commit!
-    EXPECT_EQ(raw_session->raw_ram_slice(0x10008ull, 2), (std::vector<std::uint8_t>{0x33, 0x33}));
+    // Strictly read-only enforcement: every mutation / patch / commit / revert API must refuse writes!
+    EXPECT_FALSE(model.apply_patch_bytes(0, std::vector<std::uint8_t>{0x90}, "blocked byte edit").has_value());
+    EXPECT_FALSE(model.apply_patch_bytes(0, std::vector<std::uint8_t>{0x90, 0xC3}, "blocked range edit").has_value());
+    EXPECT_FALSE(model.stage_patch_at_va(main_va, std::vector<std::uint8_t>{0x90, 0x90}, "blocked va stage").has_value());
+    EXPECT_FALSE(model.commit_patches_to_process().has_value());
+    EXPECT_FALSE(model.revert_committed_patches().has_value());
+    EXPECT_TRUE(model.changed_intervals().empty());
     EXPECT_EQ(raw_session->raw_ram_slice(main_va, 4), orig_main_bytes);
-    EXPECT_EQ(raw_session->raw_ram_slice(kHeapBase + 0x10, 4),
-              (std::vector<std::uint8_t>{0x5A, 0x5A, 0x5A, 0x5A}));
-
-    // Overlay guarantee: BinaryModel effective reads immediately see staged bytes!
-    const auto main_off = model.virtual_address_to_offset(main_va);
-    ASSERT_TRUE(main_off.has_value());
-    EXPECT_EQ(model.byte_patch_state_at_offset(*main_off), viewer::BytePatchState::Staged);
-    auto eff_main = model.read_effective_bytes(*main_off, 4);
-    ASSERT_TRUE(eff_main.has_value());
-    EXPECT_EQ(*eff_main, patch_main);
-
-    // Undo / Redo of staged patch before committing to RAM.
-    const auto before_undo_revision = model.edit_revision();
-    ASSERT_TRUE(model.undo_patch().has_value());
-    EXPECT_GT(model.edit_revision(), before_undo_revision);
-    EXPECT_EQ(*model.read_effective_bytes(*main_off, 4), orig_main_bytes);
-    const auto before_redo_revision = model.edit_revision();
-    ASSERT_TRUE(model.redo_patch().has_value());
-    EXPECT_GT(model.edit_revision(), before_redo_revision);
-    EXPECT_EQ(*model.read_effective_bytes(*main_off, 4), patch_main);
-
-    // Commit WITHOUT protection override writes 0x10008 (RW) first, then fails on `main_va` (RX),
-    // rolling 0x10008 back to {0x33, 0x33} and keeping all 3 staged patches intact!
-    auto failed_commit =
-        model.commit_patches_to_process(peelf::MemoryWriteOptions{.allow_protection_override = false});
-    EXPECT_FALSE(failed_commit.has_value());
-    EXPECT_EQ(model.staged_live_patches().size(), 3u);
-    EXPECT_EQ(raw_session->raw_ram_slice(0x10008ull, 2), (std::vector<std::uint8_t>{0x33, 0x33}));
-    EXPECT_EQ(raw_session->raw_ram_slice(main_va, 4), orig_main_bytes);
-    EXPECT_EQ(raw_session->raw_ram_slice(kHeapBase + 0x10, 4),
-              (std::vector<std::uint8_t>{0x5A, 0x5A, 0x5A, 0x5A}));
-
-    // Explicit Commit WITH protection override writes all 3 patches to live RAM!
-    auto committed =
-        model.commit_patches_to_process(peelf::MemoryWriteOptions{.allow_protection_override = true});
-    ASSERT_TRUE(committed.has_value()) << committed.error().message;
-    EXPECT_EQ(*committed, 10u);
-    EXPECT_TRUE(model.staged_live_patches().empty());
-    EXPECT_EQ(model.committed_live_patches().size(), 3u);
-    EXPECT_EQ(model.byte_patch_state_at_offset(*main_off), viewer::BytePatchState::Committed);
-
-    EXPECT_EQ(raw_session->raw_ram_slice(0x10008ull, 2), patch_low_rw);
-    EXPECT_EQ(raw_session->raw_ram_slice(main_va, 4), patch_main);
-    EXPECT_EQ(raw_session->raw_ram_slice(kHeapBase + 0x10, 4), patch_heap);
-
-    // Per-interval revert restores `main_va` in RAM while keeping RW patches committed!
-    ASSERT_TRUE(model.revert_committed_patch_at(main_va, 4).has_value());
-    EXPECT_EQ(raw_session->raw_ram_slice(main_va, 4), orig_main_bytes);
-    EXPECT_EQ(raw_session->raw_ram_slice(kHeapBase + 0x10, 4), patch_heap);
-    EXPECT_EQ(model.committed_live_patches().size(), 2u);
-
-    // Full revert restores remaining committed patches back to original RAM!
-    auto reverted = model.revert_committed_patches();
-    ASSERT_TRUE(reverted.has_value()) << reverted.error().message;
-    EXPECT_EQ(*reverted, 6u);
-    EXPECT_TRUE(model.committed_live_patches().empty());
-    EXPECT_EQ(raw_session->raw_ram_slice(0x10008ull, 2), (std::vector<std::uint8_t>{0x33, 0x33}));
-    EXPECT_EQ(raw_session->raw_ram_slice(kHeapBase + 0x10, 4),
-              (std::vector<std::uint8_t>{0x5A, 0x5A, 0x5A, 0x5A}));
 
     // Navigate directly to the heap region via VA and build Structure tree.
     const auto heap_off = model.navigate_to_virtual_address(kHeapBase + 0x20);

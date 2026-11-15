@@ -2,23 +2,34 @@ add_library(peelf_core
   src/pe/pe_parser.cpp
   src/elf/elf_parser.cpp
   src/file_reader.cpp
+  src/endian_reader.cpp
   src/binary_image.cpp
   src/patching.cpp
   src/process_common.cpp
   src/process_linux.cpp
   src/process_win32.cpp
+  src/stack_tls.cpp
+  src/memory_search.cpp
+  src/runtime_structures.cpp
+  src/handlers.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
   include/peelf/error.hpp
+  include/peelf/forgiving.hpp
+  include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
   include/peelf/patching.hpp
   include/peelf/process.hpp
+  include/peelf/stack_tls.hpp
+  include/peelf/memory_search.hpp
+  include/peelf/runtime_structures.hpp
+  include/peelf/handlers.hpp
   include/mapping/file_mapping.hpp
   src/mapping/map_errors.cpp
   src/mapping/file_mapping_posix.cpp
   src/mapping/file_mapping_win32.cpp
-        include/pe/pe_parser.h
+  include/pe/pe_parser.h
 )
 
 add_library(peelf::core ALIAS peelf_core)

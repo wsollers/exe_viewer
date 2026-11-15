@@ -73,6 +73,9 @@ namespace viewer {
         // Hex view, Symbols, MemMap, and Structure navigation). Format-agnostic.
         void disassemble_at_offset(std::uint64_t file_offset);
         void disassemble_at_offset(std::uint64_t file_offset, std::uint64_t display_address);
+        void disassemble_at_offset(std::uint64_t file_offset,
+                                   std::uint64_t display_address,
+                                   std::size_t max_window_bytes);
         void refresh_disassembly();
 
 
@@ -100,6 +103,7 @@ namespace viewer {
         std::optional<std::uint64_t> selected_code_address_;
         std::uint64_t decompile_annotation_revision_ = 0, symbol_revision_ = 0, decompile_symbol_revision_ = 0;
         char decompiler_python_[1024] = "python";
+        char decompiler_retdec_[1024] = "retdec-decompiler";
         DecompiledUnit decompiled_;
         std::future<DecompiledUnit> decompile_job_;
         std::stop_source decompile_stop_;
@@ -138,6 +142,12 @@ namespace viewer {
         ImportsPanel    imports_panel_;
         ExportsPanel    exports_panel_;
         SymbolsPanel    symbols_panel_;
+        FunctionsPanel  functions_panel_;
+        ThreadsAndStackPanel threads_panel_;
+        ThreadLocalsPanel thread_locals_panel_;
+        MemorySearchPanel memory_search_panel_;
+        RuntimeAndFlagsPanel runtime_flags_panel_;
+        HandlersPanel   handlers_panel_;
         ReferencesPanel references_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
@@ -167,9 +177,10 @@ namespace viewer {
         std::optional<peelf::ProcessId> selected_attach_pid_;
         std::string attach_error_message_;
 
-        // Current disassembly cursor for live refresh after staging/committing patches
+        // Current disassembly cursor for live refresh
         std::optional<std::uint64_t> last_disasm_offset_;
         std::uint64_t last_disasm_address_ = 0;
+        std::size_t last_disasm_window_ = 4096;
         std::string disasm_status_;
 
         CallGraphSample call_graph_sample_ = CallGraphSample::LoadedImage;

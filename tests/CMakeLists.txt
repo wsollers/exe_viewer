@@ -59,13 +59,17 @@ add_executable(peelf_tests
   binary_model_patch_test.cpp
   process_memmap_test.cpp
   live_process_self_test.cpp
+  multiarch_subsystems_test.cpp
+  live_child_inspection_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/reference_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/patch_preview.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/project.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/structured_decompiler.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/ghidra_decompiler.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
@@ -75,6 +79,7 @@ add_executable(peelf_tests
 )
 
 target_compile_features(peelf_tests PRIVATE cxx_std_23)
+peelf_apply_project_warnings(peelf_tests)
 
 target_link_libraries(peelf_tests PRIVATE
   peelf::core

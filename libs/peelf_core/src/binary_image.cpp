@@ -307,6 +307,9 @@ private:
 
 class PeImage final : public ImageBase {
 public:
+    [[nodiscard]] const PeHeader* pe_header() const noexcept override {
+        return &pe_header_;
+    }
     [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
         return base_relocations_;
     }
@@ -341,6 +344,7 @@ public:
     void rebase_to_live_base(std::uint64_t live_base);
 
 private:
+    PeHeader pe_header_;
     std::vector<PeBaseRelocationBlock> base_relocations_;
     std::vector<PeDebugDirectory> debug_directories_;
     std::optional<PeTlsDirectory> tls_directory_;
@@ -967,6 +971,11 @@ void parse_pe_load_config_directory(std::span<const std::uint8_t> b,
         load_config.guard_cf_function_table = rd64(b, off + 0x80, false);
         load_config.guard_cf_function_count = rd64(b, off + 0x88, false);
         load_config.guard_flags = rd32(b, off + 0x90, false);
+        if (load_config.size >= 0x118u &&
+            fits_range(*directory_off, 0x118u, static_cast<std::uint64_t>(b.size()))) {
+            load_config.guard_eh_continuation_table = rd64(b, off + 0x108, false);
+            load_config.guard_eh_continuation_count = rd64(b, off + 0x110, false);
+        }
     } else {
         load_config.decommit_free_block_threshold = rd32(b, off + 0x18, false);
         load_config.decommit_total_free_threshold = rd32(b, off + 0x1C, false);
@@ -986,6 +995,11 @@ void parse_pe_load_config_directory(std::span<const std::uint8_t> b,
         load_config.guard_cf_function_table = rd32(b, off + 0x50, false);
         load_config.guard_cf_function_count = rd32(b, off + 0x54, false);
         load_config.guard_flags = rd32(b, off + 0x58, false);
+        if (load_config.size >= 0xACu &&
+            fits_range(*directory_off, 0xACu, static_cast<std::uint64_t>(b.size()))) {
+            load_config.guard_eh_continuation_table = rd32(b, off + 0xA4, false);
+            load_config.guard_eh_continuation_count = rd32(b, off + 0xA8, false);
+        }
     }
 
     load_config_out = load_config;
@@ -1442,6 +1456,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         sec.virtual_size    = sh.size;
         sec.file_offset     = sh.offset;
         sec.file_size       = (sh.type == 8) ? 0 : sh.size;  // SHT_NOBITS has no file data
+        sec.raw_flags       = sh.flags;
         sec.readable   = (sh.flags & 0x2) != 0;  // SHF_ALLOC
         sec.writable   = (sh.flags & 0x1) != 0;  // SHF_WRITE
         sec.executable = (sh.flags & 0x4) != 0;  // SHF_EXECINSTR
@@ -1916,6 +1931,30 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
 
     // Sections (P2-1): the section table follows the optional header.
     const std::uint16_t num_sections = rd16(b, coff + 2, false);
+    const std::uint32_t time_date_stamp = rd32(b, coff + 4, false);
+    img->pe_header_ = PeHeader{
+        .machine = machine,
+        .number_of_sections = num_sections,
+        .time_date_stamp = time_date_stamp,
+        .symbol_table_offset = symbol_table_offset,
+        .number_of_symbols = symbol_count,
+        .optional_header_size = size_of_opt,
+        .characteristics = characteristics,
+        .optional_magic = magic,
+        .size_of_image = size_of_opt >= 0x3C ? rd32(b, opt + 0x38, false) : 0u,
+        .size_of_headers = size_of_opt >= 0x40 ? rd32(b, opt + 0x3C, false) : 0u,
+        .checksum = size_of_opt >= 0x44 ? rd32(b, opt + 0x40, false) : 0u,
+        .subsystem = size_of_opt >= 0x46 ? rd16(b, opt + 0x44, false) : std::uint16_t{0},
+        .dll_characteristics = size_of_opt >= 0x48 ? rd16(b, opt + 0x46, false) : std::uint16_t{0},
+        .stack_reserve = is64 ? (size_of_opt >= 0x50 ? rd64(b, opt + 0x48, false) : 0ull)
+                              : (size_of_opt >= 0x4C ? static_cast<std::uint64_t>(rd32(b, opt + 0x48, false)) : 0ull),
+        .stack_commit = is64 ? (size_of_opt >= 0x58 ? rd64(b, opt + 0x50, false) : 0ull)
+                             : (size_of_opt >= 0x50 ? static_cast<std::uint64_t>(rd32(b, opt + 0x4C, false)) : 0ull),
+        .heap_reserve = is64 ? (size_of_opt >= 0x60 ? rd64(b, opt + 0x58, false) : 0ull)
+                             : (size_of_opt >= 0x54 ? static_cast<std::uint64_t>(rd32(b, opt + 0x50, false)) : 0ull),
+        .heap_commit = is64 ? (size_of_opt >= 0x68 ? rd64(b, opt + 0x60, false) : 0ull)
+                            : (size_of_opt >= 0x58 ? static_cast<std::uint64_t>(rd32(b, opt + 0x54, false)) : 0ull),
+    };
     const std::size_t   sect_table   = opt + size_of_opt;
     constexpr std::size_t kSectHdr = 0x28;  // 40-byte section header
     img->sections_.reserve(num_sections);
@@ -1942,6 +1981,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         sec.virtual_size    = vsize;
         sec.file_offset     = rawptr;
         sec.file_size       = rawsize;
+        sec.raw_flags       = chars;
         if (sec.name.starts_with('/')) {
             std::uint32_t name_offset = 0;
             const auto parsed = std::from_chars(sec.name.data() + 1, sec.name.data() + sec.name.size(), name_offset);
@@ -2727,6 +2767,7 @@ void PeImage::rebase_to_live_base(std::uint64_t live_base) {
         rebase_opt_va(load_config_directory_->guard_cf_check_function_pointer);
         rebase_opt_va(load_config_directory_->guard_cf_dispatch_function_pointer);
         rebase_opt_va(load_config_directory_->guard_cf_function_table);
+        rebase_opt_va(load_config_directory_->guard_eh_continuation_table);
     }
 
     for (PeRuntimeFunction& rf : runtime_functions_) {

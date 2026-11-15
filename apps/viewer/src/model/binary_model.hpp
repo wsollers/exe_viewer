@@ -9,12 +9,19 @@
 #include <string>
 #include <vector>
 
+#include "analysis/function_index.hpp"
 #include "pe_model.hpp"
 #include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_image.hpp>
+#include <peelf/endian_reader.hpp>
+#include <peelf/forgiving.hpp>
+#include <peelf/handlers.hpp>
+#include <peelf/memory_search.hpp>
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
+#include <peelf/runtime_structures.hpp>
+#include <peelf/stack_tls.hpp>
 
 namespace viewer {
 
@@ -86,14 +93,18 @@ namespace viewer {
         [[nodiscard]] bool is_live_process() const noexcept {
             return source_kind_ == BinarySourceKind::LiveProcess && session_ != nullptr;
         }
+        [[nodiscard]] bool is_read_only() const noexcept { return is_live_process(); }
         [[nodiscard]] BinarySourceKind source_kind() const noexcept { return source_kind_; }
         [[nodiscard]] LiveViewTargetKind live_target_kind() const noexcept { return live_target_kind_; }
         [[nodiscard]] BinaryFormat format() const { return format_; }
         [[nodiscard]] peelf::Architecture architecture() const noexcept { return architecture_; }
         [[nodiscard]] peelf::Endianness endianness() const noexcept { return endianness_; }
+        [[nodiscard]] peelf::TargetLayout target_layout() const noexcept;
 
         [[nodiscard]] const FileInfo& file_info() const { return file_info_; }
         [[nodiscard]] const std::vector<std::uint8_t>& bytes() const { return bytes_; }
+        [[nodiscard]] std::span<const std::uint8_t> analysis_image_bytes() const noexcept;
+        [[nodiscard]] std::uint64_t analysis_image_size() const noexcept;
         [[nodiscard]] const std::vector<SectionInfo>& sections() const { return sections_; }
         [[nodiscard]] const std::string& last_diagnostic() const noexcept { return last_diagnostic_; }
 
@@ -103,11 +114,14 @@ namespace viewer {
         // file or live module parses.
         [[nodiscard]] const peelf::IBinaryImage* image() const { return image_.get(); }
         [[nodiscard]] const peelf::PagedBinaryImage* editable_image() const {
-            return editable_image_ ? &*editable_image_ : nullptr;
+            return (!is_live_process() && editable_image_) ? &*editable_image_ : nullptr;
         }
 
         // Live process state accessors.
         [[nodiscard]] const peelf::IProcessSession* process_session() const noexcept { return session_.get(); }
+        [[nodiscard]] const std::optional<std::filesystem::path>& resolved_executable_path() const noexcept {
+            return resolved_exe_path_;
+        }
         [[nodiscard]] const std::vector<peelf::MemoryRegion>& memory_regions() const noexcept { return regions_; }
         [[nodiscard]] const std::vector<peelf::ModuleInfo>& process_modules() const noexcept { return modules_; }
         [[nodiscard]] std::optional<std::size_t> active_module_index() const noexcept { return active_module_index_; }
@@ -115,9 +129,49 @@ namespace viewer {
         [[nodiscard]] const peelf::ModuleInfo* active_module() const noexcept;
         [[nodiscard]] const peelf::MemoryRegion* active_region() const noexcept;
 
-        // Unified symbol index (PE/ELF symbols, imports, exports, and rebased PDB debug symbols).
+        // Unified symbol & function indices (PE/ELF symbols, imports, exports, .pdata, call targets, PDB symbols).
         [[nodiscard]] const SymbolIndex& symbol_index() const noexcept { return symbol_index_; }
+        [[nodiscard]] const FunctionIndex& function_index() const noexcept { return function_index_; }
         void add_debug_symbols(std::span<const DebugSymbol> symbols);
+        void set_analysis_thumb_mode(bool thumb_mode);
+        [[nodiscard]] std::string resolve_address_symbol(std::uint64_t virtual_address) const;
+
+        // Live process & thread pause/resume, register context, stack unwinding, and TLS inspection.
+        [[nodiscard]] bool is_process_suspended() const noexcept;
+        [[nodiscard]] peelf::SubsystemStatus suspend_process();
+        [[nodiscard]] peelf::SubsystemStatus resume_process();
+        [[nodiscard]] peelf::SubsystemStatus suspend_thread(peelf::ThreadId tid);
+        [[nodiscard]] peelf::SubsystemStatus resume_thread(peelf::ThreadId tid);
+        [[nodiscard]] peelf::ForgivingValue<std::vector<peelf::ThreadInfo>> refresh_threads();
+        [[nodiscard]] const std::vector<peelf::ThreadInfo>& threads() const noexcept { return threads_; }
+        [[nodiscard]] const peelf::SubsystemStatus& threads_status() const noexcept { return threads_status_; }
+        [[nodiscard]] std::optional<peelf::ThreadId> selected_thread_id() const noexcept { return selected_tid_; }
+        void select_thread(peelf::ThreadId tid);
+        void refresh_selected_thread_inspection();
+        [[nodiscard]] const peelf::ForgivingValue<peelf::ThreadContext>& selected_thread_context() const noexcept {
+            return selected_thread_context_;
+        }
+        [[nodiscard]] const peelf::ThreadStackSnapshot& selected_thread_stack() const noexcept {
+            return selected_thread_stack_;
+        }
+        [[nodiscard]] const peelf::ThreadLocalSnapshot& selected_thread_locals() const noexcept {
+            return selected_thread_locals_;
+        }
+
+        // Endian-aware memory & file search (Heap, Selected Region, Active Module, All Readable / Full File).
+        [[nodiscard]] peelf::Result<peelf::MemorySearchReport> search_memory(
+            const peelf::MemorySearchQuery& query) const;
+
+        // Coherent PEB/TEB + Linux runtime structures, harvested header flags, and VEH/SEH/atexit/signal handlers.
+        void refresh_runtime_and_handlers();
+        [[nodiscard]] const peelf::HeaderFlagsReport& header_flags() const noexcept { return header_flags_; }
+        [[nodiscard]] const peelf::ProcessEnvironmentSnapshot& process_environment() const noexcept {
+            return process_env_;
+        }
+        [[nodiscard]] const peelf::ThreadEnvironmentSnapshot& thread_environment() const noexcept {
+            return thread_env_;
+        }
+        [[nodiscard]] const peelf::HandlersReport& handlers_report() const noexcept { return handlers_report_; }
 
         // Unified window addressing:
         // - Static file: view_base_address() == 0, view_size() == file size, offset == file offset.
@@ -131,6 +185,8 @@ namespace viewer {
                                                                             std::uint64_t size) const;
         [[nodiscard]] peelf::Result<std::vector<std::uint8_t>> read_effective_bytes(std::uint64_t offset,
                                                                                     std::uint64_t size) const;
+        [[nodiscard]] peelf::Result<std::vector<std::uint8_t>> read_virtual_bytes(std::uint64_t virtual_address,
+                                                                                  std::uint64_t size) const;
 
         [[nodiscard]] peelf::Result<void> apply_patch_bytes(std::uint64_t offset,
                                                             std::span<const std::uint8_t> bytes,
@@ -172,16 +228,21 @@ namespace viewer {
 
         FileInfo file_info_;
         std::vector<std::uint8_t> bytes_;
+        std::vector<std::uint8_t> live_backing_file_bytes_;
+        std::vector<std::uint8_t> live_module_snapshot_bytes_;
         std::vector<std::uint8_t> live_pe_backing_bytes_;
         std::vector<SectionInfo> sections_;
         std::unique_ptr<PeModel> pe_;
         std::unique_ptr<peelf::IBinaryImage> image_;
         std::optional<peelf::PagedBinaryImage> editable_image_;
         SymbolIndex symbol_index_;
+        FunctionIndex function_index_;
+        bool analysis_thumb_mode_ = false;
         std::map<std::string, std::vector<DebugSymbol>> debug_symbols_by_key_;
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
         std::unique_ptr<peelf::IProcessSession> session_;
+        std::optional<std::filesystem::path> resolved_exe_path_;
         std::vector<peelf::MemoryRegion> regions_;
         std::vector<peelf::ModuleInfo> modules_;
         std::optional<std::size_t> active_module_index_;
@@ -189,11 +250,25 @@ namespace viewer {
         std::uint64_t live_window_base_ = 0;
         std::uint64_t live_window_size_ = 0;
         peelf::LiveMemoryPatchSpace live_patches_;
+
+        // Live thread, stack, TLS, runtime structures, header flags, and handlers snapshots.
+        std::vector<peelf::ThreadInfo> threads_;
+        peelf::SubsystemStatus threads_status_;
+        std::optional<peelf::ThreadId> selected_tid_;
+        peelf::ForgivingValue<peelf::ThreadContext> selected_thread_context_;
+        peelf::ThreadStackSnapshot selected_thread_stack_;
+        peelf::ThreadLocalSnapshot selected_thread_locals_;
+        peelf::HeaderFlagsReport header_flags_;
+        peelf::ProcessEnvironmentSnapshot process_env_;
+        peelf::ThreadEnvironmentSnapshot thread_env_;
+        peelf::HandlersReport handlers_report_;
+
         mutable std::string last_diagnostic_;
 
         void reset_all();
         [[nodiscard]] std::string current_debug_symbol_key() const;
         void rebuild_symbol_index();
+        void load_live_module_backing_bytes(const peelf::ModuleInfo& module);
         bool load_pe(const std::string& path);
         bool load_elf(const std::string& path);
         void populate_live_pe_legacy_model(const peelf::ModuleInfo& module);

@@ -30,6 +30,7 @@ namespace viewer {
         void set_attach_requested_callback(std::function<void()> cb) { on_attach_requested_ = std::move(cb); }
         void set_refresh_requested_callback(std::function<void()> cb) { on_refresh_requested_ = std::move(cb); }
         void set_detach_requested_callback(std::function<void()> cb) { on_detach_requested_ = std::move(cb); }
+        void set_pause_toggle_callback(std::function<void()> cb) { on_pause_toggle_ = std::move(cb); }
     protected:
         void draw_contents() override;
     private:
@@ -37,6 +38,7 @@ namespace viewer {
         std::function<void()> on_attach_requested_;
         std::function<void()> on_refresh_requested_;
         std::function<void()> on_detach_requested_;
+        std::function<void()> on_pause_toggle_;
     };
 
     class MemoryMapPanel : public UiPanel {
@@ -45,6 +47,7 @@ namespace viewer {
         void set_attach_requested_callback(std::function<void()> cb) { on_attach_requested_ = std::move(cb); }
         void set_refresh_requested_callback(std::function<void()> cb) { on_refresh_requested_ = std::move(cb); }
         void set_detach_requested_callback(std::function<void()> cb) { on_detach_requested_ = std::move(cb); }
+        void set_pause_toggle_callback(std::function<void()> cb) { on_pause_toggle_ = std::move(cb); }
         void set_module_selected_callback(std::function<void(std::size_t)> cb) {
             on_module_selected_ = std::move(cb);
         }
@@ -64,6 +67,7 @@ namespace viewer {
         std::function<void()> on_attach_requested_;
         std::function<void()> on_refresh_requested_;
         std::function<void()> on_detach_requested_;
+        std::function<void()> on_pause_toggle_;
         std::function<void(std::size_t)> on_module_selected_;
         std::function<void(std::size_t, bool)> on_region_activated_;
     };
@@ -143,7 +147,6 @@ namespace viewer {
         BinaryModel& model_;
         const ViewerSelection& selection_;
         bool assembly_mode_ = false;
-        bool override_protection_ = true;
         char input_buf_[32768] = {};
         std::vector<std::uint8_t> output_bytes_;
         std::string hex_view_;
@@ -178,7 +181,6 @@ namespace viewer {
         const bool* thumb_ = nullptr;
         char replacement_[4096]{};
         std::optional<PatchPreview> preview_;
-        bool override_protection_ = true;
         std::string status_message_;
         std::function<void(const ViewerSelection&)> on_patch_activated_;
         std::function<void()> on_patch_mutated_;
@@ -306,6 +308,109 @@ namespace viewer {
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
+    };
+
+    class FunctionsPanel : public UiPanel {
+    public:
+        FunctionsPanel(BinaryModel& model, const ViewerSelection& selection);
+        void set_function_activated_callback(
+            std::function<void(std::uint64_t virtual_address, bool decompile)> cb) {
+            on_function_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        const ViewerSelection& selection_;
+        char filter_buf_[128] = {};
+        int origin_filter_ = 0;
+        std::function<void(std::uint64_t, bool)> on_function_activated_;
+    };
+
+    class ThreadsAndStackPanel : public UiPanel {
+    public:
+        explicit ThreadsAndStackPanel(BinaryModel& model);
+        void set_address_activated_callback(
+            std::function<void(std::uint64_t virtual_address, PreferredView view, bool decompile)> cb) {
+            on_address_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        std::string status_note_;
+        std::function<void(std::uint64_t, PreferredView, bool)> on_address_activated_;
+    };
+
+    class ThreadLocalsPanel : public UiPanel {
+    public:
+        explicit ThreadLocalsPanel(BinaryModel& model);
+        void set_address_activated_callback(
+            std::function<void(std::uint64_t virtual_address, PreferredView view)> cb) {
+            on_address_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        char filter_buf_[128] = {};
+        std::function<void(std::uint64_t, PreferredView)> on_address_activated_;
+    };
+
+    class MemorySearchPanel : public UiPanel {
+    public:
+        explicit MemorySearchPanel(BinaryModel& model);
+        void set_address_activated_callback(
+            std::function<void(std::uint64_t virtual_address, std::size_t size)> cb) {
+            on_address_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        int scope_idx_ = 0;
+        int kind_idx_ = 0;
+        int endian_mode_ = 0; // 0 = Target auto, 1 = Little, 2 = Big
+        int align_idx_ = 0;   // 0 = 1B, 1 = 2B, 2 = 4B, 3 = 8B
+        bool case_sensitive_ = true;
+        int max_results_ = 5000;
+        char query_buf_[512] = {};
+        std::optional<peelf::MemorySearchReport> last_report_;
+        std::string error_message_;
+        std::function<void(std::uint64_t, std::size_t)> on_address_activated_;
+
+        void run_search();
+    };
+
+    class RuntimeAndFlagsPanel : public UiPanel {
+    public:
+        explicit RuntimeAndFlagsPanel(BinaryModel& model);
+        void set_address_activated_callback(
+            std::function<void(std::uint64_t virtual_address, PreferredView view)> cb) {
+            on_address_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        char flags_filter_buf_[128] = {};
+        std::function<void(std::uint64_t, PreferredView)> on_address_activated_;
+    };
+
+    class HandlersPanel : public UiPanel {
+    public:
+        explicit HandlersPanel(BinaryModel& model);
+        void set_address_activated_callback(
+            std::function<void(std::uint64_t virtual_address, PreferredView view)> cb) {
+            on_address_activated_ = std::move(cb);
+        }
+    protected:
+        void draw_contents() override;
+    private:
+        BinaryModel& model_;
+        int category_filter_ = 0;
+        char filter_buf_[128] = {};
+        std::function<void(std::uint64_t, PreferredView)> on_address_activated_;
     };
 
 } // namespace viewer

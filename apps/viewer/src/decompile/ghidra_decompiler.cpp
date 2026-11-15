@@ -55,7 +55,7 @@ peelf::Result<DecompilerSettings> read_decompiler_settings(const std::filesystem
     std::istringstream in(*text); std::string magic, home, java, python; int version = 0, provider = -1;
     DecompilerSettings settings;
     if (!(in >> magic >> version >> provider >> std::quoted(home) >> std::quoted(java) >> std::quoted(python) >> settings.timeout_seconds) ||
-        magic != "PEELF_DECOMPILER" || version != 1 || provider < 0 || provider > 2 ||
+        magic != "PEELF_DECOMPILER" || version != 1 || provider < 0 || provider > 4 ||
         java.empty() || python.empty() || settings.timeout_seconds < 10 || settings.timeout_seconds > 3600)
         return peelf::make_error("Invalid decompiler settings");
     in >> std::ws;

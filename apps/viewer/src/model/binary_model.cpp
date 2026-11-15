@@ -70,14 +70,19 @@ std::filesystem::path utf8_path(std::string_view text) {
         endianness_ = peelf::Endianness::Little;
         file_info_ = {};
         bytes_.clear();
+        live_backing_file_bytes_.clear();
+        live_module_snapshot_bytes_.clear();
         live_pe_backing_bytes_.clear();
         sections_.clear();
         pe_.reset();
         image_.reset();
         editable_image_.reset();
         symbol_index_ = {};
+        function_index_ = {};
+        analysis_thumb_mode_ = false;
         debug_symbols_by_key_.clear();
         session_.reset();
+        resolved_exe_path_.reset();
         regions_.clear();
         modules_.clear();
         active_module_index_.reset();
@@ -85,6 +90,16 @@ std::filesystem::path utf8_path(std::string_view text) {
         live_window_base_ = 0;
         live_window_size_ = 0;
         live_patches_.clear();
+        threads_.clear();
+        threads_status_ = {};
+        selected_tid_.reset();
+        selected_thread_context_ = {};
+        selected_thread_stack_ = {};
+        selected_thread_locals_ = {};
+        header_flags_ = {};
+        process_env_ = {};
+        thread_env_ = {};
+        handlers_report_ = {};
         last_diagnostic_.clear();
     }
 
@@ -106,6 +121,8 @@ std::filesystem::path utf8_path(std::string_view text) {
     void BinaryModel::rebuild_symbol_index() {
         if (!image_) {
             symbol_index_ = {};
+            function_index_ = {};
+            refresh_runtime_and_handlers();
             return;
         }
         symbol_index_ = SymbolIndex::build(*image_);
@@ -118,6 +135,72 @@ std::filesystem::path utf8_path(std::string_view text) {
                         ? rebase_debug_symbols(it->second, image_->image_base())
                         : it->second;
                 symbol_index_.add_debug_symbols(*image_, rebased);
+            }
+        }
+
+        function_index_ = FunctionIndex::discover(
+            *image_,
+            symbol_index_,
+            analysis_image_bytes(),
+            analysis_thumb_mode_);
+
+        for (const FunctionEntry& fn : function_index_.entries()) {
+            if (fn.virtual_address == 0) {
+                continue;
+            }
+            const SymbolRecord* existing = symbol_index_.find_containing_address(fn.virtual_address);
+            if (existing != nullptr && existing->virtual_address == fn.virtual_address) {
+                continue;
+            }
+            SymbolRecord rec;
+            rec.name = fn.name;
+            rec.virtual_address = fn.virtual_address;
+            rec.file_offset = fn.file_offset
+                ? fn.file_offset
+                : image_->virtual_address_to_file_offset(fn.virtual_address);
+            rec.size = fn.size;
+            rec.source = SymbolSource::DebugSymbol;
+            rec.function = true;
+            symbol_index_.add_discovered_symbol(std::move(rec));
+        }
+
+        refresh_runtime_and_handlers();
+    }
+
+    void BinaryModel::load_live_module_backing_bytes(const peelf::ModuleInfo& module) {
+        live_backing_file_bytes_.clear();
+        live_module_snapshot_bytes_.clear();
+
+        std::filesystem::path candidate = module.path;
+        std::error_code ec;
+        if ((candidate.empty() || !std::filesystem::is_regular_file(candidate, ec)) &&
+            module.is_main_module && resolved_exe_path_) {
+            candidate = *resolved_exe_path_;
+        }
+
+        constexpr std::uintmax_t kMaxBackingBytes = 128ull * 1024ull * 1024ull;
+        if (!candidate.empty() && std::filesystem::is_regular_file(candidate, ec)) {
+            const auto fsize = std::filesystem::file_size(candidate, ec);
+            if (!ec && fsize >= 64u && fsize <= kMaxBackingBytes) {
+                std::ifstream in(candidate, std::ios::binary);
+                if (in) {
+                    live_backing_file_bytes_.resize(static_cast<std::size_t>(fsize));
+                    if (!in.read(reinterpret_cast<char*>(live_backing_file_bytes_.data()),
+                                 static_cast<std::streamsize>(live_backing_file_bytes_.size()))) {
+                        live_backing_file_bytes_.clear();
+                    }
+                }
+            }
+        }
+
+        if (live_backing_file_bytes_.empty() && session_ != nullptr && module.size != 0) {
+            constexpr std::uint64_t kMaxSnapshotBytes = 16ull * 1024ull * 1024ull;
+            const auto snap_sz = static_cast<std::size_t>(
+                std::min<std::uint64_t>(module.size, kMaxSnapshotBytes));
+            const peelf::MemorySample sample =
+                peelf::read_memory_tolerant(*session_, regions_, module.base_address, snap_sz);
+            if (sample.readable_count > 0) {
+                live_module_snapshot_bytes_ = sample.bytes;
             }
         }
     }
@@ -225,9 +308,22 @@ std::filesystem::path utf8_path(std::string_view text) {
         architecture_ = session_->info().architecture != peelf::Architecture::Unknown
                             ? session_->info().architecture
                             : peelf::Architecture::X86_64;
-        endianness_ = peelf::Endianness::Little;
+        endianness_ = session_->info().endianness;
 
-        return refresh_process_map();
+        std::error_code ec;
+        if (!session_->info().executable_path.empty() &&
+            std::filesystem::is_regular_file(session_->info().executable_path, ec)) {
+            resolved_exe_path_ = session_->info().executable_path;
+        } else if (!session_->info().command_line.empty()) {
+            resolved_exe_path_ = peelf::resolve_executable_from_command_line(
+                session_->info().command_line,
+                session_->info().working_directory);
+        }
+
+        auto map_res = refresh_process_map();
+        (void)refresh_threads();
+        refresh_runtime_and_handlers();
+        return map_res;
     }
 
     void BinaryModel::detach_process() {
@@ -242,6 +338,12 @@ std::filesystem::path utf8_path(std::string_view text) {
         if (!session_->is_alive()) {
             last_diagnostic_ = "Attached process PID " + std::to_string(session_->pid()) + " has exited";
             return peelf::make_error(last_diagnostic_);
+        }
+
+        if (!resolved_exe_path_ && !session_->info().command_line.empty()) {
+            resolved_exe_path_ = peelf::resolve_executable_from_command_line(
+                session_->info().command_line,
+                session_->info().working_directory);
         }
 
         const std::optional<std::uint64_t> prev_mod_base =
@@ -263,6 +365,38 @@ std::filesystem::path utf8_path(std::string_view text) {
 
         regions_ = std::move(*regs);
         modules_ = std::move(*mods);
+
+        // Hydrate main module backing path from command-line resolution when missing on disk.
+        if (resolved_exe_path_) {
+            std::error_code ec;
+            bool hydrated = false;
+            for (peelf::ModuleInfo& mod : modules_) {
+                if (mod.is_main_module) {
+                    if (mod.path.empty() || !std::filesystem::is_regular_file(mod.path, ec)) {
+                        mod.path = *resolved_exe_path_;
+                    }
+                    if (mod.name.empty()) {
+                        mod.name = mod.path.filename().string();
+                    }
+                    hydrated = true;
+                }
+            }
+            if (!hydrated && modules_.empty() && !regions_.empty()) {
+                for (const peelf::MemoryRegion& reg : regions_) {
+                    if (reg.protection.executable || reg.kind == peelf::MemoryRegionKind::Image) {
+                        modules_.push_back(peelf::ModuleInfo{
+                            .name = resolved_exe_path_->filename().string(),
+                            .path = *resolved_exe_path_,
+                            .base_address = reg.start_address,
+                            .size = reg.size(),
+                            .entry_point = 0,
+                            .is_main_module = true,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
 
         if (prev_kind == LiveViewTargetKind::Module && prev_mod_base) {
             for (std::size_t i = 0; i < modules_.size(); ++i) {
@@ -361,6 +495,7 @@ std::filesystem::path utf8_path(std::string_view text) {
         image_.reset();
         sections_.clear();
 
+        load_live_module_backing_bytes(mod);
         auto loaded = peelf::load_live_module_image(*session_, mod, regions_);
         if (loaded) {
             image_ = std::move(*loaded);
@@ -376,15 +511,16 @@ std::filesystem::path utf8_path(std::string_view text) {
 
             const std::string display_path = !mod.path.empty() ? mod.path.string() : mod.name;
             file_info_.path = display_path;
-            file_info_.format_str = std::string(peelf::to_string(image_->format())) + " (Live RAM)";
+            file_info_.format_str = std::string(peelf::to_string(image_->format())) + " (Live Read-Only)";
             file_info_.arch_str = std::string(peelf::to_string(image_->architecture()));
             file_info_.size_bytes = live_window_size_;
             file_info_.entry_point = image_->entry_point();
             file_info_.flags.clear();
-            file_info_.flags.push_back("Live PID " + std::to_string(session_->pid()));
+            file_info_.flags.push_back("Live PID " + std::to_string(session_->pid()) + " (Read-Only)");
             file_info_.flags.push_back("Base " + format_hex_addr(mod.base_address));
             file_info_.flags.push_back(std::string(peelf::to_string(image_->kind())));
             file_info_.flags.push_back(image_->is_64bit() ? "64-bit" : "32-bit");
+            file_info_.flags.push_back(std::string(peelf::to_string(image_->endianness())));
 
             for (const auto& s : image_->sections()) {
                 std::uint32_t flags = 0;
@@ -409,6 +545,9 @@ std::filesystem::path utf8_path(std::string_view text) {
                     }
                 }
             }
+            if (selected_tid_) {
+                refresh_selected_thread_inspection();
+            }
             last_diagnostic_.clear();
             return {};
         }
@@ -419,10 +558,12 @@ std::filesystem::path utf8_path(std::string_view text) {
         architecture_ = session_->info().architecture != peelf::Architecture::Unknown
                             ? session_->info().architecture
                             : peelf::Architecture::X86_64;
-        endianness_ = peelf::Endianness::Little;
+        endianness_ = session_->info().endianness;
         live_window_base_ = mod.base_address;
         live_window_size_ = std::max<std::uint64_t>(mod.size, 4096u);
         symbol_index_ = {};
+        function_index_ = {};
+        refresh_runtime_and_handlers();
 
         file_info_.path = !mod.path.empty() ? mod.path.string() : mod.name;
         file_info_.format_str = "Raw Module (Live RAM)";
@@ -473,13 +614,16 @@ std::filesystem::path utf8_path(std::string_view text) {
 
         pe_.reset();
         image_.reset();
+        live_backing_file_bytes_.clear();
+        live_module_snapshot_bytes_.clear();
         sections_.clear();
         symbol_index_ = {};
+        function_index_ = {};
         format_ = BinaryFormat::None;
         architecture_ = session_->info().architecture != peelf::Architecture::Unknown
                             ? session_->info().architecture
                             : peelf::Architecture::X86_64;
-        endianness_ = peelf::Endianness::Little;
+        endianness_ = session_->info().endianness;
 
         // If this standalone region starts with an in-RAM PE or ELF header (e.g. [vdso]
         // or manually mapped module), parse it opportunistically.
@@ -488,6 +632,9 @@ std::filesystem::path utf8_path(std::string_view text) {
                 std::min<std::uint64_t>(reg.size(), 4ull * 1024ull * 1024ull));
             const peelf::MemorySample sample =
                 peelf::read_memory_tolerant(*session_, regions_, reg.start_address, probe_sz);
+            if (sample.readable_count > 0) {
+                live_module_snapshot_bytes_ = sample.bytes;
+            }
             if (sample.readable_count >= 64) {
                 const bool looks_pe_or_elf =
                     (sample.bytes[0] == 0x7Fu && sample.bytes[1] == 'E' &&
@@ -504,6 +651,9 @@ std::filesystem::path utf8_path(std::string_view text) {
                     }
                 }
             }
+        }
+        if (!image_) {
+            refresh_runtime_and_handlers();
         }
 
         const std::string region_name = !reg.pathname.empty()
@@ -581,6 +731,91 @@ std::filesystem::path utf8_path(std::string_view text) {
         return &regions_[*active_region_index_];
     }
 
+    peelf::TargetLayout BinaryModel::target_layout() const noexcept {
+        if (image_ != nullptr) {
+            return peelf::TargetLayout::from_image(*image_);
+        }
+        const bool is_32bit =
+            architecture_ == peelf::Architecture::X86 ||
+            architecture_ == peelf::Architecture::ARM ||
+            architecture_ == peelf::Architecture::RISCV32 ||
+            architecture_ == peelf::Architecture::PowerPC ||
+            architecture_ == peelf::Architecture::MIPS32;
+        return peelf::TargetLayout::from_arch(architecture_, !is_32bit, endianness_);
+    }
+
+    std::span<const std::uint8_t> BinaryModel::analysis_image_bytes() const noexcept {
+        if (!is_live_process()) {
+            return bytes_;
+        }
+        if (!live_backing_file_bytes_.empty()) {
+            return live_backing_file_bytes_;
+        }
+        return live_module_snapshot_bytes_;
+    }
+
+    std::uint64_t BinaryModel::analysis_image_size() const noexcept {
+        if (!is_live_process()) {
+            return view_size();
+        }
+        const auto backing = static_cast<std::uint64_t>(analysis_image_bytes().size());
+        return std::max(view_size(), backing);
+    }
+
+    void BinaryModel::set_analysis_thumb_mode(bool thumb_mode) {
+        if (analysis_thumb_mode_ == thumb_mode) {
+            return;
+        }
+        analysis_thumb_mode_ = thumb_mode;
+        if (image_ != nullptr) {
+            rebuild_symbol_index();
+        }
+    }
+
+    std::string BinaryModel::resolve_address_symbol(std::uint64_t virtual_address) const {
+        if (virtual_address == 0) {
+            return {};
+        }
+
+        std::string module_prefix;
+        if (is_live_process()) {
+            if (const peelf::ModuleInfo* act = active_module()) {
+                if (virtual_address >= act->base_address &&
+                    virtual_address < act->base_address + std::max<std::uint64_t>(act->size, live_window_size_)) {
+                    module_prefix = !act->name.empty() ? act->name : act->path.filename().string();
+                }
+            }
+        }
+
+        if (const SymbolRecord* sym = symbol_index_.find_containing_address(virtual_address);
+            sym != nullptr && sym->virtual_address.has_value()) {
+            const std::uint64_t delta = virtual_address - *sym->virtual_address;
+            const std::uint64_t limit = sym->size != 0 ? sym->size : 0x4000u;
+            if (delta == 0 || delta < limit) {
+                std::string label = module_prefix.empty() ? sym->name : (module_prefix + "!" + sym->name);
+                if (delta != 0) {
+                    label += "+" + format_hex_addr(delta);
+                }
+                return label;
+            }
+        }
+
+        if (is_live_process()) {
+            for (const peelf::ModuleInfo& mod : modules_) {
+                if (virtual_address >= mod.base_address &&
+                    virtual_address < mod.base_address + std::max<std::uint64_t>(mod.size, 1u)) {
+                    const std::string mname = !mod.name.empty()
+                        ? mod.name
+                        : (!mod.path.empty() ? mod.path.filename().string() : "module");
+                    const std::uint64_t rva = virtual_address - mod.base_address;
+                    return rva == 0 ? mname : (mname + "+" + format_hex_addr(rva));
+                }
+            }
+        }
+
+        return {};
+    }
+
     void BinaryModel::add_debug_symbols(std::span<const DebugSymbol> symbols) {
         if (!image_ || symbols.empty()) {
             return;
@@ -595,7 +830,7 @@ std::filesystem::path utf8_path(std::string_view text) {
             auto& stored = debug_symbols_by_key_[key];
             stored.insert(stored.end(), rebased.begin(), rebased.end());
         }
-        symbol_index_.add_debug_symbols(*image_, rebased);
+        rebuild_symbol_index();
     }
 
     std::uint64_t BinaryModel::view_base_address() const noexcept {
@@ -722,10 +957,8 @@ std::filesystem::path utf8_path(std::string_view text) {
                 return peelf::make_error("read window size exceeds platform limit");
             }
             const std::uint64_t va = live_window_base_ + offset;
-            peelf::MemorySample sample = peelf::read_memory_tolerant(
+            return peelf::read_memory_tolerant(
                 *session_, regions_, va, static_cast<std::size_t>(size));
-            live_patches_.apply_overlay(va, sample);
-            return sample;
         }
 
         if (editable_image_) {
@@ -769,19 +1002,49 @@ std::filesystem::path utf8_path(std::string_view text) {
         }
 
         if (!editable_image_) {
+            if (!bytes_.empty()) {
+                if (offset > bytes_.size() || size > bytes_.size() - offset) {
+                    return peelf::make_error("read range exceeds loaded buffer");
+                }
+                return std::vector<std::uint8_t>(
+                    bytes_.begin() + static_cast<std::ptrdiff_t>(offset),
+                    bytes_.begin() + static_cast<std::ptrdiff_t>(offset + size));
+            }
             return peelf::make_error("no editable binary image is loaded");
         }
         return editable_image_->read_effective(offset, size);
+    }
+
+    peelf::Result<std::vector<std::uint8_t>> BinaryModel::read_virtual_bytes(
+        std::uint64_t virtual_address,
+        std::uint64_t size) const {
+        if (size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+            return peelf::make_error("requested byte count exceeds platform limit");
+        }
+        if (is_live_process()) {
+            const peelf::MemorySample sample = peelf::read_memory_tolerant(
+                *session_, regions_, virtual_address, static_cast<std::size_t>(size));
+            if (size != 0 && sample.readable_count == 0) {
+                return peelf::make_error("live virtual address range is unreadable");
+            }
+            return sample.bytes;
+        }
+        if (image_ != nullptr) {
+            const auto file_off = image_->virtual_address_to_file_offset(virtual_address);
+            if (!file_off) {
+                return peelf::make_error("virtual address does not map to file bytes");
+            }
+            return read_effective_bytes(*file_off, size);
+        }
+        return peelf::make_error("no binary image or live process is loaded");
     }
 
     peelf::Result<void> BinaryModel::apply_patch_bytes(std::uint64_t offset,
                                                        std::span<const std::uint8_t> bytes,
                                                        std::string label) {
         if (is_live_process()) {
-            if (offset > live_window_size_ || bytes.size() > live_window_size_ - offset) {
-                return peelf::make_error("patch range exceeds active live window");
-            }
-            return stage_patch_at_va(live_window_base_ + offset, bytes, std::move(label));
+            last_diagnostic_ = "Live process inspection is strictly read-only; target memory is never modified";
+            return peelf::make_error(last_diagnostic_);
         }
 
         if (!editable_image_) {
@@ -793,6 +1056,9 @@ std::filesystem::path utf8_path(std::string_view text) {
     }
 
     peelf::Result<void> BinaryModel::apply_patch_set(std::span<const peelf::PatchInterval> patches) {
+        if (is_live_process()) {
+            return peelf::make_error("Live process inspection is strictly read-only");
+        }
         if (!editable_image_) return peelf::make_error("No image loaded");
         if (patches.empty()) return {};
         auto transaction = editable_image_->begin_transaction("Restore project patches");
@@ -805,25 +1071,16 @@ std::filesystem::path utf8_path(std::string_view text) {
         return result;
     }
 
-    peelf::Result<void> BinaryModel::stage_patch_at_va(std::uint64_t virtual_address,
-                                                       std::span<const std::uint8_t> bytes,
-                                                       std::string label) {
-        if (!is_live_process()) {
-            return peelf::make_error("live VA patching requires an attached process");
-        }
-        auto res = live_patches_.stage_patch(*session_, virtual_address, bytes, std::move(label));
-        if (!res) {
-            last_diagnostic_ = res.error().message;
-        }
-        if (res) ++edit_revision_;
-        return res;
+    peelf::Result<void> BinaryModel::stage_patch_at_va(std::uint64_t /*virtual_address*/,
+                                                       std::span<const std::uint8_t> /*bytes*/,
+                                                       std::string /*label*/) {
+        last_diagnostic_ = "Live process inspection is strictly read-only; target memory is never modified";
+        return peelf::make_error(last_diagnostic_);
     }
 
     peelf::Result<void> BinaryModel::undo_patch() {
         if (is_live_process()) {
-            auto result = live_patches_.undo(*session_);
-            if (result) ++edit_revision_;
-            return result;
+            return peelf::make_error("Live process inspection is strictly read-only");
         }
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
@@ -835,9 +1092,7 @@ std::filesystem::path utf8_path(std::string_view text) {
 
     peelf::Result<void> BinaryModel::redo_patch() {
         if (is_live_process()) {
-            auto result = live_patches_.redo(*session_);
-            if (result) ++edit_revision_;
-            return result;
+            return peelf::make_error("Live process inspection is strictly read-only");
         }
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
@@ -848,63 +1103,27 @@ std::filesystem::path utf8_path(std::string_view text) {
     }
 
     void BinaryModel::discard_staged_patches() noexcept {
-        if (is_live_process()) {
-            live_patches_.clear_staged();
-            ++edit_revision_;
-        }
+        live_patches_.clear_staged();
     }
 
     peelf::Result<std::size_t> BinaryModel::commit_patches_to_process(
-        peelf::MemoryWriteOptions options) {
-        if (!is_live_process()) {
-            return peelf::make_error("cannot commit to RAM without an attached process");
-        }
-        if (!session_->is_alive()) {
-            last_diagnostic_ = "Attached process PID " + std::to_string(session_->pid()) + " has exited";
-            return peelf::make_error(last_diagnostic_);
-        }
-        auto committed = live_patches_.commit_to_process(*session_, options);
-        if (!committed) {
-            last_diagnostic_ = committed.error().message;
-        }
-        ++edit_revision_;
-        return committed;
+        peelf::MemoryWriteOptions /*options*/) {
+        last_diagnostic_ = "Live process inspection is strictly read-only; committing patches to RAM is disabled";
+        return peelf::make_error(last_diagnostic_);
     }
 
     peelf::Result<std::size_t> BinaryModel::revert_committed_patches(
-        peelf::MemoryWriteOptions options) {
-        if (!is_live_process()) {
-            return peelf::make_error("cannot revert RAM patches without an attached process");
-        }
-        if (!session_->is_alive()) {
-            last_diagnostic_ = "Attached process PID " + std::to_string(session_->pid()) + " has exited";
-            return peelf::make_error(last_diagnostic_);
-        }
-        auto reverted = live_patches_.revert_committed(*session_, options);
-        if (!reverted) {
-            last_diagnostic_ = reverted.error().message;
-        }
-        ++edit_revision_;
-        return reverted;
+        peelf::MemoryWriteOptions /*options*/) {
+        last_diagnostic_ = "Live process inspection is strictly read-only";
+        return peelf::make_error(last_diagnostic_);
     }
 
     peelf::Result<void> BinaryModel::revert_committed_patch_at(
-        std::uint64_t virtual_address,
-        std::uint64_t size,
-        peelf::MemoryWriteOptions options) {
-        if (!is_live_process()) {
-            return peelf::make_error("cannot revert RAM patch without an attached process");
-        }
-        if (!session_->is_alive()) {
-            last_diagnostic_ = "Attached process PID " + std::to_string(session_->pid()) + " has exited";
-            return peelf::make_error(last_diagnostic_);
-        }
-        auto reverted = live_patches_.revert_committed_interval(*session_, virtual_address, size, options);
-        if (!reverted) {
-            last_diagnostic_ = reverted.error().message;
-        }
-        ++edit_revision_;
-        return reverted;
+        std::uint64_t /*virtual_address*/,
+        std::uint64_t /*size*/,
+        peelf::MemoryWriteOptions /*options*/) {
+        last_diagnostic_ = "Live process inspection is strictly read-only";
+        return peelf::make_error(last_diagnostic_);
     }
 
     peelf::Result<void> BinaryModel::save_patched_as(const std::filesystem::path& output_path,
@@ -983,6 +1202,325 @@ std::filesystem::path utf8_path(std::string_view text) {
             }
         }
         return BytePatchState::Unchanged;
+    }
+
+    bool BinaryModel::is_process_suspended() const noexcept {
+        return is_live_process() && session_->is_suspended();
+    }
+
+    peelf::SubsystemStatus BinaryModel::suspend_process() {
+        if (!is_live_process()) {
+            return peelf::SubsystemStatus::unavailable("process", "Not attached to a live process");
+        }
+        auto res = session_->suspend();
+        const peelf::SubsystemStatus st = res
+            ? peelf::SubsystemStatus::available("process", "Process suspended")
+            : peelf::SubsystemStatus::unavailable("process", res.error().message);
+        if (!st.ok() && !st.detail.empty()) {
+            last_diagnostic_ = st.detail;
+        }
+        (void)refresh_threads();
+        refresh_runtime_and_handlers();
+        return st;
+    }
+
+    peelf::SubsystemStatus BinaryModel::resume_process() {
+        if (!is_live_process()) {
+            return peelf::SubsystemStatus::unavailable("process", "Not attached to a live process");
+        }
+        auto res = session_->resume();
+        const peelf::SubsystemStatus st = res
+            ? peelf::SubsystemStatus::available("process", "Process resumed")
+            : peelf::SubsystemStatus::unavailable("process", res.error().message);
+        if (!st.ok() && !st.detail.empty()) {
+            last_diagnostic_ = st.detail;
+        }
+        (void)refresh_threads();
+        refresh_runtime_and_handlers();
+        return st;
+    }
+
+    peelf::SubsystemStatus BinaryModel::suspend_thread(peelf::ThreadId tid) {
+        if (!is_live_process()) {
+            return peelf::SubsystemStatus::unavailable("thread", "Not attached to a live process");
+        }
+        auto res = session_->suspend_thread(tid);
+        const peelf::SubsystemStatus st = res
+            ? peelf::SubsystemStatus::available("thread", "Thread suspended")
+            : peelf::SubsystemStatus::unavailable("thread", res.error().message);
+        (void)refresh_threads();
+        return st;
+    }
+
+    peelf::SubsystemStatus BinaryModel::resume_thread(peelf::ThreadId tid) {
+        if (!is_live_process()) {
+            return peelf::SubsystemStatus::unavailable("thread", "Not attached to a live process");
+        }
+        auto res = session_->resume_thread(tid);
+        const peelf::SubsystemStatus st = res
+            ? peelf::SubsystemStatus::available("thread", "Thread resumed")
+            : peelf::SubsystemStatus::unavailable("thread", res.error().message);
+        (void)refresh_threads();
+        return st;
+    }
+
+    peelf::ForgivingValue<std::vector<peelf::ThreadInfo>> BinaryModel::refresh_threads() {
+        if (!is_live_process()) {
+            threads_.clear();
+            threads_status_ = peelf::SubsystemStatus::unavailable("process", "Not attached to a live process");
+            selected_tid_.reset();
+            selected_thread_context_ = {};
+            selected_thread_stack_ = {};
+            selected_thread_locals_ = {};
+            thread_env_ = {};
+            return peelf::ForgivingValue<std::vector<peelf::ThreadInfo>>{
+                .value = std::nullopt,
+                .status = threads_status_,
+            };
+        }
+
+        auto listed = session_->threads();
+        if (!listed) {
+            threads_.clear();
+            threads_status_ = peelf::SubsystemStatus::unavailable("process", listed.error().message);
+            selected_tid_.reset();
+            selected_thread_context_ = {};
+            selected_thread_stack_ = {};
+            selected_thread_locals_ = {};
+            thread_env_ = {};
+            return peelf::ForgivingValue<std::vector<peelf::ThreadInfo>>{
+                .value = std::nullopt,
+                .status = threads_status_,
+            };
+        }
+
+        threads_ = std::move(*listed);
+        threads_status_ = peelf::SubsystemStatus::available(
+            "process",
+            std::to_string(threads_.size()) + " thread(s) discovered");
+
+        bool keep_selected = false;
+        if (selected_tid_) {
+            for (const peelf::ThreadInfo& th : threads_) {
+                if (th.tid == *selected_tid_) {
+                    keep_selected = true;
+                    break;
+                }
+            }
+        }
+        if (!keep_selected) {
+            if (!threads_.empty()) {
+                selected_tid_ = threads_.front().tid;
+            } else {
+                selected_tid_.reset();
+            }
+        }
+
+        if (selected_tid_) {
+            refresh_selected_thread_inspection();
+        } else {
+            selected_thread_context_ = {};
+            selected_thread_stack_ = {};
+            selected_thread_locals_ = {};
+            thread_env_ = {};
+        }
+
+        return peelf::ForgivingValue<std::vector<peelf::ThreadInfo>>{
+            .value = threads_,
+            .status = threads_status_,
+        };
+    }
+
+    void BinaryModel::select_thread(peelf::ThreadId tid) {
+        selected_tid_ = tid;
+        refresh_selected_thread_inspection();
+    }
+
+    void BinaryModel::refresh_selected_thread_inspection() {
+        if (!is_live_process() || !selected_tid_) {
+            selected_thread_context_ = {};
+            selected_thread_stack_ = {};
+            selected_thread_locals_ = {};
+            thread_env_ = {};
+            return;
+        }
+
+        const peelf::ThreadId tid = *selected_tid_;
+        peelf::ThreadContext ctx = session_->thread_context(tid);
+        selected_thread_context_ = peelf::ForgivingValue<peelf::ThreadContext>{
+            .value = ctx,
+            .status = ctx.status,
+        };
+
+        const peelf::ThreadInfo* matched_tinfo = nullptr;
+        for (const peelf::ThreadInfo& th : threads_) {
+            if (th.tid == tid) {
+                matched_tinfo = &th;
+                break;
+            }
+        }
+
+        const peelf::AddressSymbolResolver sym_fn = [this](std::uint64_t va) -> std::string {
+            return resolve_address_symbol(va);
+        };
+
+        if (ctx.status.has_data()) {
+            selected_thread_stack_ = peelf::unwind_and_inspect_stack(
+                *session_,
+                ctx,
+                regions_,
+                modules_,
+                image_.get(),
+                sym_fn);
+        } else {
+            selected_thread_stack_ = {};
+            selected_thread_stack_.status = ctx.status;
+        }
+
+        const std::string_view mod_name = active_module() != nullptr
+            ? std::string_view(active_module()->name)
+            : std::string_view{};
+        selected_thread_locals_ = peelf::inspect_thread_locals(
+            image_.get(),
+            analysis_image_bytes(),
+            session_.get(),
+            ctx.status.has_data() ? &ctx : nullptr,
+            regions_,
+            mod_name);
+
+        if (matched_tinfo != nullptr) {
+            thread_env_ = peelf::inspect_thread_environment(
+                *session_,
+                *matched_tinfo,
+                ctx.status.has_data() ? &ctx : nullptr,
+                regions_);
+        } else {
+            thread_env_ = {};
+        }
+    }
+
+    peelf::Result<peelf::MemorySearchReport> BinaryModel::search_memory(
+        const peelf::MemorySearchQuery& query) const {
+        if (is_live_process()) {
+            const std::optional<peelf::MemoryRegion> sel_reg =
+                active_region() != nullptr ? std::optional<peelf::MemoryRegion>(*active_region()) : std::nullopt;
+            const std::optional<peelf::ModuleInfo> act_mod =
+                active_module() != nullptr ? std::optional<peelf::ModuleInfo>(*active_module()) : std::nullopt;
+            return peelf::search_process_memory(
+                *session_,
+                regions_,
+                query,
+                sel_reg,
+                act_mod);
+        }
+
+        if (!has_file() || view_size() == 0) {
+            return peelf::make_error("No file or live process loaded for search");
+        }
+
+        auto effective = read_effective_bytes(0, view_size());
+        if (!effective) {
+            return std::unexpected(effective.error());
+        }
+
+        const std::string label = file_info_.path.empty()
+            ? std::string("File")
+            : std::filesystem::path(file_info_.path).filename().string();
+        auto res = peelf::search_buffer(
+            *effective,
+            0u,
+            query,
+            label,
+            peelf::MemoryRegionKind::Image);
+        if (!res) {
+            return std::unexpected(res.error());
+        }
+
+        peelf::MemorySearchReport report = std::move(*res);
+        for (peelf::MemorySearchHit& hit : report.hits) {
+            const std::uint64_t file_off = hit.address;
+            hit.view_offset = file_off;
+            if (image_ != nullptr) {
+                if (const auto va = image_->file_offset_to_virtual_address(file_off)) {
+                    hit.address = *va;
+                }
+                for (const peelf::Section& sec : image_->sections()) {
+                    if (file_off >= sec.file_offset && file_off < sec.file_offset + sec.file_size) {
+                        hit.region_label = sec.name;
+                        break;
+                    }
+                }
+            }
+        }
+        return report;
+    }
+
+    void BinaryModel::refresh_runtime_and_handlers() {
+        if (image_ != nullptr) {
+            header_flags_ = peelf::harvest_header_flags(*image_);
+        } else {
+            header_flags_ = {};
+            header_flags_.status = peelf::SubsystemStatus::unavailable(
+                "headers",
+                "No parsed PE/ELF headers for the active selection");
+        }
+
+        const auto sym_fn = [this](std::uint64_t va) -> std::string {
+            return resolve_address_symbol(va);
+        };
+
+        if (is_live_process()) {
+            process_env_ = peelf::inspect_process_environment(
+                *session_,
+                regions_,
+                modules_,
+                image_.get());
+
+            const peelf::ThreadInfo* matched_tinfo = nullptr;
+            if (selected_tid_) {
+                for (const peelf::ThreadInfo& th : threads_) {
+                    if (th.tid == *selected_tid_) {
+                        matched_tinfo = &th;
+                        break;
+                    }
+                }
+            }
+            if (matched_tinfo != nullptr) {
+                const peelf::ThreadContext* ctx_ptr =
+                    (selected_thread_context_.has_value() && selected_thread_context_.status.has_data())
+                        ? &(*selected_thread_context_.value)
+                        : nullptr;
+                thread_env_ = peelf::inspect_thread_environment(
+                    *session_,
+                    *matched_tinfo,
+                    ctx_ptr,
+                    regions_);
+            } else {
+                thread_env_ = {};
+            }
+        } else {
+            process_env_ = {};
+            process_env_.core_status = peelf::SubsystemStatus::unavailable(
+                "static",
+                "Static file mode (attach to a running process to inspect live PEB / auxv / link_map)");
+            thread_env_ = {};
+            thread_env_.status = peelf::SubsystemStatus::unavailable(
+                "static",
+                "Static file mode (attach to a running process to inspect live TEB / TCB)");
+        }
+
+        const peelf::ThreadContext* ctx_ptr =
+            (is_live_process() && selected_thread_context_.has_value() && selected_thread_context_.status.has_data())
+                ? &(*selected_thread_context_.value)
+                : nullptr;
+        handlers_report_ = peelf::inspect_handlers(
+            image_.get(),
+            analysis_image_bytes(),
+            is_live_process() ? session_.get() : nullptr,
+            regions_,
+            modules_,
+            ctx_ptr,
+            sym_fn);
     }
 
 } // namespace viewer

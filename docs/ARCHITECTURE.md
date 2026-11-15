@@ -10,12 +10,13 @@ boundaries we are adding for assembler/decompiler/live-process work.
 flowchart LR
     user["User"]
     app["peelf_viewer<br/>Application"]
-    ui["UiApp<br/>Dear ImGui panels + MemMap + Attach Modal"]
-    model["BinaryModel<br/>static file OR live process session"]
-    core["peelf_core<br/>PE / ELF parsers + live rebasing"]
-    proc["IProcessBackend / IProcessSession<br/>Linux /proc + process_vm_* · Win32 Toolhelp + VirtualQueryEx"]
-    patches["PagedBinaryImage / LiveMemoryPatchSpace<br/>stage-first overlay + explicit Commit/Revert RAM"]
-    disasm["Capstone wrapper<br/>Disassembler"]
+    ui["UiApp<br/>Dear ImGui panels + MemMap + Threads/Stack/TLS + Search + Runtime/Flags + Handlers"]
+    model["BinaryModel<br/>static file (editable) OR strictly read-only live process"]
+    core["peelf_core<br/>C++23 EndianReader + PE/ELF parsers + live rebasing + forgiving subsystems"]
+    proc["IProcessBackend / IProcessSession<br/>read-only attach + cmdline resolution + pause/resume + thread contexts"]
+    patches["PagedBinaryImage<br/>staged edits + Save Patched As (static files only)"]
+    disasm["Capstone wrapper<br/>Disassembler + FunctionIndex"]
+    decomp["IDecompiler<br/>StructuredPseudoC + RetDec + Ghidra"]
     symbols["SymbolIndex<br/>PE/ELF symbols + GOT/PLT + rebased PDB"]
     graph["CallGraph model<br/>entry / fan-out / CFG work"]
     graphviz["Graphviz dot<br/>external renderer"]
@@ -29,6 +30,7 @@ flowchart LR
     model --> patches
     ui --> model
     ui --> disasm
+    ui --> decomp
     ui --> symbols
     ui --> graph
     graph --> graphviz
@@ -60,33 +62,34 @@ sequenceDiagram
     Ui->>Ui: navigate Hex/Disassembly to entry point
 ```
 
-## Live Process Attach, MemMap & Stage-to-RAM Flow
+## Strictly Read-Only Live Process Attach, Static Hydration & Multi-Arch Runtime Inspection
 
 ```mermaid
 sequenceDiagram
     actor User
     participant Ui as UiApp / Panels
     participant Model as BinaryModel
-    participant Proc as IProcessBackend / Session
-    participant Core as peelf_core (Live Rebasing)
-    participant Patch as LiveMemoryPatchSpace
+    participant Proc as IProcessBackend / Read-Only Session
+    participant Core as peelf_core (Forgiving Multi-Arch Subsystems)
+    participant Decomp as FunctionIndex + IDecompiler
 
     User->>Ui: File > Attach to Process...
     Ui->>Model: list_processes() / attach_process(pid)
-    Model->>Proc: open_process(pid) + memory_regions() + modules()
-    Model->>Core: load_live_module_image(main_module)
-    Note over Core: Combines live RAM at runtime ASLR base<br/>with on-disk PE/ELF (.symtab/.strtab, directories)<br/>rebased by (live_base - static_base)
-    Core-->>Model: Rebased IBinaryImage + SymbolIndex
-    Ui->>Ui: Populate Memory Map, Structure, Symbols, Hex & Disassembly
-    User->>Ui: Edit byte in Hex View or Stage Shellcode
-    Ui->>Patch: stage_patch(session, va, bytes)
-    Note over Patch: Overlay only — live process RAM untouched;<br/>visible immediately in Hex, Disasm & Patch Set
-    User->>Ui: Click "Commit to RAM"
-    Ui->>Patch: commit_to_process(session, options)
-    Patch->>Proc: Snapshot original RAM + write_memory (COW / VirtualProtectEx fallback)
-    User->>Ui: Click "Revert RAM"
-    Ui->>Patch: revert_committed(session)
-    Patch->>Proc: Restore snapshotted original RAM bytes
+    Model->>Proc: open_process(pid) [strictly read-only]
+    Model->>Core: resolve_executable_from_command_line(cmdline, cwd, PATH)
+    Model->>Core: load_live_module_image(main_module + resolved backing PE/ELF)
+    Note over Core: Combines live RAM at runtime ASLR base<br/>with resolved on-disk PE/ELF (.symtab, .pdata, .eh_frame, TLS)<br/>rebased by (live_base - static_base)
+    Core-->>Model: Rebased IBinaryImage + SymbolIndex + FunctionIndex
+    Model->>Core: harvest_header_flags + inspect_process_environment + inspect_handlers
+    Note over Core: Forgiving Availability (Available / Partial / Unavailable):<br/>PEB32/64 + TEB32/64 OR Linux auxv + status + r_debug/link_map + TCB;<br/>SEH/VEH/.pdata/.eh_frame/Linux signals/atexit across 32/64-bit LE/BE
+    User->>Ui: Click executable MemoryRegion or Function
+    Ui->>Decomp: Disassemble window + CFG + StructuredPseudoC / RetDec / Ghidra
+    User->>Ui: Pause Process -> Select Thread
+    Ui->>Proc: suspend() + threads() + thread_context(tid)
+    Model->>Core: unwind_and_inspect_stack + inspect_thread_locals
+    Note over Ui: Stack View highlights Return Addresses (Gold/Amber)<br/>vs. Base/Frame Pointers (Cyan/Teal); TLS decodes PE & ELF Variant I/II
+    User->>Ui: Search Heap (Hex / Endian Numbers / UTF-8 & UTF-16 Text)
+    Ui->>Core: search_process_memory (target endianness & alignment)
 ```
 
 ## Panel Navigation Model
