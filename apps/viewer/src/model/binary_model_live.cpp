@@ -240,6 +240,7 @@ private:
         }
         static_image_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
         process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+        execution_timeline_.set_target_instance(target_instance_id_);
 
         in_coordinated_attach_ = true;
         auto map_res = refresh_process_map();
@@ -349,6 +350,10 @@ private:
         }
         static_image_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
         process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+        execution_timeline_.set_target_instance(target_instance_id_);
+        debug_timeline_source_ =
+            std::make_shared<peelf::DebugSessionTimelineSource>(debug_session_, target_instance_id_);
+        execution_timeline_.register_source(debug_timeline_source_);
 
         in_coordinated_attach_ = true;
         auto map_res = refresh_process_map();
@@ -359,10 +364,53 @@ private:
         return map_res;
     }
 
+    std::size_t BinaryModel::sync_debugger_timeline_events() {
+        if (!debug_session_ || !debug_timeline_source_) {
+            return 0u;
+        }
+        const std::uint64_t seq_before = execution_timeline_.next_sequence();
+        auto polled = debug_timeline_source_->poll(execution_timeline_);
+        if (!polled.has_value() || *polled == 0u) {
+            return 0u;
+        }
+
+        bool added_dynamic_base = false;
+        for (const peelf::TimelineEvent& ev : execution_timeline_.events()) {
+            if (ev.sequence < seq_before ||
+                ev.kind != peelf::TimelineEventKind::DebuggerEvent ||
+                !ev.virtual_address.has_value() ||
+                *ev.virtual_address == 0u) {
+                continue;
+            }
+            const auto* dbg_ev = std::get_if<peelf::debugger::DebugEvent>(&ev.payload);
+            if (dbg_ev != nullptr &&
+                dbg_ev->kind == peelf::debugger::DebugEventKind::ModuleLoaded) {
+                if (std::ranges::find(timeline_proven_dynamic_bases_, *ev.virtual_address) ==
+                    timeline_proven_dynamic_bases_.end()) {
+                    timeline_proven_dynamic_bases_.push_back(*ev.virtual_address);
+                    added_dynamic_base = true;
+                }
+            }
+        }
+        if (added_dynamic_base && !captured_snapshots_.empty()) {
+            peelf::populate_runtime_settings_from_snapshot(
+                executable_settings_,
+                captured_snapshots_.back(),
+                timeline_proven_dynamic_bases_);
+        }
+        return *polled;
+    }
+
+    void BinaryModel::clear_execution_timeline() noexcept {
+        execution_timeline_.clear(false);
+    }
+
     std::optional<std::uint64_t> BinaryModel::sync_debugger_stop_state() {
         if (!debug_session_) {
             return std::nullopt;
         }
+
+        (void)sync_debugger_timeline_events();
 
         const peelf::debugger::DebugStopStatus st = debug_session_->stop_status();
         if (st.stop_revision == last_synced_debug_stop_revision_) {
@@ -1407,10 +1455,13 @@ private:
         captured_snapshots_.push_back(std::move(snap));
         const std::size_t new_index = captured_snapshots_.size() - 1u;
 
-        if (captured_snapshots_.size() >= 2u) {
+        if (captured_snapshots_.size() == 1u) {
+            execution_timeline_.seed_threads_from_snapshot(captured_snapshots_.back());
+        } else if (captured_snapshots_.size() >= 2u) {
             latest_snapshot_diff_ = peelf::diff_process_snapshots(
                 captured_snapshots_[captured_snapshots_.size() - 2u],
                 captured_snapshots_.back());
+            (void)execution_timeline_.ingest_snapshot_diff(*latest_snapshot_diff_);
             for (const std::uint64_t base :
                  peelf::collect_loaded_module_bases_from_diff(*latest_snapshot_diff_)) {
                 if (std::ranges::find(timeline_proven_dynamic_bases_, base) ==
@@ -1427,6 +1478,11 @@ private:
         return new_index;
     }
 
+    peelf::Result<std::size_t> BinaryModel::record_timeline_snapshot_delta(
+        bool pause_during_capture) {
+        return capture_snapshot(pause_during_capture);
+    }
+
     peelf::Result<void> BinaryModel::diff_snapshots(
         std::size_t before_index,
         std::size_t after_index) {
@@ -1439,6 +1495,7 @@ private:
             captured_snapshots_[before_index],
             captured_snapshots_[after_index]);
         if (before_index < after_index) {
+            (void)execution_timeline_.ingest_snapshot_diff(*latest_snapshot_diff_);
             for (const std::uint64_t base :
                  peelf::collect_loaded_module_bases_from_diff(*latest_snapshot_diff_)) {
                 if (std::ranges::find(timeline_proven_dynamic_bases_, base) ==

@@ -38,6 +38,18 @@ using detail::utf8_path;
 
 } // namespace
 
+    BinaryModel::BinaryModel() {
+        reset_timeline_sources();
+    }
+
+    void BinaryModel::reset_timeline_sources() {
+        debug_timeline_source_.reset();
+        execution_timeline_.clear(true);
+        execution_timeline_.clear_sources();
+        execution_timeline_.register_source(peelf::create_syscall_timeline_source());
+        execution_timeline_.register_source(peelf::create_etw_timeline_source());
+    }
+
     void BinaryModel::reset_all() {
         ++content_generation_;
         cached_content_sha256_.clear();
@@ -106,6 +118,7 @@ using detail::utf8_path;
         captured_snapshots_.clear();
         latest_snapshot_diff_.reset();
         timeline_proven_dynamic_bases_.clear();
+        reset_timeline_sources();
         process_internals_ = {};
         process_internals_loaded_ = false;
         thread_cpu_tracker_.reset();

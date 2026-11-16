@@ -52,6 +52,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/capability_matrix.cpp
   src/executable_settings.cpp
   src/process_snapshot.cpp
+  src/execution_timeline.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
@@ -64,6 +65,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/executable_settings.hpp
   include/peelf/executable_overview.hpp
   include/peelf/process_snapshot.hpp
+  include/peelf/execution_timeline.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
   include/peelf/binary_diff.hpp

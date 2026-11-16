@@ -22,6 +22,7 @@
 #include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
 #include <peelf/executable_settings.hpp>
+#include <peelf/execution_timeline.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/handlers.hpp>
 #include <peelf/memory_search.hpp>
@@ -90,7 +91,7 @@ namespace viewer {
 
     class BinaryModel {
     public:
-        BinaryModel() = default;
+        BinaryModel();
 
         bool load_file(const std::string& path);
 
@@ -406,6 +407,18 @@ namespace viewer {
             return latest_snapshot_diff_;
         }
 
+        // Multi-thread execution & event timeline (WU-24).
+        [[nodiscard]] const peelf::ExecutionTimeline& execution_timeline() const noexcept {
+            return execution_timeline_;
+        }
+        [[nodiscard]] peelf::ExecutionTimeline& execution_timeline() noexcept {
+            return execution_timeline_;
+        }
+        void clear_execution_timeline() noexcept;
+        std::size_t sync_debugger_timeline_events();
+        [[nodiscard]] peelf::Result<std::size_t> record_timeline_snapshot_delta(
+            bool pause_during_capture = false);
+
     private:
         void sync_live_executable_settings();
         BinarySourceKind source_kind_ = BinarySourceKind::None;
@@ -501,6 +514,8 @@ namespace viewer {
         peelf::CaptureStamp selected_thread_stamp_{};
         peelf::CaptureStamp runtime_stamp_{};
         peelf::CaptureStamp process_internals_stamp_{};
+        peelf::ExecutionTimeline execution_timeline_{};
+        std::shared_ptr<peelf::DebugSessionTimelineSource> debug_timeline_source_{};
 
         mutable std::string last_diagnostic_;
         mutable std::string cached_content_sha256_;
@@ -508,6 +523,7 @@ namespace viewer {
         mutable std::uint64_t cached_sha256_revision_ = std::numeric_limits<std::uint64_t>::max();
 
         void reset_all();
+        void reset_timeline_sources();
         void recompute_capabilities() noexcept;
         [[nodiscard]] peelf::CaptureStamp advance_live_capture_stamp(
             peelf::CaptureAvailability availability) noexcept;

@@ -120,7 +120,7 @@ Full data structures, capability defaults, security rules, and sandboxing contra
   - Bounded PE `RT_MANIFEST` XML, `RT_VERSION` `VS_FIXEDFILEINFO` + multi-locale `StringFileInfo`, and CLR `BSJB` metadata summary; ELF `PT_INTERP`, `.note.ABI-tag`, `.note.gnu.build-id`, `DT_SONAME`/`DT_RPATH`/`DT_RUNPATH`, and `DT_FLAGS`/`DF_1_*` in GUI + versioned `--headless` JSON.
 - [x] **WU-23** — **Timestamped `ProcessStateSnapshot`, Interval/Identity `SnapshotDiff` & Observed Runtime Settings.** *(Depends on: `WU-21`, `WU-22`)*
   - Point-in-time `ProcessStateSnapshot` capture, default secret redaction for observed environment variables, and `TargetInstanceId`-verified `SnapshotDiff` across modules, split/merged/RWX memory regions, threads/stacks, handles/FDs (detecting FD reuse), and sockets with partial-capture uncertainty propagation.
-- [ ] **WU-24** — **Multi-Thread Execution & Event Timeline.** *(Depends on: `WU-23`)*
+- [x] **WU-24** — **Multi-Thread Execution & Event Timeline.** *(Depends on: `WU-23`)*
   - `ITimelineSource` & `TimelineEvent` merging `IDebugSession` events and `SnapshotDiff` deltas with explicit `SamplingGap` & `DroppedEvents` markers, per-thread UI swimlanes, and click-to-navigate.
 - [ ] **WU-25** — **GDB Remote Serial Protocol (`GdbRemoteBackend` / QEMU Stub).** *(Depends on: `WU-21`, `WU-24`)*
   - Clean-room BSD-2-Clause RSP client behind read-only `IProcessSession` (`qSupported`, `qXfer:features:read:target.xml`, memory-map/libraries XML, `g`/`p`, `m`, multiprocess thread IDs) and explicit opt-in `IDebugSession` (`G`/`P`, `M`, `Z0`/`z0`, `Z1`–`Z4` watchpoints, `vCont`) with deterministic loopback mock-stub CTests.
@@ -362,7 +362,7 @@ Items promoted into the active **Next-Gen Execution Queue (`§1b` / `§1e`)** ca
 
 - [ ] Mach-O & Universal (`FAT_MAGIC`/`FAT_CIGAM_64`) support behind `IBinaryImage` (`WU-26`).
 - [ ] GDB Remote Serial Protocol (`GdbRemoteBackend` / QEMU stub) behind read-only `IProcessSession` and opt-in `IDebugSession` (`WU-25`).
-- [ ] Timestamped `ProcessStateSnapshot` diffing & multi-thread execution/event timeline (`WU-23`, `WU-24`).
+- [x] Timestamped `ProcessStateSnapshot` diffing & multi-thread execution/event timeline (`WU-23`, `WU-24`).
 - [x] String extraction browser linked to `ReferenceIndex` (`WU-04`); `[ ]` entropy/packer heuristics stretch.
 - [x] Symbol demangling — Itanium C++/Rust + MSVC (`WU-05`).
 - [x] PDB / DWARF debug-info association — Windows PDB/DIA + ELF/MinGW DWARF v2–v5 & `.gnu_debuglink`/`.note.gnu.build-id` separate-debug discovery + live ASLR rebasing (`WU-05`).

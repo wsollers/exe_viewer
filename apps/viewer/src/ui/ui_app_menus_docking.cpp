@@ -221,6 +221,10 @@ void UiApp::render_main_menu() {
             process_internals_panel_.set_visible(true);
             activate_panel(process_internals_panel_.name().c_str());
         }
+        if (ImGui::MenuItem("Execution Timeline")) {
+            timeline_panel_.set_visible(true);
+            activate_panel(timeline_panel_.name().c_str());
+        }
         if (ImGui::MenuItem("References & Notes", "X", false, model_.has_file())) open_references();
         if (ImGui::MenuItem("Bookmark selection", "Ctrl+B", false, model_.has_file())) {
             toggle_bookmark_at_selection();
@@ -368,6 +372,7 @@ void UiApp::render_main_menu() {
 
         for (UiPanel* extra : {static_cast<UiPanel*>(&capabilities_panel_),
                                static_cast<UiPanel*>(&executable_settings_panel_),
+                               static_cast<UiPanel*>(&timeline_panel_),
                                static_cast<UiPanel*>(&debugger_panel_),
                                static_cast<UiPanel*>(&binary_diff_panel_),
                                static_cast<UiPanel*>(&dependencies_panel_),
@@ -522,6 +527,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
 
     ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(debugger_panel_.name().c_str(), center_bottom_id);
+    ImGui::DockBuilderDockWindow(timeline_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(memory_search_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
     ImGui::DockBuilderDockWindow("Disassembly", main_id);

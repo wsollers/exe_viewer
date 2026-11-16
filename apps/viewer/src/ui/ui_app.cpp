@@ -68,6 +68,56 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , executable_settings_panel_(
           model,
           [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); })
+    , timeline_panel_(
+          model,
+          [this](const peelf::TimelineNavigationTarget& target) {
+              const peelf::TimelineNavigationTarget nav = target;
+              pending_navigations_.enqueue_custom([this, nav]() {
+                  if (nav.thread.has_value() && nav.thread->tid != 0u) {
+                      model_.select_thread(nav.thread->tid);
+                  }
+                  switch (nav.primary_panel) {
+                      case peelf::TimelineTargetPanel::None:
+                          break;
+                      case peelf::TimelineTargetPanel::Disassembly:
+                          if (nav.virtual_address.has_value() && *nav.virtual_address != 0u) {
+                              navigate_to_address(*nav.virtual_address, PreferredView::Disassembly);
+                          } else {
+                              show_disassembly_panel_ = true;
+                              focus_listing_ = true;
+                          }
+                          break;
+                      case peelf::TimelineTargetPanel::Hex:
+                          if (nav.virtual_address.has_value() && *nav.virtual_address != 0u) {
+                              navigate_to_address(*nav.virtual_address, PreferredView::Hex);
+                              if (nav.byte_size > 1u) {
+                                  if (const auto off =
+                                          model_.virtual_address_to_offset(*nav.virtual_address)) {
+                                      hex_panel_.navigate_to_range(*off, nav.byte_size);
+                                  }
+                              }
+                          }
+                          hex_panel_.set_visible(true);
+                          activate_panel(hex_panel_.name().c_str());
+                          break;
+                      case peelf::TimelineTargetPanel::ProcessInternals:
+                          process_internals_panel_.set_visible(true);
+                          activate_panel(process_internals_panel_.name().c_str());
+                          break;
+                      case peelf::TimelineTargetPanel::Debugger:
+                          if (nav.virtual_address.has_value() && *nav.virtual_address != 0u) {
+                              navigate_to_address(*nav.virtual_address, PreferredView::Disassembly);
+                          }
+                          debugger_panel_.set_visible(true);
+                          activate_panel(debugger_panel_.name().c_str());
+                          break;
+                      case peelf::TimelineTargetPanel::ExecutableSettings:
+                          executable_settings_panel_.set_visible(true);
+                          activate_panel(executable_settings_panel_.name().c_str());
+                          break;
+                  }
+              });
+          })
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -81,6 +131,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     debugger_panel_.set_visible(false);
     capabilities_panel_.set_visible(false);
     executable_settings_panel_.set_visible(false);
+    timeline_panel_.set_visible(false);
     dependencies_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
@@ -697,6 +748,7 @@ void UiApp::render() {
     debugger_panel_.draw();
     capabilities_panel_.draw();
     executable_settings_panel_.draw();
+    timeline_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());
