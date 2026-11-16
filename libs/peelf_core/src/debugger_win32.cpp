@@ -1209,7 +1209,8 @@ public:
 
     [[nodiscard]] Result<std::unique_ptr<IDebugSession>> attach(ProcessId pid) override {
         auto s = std::make_unique<Win32DebugSession>(
-            Win32DebugSession::InitMode::Attach, {}, {}, {}, pid);
+            Win32DebugSession::InitMode::Attach, std::filesystem::path{},
+            std::vector<std::string>{}, std::filesystem::path{}, pid);
         if (!s->init_result().has_value()) return std::unexpected(s->init_result().error());
         return s;
     }

@@ -1615,7 +1615,7 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
 
     LiveModuleIntegrityReport report;
     report.module_name = live_module.name;
-    report.disk_path = live_module.path;
+    report.disk_path = live_module.path.string();
     report.static_preferred_base = disk_image.image_base();
     report.live_base_address = live_module.base_address;
     report.aslr_load_bias = static_cast<std::int64_t>(
