@@ -1,5 +1,6 @@
 #include "peelf/process_internals.hpp"
 #include "peelf/crash_dump.hpp"
+#include "peelf/gdb_remote.hpp"
 
 #if defined(__linux__)
 
@@ -54,6 +55,9 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
         snap.sockets.status = SubsystemStatus::unavailable("crash_dump", "Live sockets not captured in crash dump");
         snap.security.status = SubsystemStatus::unavailable("crash_dump", "Live token/seccomp not captured in crash dump");
         return snap;
+    }
+    if (const auto* remote = dynamic_cast<const IGdbRemoteSession*>(&session); remote != nullptr) {
+        return remote->process_internals();
     }
 
     ProcessInternalsSnapshot snap{};

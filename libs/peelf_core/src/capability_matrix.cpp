@@ -2,6 +2,7 @@
 
 #include <peelf/assembler.hpp>
 #include <peelf/crash_dump.hpp>
+#include <peelf/gdb_remote.hpp>
 
 #include <algorithm>
 #include <array>
@@ -597,6 +598,25 @@ TargetProfile derive_target_profile(
                 }
             } else {
                 p.backend = BackendKind::CrashDumpElfCore;
+            }
+        } else if (const auto* gdb = dynamic_cast<const IGdbRemoteSession*>(session);
+                   gdb != nullptr) {
+            const TargetProfile& gp = gdb->target_profile();
+            p.backend = BackendKind::GdbRemote;
+            if (p.architecture == Architecture::Unknown) {
+                p.architecture = gp.architecture;
+                p.address_width = gp.address_width;
+                p.endianness = gp.endianness;
+            }
+            if (p.os == OsKind::Unknown) {
+                p.os = gp.os;
+            }
+            if (p.abi == AbiKind::Unknown) {
+                p.abi = gp.abi;
+            }
+            if (p.format == Format::Unknown) {
+                p.format = gp.format;
+                p.image_kind = gp.image_kind;
             }
         } else if (remote_gdb_rsp) {
             p.backend = BackendKind::RemoteGdbRsp;

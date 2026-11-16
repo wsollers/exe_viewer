@@ -80,6 +80,7 @@ add_executable(peelf_tests
   executable_settings_test.cpp
   process_snapshot_test.cpp
   execution_timeline_test.cpp
+  gdb_remote_rsp_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_dot.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_build.cpp

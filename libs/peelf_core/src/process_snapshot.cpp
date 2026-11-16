@@ -1,6 +1,7 @@
 #include <peelf/process_snapshot.hpp>
 
 #include <peelf/capability_matrix.hpp>
+#include <peelf/gdb_remote.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -140,11 +141,14 @@ std::atomic<std::uint64_t> g_next_snapshot_revision{1u};
 
 [[nodiscard]] TargetInstanceId derive_session_target_id(const IProcessSession& session) {
     TargetInstanceId tid{};
+    const bool is_gdb_remote = (dynamic_cast<const IGdbRemoteSession*>(&session) != nullptr);
     if (session.is_crash_dump()) {
         const std::string lower_exe = ascii_lower_copy(session.info().executable_path.generic_string());
         tid.backend = lower_exe.ends_with(".dmp") || lower_exe.ends_with(".mdmp")
                           ? BackendKind::CrashDumpMinidump
                           : BackendKind::CrashDumpElfCore;
+    } else if (is_gdb_remote) {
+        tid.backend = BackendKind::GdbRemote;
     } else if (!session.is_read_only()) {
         tid.backend = BackendKind::ActiveDebugger;
     } else {
@@ -152,7 +156,7 @@ std::atomic<std::uint64_t> g_next_snapshot_revision{1u};
     }
 
     tid.pid = session.pid();
-    if (!session.is_crash_dump() && tid.pid != 0u) {
+    if (!session.is_crash_dump() && !is_gdb_remote && tid.pid != 0u) {
         tid.creation_identity = query_process_creation_identity(tid.pid);
     }
     if (!tid.creation_identity.has_value()) {
@@ -1466,7 +1470,8 @@ ProcessStateSnapshot capture_process_snapshot(
             }
             ThreadSnapshot ts{};
             ts.info = th;
-            if (!session.is_crash_dump()) {
+            if (!session.is_crash_dump() &&
+                dynamic_cast<const IGdbRemoteSession*>(&session) == nullptr) {
                 ts.creation_identity = query_thread_creation_identity(session.pid(), th.tid);
             }
 
@@ -1605,7 +1610,14 @@ ProcessStateSnapshot capture_process_snapshot(
     }
 
     // 5. Launch / current environment settings (redacted by default)
-    if (options.capture_environment) {
+    if (dynamic_cast<const IGdbRemoteSession*>(&session) != nullptr) {
+        const CaptureStamp env_stamp = CaptureStamp::capture_now(
+            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
+        snapshot.launch_environment = Observed<LaunchEnvironmentSettings>::unavailable(
+            os_prov,
+            "GDB RSP read-only session does not expose remote OS launch environment.",
+            env_stamp);
+    } else if (options.capture_environment) {
         RuntimeSettingsOptions rt_opts{};
         rt_opts.redaction_policy = options.environment_redaction_policy;
         rt_opts.launched_by_session = options.launched_by_session;

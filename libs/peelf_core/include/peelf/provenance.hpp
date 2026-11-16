@@ -24,6 +24,7 @@ enum class BackendKind : std::uint8_t {
     ActiveDebugger,
     RemoteGdbRsp,
     Unknown,
+    GdbRemote = RemoteGdbRsp,
 };
 
 using TargetSessionKind = BackendKind;
