@@ -90,3 +90,104 @@ TEST(FileMapping, UnicodePathRoundTrips) {
     }
     std::filesystem::remove(path);
 }
+
+namespace {
+
+struct alignas(16) AlignedBlock {
+    std::uint64_t lo;
+    std::uint64_t hi;
+};
+
+struct MisalignedCountingBackend {
+    static inline int open_calls = 0;
+    static inline int close_calls = 0;
+    alignas(16) static inline std::uint8_t backing[64]{};
+
+    static std::error_code open_and_map(MisalignedCountingBackend&,
+                                        const std::string& path,
+                                        peelf::MapMode,
+                                        void** out_ptr,
+                                        std::size_t* out_size) noexcept {
+        ++open_calls;
+        if (path == "zero") {
+            *out_ptr = backing;
+            *out_size = 0;
+            return {};
+        }
+        *out_ptr = backing + 1;  // Intentionally misaligned for alignof(AlignedBlock) == 16
+        *out_size = 32;
+        return {};
+    }
+
+    static std::error_code flush(MisalignedCountingBackend&, void*, std::size_t) noexcept {
+        return {};
+    }
+
+    static std::error_code unmap_and_close(MisalignedCountingBackend&,
+                                           void* ptr,
+                                           std::size_t size) noexcept {
+        if (ptr != nullptr || size != 0) {
+            ++close_calls;
+        }
+        return {};
+    }
+};
+
+}  // namespace
+
+TEST(FileMapping, AlignmentAndZeroSizeFailuresUnmapWithoutLeakingView) {
+    MisalignedCountingBackend::open_calls = 0;
+    MisalignedCountingBackend::close_calls = 0;
+
+    peelf::FileMapping<AlignedBlock, MisalignedCountingBackend> map;
+    const std::error_code ec = map.open("misaligned", peelf::MapMode::read_only);
+    EXPECT_EQ(ec, peelf::make_error_code(peelf::MapErrc::invalid_alignment));
+    EXPECT_FALSE(map.is_open());
+    EXPECT_EQ(MisalignedCountingBackend::open_calls, 1);
+    EXPECT_EQ(MisalignedCountingBackend::close_calls, 1);
+
+    const std::error_code zero_ec = map.open("zero", peelf::MapMode::read_only);
+    EXPECT_EQ(zero_ec, peelf::make_error_code(peelf::MapErrc::size_zero));
+    EXPECT_FALSE(map.is_open());
+    EXPECT_EQ(MisalignedCountingBackend::open_calls, 2);
+    EXPECT_EQ(MisalignedCountingBackend::close_calls, 2);
+}
+
+TEST(FileMapping, EnforcesReadOnlyConstnessAndReadWriteWritableSpan) {
+    const auto path = std::filesystem::temp_directory_path() / "peelf_mapping_constness_test.bin";
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write("ABCDEFGH", 8);
+    }
+
+    {
+        ByteMapping ro_map(path, peelf::MapMode::read_only);
+        ASSERT_TRUE(ro_map.is_open());
+        EXPECT_EQ(ro_map.mode(), peelf::MapMode::read_only);
+        EXPECT_EQ(ro_map.bytes().size(), 8u);
+        EXPECT_EQ(ro_map.bytes()[0], static_cast<std::uint8_t>('A'));
+
+        auto denied = ro_map.writable_span();
+        EXPECT_FALSE(denied.has_value());
+        EXPECT_EQ(ro_map.flush(), peelf::make_error_code(peelf::MapErrc::flush_failed));
+    }
+
+    {
+        ByteMapping rw_map(path, peelf::MapMode::read_write);
+        ASSERT_TRUE(rw_map.is_open());
+        EXPECT_EQ(rw_map.mode(), peelf::MapMode::read_write);
+        auto writable = rw_map.writable_span();
+        ASSERT_TRUE(writable.has_value()) << writable.error().message;
+        ASSERT_EQ(writable->size(), 8u);
+        (*writable)[0] = static_cast<std::uint8_t>('Z');
+        EXPECT_FALSE(static_cast<bool>(rw_map.flush()));
+    }
+
+    {
+        ByteMapping verify_map(path, peelf::MapMode::read_only);
+        ASSERT_EQ(verify_map.bytes().size(), 8u);
+        EXPECT_EQ(verify_map.bytes()[0], static_cast<std::uint8_t>('Z'));
+    }
+
+    std::filesystem::remove(path);
+}

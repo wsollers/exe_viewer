@@ -5,7 +5,7 @@
 #include <charconv>
 #include <chrono>
 #include <cinttypes>
-#include <cstdio>
+#include <format>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -113,9 +113,7 @@ template <typename IntT>
         if (i > 0 && i != best_start + best_len) {
             out.push_back(':');
         }
-        std::array<char, 8> hex{};
-        std::snprintf(hex.data(), hex.size(), "%x", static_cast<unsigned>(groups[i]));
-        out += hex.data();
+        out += std::format("{:x}", static_cast<unsigned>(groups[i]));
         ++i;
     }
     out.push_back(']');
@@ -143,16 +141,12 @@ template <typename IntT>
         if (!w.has_value()) {
             return std::nullopt;
         }
-        std::array<char, 48> buf{};
-        std::snprintf(buf.data(),
-                      buf.size(),
-                      "%u.%u.%u.%u:%u",
-                      static_cast<unsigned>(*w & 0xFFu),
-                      static_cast<unsigned>((*w >> 8u) & 0xFFu),
-                      static_cast<unsigned>((*w >> 16u) & 0xFFu),
-                      static_cast<unsigned>((*w >> 24u) & 0xFFu),
-                      static_cast<unsigned>(*port));
-        return std::string(buf.data());
+        return std::format("{}.{}.{}.{}:{}",
+                           static_cast<unsigned>(*w & 0xFFu),
+                           static_cast<unsigned>((*w >> 8u) & 0xFFu),
+                           static_cast<unsigned>((*w >> 16u) & 0xFFu),
+                           static_cast<unsigned>((*w >> 24u) & 0xFFu),
+                           static_cast<unsigned>(*port));
     }
 
     if (addr_hex.size() != 32) {
@@ -170,11 +164,7 @@ template <typename IntT>
         bytes[word * 4 + 3] = static_cast<std::uint8_t>((*w >> 24u) & 0xFFu);
     }
 
-    std::string host = format_ipv6_bytes(bytes);
-    std::array<char, 16> port_buf{};
-    std::snprintf(port_buf.data(), port_buf.size(), ":%u", static_cast<unsigned>(*port));
-    host += port_buf.data();
-    return host;
+    return std::format("{}:{}", format_ipv6_bytes(bytes), static_cast<unsigned>(*port));
 }
 
 [[nodiscard]] std::string decode_linux_tcp_state(std::uint32_t st, bool is_udp) {

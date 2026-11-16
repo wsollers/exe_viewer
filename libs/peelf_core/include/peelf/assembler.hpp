@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -107,6 +108,24 @@ private:
     std::filesystem::path llvm_mc_path_{};
     SubsystemStatus status_{};
 };
+
+struct SubprocessResult {
+    int exit_code{-1};
+    bool launched{false};
+    bool timed_out{false};
+    std::string stdout_text{};
+    std::string stderr_text{};
+    std::string launch_error{};
+};
+
+/// Executes a child process directly via `argv` (never through a shell), multiplexing
+/// `stdin_payload` concurrently with `stdout` and `stderr` drains and enforcing `timeout`
+/// across the full child lifetime (terminating and reaping hung processes cleanly).
+[[nodiscard]] SubprocessResult run_argv_process(
+    const std::filesystem::path& exe_path,
+    std::span<const std::string> args,
+    std::string_view stdin_payload,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{15000});
 
 /// Deterministic target triple mapper for `llvm-mc` (exposed for unit testing).
 [[nodiscard]] std::optional<std::string> llvm_mc_triple_for_target(

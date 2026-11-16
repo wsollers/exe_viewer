@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -10,7 +11,7 @@
 #include <utility>
 #include <filesystem>
 
-
+#include <peelf/error.hpp>
 #include "mapping/map_errors.hpp"
 
 namespace peelf {
@@ -86,7 +87,7 @@ public:
         }
     }
 
-    ~FileMapping() { close(); }
+    ~FileMapping() noexcept { close(); }
 
     FileMapping(const FileMapping&) = delete;
     FileMapping& operator=(const FileMapping&) = delete;
@@ -99,38 +100,42 @@ public:
             backend_ = std::exchange(other.backend_, {});
             data_ = std::exchange(other.data_, nullptr);
             byte_size_ = std::exchange(other.byte_size_, 0);
-            mode_ = other.mode_;
+            mode_ = std::exchange(other.mode_, MapMode::read_only);
         }
         return *this;
     }
 
     // Open / close
-    std::error_code open(std::string path, MapMode mode = MapMode::read_only)
+    [[nodiscard]] std::error_code open(std::string path, MapMode mode = MapMode::read_only)
     {
         close();
-        mode_ = mode;
 
         std::size_t bytes = 0;
         void* ptr = nullptr;
 
         if (auto ec = Backend::open_and_map(backend_, path, mode, &ptr, &bytes); ec) {
+            backend_ = {};
             return ec;
         }
 
         if (bytes == 0) {
-            close();
+            (void)Backend::unmap_and_close(backend_, ptr, bytes);
+            backend_ = {};
             return make_error_code(MapErrc::size_zero);
         }
 
         // Alignment: mmap/CreateFileMapping are page-aligned, but T alignment might exceed that.
-        // Typically alignof(T) <= page size; still check for correctness.
-        if (reinterpret_cast<std::uintptr_t>(ptr) % alignof(T) != 0) {
-            close();
+        // Typically alignof(T) <= page size; still check for correctness and release the mapped
+        // view before returning if alignment is insufficient.
+        if (std::bit_cast<std::uintptr_t>(ptr) % alignof(T) != 0) {
+            (void)Backend::unmap_and_close(backend_, ptr, bytes);
+            backend_ = {};
             return make_error_code(MapErrc::invalid_alignment);
         }
 
         data_ = static_cast<T*>(ptr);
         byte_size_ = bytes;
+        mode_ = mode;
         return {};
     }
 
@@ -143,12 +148,14 @@ public:
         } else {
             // still close handles if backend has them
             (void)Backend::unmap_and_close(backend_, nullptr, 0);
-            backend_ = {};
         }
+        backend_ = {};
+        mode_ = MapMode::read_only;
     }
 
     // Accessors
     [[nodiscard]] bool is_open() const noexcept { return data_ != nullptr; }
+    [[nodiscard]] MapMode mode() const noexcept { return mode_; }
 
     [[nodiscard]] std::size_t size_bytes() const noexcept { return byte_size_; }
     [[nodiscard]] std::size_t size() const noexcept { return byte_size_ / sizeof(T); }
@@ -158,22 +165,41 @@ public:
         return {data_, size()};
     }
 
-    [[nodiscard]] std::span<T> view() noexcept
+    [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept
     {
-        return {data_, size()};
+        if (!data_) {
+            return {};
+        }
+        return {reinterpret_cast<const std::uint8_t*>(data_), byte_size_};
+    }
+
+    [[nodiscard]] Result<std::span<T>> writable_span() noexcept
+    {
+        if (!is_open()) {
+            return make_error("FileMapping is not open");
+        }
+        if (mode_ != MapMode::read_write) {
+            return make_error("FileMapping was opened read-only");
+        }
+        return std::span<T>{data_, size()};
     }
 
     // Optional: flush to disk (only meaningful for read_write)
     std::error_code flush() noexcept
     {
         if (!data_) return {};
+        if (mode_ != MapMode::read_write) return make_error_code(MapErrc::flush_failed);
         return Backend::flush(backend_, data_, byte_size_);
     }
 
 private:
     static std::string path_utf8(const std::filesystem::path& path) {
         const auto utf8 = path.u8string();
-        return std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size());
+        std::string out(utf8.size(), '\0');
+        for (std::size_t i = 0; i < utf8.size(); ++i) {
+            out[i] = static_cast<char>(utf8[i]);
+        }
+        return out;
     }
     Backend backend_{};
     T* data_ = nullptr;

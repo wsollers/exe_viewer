@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <utility>
 
@@ -152,6 +153,9 @@ public:
     [[nodiscard]] std::string_view elf_interpreter() const noexcept override {
         return {};
     }
+    [[nodiscard]] std::span<const std::string> parse_warnings() const noexcept override {
+        return parse_warnings_;
+    }
     [[nodiscard]] bool has_elf_pt_load() const noexcept {
         for (const auto& segment : segments_) {
             if (segment.type == 1) {
@@ -243,7 +247,14 @@ protected:
     std::vector<Symbol> symbols_;
     std::vector<ImportEntry> imports_;
     std::vector<ExportEntry> exports_;
+    std::vector<std::string> parse_warnings_;
     std::optional<GnuDebugLink> gnu_debuglink_;
+
+    void add_warning(std::string warning) {
+        if (!warning.empty()) {
+            parse_warnings_.push_back(std::move(warning));
+        }
+    }
 
     void parse_gnu_debuglink_section(std::span<const std::uint8_t> b, bool big) {
         for (const Section& sec : sections_) {
@@ -261,7 +272,10 @@ protected:
                 continue;
             }
             GnuDebugLink link;
-            link.filename.assign(reinterpret_cast<const char*>(b.data() + start), nul_rel);
+            link.filename.reserve(nul_rel);
+            for (std::size_t i = 0; i < nul_rel; ++i) {
+                link.filename.push_back(static_cast<char>(b[start + i]));
+            }
             const std::size_t crc_rel = (nul_rel + 1u + 3u) & ~std::size_t{3u};
             if (crc_rel + 4u <= sec.file_size) {
                 link.crc32 = rd32(b, start + crc_rel, big);
@@ -1188,9 +1202,19 @@ void parse_pe_clr_header(std::span<const std::uint8_t> b,
 
 void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t offset,
                      std::uint64_t size, bool from_program_header,
-                     std::vector<ElfNote>& notes_out) {
-    if (!fits_range(offset, size, static_cast<std::uint64_t>(b.size()))) {
+                     std::vector<ElfNote>& notes_out,
+                     std::vector<std::string>& warnings_out) {
+    if (size == 0) {
         return;
+    }
+    if (!fits_range(offset, size, static_cast<std::uint64_t>(b.size()))) {
+        warnings_out.push_back(std::format(
+            "ELF {} note payload truncated: offset 0x{:X} + {} bytes exceeds file size ({} bytes)",
+            from_program_header ? "PT_NOTE" : "SHT_NOTE", offset, size, b.size()));
+        if (offset >= b.size()) {
+            return;
+        }
+        size = static_cast<std::uint64_t>(b.size()) - offset;
     }
 
     const std::uint64_t end = offset + size;
@@ -1205,11 +1229,17 @@ void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t of
         const std::uint64_t aligned_name_size = align4(name_size);
         const std::uint64_t aligned_descriptor_size = align4(descriptor_size);
         if (cursor > end || aligned_name_size > end - cursor) {
+            warnings_out.push_back(std::format(
+                "ELF {} note entry has truncated name field at offset 0x{:X}",
+                from_program_header ? "PT_NOTE" : "SHT_NOTE", off));
             break;
         }
         const std::uint64_t name_offset = cursor;
         cursor += aligned_name_size;
         if (cursor > end || aligned_descriptor_size > end - cursor) {
+            warnings_out.push_back(std::format(
+                "ELF {} note entry has truncated descriptor field at offset 0x{:X}",
+                from_program_header ? "PT_NOTE" : "SHT_NOTE", off));
             break;
         }
         const std::uint64_t descriptor_offset = cursor;
@@ -1237,8 +1267,14 @@ void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t of
 
 void parse_elf_sysv_hash(std::span<const std::uint8_t> b, bool big,
                          const ElfSectionHeader& sh,
-                         std::vector<ElfSysvHashTable>& hash_tables_out) {
+                         std::vector<ElfSysvHashTable>& hash_tables_out,
+                         std::vector<std::string>* warnings_out = nullptr) {
     if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size())) || sh.size < 8) {
+        if (warnings_out != nullptr) {
+            warnings_out->push_back(std::format(
+                "ELF SHT_HASH section '{}' is truncated or out of file bounds",
+                sh.name.empty() ? ".hash" : sh.name));
+        }
         return;
     }
 
@@ -1250,6 +1286,11 @@ void parse_elf_sysv_hash(std::span<const std::uint8_t> b, bool big,
     if (bucket_bytes > std::numeric_limits<std::uint64_t>::max() - 8u ||
         chain_bytes > std::numeric_limits<std::uint64_t>::max() - 8u - bucket_bytes ||
         8u + bucket_bytes + chain_bytes > sh.size) {
+        if (warnings_out != nullptr) {
+            warnings_out->push_back(std::format(
+                "ELF SHT_HASH section '{}' header counts ({} buckets, {} chains) exceed section size ({} bytes)",
+                sh.name.empty() ? ".hash" : sh.name, bucket_count, chain_count, sh.size));
+        }
         return;
     }
 
@@ -1271,8 +1312,14 @@ void parse_elf_sysv_hash(std::span<const std::uint8_t> b, bool big,
 
 void parse_elf_gnu_hash(std::span<const std::uint8_t> b, bool is64, bool big,
                         const ElfSectionHeader& sh,
-                        std::vector<ElfGnuHashTable>& hash_tables_out) {
+                        std::vector<ElfGnuHashTable>& hash_tables_out,
+                        std::vector<std::string>* warnings_out = nullptr) {
     if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size())) || sh.size < 16) {
+        if (warnings_out != nullptr) {
+            warnings_out->push_back(std::format(
+                "ELF SHT_GNU_HASH section '{}' is truncated or out of file bounds",
+                sh.name.empty() ? ".gnu.hash" : sh.name));
+        }
         return;
     }
 
@@ -1287,6 +1334,11 @@ void parse_elf_gnu_hash(std::span<const std::uint8_t> b, bool is64, bool big,
     if (bloom_bytes > std::numeric_limits<std::uint64_t>::max() - 16u ||
         bucket_bytes > std::numeric_limits<std::uint64_t>::max() - 16u - bloom_bytes ||
         16u + bloom_bytes + bucket_bytes > sh.size) {
+        if (warnings_out != nullptr) {
+            warnings_out->push_back(std::format(
+                "ELF SHT_GNU_HASH section '{}' header counts exceed section size ({} bytes)",
+                sh.name.empty() ? ".gnu.hash" : sh.name, sh.size));
+        }
         return;
     }
 
@@ -1309,6 +1361,11 @@ void parse_elf_gnu_hash(std::span<const std::uint8_t> b, bool is64, bool big,
     }
 
     const std::uint64_t chain_bytes = sh.size - (cursor - sh.offset);
+    if (warnings_out != nullptr && (chain_bytes % 4u) != 0u) {
+        warnings_out->push_back(std::format(
+            "ELF SHT_GNU_HASH section '{}' has trailing unaligned chain bytes",
+            sh.name.empty() ? ".gnu.hash" : sh.name));
+    }
     const std::uint64_t chain_count = chain_bytes / 4u;
     table.chains.reserve(static_cast<std::size_t>(chain_count));
     for (std::uint64_t i = 0; i < chain_count; ++i, cursor += 4u) {
@@ -1321,22 +1378,46 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t phoff, std::uint16_t phentsize,
                         std::uint32_t phnum, std::vector<ElfProgramHeader>& headers_out,
                         std::vector<Segment>& segments_out, std::string& interpreter_out,
-                        std::vector<ElfNote>& notes_out) {
-    if (phoff == 0 || phnum == 0 || phentsize == 0) {
+                        std::vector<ElfNote>& notes_out,
+                        std::vector<std::string>& warnings_out) {
+    if (phoff == 0 && phnum == 0) {
+        return;
+    }
+    if (phoff == 0 || phnum == 0) {
+        if (phnum != 0) {
+            warnings_out.push_back("ELF header declares non-zero e_phnum with e_phoff == 0");
+        }
         return;
     }
     const std::uint16_t min_ph = is64 ? 0x38 : 0x20;
-    if (phentsize < min_ph || phnum > 65536u) {
+    if (phentsize < min_ph) {
+        warnings_out.push_back(std::format(
+            "ELF program header entry size ({}) is smaller than minimum ({})", phentsize, min_ph));
+        return;
+    }
+    if (phnum > 65536u) {
+        warnings_out.push_back(std::format(
+            "ELF program header count ({}) exceeds maximum supported limit", phnum));
         return;
     }
     const std::uint64_t table_size = static_cast<std::uint64_t>(phnum) * phentsize;
+    std::uint32_t avail_phnum = phnum;
     if (!fits_range(phoff, table_size, static_cast<std::uint64_t>(b.size()))) {
-        return;
+        warnings_out.push_back(std::format(
+            "ELF program header table truncated: offset 0x{:X} + {} entries ({} bytes) exceeds file size ({} bytes)",
+            phoff, phnum, table_size, b.size()));
+        if (phoff >= b.size()) {
+            return;
+        }
+        avail_phnum = static_cast<std::uint32_t>((static_cast<std::uint64_t>(b.size()) - phoff) / phentsize);
+        if (avail_phnum == 0) {
+            return;
+        }
     }
 
-    headers_out.reserve(phnum);
-    segments_out.reserve(phnum);
-    for (std::uint32_t i = 0; i < phnum; ++i) {
+    headers_out.reserve(avail_phnum);
+    segments_out.reserve(avail_phnum);
+    for (std::uint32_t i = 0; i < avail_phnum; ++i) {
         const std::uint64_t hdr64 = phoff + static_cast<std::uint64_t>(i) * phentsize;
         const std::size_t hdr = static_cast<std::size_t>(hdr64);
 
@@ -1373,18 +1454,22 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 
         headers_out.push_back(phdr);
         segments_out.push_back(seg);
-        if (phdr.type == 3 && fits_range(phdr.offset, phdr.file_size, static_cast<std::uint64_t>(b.size()))) {
-            interpreter_out = read_c_string(b, phdr.offset, phdr.file_size);
+        if (phdr.type == 3) {
+            if (fits_range(phdr.offset, phdr.file_size, static_cast<std::uint64_t>(b.size()))) {
+                interpreter_out = read_c_string(b, phdr.offset, phdr.file_size);
+            } else {
+                warnings_out.push_back("ELF PT_INTERP segment payload is truncated or out of file bounds");
+            }
         }
         if (phdr.type == 4) {
-            parse_elf_notes(b, big, phdr.offset, phdr.file_size, true, notes_out);
+            parse_elf_notes(b, big, phdr.offset, phdr.file_size, true, notes_out, warnings_out);
         }
     }
 }
 
 // Parse the ELF section header table into `out`. Best-effort and fully bounds-
-// checked: on any inconsistency it returns leaving `out` as-is (identity parsing
-// has already succeeded by the time this runs).
+// checked: on any inconsistency it records explicit diagnostics in `warnings_out`
+// and recovers complete prefix entries where safe.
 void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t shoff, std::uint16_t shentsize,
                         std::uint32_t shnum, std::uint32_t shstrndx,
@@ -1395,17 +1480,41 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::vector<ElfNote>& notes_out,
                         std::vector<ElfSysvHashTable>& sysv_hash_tables_out,
                         std::vector<ElfGnuHashTable>& gnu_hash_tables_out,
-                        std::vector<ImportEntry>& imports_out) {
-    if (shoff == 0 || shnum == 0 || shentsize == 0) {
+                        std::vector<ImportEntry>& imports_out,
+                        std::vector<std::string>& warnings_out) {
+    if (shoff == 0 && shnum == 0) {
+        return;
+    }
+    if (shoff == 0 || shnum == 0) {
+        if (shnum != 0) {
+            warnings_out.push_back("ELF header declares non-zero e_shnum with e_shoff == 0");
+        }
         return;
     }
     const std::uint16_t min_sh = is64 ? 0x40 : 0x28;
-    if (shentsize < min_sh || shnum > 262144u) {
+    if (shentsize < min_sh) {
+        warnings_out.push_back(std::format(
+            "ELF section header entry size ({}) is smaller than minimum ({})", shentsize, min_sh));
+        return;
+    }
+    if (shnum > 262144u) {
+        warnings_out.push_back(std::format(
+            "ELF section header count ({}) exceeds maximum supported limit", shnum));
         return;
     }
     const std::uint64_t table_size = static_cast<std::uint64_t>(shnum) * shentsize;
+    std::uint32_t avail_shnum = shnum;
     if (!fits_range(shoff, table_size, static_cast<std::uint64_t>(b.size()))) {
-        return;  // truncated table
+        warnings_out.push_back(std::format(
+            "ELF section header table truncated: offset 0x{:X} + {} entries ({} bytes) exceeds file size ({} bytes)",
+            shoff, shnum, table_size, b.size()));
+        if (shoff >= b.size()) {
+            return;
+        }
+        avail_shnum = static_cast<std::uint32_t>((static_cast<std::uint64_t>(b.size()) - shoff) / shentsize);
+        if (avail_shnum == 0) {
+            return;
+        }
     }
 
     const auto read_sh = [&](std::size_t hdr) {
@@ -1434,8 +1543,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         return s;
     };
 
-    headers.reserve(shnum);
-    for (std::uint32_t i = 0; i < shnum; ++i) {
+    headers.reserve(avail_shnum);
+    for (std::uint32_t i = 0; i < avail_shnum; ++i) {
         const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(i) * shentsize;
         headers.push_back(read_sh(static_cast<std::size_t>(hdr)));
     }
@@ -1443,10 +1552,21 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     // Section-name string table = section[eff_shstrndx].
     std::uint64_t strtab_off = 0;
     std::uint64_t strtab_size = 0;
-    if (shstrndx != 0 && shstrndx < shnum) {
-        const auto& sh = headers[shstrndx];
-        strtab_off = sh.offset;
-        strtab_size = sh.size;
+    if (shstrndx != 0) {
+        if (shstrndx < avail_shnum) {
+            const auto& sh = headers[shstrndx];
+            strtab_off = sh.offset;
+            strtab_size = sh.size;
+            if (!fits_range(strtab_off, strtab_size, static_cast<std::uint64_t>(b.size()))) {
+                warnings_out.push_back(
+                    "ELF section-name string table (.shstrtab) is truncated or out of file bounds");
+                strtab_size = strtab_off < b.size() ? (static_cast<std::uint64_t>(b.size()) - strtab_off) : 0u;
+            }
+        } else {
+            warnings_out.push_back(std::format(
+                "ELF shstrndx ({}) is out of range for {} available section headers",
+                shstrndx, avail_shnum));
+        }
     }
     const auto read_string = [&](std::uint64_t base, std::uint64_t size,
                                  std::uint32_t name_off) -> std::string {
@@ -1471,8 +1591,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         return read_string(strtab_off, strtab_size, name_off);
     };
 
-    out.reserve(shnum);
-    for (std::uint32_t i = 0; i < shnum; ++i) {
+    out.reserve(avail_shnum);
+    for (std::uint32_t i = 0; i < avail_shnum; ++i) {
         const auto& sh = headers[i];
         Section sec;
         headers[i].name = read_section_name(sh.name_offset);
@@ -1488,27 +1608,57 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         out.push_back(std::move(sec));
     }
 
-    for (std::uint32_t section_index = 0; section_index < shnum; ++section_index) {
+    for (std::uint32_t section_index = 0; section_index < avail_shnum; ++section_index) {
         const auto& sh = headers[section_index];
         const bool is_symtab = sh.type == 2;   // SHT_SYMTAB
         const bool is_dynsym = sh.type == 11;  // SHT_DYNSYM
         if (!is_symtab && !is_dynsym) {
             continue;
         }
+        const std::string_view sec_label =
+            !sh.name.empty() ? std::string_view{sh.name} : (is_dynsym ? ".dynsym" : ".symtab");
 
         const std::uint64_t min_sym = is64 ? 0x18 : 0x10;
         const std::uint64_t entry_size = sh.entry_size != 0 ? sh.entry_size : min_sym;
-        if (entry_size < min_sym || sh.link >= headers.size() ||
-            !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+        if (entry_size < min_sym) {
+            warnings_out.push_back(std::format(
+                "ELF symbol table '{}' has undersized sh_entsize ({} < {})",
+                sec_label, entry_size, min_sym));
+            continue;
+        }
+        if (sh.link >= headers.size()) {
+            warnings_out.push_back(std::format(
+                "ELF symbol table '{}' has out-of-range string-table sh_link ({})",
+                sec_label, sh.link));
             continue;
         }
 
         const auto& strings = headers[sh.link];
+        std::uint64_t eff_str_size = strings.size;
         if (!fits_range(strings.offset, strings.size, static_cast<std::uint64_t>(b.size()))) {
-            continue;
+            warnings_out.push_back(std::format(
+                "ELF string table linked by '{}' is truncated or out of file bounds", sec_label));
+            eff_str_size = strings.offset < b.size()
+                               ? (static_cast<std::uint64_t>(b.size()) - strings.offset)
+                               : 0u;
         }
 
-        const std::uint64_t count = sh.size / entry_size;
+        std::uint64_t eff_sym_bytes = sh.size;
+        if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+            warnings_out.push_back(std::format(
+                "ELF symbol table '{}' truncated: offset 0x{:X} + {} bytes exceeds file size ({} bytes)",
+                sec_label, sh.offset, sh.size, b.size()));
+            if (sh.offset >= b.size()) {
+                continue;
+            }
+            eff_sym_bytes = static_cast<std::uint64_t>(b.size()) - sh.offset;
+        } else if ((sh.size % entry_size) != 0u) {
+            warnings_out.push_back(std::format(
+                "ELF symbol table '{}' size ({}) is not a multiple of entry size ({}); trailing partial entry ignored",
+                sec_label, sh.size, entry_size));
+        }
+
+        const std::uint64_t count = eff_sym_bytes / entry_size;
         for (std::uint64_t i = 0; i < count; ++i) {
             const std::uint64_t sym_off = sh.offset + i * entry_size;
             if (!fits_range(sym_off, min_sym, static_cast<std::uint64_t>(b.size()))) {
@@ -1540,7 +1690,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             elf_symbol.type = static_cast<std::uint8_t>(info & 0x0F);
             elf_symbol.visibility = static_cast<std::uint8_t>(other & 0x03);
             elf_symbol.dynamic = is_dynsym;
-            elf_symbol.name = read_string(strings.offset, strings.size, elf_symbol.name_offset);
+            elf_symbol.name = read_string(strings.offset, eff_str_size, elf_symbol.name_offset);
 
             if (!elf_symbol.name.empty()) {
                 Symbol symbol;
@@ -1561,19 +1711,49 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         if (sh.type != 6) {  // SHT_DYNAMIC
             continue;
         }
+        const std::string_view sec_label = !sh.name.empty() ? std::string_view{sh.name} : ".dynamic";
         const std::uint64_t min_dyn = is64 ? 0x10 : 0x08;
         const std::uint64_t entry_size = sh.entry_size != 0 ? sh.entry_size : min_dyn;
-        if (entry_size < min_dyn || sh.link >= headers.size() ||
-            !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+        if (entry_size < min_dyn) {
+            warnings_out.push_back(std::format(
+                "ELF dynamic section '{}' has undersized sh_entsize ({} < {})",
+                sec_label, entry_size, min_dyn));
+            continue;
+        }
+        if (sh.link >= headers.size()) {
+            warnings_out.push_back(std::format(
+                "ELF dynamic section '{}' has out-of-range string-table sh_link ({})",
+                sec_label, sh.link));
             continue;
         }
 
         const auto& strings = headers[sh.link];
+        std::uint64_t eff_str_size = strings.size;
         if (!fits_range(strings.offset, strings.size, static_cast<std::uint64_t>(b.size()))) {
-            continue;
+            warnings_out.push_back(std::format(
+                "ELF dynamic string table linked by '{}' is truncated or out of file bounds", sec_label));
+            eff_str_size = strings.offset < b.size()
+                               ? (static_cast<std::uint64_t>(b.size()) - strings.offset)
+                               : 0u;
         }
 
-        const std::uint64_t count = sh.size / entry_size;
+        std::uint64_t eff_dyn_bytes = sh.size;
+        if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+            warnings_out.push_back(std::format(
+                "ELF dynamic section '{}' truncated: offset 0x{:X} + {} bytes exceeds file size ({} bytes)",
+                sec_label, sh.offset, sh.size, b.size()));
+            if (sh.offset >= b.size()) {
+                continue;
+            }
+            eff_dyn_bytes = static_cast<std::uint64_t>(b.size()) - sh.offset;
+        } else if ((sh.size % entry_size) != 0u) {
+            warnings_out.push_back(std::format(
+                "ELF dynamic section '{}' size ({}) is not a multiple of entry size ({}); trailing partial entry ignored",
+                sec_label, sh.size, entry_size));
+        }
+
+        const std::uint64_t count = eff_dyn_bytes / entry_size;
+        bool saw_dt_null = false;
         for (std::uint64_t i = 0; i < count; ++i) {
             const std::uint64_t dyn_off = sh.offset + i * entry_size;
             if (!fits_range(dyn_off, min_dyn, static_cast<std::uint64_t>(b.size()))) {
@@ -1590,7 +1770,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             raw_entry.value = value;
             if ((tag == 1 || tag == 14 || tag == 15 || tag == 29) &&
                 value <= std::numeric_limits<std::uint32_t>::max()) {
-                raw_entry.string_value = read_string(strings.offset, strings.size,
+                raw_entry.string_value = read_string(strings.offset, eff_str_size,
                                                      static_cast<std::uint32_t>(value));
                 if (tag == 1) {  // DT_NEEDED
                     raw_entry.needed_library = raw_entry.string_value;
@@ -1598,6 +1778,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
             }
             dynamic_entries_out.push_back(raw_entry);
             if (tag == 0) {  // DT_NULL
+                saw_dt_null = true;
                 break;
             }
             if (!raw_entry.needed_library.empty()) {
@@ -1606,19 +1787,23 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                 imports_out.push_back(std::move(entry));
             }
         }
+        if (count > 0 && !saw_dt_null) {
+            warnings_out.push_back(std::format(
+                "ELF dynamic section '{}' is missing DT_NULL terminator", sec_label));
+        }
     }
 
     for (const auto& sh : headers) {
         if (sh.type == 7) {  // SHT_NOTE
-            parse_elf_notes(b, big, sh.offset, sh.size, false, notes_out);
+            parse_elf_notes(b, big, sh.offset, sh.size, false, notes_out, warnings_out);
         }
     }
 
     for (const auto& sh : headers) {
         if (sh.type == 5) {  // SHT_HASH
-            parse_elf_sysv_hash(b, big, sh, sysv_hash_tables_out);
+            parse_elf_sysv_hash(b, big, sh, sysv_hash_tables_out, &warnings_out);
         } else if (sh.type == 0x6FFF'FFF6u) {  // SHT_GNU_HASH
-            parse_elf_gnu_hash(b, is64, big, sh, gnu_hash_tables_out);
+            parse_elf_gnu_hash(b, is64, big, sh, gnu_hash_tables_out, &warnings_out);
         }
     }
 
@@ -1628,17 +1813,35 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         if (!has_addend && !no_addend) {
             continue;
         }
+        const std::string_view sec_label =
+            !sh.name.empty() ? std::string_view{sh.name} : (has_addend ? ".rela" : ".rel");
 
         const std::uint64_t min_reloc = has_addend
             ? (is64 ? 0x18 : 0x0C)
             : (is64 ? 0x10 : 0x08);
         const std::uint64_t entry_size = sh.entry_size != 0 ? sh.entry_size : min_reloc;
-        if (entry_size < min_reloc ||
-            !fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+        if (entry_size < min_reloc) {
+            warnings_out.push_back(std::format(
+                "ELF relocation section '{}' has undersized sh_entsize ({} < {})",
+                sec_label, entry_size, min_reloc));
             continue;
         }
+        std::uint64_t eff_rel_bytes = sh.size;
+        if (!fits_range(sh.offset, sh.size, static_cast<std::uint64_t>(b.size()))) {
+            warnings_out.push_back(std::format(
+                "ELF relocation section '{}' truncated: offset 0x{:X} + {} bytes exceeds file size ({} bytes)",
+                sec_label, sh.offset, sh.size, b.size()));
+            if (sh.offset >= b.size()) {
+                continue;
+            }
+            eff_rel_bytes = static_cast<std::uint64_t>(b.size()) - sh.offset;
+        } else if ((sh.size % entry_size) != 0u) {
+            warnings_out.push_back(std::format(
+                "ELF relocation section '{}' size ({}) is not a multiple of entry size ({}); trailing partial entry ignored",
+                sec_label, sh.size, entry_size));
+        }
 
-        const std::uint64_t count = sh.size / entry_size;
+        const std::uint64_t count = eff_rel_bytes / entry_size;
         for (std::uint64_t i = 0; i < count; ++i) {
             const std::uint64_t reloc_off = sh.offset + i * entry_size;
             if (!fits_range(reloc_off, min_reloc, static_cast<std::uint64_t>(b.size()))) {
@@ -1755,35 +1958,60 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     const std::uint16_t e_shnum = rd16(b, is64 ? 0x3C : 0x30, big);
     const std::uint16_t e_shstrndx = rd16(b, is64 ? 0x3E : 0x32, big);
 
+    auto img = std::make_unique<ElfImage>();
+    if (e_ehsize != 0u && e_ehsize != ehsize) {
+        img->add_warning(std::format(
+            "ELF header declares non-standard e_ehsize {} (expected {})", e_ehsize, ehsize));
+    }
+
     // ELF extended numbering (P1-5): shdr[0] carries overflow counts when
-    // e_shnum == 0, e_shstrndx == SHN_XINDEX (0xFFFF), or e_phnum == PN_XNUM (0xFFFF).
+    // e_shnum == 0 (with e_shoff != 0), e_shstrndx == SHN_XINDEX (0xFFFF), or e_phnum == PN_XNUM (0xFFFF).
     std::uint32_t eff_phnum = e_phnum == 0xFFFFu ? 0u : static_cast<std::uint32_t>(e_phnum);
     std::uint32_t eff_shnum = static_cast<std::uint32_t>(e_shnum);
     std::uint32_t eff_shstrndx = e_shstrndx == 0xFFFFu ? 0u : static_cast<std::uint32_t>(e_shstrndx);
     const std::uint16_t min_shent = is64 ? 0x40u : 0x28u;
-    if ((e_shnum == 0u || e_shstrndx == 0xFFFFu || e_phnum == 0xFFFFu) &&
-        e_shoff != 0u && e_shentsize >= min_shent &&
-        fits_range(e_shoff, e_shentsize, static_cast<std::uint64_t>(b.size()))) {
-        const auto sh0 = static_cast<std::size_t>(e_shoff);
-        const std::uint32_t sh0_type = rd32(b, sh0 + 4u, big);
-        if (sh0_type == 0u) {
-            const std::uint64_t sh0_size = is64 ? rd64(b, sh0 + 0x20u, big)
-                                                : static_cast<std::uint64_t>(rd32(b, sh0 + 0x14u, big));
-            const std::uint32_t sh0_link = rd32(b, sh0 + (is64 ? 0x28u : 0x18u), big);
-            const std::uint32_t sh0_info = rd32(b, sh0 + (is64 ? 0x2Cu : 0x1Cu), big);
-            if (e_shnum == 0u && sh0_size > 0u && sh0_size <= 262144ull) {
-                eff_shnum = static_cast<std::uint32_t>(sh0_size);
-            }
-            if (e_shstrndx == 0xFFFFu) {
-                eff_shstrndx = sh0_link;
-            }
-            if (e_phnum == 0xFFFFu && sh0_info <= 65536u) {
-                eff_phnum = sh0_info;
+    const bool wants_extended =
+        (e_shnum == 0u && e_shoff != 0u) || e_shstrndx == 0xFFFFu || e_phnum == 0xFFFFu;
+    if (wants_extended) {
+        if (e_shoff == 0u || e_shentsize < min_shent ||
+            !fits_range(e_shoff, e_shentsize, static_cast<std::uint64_t>(b.size()))) {
+            img->add_warning(
+                "ELF extended numbering requested, but section header 0 is missing or truncated");
+        } else {
+            const auto sh0 = static_cast<std::size_t>(e_shoff);
+            const std::uint32_t sh0_type = rd32(b, sh0 + 4u, big);
+            if (sh0_type != 0u) {
+                img->add_warning(
+                    "ELF extended numbering requested, but section header 0 is not SHT_NULL");
+            } else {
+                const std::uint64_t sh0_size =
+                    is64 ? rd64(b, sh0 + 0x20u, big)
+                         : static_cast<std::uint64_t>(rd32(b, sh0 + 0x14u, big));
+                const std::uint32_t sh0_link = rd32(b, sh0 + (is64 ? 0x28u : 0x18u), big);
+                const std::uint32_t sh0_info = rd32(b, sh0 + (is64 ? 0x2Cu : 0x1Cu), big);
+                if (e_shnum == 0u) {
+                    if (sh0_size > 0u && sh0_size <= 262144ull) {
+                        eff_shnum = static_cast<std::uint32_t>(sh0_size);
+                    } else if (sh0_size > 262144ull) {
+                        img->add_warning(
+                            "ELF extended section count in shdr[0].sh_size exceeds maximum supported limit");
+                    }
+                }
+                if (e_shstrndx == 0xFFFFu) {
+                    eff_shstrndx = sh0_link;
+                }
+                if (e_phnum == 0xFFFFu) {
+                    if (sh0_info <= 65536u) {
+                        eff_phnum = sh0_info;
+                    } else {
+                        img->add_warning(
+                            "ELF extended program header count in shdr[0].sh_info exceeds maximum supported limit");
+                    }
+                }
             }
         }
     }
 
-    auto img = std::unique_ptr<ElfImage>(new ElfImage());
     img->format_ = Format::ELF;
     img->is_64_  = is64;
     img->endian_ = big ? Endianness::Big : Endianness::Little;
@@ -1816,7 +2044,8 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
 
     // Sections (P2-1), best-effort: identity above is already valid.
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, eff_phnum,
-                       img->program_headers_, img->segments_, img->interpreter_, img->notes_);
+                       img->program_headers_, img->segments_, img->interpreter_, img->notes_,
+                       img->parse_warnings_);
 
     // Determine static link-time load base from PT_LOAD segments (0 for PIE/ET_DYN, e.g. 0x400000 for ET_EXEC).
     bool found_zero_off_load = false;
@@ -1845,7 +2074,7 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, eff_shnum, eff_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
-                       img->gnu_hash_tables_, img->imports_);
+                       img->gnu_hash_tables_, img->imports_, img->parse_warnings_);
     // Recover PT_DYNAMIC entries, DT_NEEDED dependencies, dynamic symbols, hash tables, and
     // dynamic relocations on sectionless / sstrip ELFs where the section header table is absent.
     img->recover_dynamic_from_program_headers(b, is64, big, 0u, img->image_base_);
@@ -1999,7 +2228,7 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
                                              ? rd32(b, opt + (is64 ? 0xA4 : 0x94), false)
                                              : 0;
 
-    auto img = std::unique_ptr<PeImage>(new PeImage());
+    auto img = std::make_unique<PeImage>();
     img->format_ = Format::PE;
     img->endian_ = Endianness::Little;
     img->is_64_  = is64;
@@ -2541,12 +2770,26 @@ void ElfImage::recover_dynamic_from_program_headers(
     };
 
     for (const ElfProgramHeader& ph : program_headers_) {
-        if (ph.type != 2u || ph.file_size == 0u ||
-            !fits_range(ph.offset, ph.file_size, static_cast<std::uint64_t>(b.size()))) {
+        if (ph.type != 2u || ph.file_size == 0u) {
             continue;
         }
+        std::uint64_t eff_dyn_bytes = ph.file_size;
+        if (!fits_range(ph.offset, ph.file_size, static_cast<std::uint64_t>(b.size()))) {
+            add_warning(std::format(
+                "ELF PT_DYNAMIC segment truncated: offset 0x{:X} + {} bytes exceeds file size ({} bytes)",
+                ph.offset, ph.file_size, b.size()));
+            if (ph.offset >= b.size()) {
+                continue;
+            }
+            eff_dyn_bytes = static_cast<std::uint64_t>(b.size()) - ph.offset;
+        }
         const std::size_t dyn_ent_sz = is64 ? 16u : 8u;
-        const std::size_t count = static_cast<std::size_t>(ph.file_size) / dyn_ent_sz;
+        if ((ph.file_size % dyn_ent_sz) != 0u) {
+            add_warning(std::format(
+                "ELF PT_DYNAMIC segment size ({}) is not a multiple of entry size ({})",
+                ph.file_size, dyn_ent_sz));
+        }
+        const std::size_t count = static_cast<std::size_t>(eff_dyn_bytes) / dyn_ent_sz;
         std::optional<std::size_t> strtab_off;
         std::uint64_t strtab_sz = 0u;
         std::optional<std::size_t> symtab_off;
@@ -2741,11 +2984,27 @@ void ElfImage::recover_dynamic_from_program_headers(
                 return;
             }
             const std::uint64_t min_ent = has_addend ? (is64 ? 24u : 12u) : (is64 ? 16u : 8u);
-            if (ent_sz < min_ent ||
-                !fits_range(*table_off, table_sz, static_cast<std::uint64_t>(b.size()))) {
+            if (ent_sz < min_ent) {
+                add_warning(std::format(
+                    "ELF dynamic relocation table '{}' has undersized entry size ({} < {})",
+                    sec_label, ent_sz, min_ent));
                 return;
             }
-            const std::uint64_t rel_count = std::min<std::uint64_t>(table_sz / ent_sz, 262144ull);
+            std::uint64_t eff_table_sz = table_sz;
+            if (!fits_range(*table_off, table_sz, static_cast<std::uint64_t>(b.size()))) {
+                add_warning(std::format(
+                    "ELF dynamic relocation table '{}' is truncated or out of file bounds",
+                    sec_label));
+                if (*table_off >= b.size()) {
+                    return;
+                }
+                eff_table_sz = static_cast<std::uint64_t>(b.size() - *table_off);
+            } else if ((table_sz % ent_sz) != 0u) {
+                add_warning(std::format(
+                    "ELF dynamic relocation table '{}' size ({}) is not a multiple of entry size ({})",
+                    sec_label, table_sz, ent_sz));
+            }
+            const std::uint64_t rel_count = std::min<std::uint64_t>(eff_table_sz / ent_sz, 262144ull);
             for (std::uint64_t i = 0u; i < rel_count; ++i) {
                 const auto roff = static_cast<std::size_t>(*table_off + i * ent_sz);
                 ElfRelocation rel{};

@@ -1550,6 +1550,70 @@ TEST(BinaryImage, IgnoresOverflowingElfSectionTable) {
     auto result = peelf::parse_image(b);
     ASSERT_TRUE(result.has_value());
     EXPECT_TRUE((**result).sections().empty());
+    EXPECT_FALSE((**result).parse_warnings().empty());
+}
+
+TEST(BinaryImage, ReportsExplicitWarningsOnTruncatedElfTablesAndRecoversPrefixes) {
+    const auto valid_bytes = read_all(fixture_path("known-linux-x64.elf"));
+    ASSERT_FALSE(valid_bytes.empty());
+    {
+        auto valid_parsed = peelf::parse_image(valid_bytes);
+        ASSERT_TRUE(valid_parsed.has_value());
+        EXPECT_TRUE((*valid_parsed)->parse_warnings().empty());
+    }
+
+    // 1. Truncate section header table mid-way: complete prefix headers are recovered and warning emitted.
+    {
+        auto orig = peelf::parse_image(valid_bytes);
+        ASSERT_TRUE(orig.has_value());
+        const auto* eh = (*orig)->elf_header();
+        ASSERT_NE(eh, nullptr);
+        ASSERT_GT(eh->effective_section_header_count, 3u);
+        auto truncated = valid_bytes;
+        const std::size_t cut = static_cast<std::size_t>(
+            eh->section_header_offset + 3u * eh->section_header_entry_size + 12u);
+        ASSERT_LT(cut, truncated.size());
+        truncated.resize(cut);
+
+        auto parsed = peelf::parse_image(truncated);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ((*parsed)->elf_section_headers().size(), 3u);
+        const bool warned = std::ranges::any_of((*parsed)->parse_warnings(), [](const std::string& w) {
+            return w.find("section header table truncated") != std::string::npos;
+        });
+        EXPECT_TRUE(warned);
+    }
+
+    // 2. Symbol table with trailing partial entry bytes and dynamic section missing DT_NULL.
+    {
+        auto mutated = valid_bytes;
+        auto orig = peelf::parse_image(valid_bytes);
+        ASSERT_TRUE(orig.has_value());
+        const auto& shdrs = (*orig)->elf_section_headers();
+        const std::uint64_t shoff = (*orig)->elf_header()->section_header_offset;
+
+        for (std::size_t i = 0; i < shdrs.size(); ++i) {
+            const std::size_t hdr = static_cast<std::size_t>(shoff + i * 64u);
+            if (shdrs[i].type == 2u) { // SHT_SYMTAB: add 5 trailing bytes (not multiple of 24)
+                put64(mutated, hdr + 0x20u, shdrs[i].size + 5u);
+            } else if (shdrs[i].type == 6u) { // SHT_DYNAMIC: overwrite DT_NULL tag with non-zero tag
+                const std::size_t last_dyn = static_cast<std::size_t>(shdrs[i].offset + shdrs[i].size - 16u);
+                put64(mutated, last_dyn, 29u);
+            }
+        }
+
+        auto parsed = peelf::parse_image(mutated);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_FALSE((*parsed)->symbols().empty());
+        const bool sym_warned = std::ranges::any_of((*parsed)->parse_warnings(), [](const std::string& w) {
+            return w.find("symbol table") != std::string::npos;
+        });
+        const bool dyn_warned = std::ranges::any_of((*parsed)->parse_warnings(), [](const std::string& w) {
+            return w.find("missing DT_NULL") != std::string::npos;
+        });
+        EXPECT_TRUE(sym_warned);
+        EXPECT_TRUE(dyn_warned);
+    }
 }
 
 TEST(BinaryImageReview, SectionlessElfUsesLoadSegments) {

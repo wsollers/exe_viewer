@@ -3,12 +3,15 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -34,8 +37,11 @@
 #endif
 #include <windows.h>
 #else
+#include <cerrno>
+#include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -144,15 +150,60 @@ struct SourceLineIndex {
     return std::ranges::any_of(sv, [](unsigned char ch) { return !std::isspace(ch); });
 }
 
-struct SubprocessResult {
-    int exit_code{-1};
-    bool launched{false};
-    std::string stdout_text{};
-    std::string stderr_text{};
-    std::string launch_error{};
+#if defined(_WIN32)
+struct ScopedWinHandle {
+    HANDLE handle{nullptr};
+
+    ScopedWinHandle() = default;
+    explicit ScopedWinHandle(HANDLE h) noexcept : handle(h) {}
+    ~ScopedWinHandle() noexcept { reset(); }
+
+    ScopedWinHandle(const ScopedWinHandle&) = delete;
+    ScopedWinHandle& operator=(const ScopedWinHandle&) = delete;
+
+    ScopedWinHandle(ScopedWinHandle&& other) noexcept
+        : handle(std::exchange(other.handle, nullptr)) {}
+    ScopedWinHandle& operator=(ScopedWinHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            handle = std::exchange(other.handle, nullptr);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool valid() const noexcept {
+        return handle != nullptr && handle != INVALID_HANDLE_VALUE;
+    }
+    [[nodiscard]] HANDLE get() const noexcept { return handle; }
+
+    void reset(HANDLE next = nullptr) noexcept {
+        if (valid()) {
+            ::CloseHandle(handle);
+        }
+        handle = next;
+    }
 };
 
-#if defined(_WIN32)
+struct ScopedWinProcess {
+    ScopedWinHandle process{};
+    ScopedWinHandle thread{};
+    bool reaped{false};
+
+    ScopedWinProcess() = default;
+    explicit ScopedWinProcess(const PROCESS_INFORMATION& pi) noexcept
+        : process(pi.hProcess), thread(pi.hThread) {}
+
+    ~ScopedWinProcess() noexcept {
+        if (process.valid() && !reaped) {
+            (void)::TerminateProcess(process.get(), 137u);
+            (void)::WaitForSingleObject(process.get(), 5000u);
+        }
+    }
+
+    ScopedWinProcess(const ScopedWinProcess&) = delete;
+    ScopedWinProcess& operator=(const ScopedWinProcess&) = delete;
+};
+
 [[nodiscard]] std::wstring utf8_to_wide(std::string_view utf8) {
     if (utf8.empty()) {
         return {};
@@ -197,43 +248,227 @@ struct SubprocessResult {
     out.push_back(L'"');
     return out;
 }
+#else
+struct ScopedFd {
+    int fd{-1};
+
+    ScopedFd() = default;
+    explicit ScopedFd(int f) noexcept : fd(f) {}
+    ~ScopedFd() noexcept { reset(); }
+
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+
+    ScopedFd(ScopedFd&& other) noexcept : fd(std::exchange(other.fd, -1)) {}
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd = std::exchange(other.fd, -1);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool valid() const noexcept { return fd >= 0; }
+    [[nodiscard]] int get() const noexcept { return fd; }
+
+    void reset(int next = -1) noexcept {
+        if (fd >= 0) {
+            (void)::close(fd);
+        }
+        fd = next;
+    }
+};
+
+[[nodiscard]] bool make_cloexec_pipe(ScopedFd& rd, ScopedFd& wr) noexcept {
+    int raw[2]{-1, -1};
+    if (::pipe(raw) != 0) {
+        return false;
+    }
+    rd.reset(raw[0]);
+    wr.reset(raw[1]);
+    for (const int fd : {rd.get(), wr.get()}) {
+        const int flags = ::fcntl(fd, F_GETFD);
+        if (flags < 0 || ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            rd.reset();
+            wr.reset();
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] bool set_nonblocking(int fd) noexcept {
+    const int flags = ::fcntl(fd, F_GETFL);
+    if (flags < 0) {
+        return false;
+    }
+    return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+// Suppresses SIGPIPE on the calling thread without mutating process-wide signal handlers.
+class ScopedThreadSigpipeGuard {
+public:
+    explicit ScopedThreadSigpipeGuard(int write_fd) noexcept {
+#if defined(F_SETNOSIGPIPE)
+        (void)::fcntl(write_fd, F_SETNOSIGPIPE, 1);
+#else
+        (void)write_fd;
+        struct sigaction sa{};
+        if (::sigaction(SIGPIPE, nullptr, &sa) == 0 && sa.sa_handler == SIG_IGN) {
+            return;
+        }
+        sigemptyset(&pipe_set_);
+        sigaddset(&pipe_set_, SIGPIPE);
+        sigemptyset(&orig_set_);
+        if (::pthread_sigmask(SIG_BLOCK, nullptr, &orig_set_) == 0 &&
+            ::sigismember(&orig_set_, SIGPIPE) == 0) {
+            if (::pthread_sigmask(SIG_BLOCK, &pipe_set_, &orig_set_) == 0) {
+                blocked_here_ = true;
+            }
+        }
+#endif
+    }
+
+    ~ScopedThreadSigpipeGuard() noexcept {
+#if !defined(F_SETNOSIGPIPE)
+        if (blocked_here_) {
+            drain_pending();
+            (void)::pthread_sigmask(SIG_SETMASK, &orig_set_, nullptr);
+        }
+#endif
+    }
+
+    ScopedThreadSigpipeGuard(const ScopedThreadSigpipeGuard&) = delete;
+    ScopedThreadSigpipeGuard& operator=(const ScopedThreadSigpipeGuard&) = delete;
+
+    void drain_pending() noexcept {
+#if defined(__linux__) && !defined(F_SETNOSIGPIPE)
+        if (!blocked_here_) {
+            return;
+        }
+        timespec zero_ts{0, 0};
+        while (::sigtimedwait(&pipe_set_, nullptr, &zero_ts) == SIGPIPE) {
+        }
+#endif
+    }
+
+private:
+#if !defined(F_SETNOSIGPIPE)
+    sigset_t pipe_set_{};
+    sigset_t orig_set_{};
+    bool blocked_here_{false};
+#endif
+};
+
+class ScopedPosixChild {
+public:
+    ScopedPosixChild() = default;
+    explicit ScopedPosixChild(pid_t pid) noexcept : pid_(pid) {}
+
+    ~ScopedPosixChild() noexcept {
+        if (pid_ > 0 && !reaped_) {
+            int dummy = 0;
+            terminate_and_reap(dummy);
+        }
+    }
+
+    ScopedPosixChild(const ScopedPosixChild&) = delete;
+    ScopedPosixChild& operator=(const ScopedPosixChild&) = delete;
+
+    [[nodiscard]] bool try_reap_nonblocking(int& status_out) noexcept {
+        if (pid_ <= 0 || reaped_) {
+            return true;
+        }
+        while (true) {
+            const pid_t r = ::waitpid(pid_, &status_out, WNOHANG);
+            if (r == pid_) {
+                reaped_ = true;
+                return true;
+            }
+            if (r == 0) {
+                return false;
+            }
+            if (errno != EINTR) {
+                reaped_ = true;
+                return true;
+            }
+        }
+    }
+
+    void reap_blocking(int& status_out) noexcept {
+        if (pid_ <= 0 || reaped_) {
+            return;
+        }
+        while (::waitpid(pid_, &status_out, 0) < 0) {
+            if (errno != EINTR) {
+                break;
+            }
+        }
+        reaped_ = true;
+    }
+
+    void terminate_and_reap(int& status_out) noexcept {
+        if (pid_ <= 0 || reaped_) {
+            return;
+        }
+        (void)::kill(-pid_, SIGKILL);
+        (void)::kill(pid_, SIGKILL);
+        reap_blocking(status_out);
+    }
+
+private:
+    pid_t pid_{-1};
+    bool reaped_{false};
+};
 #endif
 
-[[nodiscard]] SubprocessResult run_argv_process(
+} // namespace
+
+SubprocessResult run_argv_process(
     const std::filesystem::path& exe_path,
     std::span<const std::string> args,
-    std::string_view stdin_payload) {
+    std::string_view stdin_payload,
+    std::chrono::milliseconds timeout) {
     SubprocessResult res;
     if (exe_path.empty()) {
         res.launch_error = "empty executable path";
         return res;
     }
 
+    const auto effective_timeout =
+        timeout > std::chrono::milliseconds::zero() ? timeout : std::chrono::milliseconds{1};
+    const auto deadline = std::chrono::steady_clock::now() + effective_timeout;
+
 #if defined(_WIN32)
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     sa.bInheritHandle = TRUE;
 
-    HANDLE stdin_rd = nullptr, stdin_wr = nullptr;
-    HANDLE stdout_rd = nullptr, stdout_wr = nullptr;
-    HANDLE stderr_rd = nullptr, stderr_wr = nullptr;
+    HANDLE raw_in_rd = nullptr, raw_in_wr = nullptr;
+    HANDLE raw_out_rd = nullptr, raw_out_wr = nullptr;
+    HANDLE raw_err_rd = nullptr, raw_err_wr = nullptr;
 
-    if (!::CreatePipe(&stdin_rd, &stdin_wr, &sa, 0) ||
-        !::CreatePipe(&stdout_rd, &stdout_wr, &sa, 0) ||
-        !::CreatePipe(&stderr_rd, &stderr_wr, &sa, 0)) {
-        if (stdin_rd) ::CloseHandle(stdin_rd);
-        if (stdin_wr) ::CloseHandle(stdin_wr);
-        if (stdout_rd) ::CloseHandle(stdout_rd);
-        if (stdout_wr) ::CloseHandle(stdout_wr);
-        if (stderr_rd) ::CloseHandle(stderr_rd);
-        if (stderr_wr) ::CloseHandle(stderr_wr);
-        res.launch_error = "CreatePipe failed";
+    if (!::CreatePipe(&raw_in_rd, &raw_in_wr, &sa, 0)) {
+        res.launch_error = "CreatePipe(stdin) failed";
         return res;
     }
+    ScopedWinHandle stdin_rd(raw_in_rd), stdin_wr(raw_in_wr);
 
-    ::SetHandleInformation(stdin_wr, HANDLE_FLAG_INHERIT, 0);
-    ::SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
-    ::SetHandleInformation(stderr_rd, HANDLE_FLAG_INHERIT, 0);
+    if (!::CreatePipe(&raw_out_rd, &raw_out_wr, &sa, 0)) {
+        res.launch_error = "CreatePipe(stdout) failed";
+        return res;
+    }
+    ScopedWinHandle stdout_rd(raw_out_rd), stdout_wr(raw_out_wr);
+
+    if (!::CreatePipe(&raw_err_rd, &raw_err_wr, &sa, 0)) {
+        res.launch_error = "CreatePipe(stderr) failed";
+        return res;
+    }
+    ScopedWinHandle stderr_rd(raw_err_rd), stderr_wr(raw_err_wr);
+
+    ::SetHandleInformation(stdin_wr.get(), HANDLE_FLAG_INHERIT, 0);
+    ::SetHandleInformation(stdout_rd.get(), HANDLE_FLAG_INHERIT, 0);
+    ::SetHandleInformation(stderr_rd.get(), HANDLE_FLAG_INHERIT, 0);
 
     const std::wstring app_w = exe_path.wstring();
     std::wstring cmdline = quote_win32_arg(app_w);
@@ -245,9 +480,9 @@ struct SubprocessResult {
     STARTUPINFOW si{};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = stdin_rd;
-    si.hStdOutput = stdout_wr;
-    si.hStdError = stderr_wr;
+    si.hStdInput = stdin_rd.get();
+    si.hStdOutput = stdout_wr.get();
+    si.hStdError = stderr_wr.get();
 
     PROCESS_INFORMATION pi{};
     const BOOL ok = ::CreateProcessW(
@@ -262,54 +497,106 @@ struct SubprocessResult {
         &si,
         &pi);
 
-    ::CloseHandle(stdin_rd);
-    ::CloseHandle(stdout_wr);
-    ::CloseHandle(stderr_wr);
+    stdin_rd.reset();
+    stdout_wr.reset();
+    stderr_wr.reset();
 
     if (!ok) {
-        ::CloseHandle(stdin_wr);
-        ::CloseHandle(stdout_rd);
-        ::CloseHandle(stderr_rd);
         res.launch_error = "CreateProcessW failed";
         return res;
     }
 
+    ScopedWinProcess child(pi);
     res.launched = true;
-    if (!stdin_payload.empty()) {
-        DWORD written = 0;
-        (void)::WriteFile(stdin_wr, stdin_payload.data(),
-                          static_cast<DWORD>(stdin_payload.size()), &written, nullptr);
-    }
-    ::CloseHandle(stdin_wr);
 
-    auto drain_handle = [](HANDLE h, std::string& dst) {
-        std::array<char, 4096> buf{};
-        DWORD n = 0;
-        while (::ReadFile(h, buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) && n > 0) {
-            dst.append(buf.data(), static_cast<std::size_t>(n));
+    std::jthread stdin_writer([in_handle = std::move(stdin_wr), stdin_payload]() mutable {
+        std::size_t offset = 0;
+        while (offset < stdin_payload.size()) {
+            const std::size_t rem = stdin_payload.size() - offset;
+            const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(rem, 65536u));
+            DWORD written = 0;
+            if (!::WriteFile(in_handle.get(), stdin_payload.data() + offset, chunk, &written, nullptr) ||
+                written == 0) {
+                break;
+            }
+            offset += static_cast<std::size_t>(written);
         }
-    };
-    drain_handle(stdout_rd, res.stdout_text);
-    drain_handle(stderr_rd, res.stderr_text);
-    ::CloseHandle(stdout_rd);
-    ::CloseHandle(stderr_rd);
+        in_handle.reset();
+    });
 
-    ::WaitForSingleObject(pi.hProcess, 15000);
+    auto make_drainer = [](ScopedWinHandle rd_handle, std::string& dst) {
+        return std::jthread([h = std::move(rd_handle), &dst]() mutable {
+            std::array<char, 8192> buf{};
+            DWORD n = 0;
+            while (::ReadFile(h.get(), buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) &&
+                   n > 0) {
+                dst.append(buf.data(), static_cast<std::size_t>(n));
+            }
+            h.reset();
+        });
+    };
+
+    std::jthread stdout_drainer = make_drainer(std::move(stdout_rd), res.stdout_text);
+    std::jthread stderr_drainer = make_drainer(std::move(stderr_rd), res.stderr_text);
+
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            res.timed_out = true;
+            break;
+        }
+        const auto rem_ms = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const DWORD wait_slice = static_cast<DWORD>(
+            std::clamp<long long>(rem_ms, 1LL, static_cast<long long>(std::numeric_limits<DWORD>::max() - 1u)));
+        const DWORD wait_rc = ::WaitForSingleObject(child.process.get(), wait_slice);
+        if (wait_rc == WAIT_OBJECT_0) {
+            child.reaped = true;
+            break;
+        }
+        if (wait_rc != WAIT_TIMEOUT) {
+            child.reaped = true;
+            break;
+        }
+    }
+
+    if (res.timed_out) {
+        (void)::TerminateProcess(child.process.get(), 137u);
+        (void)::WaitForSingleObject(child.process.get(), 5000u);
+        child.reaped = true;
+        if (stdin_writer.joinable()) {
+            (void)::CancelSynchronousIo(stdin_writer.native_handle());
+        }
+        if (stdout_drainer.joinable()) {
+            (void)::CancelSynchronousIo(stdout_drainer.native_handle());
+        }
+        if (stderr_drainer.joinable()) {
+            (void)::CancelSynchronousIo(stderr_drainer.native_handle());
+        }
+    }
+
+    stdin_writer.join();
+    stdout_drainer.join();
+    stderr_drainer.join();
+
+    if (res.timed_out) {
+        res.exit_code = -1;
+        return res;
+    }
+
     DWORD exit_code = 1;
-    if (::GetExitCodeProcess(pi.hProcess, &exit_code)) {
+    if (::GetExitCodeProcess(child.process.get(), &exit_code)) {
         res.exit_code = static_cast<int>(exit_code);
     }
-    ::CloseHandle(pi.hThread);
-    ::CloseHandle(pi.hProcess);
     return res;
 #else
-    int in_pipe[2]{-1, -1};
-    int out_pipe[2]{-1, -1};
-    int err_pipe[2]{-1, -1};
-    if (::pipe(in_pipe) != 0 || ::pipe(out_pipe) != 0 || ::pipe(err_pipe) != 0) {
-        if (in_pipe[0] >= 0) { ::close(in_pipe[0]); ::close(in_pipe[1]); }
-        if (out_pipe[0] >= 0) { ::close(out_pipe[0]); ::close(out_pipe[1]); }
-        if (err_pipe[0] >= 0) { ::close(err_pipe[0]); ::close(err_pipe[1]); }
+    ScopedFd in_rd, in_wr;
+    ScopedFd out_rd, out_wr;
+    ScopedFd err_rd, err_wr;
+    ScopedFd exec_rd, exec_wr;
+    if (!make_cloexec_pipe(in_rd, in_wr) ||
+        !make_cloexec_pipe(out_rd, out_wr) ||
+        !make_cloexec_pipe(err_rd, err_wr) ||
+        !make_cloexec_pipe(exec_rd, exec_wr)) {
         res.launch_error = "pipe() failed";
         return res;
     }
@@ -330,91 +617,205 @@ struct SubprocessResult {
 
     const pid_t pid = ::fork();
     if (pid < 0) {
-        ::close(in_pipe[0]); ::close(in_pipe[1]);
-        ::close(out_pipe[0]); ::close(out_pipe[1]);
-        ::close(err_pipe[0]); ::close(err_pipe[1]);
         res.launch_error = "fork() failed";
         return res;
     }
 
     if (pid == 0) {
-        (void)::dup2(in_pipe[0], STDIN_FILENO);
-        (void)::dup2(out_pipe[1], STDOUT_FILENO);
-        (void)::dup2(err_pipe[1], STDERR_FILENO);
-        ::close(in_pipe[0]); ::close(in_pipe[1]);
-        ::close(out_pipe[0]); ::close(out_pipe[1]);
-        ::close(err_pipe[0]); ::close(err_pipe[1]);
+        (void)::setpgid(0, 0);
+        auto bind_std_fd = [](int src_fd, int dst_fd) noexcept -> bool {
+            if (src_fd == dst_fd) {
+                return ::fcntl(dst_fd, F_SETFD, 0) == 0;
+            }
+            return ::dup2(src_fd, dst_fd) == dst_fd;
+        };
+        if (!bind_std_fd(in_rd.get(), STDIN_FILENO) ||
+            !bind_std_fd(out_wr.get(), STDOUT_FILENO) ||
+            !bind_std_fd(err_wr.get(), STDERR_FILENO)) {
+            const int err = errno;
+            (void)::write(exec_wr.get(), &err, sizeof(err));
+            _exit(127);
+        }
+        in_rd.reset();
+        in_wr.reset();
+        out_rd.reset();
+        out_wr.reset();
+        err_rd.reset();
+        err_wr.reset();
+        exec_rd.reset();
+        // exec_wr remains FD_CLOEXEC so successful execv() signals EOF to parent.
         ::execv(exe_str.c_str(), argv_ptrs.data());
+        const int err = errno;
+        (void)::write(exec_wr.get(), &err, sizeof(err));
         _exit(127);
     }
 
-    ::close(in_pipe[0]);
-    ::close(out_pipe[1]);
-    ::close(err_pipe[1]);
+    ScopedPosixChild child(pid);
+    in_rd.reset();
+    out_wr.reset();
+    err_wr.reset();
+    exec_wr.reset();
 
-    // Write stdin payload (non-blocking safe for small/medium assembly snippets)
-    std::size_t written_total = 0;
-    while (written_total < stdin_payload.size()) {
-        const ssize_t w = ::write(in_pipe[1],
-                                  stdin_payload.data() + written_total,
-                                  stdin_payload.size() - written_total);
-        if (w <= 0) {
-            break;
-        }
-        written_total += static_cast<std::size_t>(w);
+    int child_exec_errno = 0;
+    ssize_t exec_read = 0;
+    do {
+        exec_read = ::read(exec_rd.get(), &child_exec_errno, sizeof(child_exec_errno));
+    } while (exec_read < 0 && errno == EINTR);
+    exec_rd.reset();
+
+    if (exec_read > 0) {
+        in_wr.reset();
+        out_rd.reset();
+        err_rd.reset();
+        int status = 0;
+        child.reap_blocking(status);
+        res.launched = false;
+        res.launch_error = std::format(
+            "execv('{}') failed: {}", exe_str, std::strerror(child_exec_errno));
+        return res;
     }
-    ::close(in_pipe[1]);
 
-    std::array<pollfd, 2> fds{{
-        pollfd{.fd = out_pipe[0], .events = POLLIN, .revents = 0},
-        pollfd{.fd = err_pipe[0], .events = POLLIN, .revents = 0},
-    }};
-    int open_count = 2;
-    std::array<char, 4096> buf{};
-    while (open_count > 0) {
-        const int pr = ::poll(fds.data(), fds.size(), 15000);
-        if (pr <= 0) {
-            break;
-        }
-        for (std::size_t idx = 0; idx < fds.size(); ++idx) {
-            if (fds[idx].fd < 0) {
+    res.launched = true;
+
+    ScopedThreadSigpipeGuard sigpipe_guard(in_wr.get());
+    if (stdin_payload.empty()) {
+        in_wr.reset();
+    } else if (!set_nonblocking(in_wr.get())) {
+        res.launch_error = "fcntl(O_NONBLOCK) failed on stdin pipe";
+        return res;
+    }
+    if (!set_nonblocking(out_rd.get()) || !set_nonblocking(err_rd.get())) {
+        res.launch_error = "fcntl(O_NONBLOCK) failed on output pipe";
+        return res;
+    }
+
+    std::size_t stdin_offset = 0;
+    std::array<char, 8192> buf{};
+
+    auto drain_fd = [&](ScopedFd& fd, std::string& dst) {
+        while (fd.valid()) {
+            const ssize_t n = ::read(fd.get(), buf.data(), buf.size());
+            if (n > 0) {
+                dst.append(buf.data(), static_cast<std::size_t>(n));
                 continue;
             }
-            if (fds[idx].revents & (POLLIN | POLLHUP | POLLERR)) {
-                const ssize_t n = ::read(fds[idx].fd, buf.data(), buf.size());
-                if (n > 0) {
-                    if (idx == 0) {
-                        res.stdout_text.append(buf.data(), static_cast<std::size_t>(n));
-                    } else {
-                        res.stderr_text.append(buf.data(), static_cast<std::size_t>(n));
-                    }
-                } else {
-                    ::close(fds[idx].fd);
-                    fds[idx].fd = -1;
-                    --open_count;
+            if (n == 0) {
+                fd.reset();
+                break;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            fd.reset();
+            break;
+        }
+    };
+
+    while (in_wr.valid() || out_rd.valid() || err_rd.valid()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            res.timed_out = true;
+            break;
+        }
+
+        const auto rem_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const int poll_ms = static_cast<int>(
+            std::clamp<long long>(rem_ms, 1LL, static_cast<long long>(std::numeric_limits<int>::max())));
+
+        std::array<pollfd, 3> pfds{{
+            pollfd{.fd = in_wr.get(), .events = POLLOUT, .revents = 0},
+            pollfd{.fd = out_rd.get(), .events = POLLIN, .revents = 0},
+            pollfd{.fd = err_rd.get(), .events = POLLIN, .revents = 0},
+        }};
+
+        const int pr = ::poll(pfds.data(), pfds.size(), poll_ms);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (pr == 0) {
+            continue;
+        }
+
+        if (pfds[1].revents != 0 && out_rd.valid()) {
+            drain_fd(out_rd, res.stdout_text);
+        }
+        if (pfds[2].revents != 0 && err_rd.valid()) {
+            drain_fd(err_rd, res.stderr_text);
+        }
+        if (pfds[0].revents != 0 && in_wr.valid()) {
+            while (stdin_offset < stdin_payload.size()) {
+                const std::size_t chunk =
+                    std::min<std::size_t>(stdin_payload.size() - stdin_offset, 65536u);
+                const ssize_t w =
+                    ::write(in_wr.get(), stdin_payload.data() + stdin_offset, chunk);
+                if (w > 0) {
+                    stdin_offset += static_cast<std::size_t>(w);
+                    continue;
                 }
+                if (w < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    if ((pfds[0].revents & (POLLERR | POLLHUP)) != 0 &&
+                        (pfds[0].revents & POLLOUT) == 0) {
+                        sigpipe_guard.drain_pending();
+                        in_wr.reset();
+                    }
+                    break;
+                }
+                sigpipe_guard.drain_pending();
+                in_wr.reset();
+                break;
+            }
+            if (stdin_offset >= stdin_payload.size()) {
+                in_wr.reset();
             }
         }
     }
-    if (fds[0].fd >= 0) ::close(fds[0].fd);
-    if (fds[1].fd >= 0) ::close(fds[1].fd);
+
+    in_wr.reset();
+    out_rd.reset();
+    err_rd.reset();
 
     int status = 0;
-    if (::waitpid(pid, &status, 0) == pid) {
-        if (WIFEXITED(status)) {
-            res.exit_code = WEXITSTATUS(status);
-            res.launched = (res.exit_code != 127);
-        } else if (WIFSIGNALED(status)) {
-            res.exit_code = 128 + WTERMSIG(status);
-            res.launched = true;
-        }
+    if (res.timed_out) {
+        child.terminate_and_reap(status);
+        res.exit_code = -1;
+        return res;
     }
-    if (!res.launched && res.launch_error.empty()) {
-        res.launch_error = "execv failed to start llvm-mc";
+
+    while (!child.try_reap_nonblocking(status)) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            res.timed_out = true;
+            child.terminate_and_reap(status);
+            res.exit_code = -1;
+            return res;
+        }
+        const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+        std::this_thread::sleep_for(
+            std::min(rem, std::chrono::milliseconds{2}));
+    }
+
+    if (WIFEXITED(status)) {
+        res.exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        res.exit_code = 128 + WTERMSIG(status);
+    } else {
+        res.exit_code = -1;
     }
     return res;
 #endif
 }
+
+namespace {
 
 [[nodiscard]] bool is_executable_file(const std::filesystem::path& p) {
     std::error_code ec;
@@ -963,13 +1364,16 @@ LlvmMcAssemblerProvider::LlvmMcAssemblerProvider(std::filesystem::path explicit_
     }
 
     const std::array<std::string, 1> ver_args{"--version"};
-    const SubprocessResult probe = run_argv_process(llvm_mc_path_, ver_args, {});
-    if (!probe.launched || probe.exit_code != 0) {
+    const SubprocessResult probe =
+        run_argv_process(llvm_mc_path_, ver_args, {}, std::chrono::milliseconds{5000});
+    if (!probe.launched || probe.timed_out || probe.exit_code != 0) {
         status_ = SubsystemStatus::unavailable(
             "llvm-mc",
             std::format("Failed to run '{} --version': {}",
                         llvm_mc_path_.string(),
-                        !probe.launch_error.empty() ? probe.launch_error : trim_ascii(probe.stderr_text)));
+                        probe.timed_out ? "process timed out"
+                        : (!probe.launch_error.empty() ? probe.launch_error
+                                                       : trim_ascii(probe.stderr_text))));
         llvm_mc_path_.clear();
         return;
     }
@@ -1030,6 +1434,9 @@ Result<AssembleOutput> LlvmMcAssemblerProvider::assemble(const AssembleRequest& 
     const SubprocessResult run = run_argv_process(llvm_mc_path_, args, payload);
     if (!run.launched) {
         return make_error(std::format("Failed to invoke llvm-mc: {}", run.launch_error));
+    }
+    if (run.timed_out) {
+        return make_error("llvm-mc timed out while assembling input");
     }
     if (run.exit_code != 0) {
         auto parsed_err = parse_llvm_mc_show_encoding_output(

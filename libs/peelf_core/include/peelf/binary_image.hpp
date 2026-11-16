@@ -427,6 +427,9 @@ public:
     [[nodiscard]] virtual const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept = 0;
     [[nodiscard]] virtual std::string_view elf_interpreter() const noexcept = 0;
+    [[nodiscard]] virtual std::span<const std::string> parse_warnings() const noexcept {
+        return {};
+    }
     [[nodiscard]] virtual std::optional<std::uint64_t> file_offset_to_virtual_address(
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(

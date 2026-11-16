@@ -8,8 +8,8 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
+#include <format>
 #include <limits>
 #include <optional>
 #include <span>
@@ -395,18 +395,14 @@ struct ExplicitSpecialFloat {
             if (!v) {
                 return format_hex_bytes_preview(capped, has_more);
             }
-            std::array<char, 64> buf{};
-            std::snprintf(buf.data(), buf.size(), "%.7g", static_cast<double>(*v));
-            return std::string(buf.data());
+            return std::format("{:.7g}", static_cast<double>(*v));
         }
         case SearchValueKind::Float64: {
             const auto v = reader.read_f64(0);
             if (!v) {
                 return format_hex_bytes_preview(capped, has_more);
             }
-            std::array<char, 64> buf{};
-            std::snprintf(buf.data(), buf.size(), "%.15g", *v);
-            return std::string(buf.data());
+            return std::format("{:.15g}", *v);
         }
         case SearchValueKind::Utf8Text:
             return sanitize_utf8_preview(capped, has_more);

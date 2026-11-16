@@ -6,7 +6,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <initializer_list>
 #include <optional>
 #include <span>
@@ -21,13 +21,7 @@ namespace peelf {
 namespace {
 
 [[nodiscard]] std::string hex_u64(std::uint64_t val, unsigned min_digits = 1u) {
-    std::array<char, 32> buf{};
-    std::snprintf(buf.data(),
-                  buf.size(),
-                  "0x%0*llX",
-                  static_cast<int>(min_digits),
-                  static_cast<unsigned long long>(val));
-    return std::string(buf.data());
+    return std::format("0x{:0{}X}", val, min_digits);
 }
 
 [[nodiscard]] std::string hex_ptr(std::uint64_t val, TargetLayout layout) {

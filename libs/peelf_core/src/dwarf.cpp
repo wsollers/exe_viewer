@@ -397,6 +397,43 @@ struct AttrValue {
     std::vector<std::uint8_t> block{};
 };
 
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_add_u64(
+    std::uint64_t a,
+    std::uint64_t b) noexcept {
+    if (b > std::numeric_limits<std::uint64_t>::max() - a) {
+        return std::nullopt;
+    }
+    return a + b;
+}
+
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_mul_u64(
+    std::uint64_t a,
+    std::uint64_t b) noexcept {
+    if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) {
+        return std::nullopt;
+    }
+    return a * b;
+}
+
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_entry_offset(
+    std::uint64_t base,
+    std::uint64_t index,
+    std::uint64_t entry_size,
+    std::uint64_t section_size) noexcept {
+    if (entry_size == 0 || base > section_size) {
+        return std::nullopt;
+    }
+    const std::uint64_t avail = section_size - base;
+    if (entry_size > avail) {
+        return std::nullopt;
+    }
+    const std::uint64_t max_entries = avail / entry_size;
+    if (index >= max_entries) {
+        return std::nullopt;
+    }
+    return base + index * entry_size;
+}
+
 [[nodiscard]] std::string resolve_strx(const DwarfSectionViews& views,
                                        const CompileUnitContext& cu,
                                        std::uint64_t index) {
@@ -407,9 +444,13 @@ struct AttrValue {
     if (base == 0 && views.debug_str_offsets.size() >= (cu.offset_size == 8 ? 16u : 8u)) {
         base = (cu.offset_size == 8) ? 16u : 8u;
     }
-    const std::uint64_t pos = base + index * entry_size;
+    const auto pos = checked_entry_offset(
+        base, index, entry_size, static_cast<std::uint64_t>(views.debug_str_offsets.size()));
+    if (!pos.has_value()) {
+        return {};
+    }
     EndianReader r(views.debug_str_offsets, views.endian);
-    std::size_t cursor = static_cast<std::size_t>(pos);
+    std::size_t cursor = static_cast<std::size_t>(*pos);
     const auto str_off = read_sized_uint(r, cursor, cu.offset_size);
     if (!str_off) {
         return {};
@@ -425,9 +466,13 @@ struct AttrValue {
     if (base == 0 && cu.version >= 5 && views.debug_addr.size() >= (cu.offset_size == 8 ? 16u : 8u)) {
         base = (cu.offset_size == 8) ? 16u : 8u;
     }
-    const std::uint64_t pos = base + index * cu.address_size;
+    const auto pos = checked_entry_offset(
+        base, index, cu.address_size, static_cast<std::uint64_t>(views.debug_addr.size()));
+    if (!pos.has_value()) {
+        return std::nullopt;
+    }
     EndianReader r(views.debug_addr, views.endian);
-    std::size_t cursor = static_cast<std::size_t>(pos);
+    std::size_t cursor = static_cast<std::size_t>(*pos);
     return read_sized_uint(r, cursor, cu.address_size);
 }
 
@@ -484,7 +529,7 @@ struct AttrValue {
         return val;
     }
     case kDW_FORM_data16: {
-        if (cursor + 16 > limit) return std::nullopt;
+        if (cursor > limit || limit - cursor < 16u) return std::nullopt;
         cursor += 16;
         val.kind = AttrValue::Kind::Uint;
         return val;
@@ -610,8 +655,11 @@ struct AttrValue {
         else if (form == kDW_FORM_ref8) rel = read_sized_uint(info_reader, cursor, 8);
         else rel = read_uleb128(raw, cursor);
         if (!rel || cursor > limit) return std::nullopt;
+        const auto abs_ref = checked_add_u64(static_cast<std::uint64_t>(cu.cu_start), *rel);
         val.kind = AttrValue::Kind::DieRef;
-        val.uval = static_cast<std::uint64_t>(cu.cu_start) + *rel;
+        val.uval = (abs_ref.has_value() && *abs_ref < static_cast<std::uint64_t>(cu.cu_end))
+                       ? *abs_ref
+                       : std::numeric_limits<std::uint64_t>::max();
         return val;
     }
     case kDW_FORM_ref_sup4: {
@@ -767,7 +815,7 @@ struct ResolvedTypeInfo {
     case kDW_TAG_array_type: {
         const auto elem = resolve_die_type(d.type_ref, dies, ptr_size, depth + 1);
         std::string dims;
-        std::uint64_t total_elems = 1;
+        std::optional<std::uint64_t> total_elems = std::uint64_t{1};
         bool has_dim = false;
         for (const std::uint64_t child_off : d.child_offsets) {
             const auto cit = dies.find(child_off);
@@ -775,7 +823,9 @@ struct ResolvedTypeInfo {
                 if (cit->second.array_count.has_value()) {
                     const std::uint64_t cnt = *cit->second.array_count;
                     dims += "[" + std::to_string(cnt) + "]";
-                    total_elems *= cnt;
+                    total_elems = total_elems.has_value()
+                                      ? checked_mul_u64(*total_elems, cnt)
+                                      : std::nullopt;
                     has_dim = true;
                 } else {
                     dims += "[]";
@@ -783,7 +833,11 @@ struct ResolvedTypeInfo {
             }
         }
         if (dims.empty()) dims = "[]";
-        const std::uint64_t sz = d.byte_size.value_or(has_dim ? (elem.byte_size * total_elems) : 0);
+        const auto computed_sz =
+            (has_dim && total_elems.has_value())
+                ? checked_mul_u64(elem.byte_size, *total_elems)
+                : std::optional<std::uint64_t>{0};
+        const std::uint64_t sz = d.byte_size.value_or(computed_sz.value_or(0));
         return ResolvedTypeInfo{.name = elem.name + dims, .byte_size = sz};
     }
     case kDW_TAG_structure_type:
@@ -871,11 +925,14 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
             }
             abbrev_offset = *abbrev_off;
             if (*unit_type == kDW_UT_skeleton || *unit_type == kDW_UT_split_compile) {
-                if (cursor + 8 > cu_end) { cursor = cu_end; continue; }
+                if (cu_end - cursor < 8u) { cursor = cu_end; continue; }
                 cursor += 8;
             } else if (*unit_type == kDW_UT_type || *unit_type == kDW_UT_split_type) {
-                if (cursor + 8 + cu.offset_size > cu_end) { cursor = cu_end; continue; }
-                cursor += 8 + cu.offset_size;
+                if (cu_end - cursor < static_cast<std::size_t>(8u + cu.offset_size)) {
+                    cursor = cu_end;
+                    continue;
+                }
+                cursor += 8u + cu.offset_size;
             }
         } else {
             const auto abbrev_off = read_sized_uint(reader, cursor, cu.offset_size);
@@ -1019,7 +1076,7 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
             }
 
             if (!node.array_count.has_value() && upper_bound.has_value()) {
-                node.array_count = *upper_bound + 1u;
+                node.array_count = checked_add_u64(*upper_bound, 1u);
             }
 
             if (is_root_die) {
@@ -1318,7 +1375,10 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
                 dir_fmt.emplace_back(*ct, *fm);
             }
             const auto dir_cnt = ok ? read_uleb128(views.debug_line, cursor) : std::nullopt;
-            if (!dir_cnt) { cursor = unit_end; continue; }
+            if (!dir_cnt || (*dir_cnt > 0 && dir_fmt.empty()) || *dir_cnt > 65536u) {
+                cursor = unit_end;
+                continue;
+            }
             for (std::uint64_t d = 0; d < *dir_cnt && ok; ++d) {
                 std::string dpath;
                 for (const auto& [ct, fm] : dir_fmt) {
@@ -1341,7 +1401,10 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
                 file_fmt.emplace_back(*ct, *fm);
             }
             const auto file_cnt = ok ? read_uleb128(views.debug_line, cursor) : std::nullopt;
-            if (!file_cnt) { cursor = unit_end; continue; }
+            if (!file_cnt || (*file_cnt > 0 && file_fmt.empty()) || *file_cnt > 262144u) {
+                cursor = unit_end;
+                continue;
+            }
             for (std::uint64_t f = 0; f < *file_cnt && ok; ++f) {
                 LineFileEntry fe;
                 for (const auto& [ct, fm] : file_fmt) {
@@ -1392,9 +1455,19 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
         LineRegs regs = reset_regs();
 
         const auto advance_addr = [&](std::uint64_t op_advance) {
-            const std::uint64_t total_ops = regs.op_index + op_advance;
-            regs.address += (*min_inst_len) * (total_ops / max_ops_per_inst);
+            const std::uint64_t total_ops =
+                checked_add_u64(regs.op_index, op_advance)
+                    .value_or(std::numeric_limits<std::uint64_t>::max());
+            const std::uint64_t addr_delta =
+                checked_mul_u64(*min_inst_len, total_ops / max_ops_per_inst).value_or(0u);
+            regs.address = checked_add_u64(regs.address, addr_delta).value_or(0u);
             regs.op_index = total_ops % max_ops_per_inst;
+        };
+
+        const auto advance_line_checked = [&](std::int64_t delta) {
+            // Perform addition in unsigned domain to avoid signed integer overflow UB on hostile SLEB128.
+            regs.line = static_cast<std::int64_t>(
+                static_cast<std::uint64_t>(regs.line) + static_cast<std::uint64_t>(delta));
         };
 
         const auto emit_row = [&]() {
@@ -1466,7 +1539,9 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
                     if (const auto adv = read_uleb128(views.debug_line, cursor)) advance_addr(*adv);
                     break;
                 case kDW_LNS_advance_line:
-                    if (const auto dline = read_sleb128(views.debug_line, cursor)) regs.line += *dline;
+                    if (const auto dline = read_sleb128(views.debug_line, cursor)) {
+                        advance_line_checked(*dline);
+                    }
                     break;
                 case kDW_LNS_set_file:
                     if (const auto f = read_uleb128(views.debug_line, cursor)) regs.file = *f;
@@ -1504,7 +1579,8 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
                 // Special opcode
                 const std::uint8_t adj = static_cast<std::uint8_t>(op - *opcode_base);
                 advance_addr(adj / *line_range);
-                regs.line += static_cast<std::int64_t>(line_base) + static_cast<std::int64_t>(adj % *line_range);
+                advance_line_checked(static_cast<std::int64_t>(line_base) +
+                                     static_cast<std::int64_t>(adj % *line_range));
                 emit_row();
             }
         }

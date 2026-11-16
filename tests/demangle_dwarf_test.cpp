@@ -639,3 +639,122 @@ TEST(DwarfLiveAslrTest, RebasesSidecarDwarfSymbolsAndSourceLinesOntoLiveProcessM
         EXPECT_LT(line.virtual_address, kLiveBase + 0x40000ULL);
     }
 }
+
+TEST(DwarfCheckedArithmeticTest, RejectsWrappingStrxAndAddrxIndicesWithoutModuloAliasing) {
+    auto push_u16_le = [](std::vector<std::uint8_t>& out, std::uint16_t v) {
+        out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+        out.push_back(static_cast<std::uint8_t>((v >> 8u) & 0xFFu));
+    };
+    auto push_u32_le = [](std::vector<std::uint8_t>& out, std::uint32_t v) {
+        for (int s = 0; s < 32; s += 8) {
+            out.push_back(static_cast<std::uint8_t>((v >> s) & 0xFFu));
+        }
+    };
+    auto push_u64_le = [](std::vector<std::uint8_t>& out, std::uint64_t v) {
+        for (int s = 0; s < 64; s += 8) {
+            out.push_back(static_cast<std::uint8_t>((v >> s) & 0xFFu));
+        }
+    };
+    auto push_uleb = [](std::vector<std::uint8_t>& out, std::uint64_t v) {
+        do {
+            std::uint8_t byte = static_cast<std::uint8_t>(v & 0x7Fu);
+            v >>= 7u;
+            if (v != 0) byte |= 0x80u;
+            out.push_back(byte);
+        } while (v != 0);
+    };
+
+    // .debug_str: offset 0 = "valid_fn\0", offset 9 = "wrapped_secret\0"
+    std::vector<std::uint8_t> debug_str;
+    for (char c : std::string_view{"valid_fn", 9}) debug_str.push_back(static_cast<std::uint8_t>(c));
+    for (char c : std::string_view{"wrapped_secret", 15}) debug_str.push_back(static_cast<std::uint8_t>(c));
+
+    // DWARF64 .debug_str_offsets: 16-byte header, entry[0] @ 16 -> 0 ("valid_fn"), entry[1] @ 24 -> 9 ("wrapped_secret")
+    std::vector<std::uint8_t> debug_str_offsets(16, 0);
+    push_u64_le(debug_str_offsets, 0ull);
+    push_u64_le(debug_str_offsets, 9ull);
+
+    // .debug_addr: 16-byte header, entry[0] @ 16 -> 0x401000, entry[1] @ 24 -> 0xDEADBEEFCAFEBABE
+    std::vector<std::uint8_t> debug_addr(16, 0);
+    push_u64_le(debug_addr, 0x401000ull);
+    push_u64_le(debug_addr, 0xDEADBEEFCAFEBABEull);
+
+    // Abbrev table:
+    //   [1] DW_TAG_compile_unit, children=yes: DW_AT_str_offsets_base (sec_offset=0x17), DW_AT_addr_base (sec_offset=0x17)
+    //   [2] DW_TAG_subprogram, children=no: DW_AT_name (strx=0x1a), DW_AT_low_pc (addrx=0x1b), DW_AT_high_pc (data8=0x07)
+    std::vector<std::uint8_t> debug_abbrev;
+    push_uleb(debug_abbrev, 1u);
+    push_uleb(debug_abbrev, 0x11u); // DW_TAG_compile_unit
+    debug_abbrev.push_back(1u);     // DW_CHILDREN_yes
+    push_uleb(debug_abbrev, 0x72u); // DW_AT_str_offsets_base
+    push_uleb(debug_abbrev, 0x17u); // DW_FORM_sec_offset
+    push_uleb(debug_abbrev, 0x73u); // DW_AT_addr_base
+    push_uleb(debug_abbrev, 0x17u); // DW_FORM_sec_offset
+    debug_abbrev.push_back(0u);
+    debug_abbrev.push_back(0u);
+
+    push_uleb(debug_abbrev, 2u);
+    push_uleb(debug_abbrev, 0x2eu); // DW_TAG_subprogram
+    debug_abbrev.push_back(0u);     // DW_CHILDREN_no
+    push_uleb(debug_abbrev, 0x03u); // DW_AT_name
+    push_uleb(debug_abbrev, 0x1au); // DW_FORM_strx
+    push_uleb(debug_abbrev, 0x11u); // DW_AT_low_pc
+    push_uleb(debug_abbrev, 0x1bu); // DW_FORM_addrx
+    push_uleb(debug_abbrev, 0x12u); // DW_AT_high_pc
+    push_uleb(debug_abbrev, 0x07u); // DW_FORM_data8
+    debug_abbrev.push_back(0u);
+    debug_abbrev.push_back(0u);
+    debug_abbrev.push_back(0u);
+
+    // Craft wrapping index: (2^64 / 8) + 1 = 0x2000000000000001ULL.
+    // Unchecked `16 + index * 8` wraps modulo 2^64 to `16 + 8 == 24` (entry[1]!).
+    constexpr std::uint64_t kWrappingIndex = (1ull << 61u) + 1ull;
+    static_assert(16ull + kWrappingIndex * 8ull == 24ull);
+
+    std::vector<std::uint8_t> cu_body;
+    push_u16_le(cu_body, 5u);  // DWARF v5
+    cu_body.push_back(0x01u);  // DW_UT_compile
+    cu_body.push_back(8u);     // address_size = 8
+    push_u64_le(cu_body, 0ull); // abbrev_offset = 0
+
+    // DIE [1] compile_unit: str_offsets_base = 16, addr_base = 16
+    push_uleb(cu_body, 1u);
+    push_u64_le(cu_body, 16ull);
+    push_u64_le(cu_body, 16ull);
+
+    // DIE [2] valid subprogram (index 0 -> "valid_fn" @ 0x401000)
+    push_uleb(cu_body, 2u);
+    push_uleb(cu_body, 0u);
+    push_uleb(cu_body, 0u);
+    push_u64_le(cu_body, 0x20ull);
+
+    // DIE [2] hostile subprogram (wrapping index -> must NOT alias entry[1])
+    push_uleb(cu_body, 2u);
+    push_uleb(cu_body, kWrappingIndex);
+    push_uleb(cu_body, kWrappingIndex);
+    push_u64_le(cu_body, 0x20ull);
+
+    cu_body.push_back(0u); // end of children
+
+    // DWARF64 unit header: 0xFFFFFFFF + 8-byte length
+    std::vector<std::uint8_t> debug_info;
+    push_u32_le(debug_info, 0xFFFF'FFFFu);
+    push_u64_le(debug_info, static_cast<std::uint64_t>(cu_body.size()));
+    debug_info.insert(debug_info.end(), cu_body.begin(), cu_body.end());
+
+    peelf::DwarfSectionViews views{
+        .endian = peelf::Endianness::Little,
+        .default_address_size = 8,
+        .debug_info = debug_info,
+        .debug_abbrev = debug_abbrev,
+        .debug_str = debug_str,
+        .debug_str_offsets = debug_str_offsets,
+        .debug_addr = debug_addr,
+    };
+
+    const auto parsed_res = peelf::parse_dwarf_sections(views);
+    ASSERT_TRUE(parsed_res.has_value()) << parsed_res.error().message;
+    ASSERT_EQ(parsed_res->functions.size(), 1u);
+    EXPECT_EQ(parsed_res->functions[0].name, "valid_fn");
+    EXPECT_EQ(parsed_res->functions[0].low_pc, 0x401000ull);
+}

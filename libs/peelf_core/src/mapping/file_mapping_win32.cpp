@@ -2,8 +2,7 @@
 
 #include <cstdint>
 #include <limits>
-#include <memory>
-#include <new>
+#include <string>
 
 #include "mapping/file_mapping_win32.hpp"
 #include "mapping/file_mapping.hpp"
@@ -24,16 +23,22 @@ std::error_code Win32FileMappingBackend::open_and_map(Win32FileMappingBackend& s
         ? GENERIC_READ
         : (GENERIC_READ | GENERIC_WRITE);
 
-    if (path.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+    if (path.empty() || path.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
         return make_error_code(MapErrc::open_failed);
-    const int length = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), nullptr, 0);
-    if (length == 0) return make_error_code(MapErrc::open_failed);
-    std::unique_ptr<wchar_t[]> wide(new (std::nothrow) wchar_t[static_cast<std::size_t>(length) + 1]);
-    if (!wide || ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), wide.get(), length) != length)
+    const int length = ::MultiByteToWideChar(
+        CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), nullptr, 0);
+    if (length <= 0) return make_error_code(MapErrc::open_failed);
+    std::wstring wide;
+    try {
+        wide.resize(static_cast<std::size_t>(length));
+    } catch (...) {
         return make_error_code(MapErrc::open_failed);
-    wide[length] = L'\0';
+    }
+    if (::MultiByteToWideChar(
+            CP_UTF8, MB_ERR_INVALID_CHARS, path.data(), static_cast<int>(path.size()), wide.data(), length) != length)
+        return make_error_code(MapErrc::open_failed);
     HANDLE hFile = ::CreateFileW(
-        wide.get(),
+        wide.c_str(),
         desiredAccess,
         FILE_SHARE_READ,       // share read; adjust if needed
         nullptr,
@@ -62,7 +67,7 @@ std::error_code Win32FileMappingBackend::open_and_map(Win32FileMappingBackend& s
     const std::size_t size = static_cast<std::size_t>(size64);
 
     const DWORD protect = (mode == MapMode::read_only) ? PAGE_READONLY : PAGE_READWRITE;
-    HANDLE hMap = ::CreateFileMappingA(hFile, nullptr, protect, 0, 0, nullptr);
+    HANDLE hMap = ::CreateFileMappingW(hFile, nullptr, protect, 0, 0, nullptr);
     if (!hMap) {
         ::CloseHandle(hFile);
         return make_error_code(MapErrc::map_failed);

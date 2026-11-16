@@ -6,7 +6,7 @@ namespace peelf {
 
 
 
-std::string_view to_string(FileKind k) {
+std::string_view to_string(FileKind k) noexcept {
     switch (k) {
         case FileKind::ELF: return "ELF";
         case FileKind::PE: return "PE";

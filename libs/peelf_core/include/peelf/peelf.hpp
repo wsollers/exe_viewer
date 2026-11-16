@@ -40,7 +40,7 @@ struct FileInfo {
 // Future: detect kind from a path and dispatch (ToDo.md P1-2).
 // Result<FileInfo> parse_file(const std::filesystem::path& path);
 
-std::string_view to_string(FileKind k);
+[[nodiscard]] std::string_view to_string(FileKind k) noexcept;
 
 
 } // namespace peelf

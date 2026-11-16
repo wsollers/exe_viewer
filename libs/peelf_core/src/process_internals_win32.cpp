@@ -18,8 +18,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <cstdio>
+#include <format>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace peelf {
@@ -127,26 +128,24 @@ struct ScopedHandle {
     IN_ADDR addr{};
     addr.S_un.S_addr = net_order_ip;
     std::array<char, INET_ADDRSTRLEN> ip_buf{};
-    if (::inet_ntop(AF_INET, &addr, ip_buf.data(), ip_buf.size()) == nullptr) {
-        std::snprintf(ip_buf.data(), ip_buf.size(), "0.0.0.0");
-    }
+    const std::string_view ip_str =
+        ::inet_ntop(AF_INET, &addr, ip_buf.data(), ip_buf.size()) != nullptr
+            ? std::string_view(ip_buf.data())
+            : std::string_view("0.0.0.0");
     const unsigned port = ::ntohs(static_cast<u_short>(net_order_port));
-    std::array<char, 64> out{};
-    std::snprintf(out.data(), out.size(), "%s:%u", ip_buf.data(), port);
-    return out.data();
+    return std::format("{}:{}", ip_str, port);
 }
 
 [[nodiscard]] std::string format_win32_ipv6(const UCHAR ip6[16], DWORD net_order_port) {
     IN6_ADDR addr{};
     std::copy_n(ip6, 16, addr.u.Byte);
     std::array<char, INET6_ADDRSTRLEN> ip_buf{};
-    if (::inet_ntop(AF_INET6, &addr, ip_buf.data(), ip_buf.size()) == nullptr) {
-        std::snprintf(ip_buf.data(), ip_buf.size(), "::");
-    }
+    const std::string_view ip_str =
+        ::inet_ntop(AF_INET6, &addr, ip_buf.data(), ip_buf.size()) != nullptr
+            ? std::string_view(ip_buf.data())
+            : std::string_view("::");
     const unsigned port = ::ntohs(static_cast<u_short>(net_order_port));
-    std::array<char, 96> out{};
-    std::snprintf(out.data(), out.size(), "[%s]:%u", ip_buf.data(), port);
-    return out.data();
+    return std::format("[{}]:{}", ip_str, port);
 }
 
 [[nodiscard]] std::string win32_tcp_state_name(DWORD state) {
@@ -249,9 +248,8 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
 
                 ProcessHandleEntry entry{};
                 entry.handle_or_fd = static_cast<std::uint64_t>(raw.HandleValue);
-                std::array<char, 24> acc_buf{};
-                std::snprintf(acc_buf.data(), acc_buf.size(), "0x%08lX", raw.GrantedAccess);
-                entry.access_or_flags = acc_buf.data();
+                entry.access_or_flags =
+                    std::format("0x{:08X}", static_cast<std::uint32_t>(raw.GrantedAccess));
 
                 if (proc_dup.valid() && nt_query_obj != nullptr) {
                     HANDLE dup = nullptr;

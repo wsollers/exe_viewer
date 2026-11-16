@@ -4,6 +4,15 @@ else()
   set(_peelf_core_lib_type STATIC)
 endif()
 
+file(GLOB_RECURSE PEELF_CORE_ORPHAN_HEADER_CPPS
+  CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/include/*.cpp"
+)
+if(PEELF_CORE_ORPHAN_HEADER_CPPS)
+  message(FATAL_ERROR
+    "Orphan .cpp source files must not reside under libs/peelf_core/include/: ${PEELF_CORE_ORPHAN_HEADER_CPPS}")
+endif()
+
 add_library(peelf_core ${_peelf_core_lib_type}
   src/pe/pe_parser.cpp
   src/elf/elf_parser.cpp
