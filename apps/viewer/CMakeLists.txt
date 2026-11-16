@@ -89,6 +89,8 @@ add_library(peelf_gui SHARED
         src/analysis/patch_preview.cpp
         src/analysis/project.cpp
         src/decompile/decompiler.cpp
+        src/decompile/decompile_controller.hpp
+        src/decompile/decompile_controller.cpp
         src/decompile/structured_decompiler.hpp
         src/decompile/structured_decompiler.cpp
         src/decompile/ghidra_decompiler.cpp

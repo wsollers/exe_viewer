@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <format>
@@ -29,26 +30,6 @@ namespace {
                    std::tolower(static_cast<unsigned char>(b));
         });
     return it != haystack.end();
-}
-
-[[nodiscard]] std::optional<viewer::Architecture> to_viewer_arch(peelf::Architecture arch) noexcept {
-    switch (arch) {
-        case peelf::Architecture::X86:       return viewer::Architecture::X86_32;
-        case peelf::Architecture::X86_64:    return viewer::Architecture::X86_64;
-        case peelf::Architecture::ARM:       return viewer::Architecture::ARM32;
-        case peelf::Architecture::ARM64:     return viewer::Architecture::ARM64;
-        case peelf::Architecture::MIPS32:    return viewer::Architecture::MIPS32;
-        case peelf::Architecture::MIPS64:    return viewer::Architecture::MIPS64;
-        case peelf::Architecture::PowerPC:   return viewer::Architecture::PowerPC32;
-        case peelf::Architecture::PowerPC64: return viewer::Architecture::PowerPC64;
-        case peelf::Architecture::RISCV32:   return viewer::Architecture::RISCV32;
-        case peelf::Architecture::RISCV64:   return viewer::Architecture::RISCV64;
-        default:                             return std::nullopt;
-    }
-}
-
-[[nodiscard]] viewer::Endianness to_viewer_endian(peelf::Endianness e) noexcept {
-    return e == peelf::Endianness::Big ? viewer::Endianness::Big : viewer::Endianness::Little;
 }
 
 [[nodiscard]] ImVec4 color_for_diff_status(peelf::DiffChangeKind k) noexcept {
@@ -254,13 +235,13 @@ void BinaryDiffPanel::poll_async_completion() {
         selected_hunk_index_ = 0;
 
         if (lhs_owned_image_ != nullptr) {
-            if (const auto arch = to_viewer_arch(lhs_owned_image_->architecture())) {
-                (void)lhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
+            if (const auto arch = to_disassembler_architecture(lhs_owned_image_->architecture())) {
+                (void)lhs_disasm_.init(*arch, to_disassembler_endianness(lhs_owned_image_->endianness()));
             }
         }
         if (rhs_owned_image_ != nullptr) {
-            if (const auto arch = to_viewer_arch(rhs_owned_image_->architecture())) {
-                (void)rhs_disasm_.init(*arch, to_viewer_endian(rhs_owned_image_->endianness()));
+            if (const auto arch = to_disassembler_architecture(rhs_owned_image_->architecture())) {
+                (void)rhs_disasm_.init(*arch, to_disassembler_endianness(rhs_owned_image_->endianness()));
             }
         }
 
@@ -296,9 +277,9 @@ void BinaryDiffPanel::poll_async_completion() {
         selected_hunk_index_ = 0;
 
         if (lhs_owned_image_ != nullptr) {
-            if (const auto arch = to_viewer_arch(lhs_owned_image_->architecture())) {
-                (void)lhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
-                (void)rhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
+            if (const auto arch = to_disassembler_architecture(lhs_owned_image_->architecture())) {
+                (void)lhs_disasm_.init(*arch, to_disassembler_endianness(lhs_owned_image_->endianness()));
+                (void)rhs_disasm_.init(*arch, to_disassembler_endianness(lhs_owned_image_->endianness()));
             }
         }
 
@@ -543,11 +524,11 @@ void BinaryDiffPanel::draw_overview_tab() {
         ImGui::Text("Module: %s", lr.module_name.c_str());
         ImGui::Text("Backing Disk File: %s", lr.disk_path.c_str());
         ImGui::Text("Disk SHA-256: %s", lr.disk_sha256.c_str());
-        ImGui::Text("Preferred Static Base: 0x%llX   |   Live Runtime Base: 0x%llX   |   ASLR Slide: %+lld (0x%llX)",
-                    static_cast<unsigned long long>(lr.static_preferred_base),
-                    static_cast<unsigned long long>(lr.live_base_address),
-                    static_cast<long long>(lr.aslr_load_bias),
-                    static_cast<unsigned long long>(lr.live_base_address - lr.static_preferred_base));
+        ImGui::Text("Preferred Static Base: 0x%" PRIX64 "   |   Live Runtime Base: 0x%" PRIX64 "   |   ASLR Slide: %+" PRId64 " (0x%" PRIX64 ")",
+                    lr.static_preferred_base,
+                    lr.live_base_address,
+                    lr.aslr_load_bias,
+                    lr.live_base_address - lr.static_preferred_base);
         ImGui::Separator();
         ImGui::TextColored(lr.inline_code_hook_count > 0 ? ImVec4(0.98f, 0.34f, 0.36f, 1.0f)
                                                          : ImVec4(0.35f, 0.92f, 0.55f, 1.0f),
@@ -557,9 +538,9 @@ void BinaryDiffPanel::draw_overview_tab() {
                            "IAT / GOT Pointer Hooks: %zu", lr.iat_got_hook_count);
         ImGui::Text("Normalized Base Relocations: %zu   |   Clean Dynamic Loader Slots: %zu",
                     lr.normalized_relocation_count, lr.normalized_loader_slot_count);
-        ImGui::Text("Read-Only Data Modifications: %zu   |   Writable (.data/.bss) Mutated Bytes: %llu",
+        ImGui::Text("Read-Only Data Modifications: %zu   |   Writable (.data/.bss) Mutated Bytes: %" PRIu64,
                     lr.readonly_data_diff_count,
-                    static_cast<unsigned long long>(lr.writable_data_changed_bytes));
+                    lr.writable_data_changed_bytes);
     }
 }
 
@@ -603,15 +584,15 @@ void BinaryDiffPanel::draw_sections_tab() {
             ImGui::TableNextColumn();
             ImGui::Text("%s", s.rhs_va ? std::format("0x{:X}", *s.rhs_va).c_str() : "-");
             ImGui::TableNextColumn();
-            ImGui::Text("%llu -> %llu",
-                        static_cast<unsigned long long>(s.lhs_file_size),
-                        static_cast<unsigned long long>(s.rhs_file_size));
+            ImGui::Text("%" PRIu64 " -> %" PRIu64,
+                        s.lhs_file_size,
+                        s.rhs_file_size);
             ImGui::TableNextColumn();
             ImGui::Text("%s / %s",
                         s.lhs_permissions.empty() ? "-" : s.lhs_permissions.c_str(),
                         s.rhs_permissions.empty() ? "-" : s.rhs_permissions.c_str());
             ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(s.changed_byte_count));
+            ImGui::Text("%" PRIu64, s.changed_byte_count);
             ImGui::TableNextColumn();
             const std::string lshort = s.lhs_sha256.size() >= 12 ? s.lhs_sha256.substr(0, 12) : "-";
             const std::string rshort = s.rhs_sha256.size() >= 12 ? s.rhs_sha256.substr(0, 12) : "-";
@@ -659,9 +640,9 @@ void BinaryDiffPanel::draw_imports_exports_tab() {
                     ImGui::TextUnformatted(sl.symbol_name.c_str());
                 }
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%llX", static_cast<unsigned long long>(sl.live_slot_va));
+                ImGui::Text("0x%" PRIX64, sl.live_slot_va);
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%llX", static_cast<unsigned long long>(sl.live_target_va));
+                ImGui::Text("0x%" PRIX64, sl.live_target_va);
                 ImGui::TableNextColumn();
                 ImGui::TextColored(sl.is_hooked ? ImVec4(0.98f, 0.34f, 0.36f, 1.0f)
                                                 : ImVec4(0.45f, 0.82f, 0.96f, 1.0f),
@@ -800,9 +781,9 @@ void BinaryDiffPanel::draw_functions_tab() {
             ImGui::TableNextColumn();
             ImGui::Text("%s", fn.rhs_va ? std::format("0x{:X}", *fn.rhs_va).c_str() : "-");
             ImGui::TableNextColumn();
-            ImGui::Text("%llu (%+lld)",
-                        static_cast<unsigned long long>(fn.lhs_size != 0u ? fn.lhs_size : fn.rhs_size),
-                        static_cast<long long>(fn.size_delta));
+            ImGui::Text("%" PRIu64 " (%+" PRId64 ")",
+                        fn.lhs_size != 0u ? fn.lhs_size : fn.rhs_size,
+                        fn.size_delta);
             ImGui::TableNextColumn();
             ImGui::Text("%.1f%%", fn.similarity * 100.0);
         }
@@ -866,7 +847,7 @@ void BinaryDiffPanel::draw_hunks_tab() {
             ImGui::TableNextColumn();
             ImGui::Text("%s", h.rhs_va ? std::format("0x{:X}", *h.rhs_va).c_str() : "-");
             ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(h.size));
+            ImGui::Text("%" PRIu64, static_cast<std::uint64_t>(h.size));
             ImGui::TableNextColumn();
             ImGui::Text("%s -> %s",
                         hex_preview_short(h.lhs_sample, 6u).c_str(),
@@ -912,10 +893,10 @@ void BinaryDiffPanel::draw_side_by_side_tab() {
         if (target != 0u) on_navigate_(target, PreferredView::Disassembly);
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("Primary VA 0x%llX  <->  %s VA 0x%llX",
-                        static_cast<unsigned long long>(sbs_lhs_va_),
+    ImGui::TextDisabled("Primary VA 0x%" PRIX64 "  <->  %s VA 0x%" PRIX64,
+                        sbs_lhs_va_,
                         mode_ == ActiveDiffMode::DiskVsLiveRam ? "Live RAM" : "Comparison",
-                        static_cast<unsigned long long>(sbs_rhs_va_));
+                        sbs_rhs_va_);
 
     // Synchronized Hex Rows (16 bytes per row)
     if (ImGui::CollapsingHeader("Synchronized Side-by-Side Hex", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -935,7 +916,7 @@ void BinaryDiffPanel::draw_side_by_side_tab() {
             for (std::size_t row_off = 0; row_off < max_bytes; row_off += 16u) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%llX", static_cast<unsigned long long>(sbs_lhs_va_ + row_off));
+                ImGui::Text("0x%" PRIX64, sbs_lhs_va_ + row_off);
 
                 ImGui::TableNextColumn();
                 for (std::size_t b = 0; b < 16u && (row_off + b) < sbs_lhs_slice_.size(); ++b) {
@@ -951,7 +932,7 @@ void BinaryDiffPanel::draw_side_by_side_tab() {
                 }
 
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%llX", static_cast<unsigned long long>(sbs_rhs_va_ + row_off));
+                ImGui::Text("0x%" PRIX64, sbs_rhs_va_ + row_off);
 
                 ImGui::TableNextColumn();
                 for (std::size_t b = 0; b < 16u && (row_off + b) < sbs_rhs_slice_.size(); ++b) {
@@ -1020,7 +1001,7 @@ void BinaryDiffPanel::draw_side_by_side_tab() {
 
                 ImGui::TableNextColumn();
                 if (ri != nullptr) {
-                    ImGui::Text("0x%llX", static_cast<unsigned long long>(ri->address));
+                    ImGui::Text("0x%" PRIX64, ri->address);
                 } else {
                     ImGui::TextDisabled("-");
                 }

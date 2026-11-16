@@ -86,6 +86,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/patch_preview.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/project.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompile_controller.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/structured_decompiler.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/ghidra_decompiler.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler_symbols.cpp

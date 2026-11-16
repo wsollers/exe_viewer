@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 
+#include <cinttypes>
 #include <cstdint>
 #include <string>
 
@@ -64,7 +65,7 @@ void ImportsPanel::draw_contents() {
             if (entry.address == 0) {
                 ImGui::TextUnformatted("-");
             } else {
-                ImGui::Text("0x%llX", static_cast<unsigned long long>(entry.address));
+                ImGui::Text("0x%" PRIX64, entry.address);
             }
             ++row_id;
         }

@@ -11,27 +11,6 @@ namespace viewer {
 
 namespace {
 
-[[nodiscard]] std::optional<Architecture> to_disasm_architecture(peelf::Architecture arch) noexcept {
-    switch (arch) {
-        case peelf::Architecture::X86:       return Architecture::X86_32;
-        case peelf::Architecture::X86_64:    return Architecture::X86_64;
-        case peelf::Architecture::ARM:       return Architecture::ARM32;
-        case peelf::Architecture::ARM64:     return Architecture::ARM64;
-        case peelf::Architecture::MIPS32:    return Architecture::MIPS32;
-        case peelf::Architecture::MIPS64:    return Architecture::MIPS64;
-        case peelf::Architecture::PowerPC:   return Architecture::PowerPC32;
-        case peelf::Architecture::PowerPC64: return Architecture::PowerPC64;
-        case peelf::Architecture::RISCV32:   return Architecture::RISCV32;
-        case peelf::Architecture::RISCV64:   return Architecture::RISCV64;
-        case peelf::Architecture::Unknown:   return std::nullopt;
-    }
-    return std::nullopt;
-}
-
-[[nodiscard]] Endianness to_disasm_endianness(peelf::Endianness endian) noexcept {
-    return endian == peelf::Endianness::Big ? Endianness::Big : Endianness::Little;
-}
-
 [[nodiscard]] std::vector<std::uint8_t> nop_pattern_for_target(peelf::Architecture arch,
                                                                peelf::Endianness endian,
                                                                bool thumb) {
@@ -142,12 +121,12 @@ std::vector<Instruction> disassemble_patch_bytes(
     if (bytes.empty()) {
         return {};
     }
-    const auto dis_arch = to_disasm_architecture(arch);
+    const auto dis_arch = to_disassembler_architecture(arch);
     if (!dis_arch.has_value()) {
         return {};
     }
     Disassembler dis;
-    if (!dis.init(*dis_arch, to_disasm_endianness(endian))) {
+    if (!dis.init(*dis_arch, to_disassembler_endianness(endian))) {
         return {};
     }
     if (*dis_arch == Architecture::ARM32) {

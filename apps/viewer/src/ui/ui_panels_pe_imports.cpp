@@ -1,6 +1,7 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
 
+#include <cinttypes>
 #include <string>
 
 namespace viewer {
@@ -48,8 +49,7 @@ namespace viewer {
 
             ImGui::TextUnformatted(imp.library.c_str()); ImGui::NextColumn();
             ImGui::TextUnformatted(func_display.c_str()); ImGui::NextColumn();
-            ImGui::Text("0x%llX",
-                        static_cast<unsigned long long>(imp.address)); ImGui::NextColumn();
+            ImGui::Text("0x%" PRIX64, imp.address); ImGui::NextColumn();
         }
 
         ImGui::Columns(1);

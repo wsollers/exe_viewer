@@ -22,8 +22,7 @@
 #include "ui_panels_dependencies.hpp"
 #include "ui_panels_diff.hpp"
 #include "ui_panels_debugger.hpp"
-#include "decompile/decompiler.hpp"
-#include <future>
+#include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
 #include "symbols/symbol_index.hpp"
@@ -120,9 +119,7 @@ namespace viewer {
         char decompiler_retdec_[1024] = "retdec-decompiler";
         DecompiledUnit decompiled_;
         DecompileCache decompile_cache_;
-        std::optional<DecompileCacheKey> pending_decompile_cache_key_;
-        std::future<DecompiledUnit> decompile_job_;
-        std::stop_source decompile_stop_;
+        DecompileController decompile_controller_;
         std::uint64_t decompile_revision_ = 0, file_generation_ = 0, decompile_generation_ = 0;
         bool show_about_ = false;
         std::uint64_t jump_address_ = 0;
@@ -226,7 +223,7 @@ namespace viewer {
         std::string disasm_status_;
 
         CallGraphSample call_graph_sample_ = CallGraphSample::LoadedImage;
-        std::optional<VulkanManager::Texture> call_graph_texture_;
+        VulkanManager::UniqueTexture call_graph_texture_;
         std::optional<CallGraph> current_call_graph_;
         std::optional<GraphLayout> current_call_graph_layout_;
         std::optional<GraphLayout> original_call_graph_layout_;
@@ -257,6 +254,7 @@ namespace viewer {
 
 
         void render_main_menu();
+        [[nodiscard]] DecompileValidationStamp current_decompile_stamp() const;
         void request_decompile(bool force_reanalyze = false);
         void clear_decompiler_caches();
         void render_decompiler();
@@ -295,4 +293,4 @@ namespace viewer {
 
     };
 
-} // namespace viewe
+} // namespace viewer

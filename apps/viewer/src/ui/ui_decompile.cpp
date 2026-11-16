@@ -1,9 +1,12 @@
 #include "ui_app.hpp"
 #include "decompile/structured_decompiler.hpp"
-#include <format>
-#include <cstdio>
 #include <algorithm>
+#include <cinttypes>
+#include <cstring>
+#include <format>
 #include <limits>
+#include <span>
+#include <string_view>
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -18,7 +21,42 @@ namespace {
     unit.diagnostic = std::move(diagnostic);
     return unit;
 }
+
+void copy_cstr_buffer(std::span<char> dest, std::string_view src) noexcept {
+    if (dest.empty()) {
+        return;
+    }
+    const std::size_t count = std::min(dest.size() - 1, src.size());
+    if (count > 0) {
+        std::memcpy(dest.data(), src.data(), count);
+    }
+    dest[count] = '\0';
 }
+} // namespace
+
+DecompileValidationStamp UiApp::current_decompile_stamp() const {
+    std::string identity = model_.content_sha256();
+    if (identity.empty()) {
+        identity = model_.file_info().path;
+    }
+    if (model_.is_live_process() && model_.process_session() != nullptr) {
+        identity = std::format("pid:{}:{}:{}",
+                               model_.process_session()->pid(),
+                               model_.active_module_index().value_or(std::numeric_limits<std::size_t>::max()),
+                               identity);
+    }
+    const std::uint64_t snapshot_rev =
+        symbol_revision_ ^ (annotations_.revision() * 0x9E3779B97F4A7C15ULL) ^
+        (model_.demangle_symbols() ? 0xD3A461E5ULL : 0ULL) ^
+        (thumb_mode_ ? 0x517CC1B727220A95ULL : 0ULL);
+    return DecompileValidationStamp{
+        .target_identity = std::move(identity),
+        .file_generation = file_generation_,
+        .edit_revision = model_.edit_revision(),
+        .snapshot_revision = snapshot_rev,
+    };
+}
+
 void UiApp::initialize_decompiler() {
 #ifdef _WIN32
     wchar_t executable[32768]{}; GetModuleFileNameW(nullptr, executable, 32768);
@@ -38,10 +76,10 @@ void UiApp::initialize_decompiler() {
     }
     decompiler_provider_ = static_cast<int>(settings.provider);
     decompiler_timeout_ = settings.timeout_seconds;
-    std::snprintf(ghidra_home_, sizeof(ghidra_home_), "%s", settings.ghidra_home.string().c_str());
-    std::snprintf(decompiler_java_, sizeof(decompiler_java_), "%s", settings.java.string().c_str());
-    std::snprintf(decompiler_python_, sizeof(decompiler_python_), "%s", settings.python.string().c_str());
-    std::snprintf(decompiler_retdec_, sizeof(decompiler_retdec_), "%s", settings.retdec.string().c_str());
+    copy_cstr_buffer(ghidra_home_, settings.ghidra_home.string());
+    copy_cstr_buffer(decompiler_java_, settings.java.string());
+    copy_cstr_buffer(decompiler_python_, settings.python.string());
+    copy_cstr_buffer(decompiler_retdec_, settings.retdec.string());
 }
 void UiApp::clear_decompiler_caches() {
     decompile_cache_.clear();
@@ -52,9 +90,11 @@ void UiApp::clear_decompiler_caches() {
 void UiApp::request_decompile(bool force_reanalyze) {
     show_decompiler_ = true;
     focus_decompiler_ = true;
-    if (decompile_job_.valid()) return;
     if (!current_selection_.virtual_address) {
-        decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Select a mapped function or executable address first");
+        decompile_controller_.reset_for_new_target();
+        decompiled_ = make_decompile_message(
+            DecompileStatus::NoFunction,
+            "Select a mapped function or executable address first");
         return;
     }
 
@@ -78,6 +118,9 @@ void UiApp::request_decompile(bool force_reanalyze) {
     settings.retdec = decompiler_retdec_;
     settings.timeout_seconds = decompiler_timeout_;
 
+    std::optional<SymbolRecord> resolved_root;
+    std::optional<DecompileCacheKey> resolved_cache_key;
+
     if (image != nullptr) {
         auto root = containing_function(*image, symbol_index_, selected_va, navigation_graph_root(selected_va));
         if (!root) {
@@ -92,6 +135,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
             }
         }
         if (!root || !root->virtual_address) {
+            decompile_controller_.reset_for_new_target();
             decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "No function selected");
             return;
         }
@@ -100,6 +144,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
         const std::size_t analysis_size = model_.analysis_image_size();
         const auto extent = discover_function_extent(*image, symbol_index_, root_for_extent, analysis_size);
         if (!extent) {
+            decompile_controller_.reset_for_new_target();
             decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Selection is not executable");
             return;
         }
@@ -127,13 +172,15 @@ void UiApp::request_decompile(bool force_reanalyze) {
             request.symbols.push_back(std::move(symbol));
         }
         request.types = debug_types_;
-        decompiled_root_ = root;
+        resolved_root = root;
         request.thumb = image->architecture() == peelf::Architecture::ARM && thumb_mode_;
 
         const DecompileCacheKey cache_key = make_decompile_cache_key(request, settings);
         if (force_reanalyze) {
             decompile_cache_.invalidate_function(cache_key.binary_sha256, cache_key.function_address);
         } else if (auto cached = decompile_cache_.get(cache_key)) {
+            decompile_controller_.reset_for_new_target();
+            decompiled_root_ = resolved_root;
             decompile_revision_ = model_.edit_revision();
             decompile_generation_ = file_generation_;
             decompiler_thumb_ = thumb_mode_;
@@ -145,6 +192,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
 
         auto bytes = model_.read_virtual_bytes(extent->virtual_address, static_cast<std::size_t>(extent->size));
         if (!bytes) {
+            decompile_controller_.reset_for_new_target();
             decompiled_ = make_decompile_message(DecompileStatus::Failed, bytes.error().message);
             return;
         }
@@ -172,17 +220,19 @@ void UiApp::request_decompile(bool force_reanalyze) {
             } else {
                 auto snapshot = model_.read_effective_bytes(0, model_.bytes().size());
                 if (!snapshot) {
+                    decompile_controller_.reset_for_new_target();
                     decompiled_ = make_decompile_message(DecompileStatus::Failed, snapshot.error().message);
                     return;
                 }
                 request.image_bytes = std::move(*snapshot);
             }
         }
-        pending_decompile_cache_key_ = cache_key;
+        resolved_cache_key = cache_key;
     } else if (model_.is_live_process()) {
         // Anonymous / JIT executable memory region without a backing module header.
         auto bytes = model_.read_virtual_bytes(selected_va, 4096);
         if (!bytes || bytes->empty()) {
+            decompile_controller_.reset_for_new_target();
             decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Selected live address is not readable");
             return;
         }
@@ -203,7 +253,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
             thumb_mode_,
             true);
         request.image_bytes = std::move(*bytes);
-        decompiled_root_ = SymbolRecord{
+        resolved_root = SymbolRecord{
             .name = fn_name,
             .virtual_address = selected_va,
             .file_offset = model_.virtual_address_to_offset(selected_va),
@@ -214,6 +264,8 @@ void UiApp::request_decompile(bool force_reanalyze) {
         if (force_reanalyze) {
             decompile_cache_.invalidate_function(cache_key.binary_sha256, cache_key.function_address);
         } else if (auto cached = decompile_cache_.get(cache_key)) {
+            decompile_controller_.reset_for_new_target();
+            decompiled_root_ = resolved_root;
             decompile_revision_ = model_.edit_revision();
             decompile_generation_ = file_generation_;
             decompiler_thumb_ = thumb_mode_;
@@ -222,47 +274,36 @@ void UiApp::request_decompile(bool force_reanalyze) {
             decompiled_ = std::move(*cached);
             return;
         }
-        pending_decompile_cache_key_ = cache_key;
+        resolved_cache_key = cache_key;
     } else {
+        decompile_controller_.reset_for_new_target();
         decompiled_ = make_decompile_message(DecompileStatus::NoFunction, "Select a mapped function first");
         return;
     }
 
-    const auto resources = decompiler_directory_ / "resources";
-    decompile_stop_ = {}; const auto token = decompile_stop_.get_token();
-    decompile_revision_ = model_.edit_revision(); decompile_generation_ = file_generation_;
+    DecompileValidationStamp stamp = current_decompile_stamp();
+    decompiled_root_ = resolved_root;
+    decompile_revision_ = stamp.edit_revision;
+    decompile_generation_ = stamp.file_generation;
     decompiler_thumb_ = thumb_mode_;
-    decompile_annotation_revision_ = annotations_.revision(); decompile_symbol_revision_ = symbol_revision_;
+    decompile_annotation_revision_ = annotations_.revision();
+    decompile_symbol_revision_ = symbol_revision_;
     decompiled_ = make_decompile_message(DecompileStatus::Ready, "Analyzing selected function...");
-    decompile_job_ = std::async(std::launch::async, [request = std::move(request), settings, resources, token]() {
-        BackendRunner runner;
-        switch (settings.provider) {
-        case DecompilerProvider::Ghidra: {
-            auto unit = GhidraDecompiler(settings, resources, runner).decompile(request, token);
-            if (unit.status == DecompileStatus::Unavailable && settings.ghidra_home.empty()) {
-                auto fallback = StructuredPseudoCDecompiler{}.decompile(request, token);
-                if (fallback.status == DecompileStatus::Ready) {
-                    fallback.diagnostic = "Ghidra is not configured; decompiled with built-in Structured Pseudo-C.";
-                    return fallback;
-                }
-            }
-            return unit;
-        }
-        case DecompilerProvider::BinaryNinja:
-            return BinaryNinjaDecompiler(settings.python, resources / "bn_decompile.py", runner).decompile(request, token);
-        case DecompilerProvider::StructuredPseudoC:
-            return StructuredPseudoCDecompiler{}.decompile(request, token);
-        case DecompilerProvider::RetDec:
-            return RetDecDecompiler(settings.retdec, runner, settings.timeout_seconds).decompile(request, token);
-        default:
-            return AnnotatedCodeDecompiler{}.decompile(request, token);
-        }
+
+    (void)decompile_controller_.submit(DecompileJobSpec{
+        .request = std::move(request),
+        .settings = std::move(settings),
+        .resources_directory = decompiler_directory_ / "resources",
+        .stamp = std::move(stamp),
+        .cache_key = std::move(resolved_cache_key),
+        .root_symbol = std::move(resolved_root),
     });
 }
 void UiApp::render_decompiler() {
     if (focus_decompiler_) { ImGui::SetNextWindowFocus(); focus_decompiler_ = false; }
     if (!ImGui::Begin("Decompiler",&show_decompiler_)) { ImGui::End(); return; }
-    ImGui::BeginDisabled(decompile_job_.valid());
+    const bool job_busy = decompile_controller_.is_busy();
+    ImGui::BeginDisabled(job_busy);
     ImGui::SetNextItemWidth(-1);
     ImGui::Combo("##provider",
                  &decompiler_provider_,
@@ -300,11 +341,11 @@ void UiApp::render_decompiler() {
         ImGui::TextWrapped("%s", decompiler_settings_status_.c_str());
     }
     ImGui::EndDisabled();
-    ImGui::BeginDisabled(decompile_job_.valid());
     if (ImGui::Button("Analyze selection (F5)")) request_decompile(false);
     ImGui::SameLine();
     if (ImGui::Button("Re-analyze")) request_decompile(true);
     ImGui::SameLine();
+    ImGui::BeginDisabled(job_busy);
     if (ImGui::Button("Clear Cache")) clear_decompiler_caches();
     ImGui::SameLine();
     bool demangle_decompile = model_.demangle_symbols();
@@ -313,15 +354,18 @@ void UiApp::render_decompiler() {
         ++symbol_revision_;
     }
     ImGui::EndDisabled();
-    if (decompile_job_.valid()) { ImGui::SameLine(); if (ImGui::Button("Cancel")) decompile_stop_.request_stop(); }
+    if (job_busy) {
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) decompile_controller_.cancel_current();
+    }
     ImGui::TextWrapped("%s", decompiled_.provider.c_str());
-    if (!decompile_job_.valid() && decompiled_.status == DecompileStatus::Ready && !decompiled_.lines.empty()) {
+    if (!job_busy && decompiled_.status == DecompileStatus::Ready && !decompiled_.lines.empty()) {
         ImGui::SameLine();
         const std::string_view source_label = to_string(decompiled_.cache_source);
         ImGui::TextDisabled("[%.*s]", static_cast<int>(source_label.size()), source_label.data());
     }
     ImGui::TextWrapped("%s", decompiled_.diagnostic.c_str());
-    if (!decompile_job_.valid() && decompiled_.status != DecompileStatus::Ready && decompiler_provider_ != 3) {
+    if (!job_busy && decompiled_.status != DecompileStatus::Ready && decompiler_provider_ != 3) {
         if (ImGui::Button("Decompile with Structured Pseudo-C")) {
             decompiler_provider_ = 3;
             request_decompile();
@@ -426,8 +470,11 @@ void UiApp::render_data_types() {
                         for (const auto* name : {"Offset","Size","Member","Type"}) ImGui::TableSetupColumn(name);
                         ImGui::TableHeadersRow();
                         for (const auto& member : type.members) {
-                            ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0); ImGui::Text("0x%llX",static_cast<unsigned long long>(member.offset));
-                            ImGui::TableSetColumnIndex(1); ImGui::Text("%llu",static_cast<unsigned long long>(member.size));
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::Text("0x%" PRIX64, member.offset);
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::Text("%" PRIu64, member.size);
                             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(member.name.c_str());
                             ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(member.type.c_str());
                         }
@@ -452,8 +499,11 @@ void UiApp::render_data_types() {
                         navigate_to_address(*symbol.virtual_address,PreferredView::Hex);
                         if (symbol.file_offset && symbol.size) hex_panel_.navigate_to_range(*symbol.file_offset,symbol.size);
                     }
-                    ImGui::TableSetColumnIndex(1); ImGui::Text("%016llX",static_cast<unsigned long long>(*symbol.virtual_address));
-                    ImGui::TableSetColumnIndex(2); ImGui::Text("%llu",static_cast<unsigned long long>(symbol.size)); ImGui::PopID();
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%016" PRIX64, *symbol.virtual_address);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%" PRIu64, symbol.size);
+                    ImGui::PopID();
                 }
                 ImGui::EndTable();
             }

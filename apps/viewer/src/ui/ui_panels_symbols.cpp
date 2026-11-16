@@ -126,10 +126,10 @@ void SymbolsPanel::draw_contents() {
             ImGui::PopID();
 
             ImGui::TableNextColumn();
-            if (symbol.virtual_address) ImGui::Text("0x%llX", static_cast<unsigned long long>(*symbol.virtual_address));
+            if (symbol.virtual_address) ImGui::Text("0x%" PRIX64, *symbol.virtual_address);
             else ImGui::TextDisabled("Unmapped");
             ImGui::TableNextColumn();
-            ImGui::Text("0x%llX", static_cast<unsigned long long>(symbol.size));
+            ImGui::Text("0x%" PRIX64, symbol.size);
             const char* source = "Embedded";
             switch (symbol.source) {
                 case SymbolSource::DebugSymbol: source = "Debug Info (PDB/DWARF)"; break;

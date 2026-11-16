@@ -2,12 +2,13 @@
 #pragma once
 
 #include <capstone/capstone.h>
+#include <peelf/binary_image.hpp>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
-#include <optional>
 
 namespace viewer {
 
@@ -409,7 +410,49 @@ private:
     bool initialized_ = false;
 };
 
-inline Architecture architecture_from_machine(std::uint16_t machine) {
+[[nodiscard]] constexpr std::optional<Architecture> to_disassembler_architecture(
+    peelf::Architecture arch) noexcept {
+    switch (arch) {
+        case peelf::Architecture::X86:       return Architecture::X86_32;
+        case peelf::Architecture::X86_64:    return Architecture::X86_64;
+        case peelf::Architecture::ARM:       return Architecture::ARM32;
+        case peelf::Architecture::ARM64:     return Architecture::ARM64;
+        case peelf::Architecture::MIPS32:    return Architecture::MIPS32;
+        case peelf::Architecture::MIPS64:    return Architecture::MIPS64;
+        case peelf::Architecture::PowerPC:   return Architecture::PowerPC32;
+        case peelf::Architecture::PowerPC64: return Architecture::PowerPC64;
+        case peelf::Architecture::RISCV32:   return Architecture::RISCV32;
+        case peelf::Architecture::RISCV64:   return Architecture::RISCV64;
+        case peelf::Architecture::Unknown:   return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] constexpr peelf::Architecture to_core_architecture(Architecture arch) noexcept {
+    switch (arch) {
+        case Architecture::X86_32:    return peelf::Architecture::X86;
+        case Architecture::X86_64:    return peelf::Architecture::X86_64;
+        case Architecture::ARM32:     return peelf::Architecture::ARM;
+        case Architecture::ARM64:     return peelf::Architecture::ARM64;
+        case Architecture::MIPS32:    return peelf::Architecture::MIPS32;
+        case Architecture::MIPS64:    return peelf::Architecture::MIPS64;
+        case Architecture::PowerPC32: return peelf::Architecture::PowerPC;
+        case Architecture::PowerPC64: return peelf::Architecture::PowerPC64;
+        case Architecture::RISCV32:   return peelf::Architecture::RISCV32;
+        case Architecture::RISCV64:   return peelf::Architecture::RISCV64;
+    }
+    return peelf::Architecture::Unknown;
+}
+
+[[nodiscard]] constexpr Endianness to_disassembler_endianness(peelf::Endianness endian) noexcept {
+    return endian == peelf::Endianness::Big ? Endianness::Big : Endianness::Little;
+}
+
+[[nodiscard]] constexpr peelf::Endianness to_core_endianness(Endianness endian) noexcept {
+    return endian == Endianness::Big ? peelf::Endianness::Big : peelf::Endianness::Little;
+}
+
+[[nodiscard]] constexpr Architecture architecture_from_machine(std::uint16_t machine) noexcept {
     switch (machine) {
         case 0x014C: return Architecture::X86_32;
         case 0x8664: return Architecture::X86_64;
@@ -420,4 +463,4 @@ inline Architecture architecture_from_machine(std::uint16_t machine) {
     }
 }
 
-} // namespace viewe
+} // namespace viewer

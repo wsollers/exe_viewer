@@ -71,7 +71,7 @@ void HexViewPanel::draw_contents() {
     const bool is_live = model_.is_live_process();
     const std::uint64_t base_va = model_.view_base_address();
     ImGui::SetNextItemWidth(160.0f);
-    ImGui::InputScalar("Offset (hex)", ImGuiDataType_U64, &goto_offset_, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
+    ImGui::InputScalar("Offset (hex)", ImGuiDataType_U64, &goto_offset_, nullptr, nullptr, "%" PRIX64, ImGuiInputTextFlags_CharsHexadecimal);
     ImGui::SameLine();
     if (ImGui::Button("Go")) {
         if (goto_offset_ < total64) {
@@ -124,7 +124,7 @@ void HexViewPanel::draw_contents() {
         }
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("0x%llX | %zu bytes", static_cast<unsigned long long>(selected_offset_), highlighted_size_);
+    ImGui::TextDisabled("0x%" PRIX64 " | %zu bytes", static_cast<std::uint64_t>(selected_offset_), highlighted_size_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shift-click a byte to extend the selection.");
     if (!edit_status_.empty()) ImGui::TextUnformatted(edit_status_.c_str());
     ImGui::Separator();
@@ -134,8 +134,8 @@ void HexViewPanel::draw_contents() {
                             base_va,
                             base_va + total64);
     } else {
-        ImGui::TextDisabled("Static File: %llu bytes  (right-click byte to stage patch)",
-                            static_cast<unsigned long long>(total64));
+        ImGui::TextDisabled("Static File: %" PRIu64 " bytes  (right-click byte to stage patch)",
+                            total64);
     }
 
     ImGui::BeginChild("HexScroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);

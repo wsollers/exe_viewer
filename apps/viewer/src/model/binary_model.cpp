@@ -6,8 +6,7 @@
 #include <peelf/sha256.hpp>
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
+#include <format>
 #include <fstream>
 #include <limits>
 #include <utility>
@@ -19,9 +18,7 @@ std::filesystem::path utf8_path(std::string_view text) {
 }
 
 [[nodiscard]] std::string format_hex_addr(std::uint64_t value) {
-    std::array<char, 32> buf{};
-    std::snprintf(buf.data(), buf.size(), "0x%llX", static_cast<unsigned long long>(value));
-    return buf.data();
+    return std::format("0x{:X}", value);
 }
 
 [[nodiscard]] std::uint64_t compute_image_mapped_span(const peelf::IBinaryImage& img,

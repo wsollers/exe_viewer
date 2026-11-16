@@ -4,6 +4,7 @@
 #include <peelf/assembler.hpp>
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstring>
 #include <format>
 #include <span>
@@ -230,9 +231,9 @@ void ShellcodeScratchPanel::draw_contents() {
         }
 
         ImGui::TextDisabled(
-            "%s (Base VA: 0x%llX)",
+            "%s (Base VA: 0x%" PRIX64 ")",
             assembly_mode_ ? "Assembly -> machine code" : "Hex/shellcode -> bytes",
-            static_cast<unsigned long long>(effective_base_address()));
+            effective_base_address());
         ImGui::SameLine();
         if (model_.is_live_process()) {
             ImGui::TextDisabled("| Live process is read-only");

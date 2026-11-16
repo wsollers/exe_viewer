@@ -1,5 +1,6 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
+#include <cinttypes>
 
 namespace viewer {
 
@@ -19,8 +20,7 @@ namespace viewer {
         ImGui::Text("Machine: 0x%04X", static_cast<unsigned int>(pe.machine));
         ImGui::Text("Sections: %u", static_cast<unsigned int>(pe.number_of_sections));
         ImGui::Text("Timestamp: 0x%08X", pe.time_date_stamp);
-        ImGui::Text("ImageBase: 0x%llX",
-                    static_cast<unsigned long long>(img->image_base()));
+        ImGui::Text("ImageBase: 0x%" PRIX64, img->image_base());
         ImGui::Text("EntryPoint RVA: 0x%08X", pe.entry_point_rva);
         ImGui::Text("SizeOfImage: 0x%08X", pe.size_of_image);
         ImGui::Text("Subsystem: 0x%04X", static_cast<unsigned int>(pe.subsystem));

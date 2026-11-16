@@ -1,10 +1,15 @@
+#include "decompile/decompile_controller.hpp"
 #include "decompile/decompiler.hpp"
 #include <peelf/sha256.hpp>
 #include <gtest/gtest.h>
+#include <atomic>
+#include <condition_variable>
 #include <fstream>
 #include "model/binary_model.hpp"
 #include <algorithm>
 #include <cctype>
+#include <format>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include "symbols/debug_symbols.hpp"
@@ -676,3 +681,219 @@ TEST(Decompiler, GhidraWorkspaceLruEvictionAndCacheRootOffMntC) {
     EXPECT_FALSE(std::filesystem::exists(ws1));
     EXPECT_FALSE(std::filesystem::exists(ws3));
 }
+
+TEST(DecompileController, BurstOfRequestsCancelsIntermediatesAndDeliversLatest) {
+    std::mutex gate_mutex;
+    std::condition_variable_any gate_cv;
+    bool first_job_started = false;
+    std::vector<std::uint64_t> executed_addresses;
+
+    DecompileController controller(
+        [&](const DecompileJobSpec& spec, std::stop_token stop_token) -> DecompiledUnit {
+            {
+                std::scoped_lock lock(gate_mutex);
+                executed_addresses.push_back(spec.request.address);
+                if (spec.request.address == 0x1001u) {
+                    first_job_started = true;
+                    gate_cv.notify_all();
+                }
+            }
+            if (spec.request.address == 0x1001u) {
+                std::unique_lock lock(gate_mutex);
+                gate_cv.wait_for(lock, stop_token, std::chrono::seconds(5), [] { return false; });
+                if (stop_token.stop_requested()) {
+                    return DecompiledUnit{
+                        .status = DecompileStatus::Cancelled,
+                        .provider = "Mock",
+                        .diagnostic = "cancelled",
+                    };
+                }
+            }
+            DecompiledUnit out;
+            out.status = DecompileStatus::Ready;
+            out.provider = "Mock";
+            out.diagnostic = std::format("fn_0x{:X}", spec.request.address);
+            out.lines.push_back({.address = spec.request.address, .text = out.diagnostic});
+            return out;
+        });
+
+    const DecompileValidationStamp stamp{
+        .target_identity = "sha256:abc123",
+        .file_generation = 1,
+        .edit_revision = 2,
+        .snapshot_revision = 3,
+    };
+
+    // Submit request #1 and wait until it is actively running on the worker jthread.
+    {
+        DecompileJobSpec first;
+        first.request.address = 0x1001u;
+        first.stamp = stamp;
+        EXPECT_EQ(controller.submit(std::move(first)), 1u);
+    }
+    {
+        std::unique_lock lock(gate_mutex);
+        ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(5), [&] { return first_job_started; }));
+    }
+
+    // Rapidly submit requests #2..#10 while request #1 is winding down.
+    std::uint64_t final_seq = 0;
+    for (std::uint64_t idx = 2; idx <= 10; ++idx) {
+        DecompileJobSpec spec;
+        spec.request.address = 0x1000u + idx;
+        spec.stamp = stamp;
+        spec.root_symbol = SymbolRecord{
+            .name = std::format("sub_{:X}", spec.request.address),
+            .virtual_address = spec.request.address,
+            .function = true,
+        };
+        final_seq = controller.submit(std::move(spec));
+    }
+    EXPECT_EQ(final_seq, 10u);
+
+    controller.wait_for_idle();
+    EXPECT_FALSE(controller.is_busy());
+
+    const auto completed = controller.poll_completed(stamp);
+    ASSERT_TRUE(completed.has_value());
+    EXPECT_EQ(completed->sequence, 10u);
+    EXPECT_EQ(completed->unit.status, DecompileStatus::Ready);
+    EXPECT_EQ(completed->unit.diagnostic, "fn_0x100A");
+    ASSERT_TRUE(completed->root_symbol.has_value());
+    EXPECT_EQ(completed->root_symbol->virtual_address, 0x100Au);
+
+    {
+        std::scoped_lock lock(gate_mutex);
+        ASSERT_GE(executed_addresses.size(), 2u);
+        EXPECT_EQ(executed_addresses.front(), 0x1001u);
+        EXPECT_EQ(executed_addresses.back(), 0x100Au);
+        EXPECT_LT(executed_addresses.size(), 10u);
+    }
+}
+
+TEST(DecompileController, RejectsStaleCompletionsAcrossTargetEditAndSnapshotRevisions) {
+    DecompileController controller(
+        [](const DecompileJobSpec& spec, std::stop_token) -> DecompiledUnit {
+            DecompiledUnit unit;
+            unit.status = DecompileStatus::Ready;
+            unit.provider = "Mock";
+            unit.diagnostic = std::format("addr=0x{:X}", spec.request.address);
+            return unit;
+        });
+
+    const DecompileValidationStamp base_stamp{
+        .target_identity = "sha256:binA",
+        .file_generation = 4,
+        .edit_revision = 7,
+        .snapshot_revision = 11,
+    };
+
+    auto submit_with_base = [&](std::uint64_t va) {
+        DecompileJobSpec spec;
+        spec.request.address = va;
+        spec.stamp = base_stamp;
+        (void)controller.submit(std::move(spec));
+        controller.wait_for_idle();
+    };
+
+    // 1. Target identity mismatch (new binary opened): discarded without same-target stale flag.
+    submit_with_base(0x401000u);
+    DecompileValidationStamp wrong_target = base_stamp;
+    wrong_target.target_identity = "sha256:binB";
+    EXPECT_FALSE(controller.poll_completed(wrong_target).has_value());
+    EXPECT_FALSE(controller.consume_stale_discard_notice());
+
+    // 2. Edit revision mismatch (bytes patched during decompile): discarded + stale notice set.
+    submit_with_base(0x401020u);
+    DecompileValidationStamp wrong_edit = base_stamp;
+    wrong_edit.edit_revision = 8;
+    EXPECT_FALSE(controller.poll_completed(wrong_edit).has_value());
+    EXPECT_TRUE(controller.consume_stale_discard_notice());
+    EXPECT_FALSE(controller.consume_stale_discard_notice());
+
+    // 3. Snapshot revision mismatch (symbols/annotations edited during decompile): discarded + stale notice set.
+    submit_with_base(0x401040u);
+    DecompileValidationStamp wrong_snapshot = base_stamp;
+    wrong_snapshot.snapshot_revision = 12;
+    EXPECT_FALSE(controller.poll_completed(wrong_snapshot).has_value());
+    EXPECT_TRUE(controller.consume_stale_discard_notice());
+
+    // 4. Exact match succeeds.
+    submit_with_base(0x401060u);
+    const auto valid = controller.poll_completed(base_stamp);
+    ASSERT_TRUE(valid.has_value());
+    EXPECT_EQ(valid->unit.diagnostic, "addr=0x401060");
+    EXPECT_FALSE(controller.consume_stale_discard_notice());
+}
+
+TEST(DecompileController, CancelResetAndDestructorWhileBusyJoinCleanly) {
+    std::mutex mutex;
+    std::condition_variable_any cv;
+    bool running = false;
+
+    auto blocking_worker = [&](const DecompileJobSpec&, std::stop_token stop_token) -> DecompiledUnit {
+        {
+            std::scoped_lock lock(mutex);
+            running = true;
+            cv.notify_all();
+        }
+        std::unique_lock lock(mutex);
+        cv.wait_for(lock, stop_token, std::chrono::seconds(5), [] { return false; });
+        return DecompiledUnit{
+            .status = stop_token.stop_requested() ? DecompileStatus::Cancelled : DecompileStatus::Ready,
+            .provider = "Mock",
+            .diagnostic = stop_token.stop_requested() ? "Cancelled" : "Done",
+        };
+    };
+
+    const DecompileValidationStamp stamp{
+        .target_identity = "sha256:cancel-test",
+        .file_generation = 1,
+        .edit_revision = 0,
+        .snapshot_revision = 0,
+    };
+
+    {
+        DecompileController controller(blocking_worker);
+        DecompileJobSpec spec;
+        spec.request.address = 0x5000u;
+        spec.stamp = stamp;
+        (void)controller.submit(std::move(spec));
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return running; }));
+            running = false;
+        }
+
+        controller.cancel_current();
+        controller.wait_for_idle();
+        const auto cancelled = controller.poll_completed(stamp);
+        ASSERT_TRUE(cancelled.has_value());
+        EXPECT_EQ(cancelled->unit.status, DecompileStatus::Cancelled);
+
+        // Resetting for a new target cancels in-flight work and drops its output.
+        spec = {};
+        spec.request.address = 0x5010u;
+        spec.stamp = stamp;
+        (void)controller.submit(std::move(spec));
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return running; }));
+            running = false;
+        }
+        controller.reset_for_new_target();
+        controller.wait_for_idle();
+        EXPECT_FALSE(controller.poll_completed(stamp).has_value());
+
+        // Destroying controller while busy requests stop and joins jthread without hanging.
+        spec = {};
+        spec.request.address = 0x5020u;
+        spec.stamp = stamp;
+        (void)controller.submit(std::move(spec));
+        {
+            std::unique_lock lock(mutex);
+            ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5), [&] { return running; }));
+        }
+    }
+}
+

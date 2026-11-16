@@ -213,27 +213,6 @@ constexpr std::uint64_t kElfDtPreinitArraySz = 33u;
     return false;
 }
 
-[[nodiscard]] std::optional<Architecture> to_disasm_arch(peelf::Architecture arch) noexcept {
-    switch (arch) {
-        case peelf::Architecture::X86:       return Architecture::X86_32;
-        case peelf::Architecture::X86_64:    return Architecture::X86_64;
-        case peelf::Architecture::ARM:       return Architecture::ARM32;
-        case peelf::Architecture::ARM64:     return Architecture::ARM64;
-        case peelf::Architecture::MIPS32:    return Architecture::MIPS32;
-        case peelf::Architecture::MIPS64:    return Architecture::MIPS64;
-        case peelf::Architecture::PowerPC:   return Architecture::PowerPC32;
-        case peelf::Architecture::PowerPC64: return Architecture::PowerPC64;
-        case peelf::Architecture::RISCV32:   return Architecture::RISCV32;
-        case peelf::Architecture::RISCV64:   return Architecture::RISCV64;
-        case peelf::Architecture::Unknown:   return std::nullopt;
-    }
-    return std::nullopt;
-}
-
-[[nodiscard]] Endianness to_disasm_endian(peelf::Endianness endian) noexcept {
-    return endian == peelf::Endianness::Big ? Endianness::Big : Endianness::Little;
-}
-
 [[nodiscard]] std::size_t instruction_alignment(peelf::Architecture arch, bool thumb_mode) noexcept {
     switch (arch) {
         case peelf::Architecture::X86:
@@ -852,9 +831,9 @@ FunctionIndex FunctionIndex::discover(
 
     // 6. Direct Call Target Analysis across executable sections (or PT_LOAD segments if stripped).
     if (!image_bytes.empty()) {
-        if (const auto dis_arch = to_disasm_arch(image.architecture()); dis_arch.has_value()) {
+        if (const auto dis_arch = to_disassembler_architecture(image.architecture()); dis_arch.has_value()) {
             Disassembler disasm;
-            if (disasm.init(*dis_arch, to_disasm_endian(image.endianness()))) {
+            if (disasm.init(*dis_arch, to_disassembler_endianness(image.endianness()))) {
                 if (image.architecture() == peelf::Architecture::ARM) {
                     (void)disasm.set_thumb_mode(thumb_mode);
                 }

@@ -1,5 +1,6 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
+#include <cinttypes>
 #include <format>
 
 namespace viewer {
@@ -24,9 +25,9 @@ namespace viewer {
             if (const peelf::IProcessSession* sess = model_.process_session()) {
                 if (const peelf::CrashDumpSummary* dump = model_.crash_dump_summary(); dump != nullptr) {
                     ImGui::TextColored(ImVec4(1.0f, 0.50f, 0.36f, 1.0f),
-                                       "[CRASH DUMP] %s (PID %llu) — %s",
+                                       "[CRASH DUMP] %s (PID %" PRIu64 ") — %s",
                                        sess->info().name.empty() ? "<dump>" : sess->info().name.c_str(),
-                                       static_cast<unsigned long long>(sess->pid()),
+                                       static_cast<std::uint64_t>(sess->pid()),
                                        std::string(peelf::to_string(dump->kind)).c_str());
                     if (dump->exception.has_value()) {
                         ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f),
@@ -47,10 +48,10 @@ namespace viewer {
                     const bool paused = model_.is_process_suspended();
                     ImGui::TextColored(paused ? ImVec4(1.0f, 0.78f, 0.25f, 1.0f)
                                               : ImVec4(0.35f, 0.85f, 0.55f, 1.0f),
-                                       "%s LIVE PROCESS: %s (PID %llu) [Read-Only]",
+                                       "%s LIVE PROCESS: %s (PID %" PRIu64 ") [Read-Only]",
                                        paused ? "[PAUSED]" : "[RUNNING]",
                                        sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
-                                       static_cast<unsigned long long>(sess->pid()));
+                                       static_cast<std::uint64_t>(sess->pid()));
                     if (ImGui::SmallButton(paused ? "Resume Process" : "Pause Process")) {
                         if (on_pause_toggle_) {
                             on_pause_toggle_();

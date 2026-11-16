@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cinttypes>
 #include <cstdio>
 #include <format>
 
@@ -341,7 +342,7 @@ void DependenciesPanel::draw_selected_details() {
     }
     if (node.live_base_va.has_value()) {
         ImGui::SameLine();
-        ImGui::Text("| Live Base: 0x%llx", static_cast<unsigned long long>(*node.live_base_va));
+        ImGui::Text("| Live Base: 0x%" PRIx64, *node.live_base_va);
     }
     if (!node.soname.empty()) {
         ImGui::Text("DT_SONAME: %s", node.soname.c_str());
@@ -427,14 +428,14 @@ void DependenciesPanel::draw_selected_details() {
 
             ImGui::TableSetColumnIndex(2);
             if (sym.call_site_va != 0) {
-                ImGui::Text("0x%llx", static_cast<unsigned long long>(sym.call_site_va));
+                ImGui::Text("0x%" PRIx64, sym.call_site_va);
             } else {
                 ImGui::TextDisabled("-");
             }
 
             ImGui::TableSetColumnIndex(3);
             if (sym.resolved_export_va != 0) {
-                ImGui::Text("0x%llx", static_cast<unsigned long long>(sym.resolved_export_va));
+                ImGui::Text("0x%" PRIx64, sym.resolved_export_va);
             } else {
                 ImGui::TextDisabled("-");
             }

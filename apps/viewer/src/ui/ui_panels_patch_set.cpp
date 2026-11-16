@@ -142,12 +142,12 @@ void PatchSetPanel::draw_contents() {
 
     if (target_offset.has_value()) {
         if (target_va.has_value()) {
-            ImGui::Text("Target: File Offset 0x%llX  |  VA 0x%llX",
-                        static_cast<unsigned long long>(*target_offset),
-                        static_cast<unsigned long long>(*target_va));
+            ImGui::Text("Target: File Offset 0x%" PRIX64 "  |  VA 0x%" PRIX64,
+                        *target_offset,
+                        *target_va);
         } else {
-            ImGui::Text("Target: File Offset 0x%llX  |  (unmapped file region)",
-                        static_cast<unsigned long long>(*target_offset));
+            ImGui::Text("Target: File Offset 0x%" PRIX64 "  |  (unmapped file region)",
+                        *target_offset);
         }
     } else {
         ImGui::TextDisabled("Select an instruction, symbol, or byte in Disassembly / Hex View to target a patch.");
@@ -232,8 +232,8 @@ void PatchSetPanel::draw_contents() {
         if (!live_asm_disasm_.empty()) {
             ImGui::TextDisabled("Live Capstone Round-Trip:");
             for (const Instruction& inst : live_asm_disasm_) {
-                ImGui::BulletText("0x%llX: %s %s  [%s]",
-                                  static_cast<unsigned long long>(inst.address),
+                ImGui::BulletText("0x%" PRIX64 ": %s %s  [%s]",
+                                  inst.address,
                                   inst.mnemonic.c_str(),
                                   inst.operands.c_str(),
                                   format_bytes(inst.bytes, 16).c_str());
@@ -262,8 +262,8 @@ void PatchSetPanel::draw_contents() {
 
     if (preview_) {
         ImGui::Spacing();
-        ImGui::Text("Preview Offset: 0x%llX | %zu byte(s) | Original: [%s] -> Patched: [%s]",
-                    static_cast<unsigned long long>(preview_->offset),
+        ImGui::Text("Preview Offset: 0x%" PRIX64 " | %zu byte(s) | Original: [%s] -> Patched: [%s]",
+                    preview_->offset,
                     preview_->replacement.size(),
                     format_bytes(preview_->original_bytes, 12).c_str(),
                     format_bytes(preview_->replacement, 12).c_str());
@@ -289,8 +289,8 @@ void PatchSetPanel::draw_contents() {
                 for (const auto& node : graph->nodes) {
                     ImGui::TextDisabled("%s", node.label.c_str());
                     for (const auto& instruction : node.instructions) {
-                        ImGui::Text("%llX  %s %s",
-                                    static_cast<unsigned long long>(instruction.address),
+                        ImGui::Text("%" PRIX64 "  %s %s",
+                                    instruction.address,
                                     instruction.mnemonic.c_str(),
                                     instruction.operands.c_str());
                     }

@@ -449,10 +449,10 @@ void DebuggerPanel::draw_transport_bar() {
     ImGui::TextColored(state_badge_color(stop.state), "[%.*s]",
                        static_cast<int>(state_sv.size()), state_sv.data());
     ImGui::SameLine();
-    ImGui::Text("PID %u  |  TID %llu  |  IP 0x%llX",
+    ImGui::Text("PID %u  |  TID %" PRIu64 "  |  IP 0x%" PRIX64,
                 model_.process_session() ? model_.process_session()->pid() : 0u,
-                static_cast<unsigned long long>(stop.active_tid),
-                static_cast<unsigned long long>(stop.instruction_pointer));
+                static_cast<std::uint64_t>(stop.active_tid),
+                stop.instruction_pointer);
     if (stop.instruction_pointer != 0u) {
         const std::string sym = model_.resolve_address_symbol(stop.instruction_pointer);
         if (!sym.empty()) {
@@ -578,7 +578,7 @@ void DebuggerPanel::draw_breakpoints_tab() {
             ImGui::EndDisabled();
 
             ImGui::TableNextColumn();
-            ImGui::Text("#%llu", static_cast<unsigned long long>(bp.id));
+            ImGui::Text("#%" PRIu64, bp.id);
 
             ImGui::TableNextColumn();
             const auto kind_sv = peelf::debugger::to_string(bp.kind);
@@ -604,7 +604,7 @@ void DebuggerPanel::draw_breakpoints_tab() {
             ImGui::Text("%uB", static_cast<unsigned>(bp.byte_size));
 
             ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(bp.hit_count));
+            ImGui::Text("%" PRIu64, bp.hit_count);
 
             ImGui::TableNextColumn();
             ImGui::BeginDisabled(!paused);
@@ -705,9 +705,13 @@ void DebuggerPanel::draw_registers_tab() {
                 : ImVec4(0.86f, 0.90f, 0.95f, 1.0f);
             ImGui::PushStyleColor(ImGuiCol_Text, name_col);
             if (ImGui::Selectable(rv.name.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick)) {
-                std::snprintf(edit_reg_name_buf_.data(), edit_reg_name_buf_.size(), "%s", rv.name.c_str());
-                std::snprintf(edit_reg_val_buf_.data(), edit_reg_val_buf_.size(), "0x%llX",
-                              static_cast<unsigned long long>(rv.value_u64));
+                const std::size_t name_len = std::min(edit_reg_name_buf_.size() - 1, rv.name.size());
+                std::copy_n(rv.name.data(), name_len, edit_reg_name_buf_.data());
+                edit_reg_name_buf_[name_len] = '\0';
+                const std::string reg_hex = std::format("0x{:X}", rv.value_u64);
+                const std::size_t val_len = std::min(edit_reg_val_buf_.size() - 1, reg_hex.size());
+                std::copy_n(reg_hex.data(), val_len, edit_reg_val_buf_.data());
+                edit_reg_val_buf_[val_len] = '\0';
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && on_navigate_ && rv.value_u64 != 0u) {
                     on_navigate_(rv.value_u64, PreferredView::Disassembly);
                 }
@@ -727,8 +731,7 @@ void DebuggerPanel::draw_registers_tab() {
 
             ImGui::TableNextColumn();
             if (changed && prev_opt.has_value()) {
-                ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.30f, 1.0f), "0x%llX",
-                                   static_cast<unsigned long long>(*prev_opt));
+                ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.30f, 1.0f), "0x%" PRIX64, *prev_opt);
             } else {
                 ImGui::TextDisabled("-");
             }
@@ -792,14 +795,14 @@ void DebuggerPanel::draw_events_tab() {
             ImGui::PushID(static_cast<int>(ev.sequence & 0x7FFFFFFFu));
 
             ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(ev.sequence));
+            ImGui::Text("%" PRIu64, ev.sequence);
 
             ImGui::TableNextColumn();
             const auto ksv = peelf::debugger::to_string(ev.kind);
             ImGui::TextUnformatted(ksv.data(), ksv.data() + ksv.size());
 
             ImGui::TableNextColumn();
-            ImGui::Text("%llu", static_cast<unsigned long long>(ev.tid));
+            ImGui::Text("%" PRIu64, static_cast<std::uint64_t>(ev.tid));
 
             ImGui::TableNextColumn();
             if (ev.address.has_value() && *ev.address != 0u) {

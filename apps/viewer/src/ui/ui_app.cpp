@@ -41,26 +41,6 @@ void activate_panel(const char* name) {
     }
 }
 
-[[nodiscard]] std::optional<viewer::Architecture> disassembler_architecture(peelf::Architecture arch) {
-    switch (arch) {
-        case peelf::Architecture::X86:       return viewer::Architecture::X86_32;
-        case peelf::Architecture::X86_64:    return viewer::Architecture::X86_64;
-        case peelf::Architecture::ARM:       return viewer::Architecture::ARM32;
-        case peelf::Architecture::ARM64:     return viewer::Architecture::ARM64;
-        case peelf::Architecture::MIPS32:    return viewer::Architecture::MIPS32;
-        case peelf::Architecture::MIPS64:    return viewer::Architecture::MIPS64;
-        case peelf::Architecture::PowerPC:   return viewer::Architecture::PowerPC32;
-        case peelf::Architecture::PowerPC64: return viewer::Architecture::PowerPC64;
-        case peelf::Architecture::RISCV32:   return viewer::Architecture::RISCV32;
-        case peelf::Architecture::RISCV64:   return viewer::Architecture::RISCV64;
-        default:                             return std::nullopt;
-    }
-}
-
-[[nodiscard]] viewer::Endianness disassembler_endianness(peelf::Endianness endianness) {
-    return endianness == peelf::Endianness::Big ? viewer::Endianness::Big : viewer::Endianness::Little;
-}
-
 [[nodiscard]] bool same_selection(const ViewerSelection& lhs, const ViewerSelection& rhs) {
     return lhs.kind == rhs.kind &&
            lhs.object_index == rhs.object_index &&
@@ -100,9 +80,7 @@ struct GraphLayoutBounds {
 };
 
 [[nodiscard]] std::string format_graph_hex(std::uint64_t value) {
-    std::array<char, 32> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "0x%llX", static_cast<unsigned long long>(value));
-    return buffer.data();
+    return std::format("0x{:X}", value);
 }
 
 [[nodiscard]] std::string call_graph_node_display_label(const CallGraphNode& node, bool demangle = true) {
@@ -707,11 +685,8 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 }
 
 UiApp::~UiApp() {
-    decompile_stop_.request_stop();
-    if (call_graph_texture_) {
-        vulkan_.destroy_texture(*call_graph_texture_);
-        call_graph_texture_.reset();
-    }
+    decompile_controller_.shutdown();
+    call_graph_texture_.reset();
 }
 
 void UiApp::render() {
@@ -781,7 +756,7 @@ void UiApp::render() {
         if (ImGui::Button("Entry") && model_.image()) navigate_to_address(model_.image()->entry_point());
         ImGui::SameLine();
         ImGui::SetNextItemWidth(ImGui::GetFontSize() * 9);
-        ImGui::InputScalar("##JumpVA", ImGuiDataType_U64, &jump_address_, nullptr, nullptr, "%llX", ImGuiInputTextFlags_CharsHexadecimal);
+        ImGui::InputScalar("##JumpVA", ImGuiDataType_U64, &jump_address_, nullptr, nullptr, "%" PRIX64, ImGuiInputTextFlags_CharsHexadecimal);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("Jump to virtual address (hexadecimal)");
         ImGui::SameLine();
         if (ImGui::Button("Jump") && model_.has_file()) {
@@ -838,8 +813,8 @@ void UiApp::render() {
                     }
                 }
                 ImGui::PopStyleColor();
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("VA 0x%llX | %llu bytes%s",
-                    static_cast<unsigned long long>(section.virtual_address), static_cast<unsigned long long>(sec_size),
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("VA 0x%" PRIX64 " | %" PRIu64 " bytes%s",
+                    section.virtual_address, sec_size,
                     section.executable ? " | executable" : "");
                 ImGui::PopID();
             }
@@ -1133,7 +1108,9 @@ peelf::Result<void> UiApp::open_project(const std::filesystem::path& path,
         const std::string initial_path = !resolved.resolved_path.empty()
                                              ? resolved.resolved_path.string()
                                              : project->source;
-        std::snprintf(relocate_binary_buf_, sizeof(relocate_binary_buf_), "%s", initial_path.c_str());
+        const std::size_t copy_len = std::min(sizeof(relocate_binary_buf_) - 1, initial_path.size());
+        std::copy_n(initial_path.data(), copy_len, relocate_binary_buf_);
+        relocate_binary_buf_[copy_len] = '\0';
         open_relocate_modal_next_frame_ = true;
         return peelf::make_error(resolved.diagnostic);
     }
@@ -1230,14 +1207,14 @@ void UiApp::render_relocate_project_modal() {
         pending_relocation_resolution_.diagnostic.c_str());
 
     if (!pending_relocation_project_->source_sha256.empty()) {
-        ImGui::TextDisabled("Expected SHA-256: %s (%llu bytes)",
+        ImGui::TextDisabled("Expected SHA-256: %s (%" PRIu64 " bytes)",
                             pending_relocation_project_->source_sha256.c_str(),
-                            static_cast<unsigned long long>(pending_relocation_project_->source_size));
+                            pending_relocation_project_->source_size);
     }
     if (!pending_relocation_resolution_.actual_sha256.empty()) {
-        ImGui::TextDisabled("Found SHA-256:    %s (%llu bytes)",
+        ImGui::TextDisabled("Found SHA-256:    %s (%" PRIu64 " bytes)",
                             pending_relocation_resolution_.actual_sha256.c_str(),
-                            static_cast<unsigned long long>(pending_relocation_resolution_.actual_size));
+                            pending_relocation_resolution_.actual_size);
     }
 
     ImGui::Separator();
@@ -1965,10 +1942,9 @@ void UiApp::render_attach_process_modal() {
                 continue;
             }
             const std::string exe_path_str = proc.executable_path.string();
-            std::array<char, 32> pid_str{};
-            std::snprintf(pid_str.data(), pid_str.size(), "%" PRIu32, proc.pid);
+            const std::string pid_str = std::format("{}", proc.pid);
             if (!filter.empty() &&
-                !icontains_filter(pid_str.data(), filter) &&
+                !icontains_filter(pid_str, filter) &&
                 !icontains_filter(proc.name, filter) &&
                 !icontains_filter(exe_path_str, filter) &&
                 !icontains_filter(proc.command_line, filter)) {
@@ -1979,7 +1955,7 @@ void UiApp::render_attach_process_modal() {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::PushID(static_cast<int>(proc.pid & 0x7FFFFFFFu));
-            if (ImGui::Selectable(pid_str.data(),
+            if (ImGui::Selectable(pid_str.c_str(),
                                   is_sel,
                                   ImGuiSelectableFlags_SpanAllColumns |
                                       ImGuiSelectableFlags_AllowDoubleClick)) {
@@ -2060,20 +2036,25 @@ void UiApp::queue_call_graph_sample(CallGraphSample sample) {
 }
 
 void UiApp::process_deferred_gpu_work() {
-    if (decompile_job_.valid() && decompile_job_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-        try {
-            auto result = decompile_job_.get();
-            if (decompile_generation_ == file_generation_) {
-                if (pending_decompile_cache_key_ && result.status == DecompileStatus::Ready) {
-                    decompile_cache_.put(*pending_decompile_cache_key_, result);
-                }
-                decompiled_ = std::move(result);
-            }
-            pending_decompile_cache_key_.reset();
-        } catch (const std::exception& error) {
-            pending_decompile_cache_key_.reset();
-            decompiled_ = {DecompileStatus::Failed,"Decompiler",error.what()};
+    if (auto completed = decompile_controller_.poll_completed(current_decompile_stamp())) {
+        if (completed->cache_key && completed->unit.status == DecompileStatus::Ready) {
+            decompile_cache_.put(*completed->cache_key, completed->unit);
         }
+        if (completed->root_symbol) {
+            decompiled_root_ = std::move(completed->root_symbol);
+        }
+        decompile_revision_ = completed->stamp.edit_revision;
+        decompile_generation_ = completed->stamp.file_generation;
+        decompiler_thumb_ = completed->thumb;
+        decompile_annotation_revision_ = annotations_.revision();
+        decompile_symbol_revision_ = symbol_revision_;
+        decompiled_ = std::move(completed->unit);
+    } else if (decompile_controller_.consume_stale_discard_notice()) {
+        decompiled_ = DecompiledUnit{
+            .status = DecompileStatus::Failed,
+            .provider = "Decompiler",
+            .diagnostic = "Bytes or symbols changed during analysis; press F5 to analyze the updated state.",
+        };
     }
     reference_scanner_.poll(reference_index_);
     if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
@@ -2251,10 +2232,7 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
         return;
     }
 
-    if (call_graph_texture_) {
-        vulkan_.destroy_texture(*call_graph_texture_);
-        call_graph_texture_.reset();
-    }
+    call_graph_texture_.reset();
 
     loaded_call_graph_bmp_ = plain_path;
     original_call_graph_layout_ = current_call_graph_layout_;
@@ -2914,10 +2892,9 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                 }
             }
             std::string bytes_str;
-            for (std::uint8_t b: inst.bytes) {
-                char buf[4];
-                std::snprintf(buf, sizeof(buf), "%02X ", b);
-                bytes_str += buf;
+            bytes_str.reserve(inst.bytes.size() * 3);
+            for (const std::uint8_t b : inst.bytes) {
+                bytes_str += std::format("{:02X} ", b);
             }
             if (inst_patch_state == BytePatchState::Staged) {
                 ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.25f, 1.0f), "%s", bytes_str.c_str());
@@ -3015,16 +2992,13 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
         pending_call_graph_request_.reset();
-        if (call_graph_texture_) {
-            vulkan_.destroy_texture(*call_graph_texture_);
-            call_graph_texture_.reset();
-        }
+        call_graph_texture_.reset();
 
         const peelf::Architecture target_arch = model_.architecture() != peelf::Architecture::Unknown
             ? model_.architecture()
             : sess->info().architecture;
-        if (const std::optional<viewer::Architecture> arch = disassembler_architecture(target_arch)) {
-            file_loaded_ = disasm_.init(*arch, disassembler_endianness(model_.endianness()));
+        if (const std::optional<viewer::Architecture> arch = to_disassembler_architecture(target_arch)) {
+            file_loaded_ = disasm_.init(*arch, to_disassembler_endianness(model_.endianness()));
         } else {
             file_loaded_ = false;
         }
@@ -3084,7 +3058,9 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     void UiApp::on_file_loaded() {
         patch_set_panel_.reset_preview();
         binary_diff_panel_.invalidate();
-        decompile_stop_.request_stop(); ++file_generation_; decompiled_ = {};
+        decompile_controller_.reset_for_new_target();
+        ++file_generation_;
+        decompiled_ = {};
         annotations_.clear();
         debug_types_.clear(); ++symbol_revision_; decompiled_root_.reset();
         selected_code_ranges_.clear(); selected_code_address_.reset();
@@ -3158,7 +3134,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
                    model_.source_lines().size());
 
         // Map the unified architecture onto the disassembler's enum.
-        const std::optional<viewer::Architecture> arch = disassembler_architecture(img->architecture());
+        const std::optional<viewer::Architecture> arch = to_disassembler_architecture(img->architecture());
         if (!arch) {
             Log().error(std::string("Disassembly is not supported for architecture: ") +
                         std::string(peelf::to_string(img->architecture())));
@@ -3167,7 +3143,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             return;
         }
 
-        if (!disasm_.init(*arch, disassembler_endianness(img->endianness()))) {
+        if (!disasm_.init(*arch, to_disassembler_endianness(img->endianness()))) {
             Log().error(std::string("Failed to initialize disassembler: ") + disasm_.get_error());
             file_loaded_ = false;
             return;
@@ -3192,10 +3168,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             focus_graph_ = true;
         }
         call_graph_status_ = "Analyzing entry point";
-        if (call_graph_texture_) {
-            vulkan_.destroy_texture(*call_graph_texture_);
-            call_graph_texture_.reset();
-        }
+        call_graph_texture_.reset();
     }
 
     void UiApp::load_debug_symbols(const std::filesystem::path& path) {
@@ -3228,10 +3201,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         pending_call_graph_request_.reset();
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;
-        if (call_graph_texture_) {
-            vulkan_.destroy_texture(*call_graph_texture_);
-            call_graph_texture_.reset();
-        }
+        call_graph_texture_.reset();
     }
 
 
@@ -3453,60 +3423,55 @@ void UiApp::switch_analysis_view(bool graph) {
         const std::uint64_t va = section->virtual_address;
         const auto instructions = disasm_.disassemble(sample->data(), sample->size(), va);
 
-        printf("Section: %s (0x%llX - 0x%llX)\n",
-               section_name.c_str(),
-               static_cast<unsigned long long>(va),
-               static_cast<unsigned long long>(va + section->virtual_size));
-        printf("----------------------------------------\n");
+        Log().info("Section: {} (0x{:X} - 0x{:X})",
+                   section_name,
+                   va,
+                   va + section->virtual_size);
 
         for (const auto& inst : instructions) {
             std::string bytes_str;
-            for (std::uint8_t b : inst.bytes) {
-                char buf[4];
-                snprintf(buf, sizeof(buf), "%02X ", b);
-                bytes_str += buf;
+            bytes_str.reserve(inst.bytes.size() * 3);
+            for (const std::uint8_t b : inst.bytes) {
+                bytes_str += std::format("{:02X} ", b);
             }
 
-            printf("%016llX  %-24s  %s\n",
-                   static_cast<unsigned long long>(inst.address),
-                   bytes_str.c_str(),
-                   inst.to_string().c_str());
+            Log().info("{:016X}  {:<24}  {}",
+                       inst.address,
+                       bytes_str,
+                       inst.to_string());
         }
     }
     void UiApp::disassemble_at(std::uint64_t rva, std::size_t size) {
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr) {
-            fprintf(stderr, "No binary image loaded\n");
+            Log().error("No binary image loaded");
             return;
         }
         const std::uint64_t va = img->image_base() + rva;
         const auto window_off = model_.virtual_address_to_offset(va);
         if (!window_off.has_value()) {
-            fprintf(stderr, "Failed to convert RVA 0x%llX to offset\n",
-                    static_cast<unsigned long long>(rva));
+            Log().error("Failed to convert RVA 0x{:X} to offset", rva);
             return;
         }
 
         const auto sample = model_.read_effective_bytes(*window_off, size);
         if (!sample.has_value() || sample->empty()) {
-            fprintf(stderr, "Failed to read %zu bytes at offset 0x%llX\n",
-                    size, static_cast<unsigned long long>(*window_off));
+            Log().error("Failed to read {} bytes at offset 0x{:X}", size, *window_off);
             return;
         }
 
         const auto instructions = disasm_.disassemble(sample->data(), sample->size(), va);
         for (const auto& inst : instructions) {
             std::string bytes_str;
-            for (std::uint8_t b : inst.bytes) {
-                char buf[4];
-                snprintf(buf, sizeof(buf), "%02X ", b);
-                bytes_str += buf;
+            bytes_str.reserve(inst.bytes.size() * 3);
+            for (const std::uint8_t b : inst.bytes) {
+                bytes_str += std::format("{:02X} ", b);
             }
 
-            printf("%016llX  %-24s  %s\n",
-                   static_cast<unsigned long long>(inst.address),
-                   bytes_str.c_str(),
-                   inst.to_string().c_str());
+            Log().info("{:016X}  {:<24}  {}",
+                       inst.address,
+                       bytes_str,
+                       inst.to_string());
         }
     }
 
@@ -3592,20 +3557,18 @@ void UiApp::switch_analysis_view(bool graph) {
         current_instructions_ = disasm_.disassemble(sample->data(), sample->size(), va);
 
         Log().info("Entry Point: 0x{:X}", va);
-        printf("----------------------------------------\n");
 
         for (const auto& inst : current_instructions_) {
             std::string bytes_str;
-            for (std::uint8_t b : inst.bytes) {
-                char buf[4];
-                snprintf(buf, sizeof(buf), "%02X ", b);
-                bytes_str += buf;
+            bytes_str.reserve(inst.bytes.size() * 3);
+            for (const std::uint8_t b : inst.bytes) {
+                bytes_str += std::format("{:02X} ", b);
             }
 
             Log().info("{:016X}  {:24}  {}",
-                   inst.address,
-                   bytes_str.c_str(),
-                   inst.to_string().c_str());
+                       inst.address,
+                       bytes_str,
+                       inst.to_string());
         }
     }
 

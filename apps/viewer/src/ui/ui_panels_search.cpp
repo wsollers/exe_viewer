@@ -150,11 +150,11 @@ void MemorySearchPanel::draw_contents() {
         return;
     }
 
-    ImGui::TextDisabled("Hits: %zu%s  |  Scanned %zu region(s), %llu bytes  |  %s",
+    ImGui::TextDisabled("Hits: %zu%s  |  Scanned %zu region(s), %" PRIu64 " bytes  |  %s",
                         last_report_->hits.size(),
                         last_report_->truncated ? " (truncated)" : "",
                         last_report_->regions_scanned,
-                        static_cast<unsigned long long>(last_report_->bytes_scanned),
+                        last_report_->bytes_scanned,
                         last_report_->status.detail.c_str());
     ImGui::Separator();
 

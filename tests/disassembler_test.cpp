@@ -161,3 +161,39 @@ TEST(Disassembler, DecodesPowerPc64BigEndianNop) {
     EXPECT_EQ(instructions.front().address, 0x400080u);
     EXPECT_EQ(instructions.front().mnemonic, "nop");
 }
+
+TEST(Disassembler, CoreArchitectureAndEndiannessConvertersRoundTrip) {
+    static_assert(!viewer::to_disassembler_architecture(peelf::Architecture::Unknown).has_value());
+    static_assert(viewer::to_disassembler_architecture(peelf::Architecture::X86_64) ==
+                  viewer::Architecture::X86_64);
+    static_assert(viewer::to_core_architecture(viewer::Architecture::ARM32) ==
+                  peelf::Architecture::ARM);
+    static_assert(viewer::to_disassembler_endianness(peelf::Endianness::Big) ==
+                  viewer::Endianness::Big);
+    static_assert(viewer::to_core_endianness(viewer::Endianness::Little) ==
+                  peelf::Endianness::Little);
+
+    constexpr std::array<peelf::Architecture, 10> kCoreArchs{
+        peelf::Architecture::X86,
+        peelf::Architecture::X86_64,
+        peelf::Architecture::ARM,
+        peelf::Architecture::ARM64,
+        peelf::Architecture::MIPS32,
+        peelf::Architecture::MIPS64,
+        peelf::Architecture::PowerPC,
+        peelf::Architecture::PowerPC64,
+        peelf::Architecture::RISCV32,
+        peelf::Architecture::RISCV64,
+    };
+    for (const peelf::Architecture arch : kCoreArchs) {
+        const auto mapped = viewer::to_disassembler_architecture(arch);
+        ASSERT_TRUE(mapped.has_value());
+        EXPECT_EQ(viewer::to_core_architecture(*mapped), arch);
+    }
+    EXPECT_FALSE(viewer::to_disassembler_architecture(peelf::Architecture::Unknown).has_value());
+    EXPECT_EQ(viewer::to_core_endianness(viewer::to_disassembler_endianness(peelf::Endianness::Big)),
+              peelf::Endianness::Big);
+    EXPECT_EQ(viewer::to_core_endianness(viewer::to_disassembler_endianness(peelf::Endianness::Little)),
+              peelf::Endianness::Little);
+}
+

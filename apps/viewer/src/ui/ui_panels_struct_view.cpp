@@ -333,7 +333,7 @@ void StructureViewPanel::draw_contents() {
                            &target_address_,
                            nullptr,
                            nullptr,
-                           "%llX",
+                           "%" PRIX64,
                            ImGuiInputTextFlags_CharsHexadecimal)) {
         sync_with_selection_ = false;
         dirty_ = true;

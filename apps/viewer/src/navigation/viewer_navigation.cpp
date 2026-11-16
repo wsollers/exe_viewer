@@ -1,8 +1,7 @@
 #include "navigation/viewer_navigation.hpp"
 
 #include <algorithm>
-#include <array>
-#include <cstdio>
+#include <format>
 #include <string>
 
 #include "graph/call_graph.hpp"
@@ -48,9 +47,7 @@ namespace {
 }
 
 [[nodiscard]] std::string hex64(std::uint64_t value) {
-    std::array<char, 32> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%llX", static_cast<unsigned long long>(value));
-    return buffer.data();
+    return std::format("{:X}", value);
 }
 
 void add_headers(const peelf::IBinaryImage& image, StructureNode& root) {

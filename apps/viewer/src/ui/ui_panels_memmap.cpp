@@ -323,8 +323,8 @@ void MemoryMapPanel::draw_contents() {
     if (sess != nullptr) {
         if (const peelf::CrashDumpSummary* dump = model_.crash_dump_summary(); dump != nullptr) {
             ImGui::TextColored(ImVec4(1.0f, 0.48f, 0.34f, 1.0f),
-                               "[CRASH DUMP] PID %llu: %s (%s, Offline Read-Only)",
-                               static_cast<unsigned long long>(sess->pid()),
+                               "[CRASH DUMP] PID %" PRIu64 ": %s (%s, Offline Read-Only)",
+                               static_cast<std::uint64_t>(sess->pid()),
                                sess->info().name.empty() ? "<dump>" : sess->info().name.c_str(),
                                std::string(peelf::to_string(sess->info().architecture)).c_str());
             if (dump->exception.has_value()) {
@@ -338,9 +338,9 @@ void MemoryMapPanel::draw_contents() {
             ImGui::TextColored(!alive ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
                                       : (paused ? ImVec4(1.0f, 0.78f, 0.25f, 1.0f)
                                                 : ImVec4(0.35f, 0.90f, 0.55f, 1.0f)),
-                               "%s PID %llu: %s (%s, Read-Only)",
+                               "%s PID %" PRIu64 ": %s (%s, Read-Only)",
                                !alive ? "[EXITED]" : (paused ? "[PAUSED]" : "[LIVE]"),
-                               static_cast<unsigned long long>(sess->pid()),
+                               static_cast<std::uint64_t>(sess->pid()),
                                sess->info().name.empty() ? "<process>" : sess->info().name.c_str(),
                                std::string(peelf::to_string(sess->info().architecture)).c_str());
         }

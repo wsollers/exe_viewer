@@ -4,6 +4,7 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
 
+#include <cinttypes>
 #include <limits>
 
 namespace viewer {
@@ -71,8 +72,8 @@ void draw_permissions(bool readable, bool writable, bool executable) {
             }
             ImGui::PopID();
             ImGui::NextColumn();
-            ImGui::Text("0x%llX", (unsigned long long)s.virtual_address); ImGui::NextColumn();
-            ImGui::Text("0x%llX", (unsigned long long)s.virtual_size); ImGui::NextColumn();
+            ImGui::Text("0x%" PRIX64, s.virtual_address); ImGui::NextColumn();
+            ImGui::Text("0x%" PRIX64, s.virtual_size); ImGui::NextColumn();
             draw_permissions(s.readable, s.writable, s.executable); ImGui::NextColumn();
             ++section_index;
         }
@@ -91,9 +92,9 @@ void draw_permissions(bool readable, bool writable, bool executable) {
 
             for (const auto& segment : img->segments()) {
                 ImGui::Text("0x%X", segment.type); ImGui::NextColumn();
-                ImGui::Text("0x%llX", (unsigned long long)segment.virtual_address); ImGui::NextColumn();
-                ImGui::Text("0x%llX", (unsigned long long)segment.virtual_size); ImGui::NextColumn();
-                ImGui::Text("0x%llX", (unsigned long long)segment.file_offset); ImGui::NextColumn();
+                ImGui::Text("0x%" PRIX64, segment.virtual_address); ImGui::NextColumn();
+                ImGui::Text("0x%" PRIX64, segment.virtual_size); ImGui::NextColumn();
+                ImGui::Text("0x%" PRIX64, segment.file_offset); ImGui::NextColumn();
                 draw_permissions(segment.readable, segment.writable, segment.executable); ImGui::NextColumn();
             }
             ImGui::Columns(1);

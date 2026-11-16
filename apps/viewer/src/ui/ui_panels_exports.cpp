@@ -2,6 +2,7 @@
 
 #include <imgui.h>
 
+#include <cinttypes>
 #include <cstdint>
 #include <string>
 
@@ -57,7 +58,7 @@ void ExportsPanel::draw_contents() {
             ImGui::TableNextColumn();
             ImGui::Text("%u", entry.ordinal);
             ImGui::TableNextColumn();
-            ImGui::Text("0x%llX", static_cast<unsigned long long>(entry.virtual_address));
+            ImGui::Text("0x%" PRIX64, entry.virtual_address);
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(entry.forwarder.empty() ? "-" : entry.forwarder.c_str());
             ++row_id;

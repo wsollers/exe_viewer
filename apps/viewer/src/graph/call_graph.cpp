@@ -340,26 +340,6 @@ namespace {
            mnemonic == "bc";
 }
 
-[[nodiscard]] std::optional<Architecture> disassembler_architecture(peelf::Architecture arch) {
-    switch (arch) {
-        case peelf::Architecture::X86:       return Architecture::X86_32;
-        case peelf::Architecture::X86_64:    return Architecture::X86_64;
-        case peelf::Architecture::ARM:       return Architecture::ARM32;
-        case peelf::Architecture::ARM64:     return Architecture::ARM64;
-        case peelf::Architecture::MIPS32:    return Architecture::MIPS32;
-        case peelf::Architecture::MIPS64:    return Architecture::MIPS64;
-        case peelf::Architecture::PowerPC:   return Architecture::PowerPC32;
-        case peelf::Architecture::PowerPC64: return Architecture::PowerPC64;
-        case peelf::Architecture::RISCV32:   return Architecture::RISCV32;
-        case peelf::Architecture::RISCV64:   return Architecture::RISCV64;
-        default:                             return std::nullopt;
-    }
-}
-
-[[nodiscard]] Endianness disassembler_endianness(peelf::Endianness endianness) {
-    return endianness == peelf::Endianness::Big ? Endianness::Big : Endianness::Little;
-}
-
 [[nodiscard]] bool contains_case_sensitive(std::string_view text, std::string_view needle) {
     return text.find(needle) != std::string_view::npos;
 }
@@ -1053,10 +1033,10 @@ CallGraph build_symbol_fanout_call_graph(const peelf::IBinaryImage& image,
     };
 
     if (root.file_offset && root.virtual_address && read_bytes) {
-        const std::optional<Architecture> arch = disassembler_architecture(image.architecture());
+        const std::optional<Architecture> arch = to_disassembler_architecture(image.architecture());
         if (arch) {
             Disassembler disassembler;
-            if (disassembler.init(*arch, disassembler_endianness(image.endianness()))) {
+            if (disassembler.init(*arch, to_disassembler_endianness(image.endianness()))) {
                 const std::uint64_t requested_size = root.size != 0 ? root.size : max_function_scan;
                 const std::size_t bytes_to_read = static_cast<std::size_t>(
                     std::min<std::uint64_t>(requested_size, max_function_scan));
@@ -1893,7 +1873,7 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
         .indirect_recoveries = {},
     };
 
-    const std::optional<Architecture> arch = disassembler_architecture(architecture);
+    const std::optional<Architecture> arch = to_disassembler_architecture(architecture);
     if (!arch || function_bytes.empty()) {
         return graph;
     }
@@ -1901,7 +1881,7 @@ CallGraph build_function_cfg_call_graph(std::span<const std::uint8_t> function_b
     if (file_offset && function_bytes.size() > std::numeric_limits<std::uint64_t>::max() - *file_offset) return graph;
 
     Disassembler disassembler;
-    if (!disassembler.init(*arch, disassembler_endianness(endianness))) {
+    if (!disassembler.init(*arch, to_disassembler_endianness(endianness))) {
         return graph;
     }
     if (architecture == peelf::Architecture::ARM && !disassembler.set_thumb_mode(thumb_mode)) return graph;
