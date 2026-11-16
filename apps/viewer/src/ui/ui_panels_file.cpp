@@ -1,4 +1,5 @@
 #include "ui_panels.hpp"
+#include "ui_panels_capabilities.hpp"
 #include <imgui.h>
 #include <cinttypes>
 #include <format>
@@ -80,8 +81,13 @@ namespace viewer {
                     ImGui::TextDisabled("Backing binary: %s",
                                         model_.resolved_executable_path()->string().c_str());
                 }
+                ui_provenance::draw_backing_identity_banner(model_.backing_identity_status());
+                ui_provenance::draw_capture_stamp_badge("Map", model_.memory_map_stamp());
                 ImGui::Separator();
             }
+        } else {
+            ui_provenance::draw_capture_stamp_badge("StaticFile", model_.static_image_stamp());
+            ImGui::Separator();
         }
 
         const auto& info = model_.file_info();

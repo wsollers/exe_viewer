@@ -1683,6 +1683,31 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
         all_regions = std::move(*regs);
     }
 
+    report.live_provenance =
+        session.is_crash_dump() ? ProvenanceTag::CrashDump : ProvenanceTag::LiveMemory;
+    report.backing_identity = verify_live_module_backing_identity(
+        disk_image,
+        disk_file_bytes,
+        session,
+        live_module,
+        all_regions);
+    {
+        TargetInstanceId tid;
+        tid.backend = session.is_crash_dump()
+                          ? BackendKind::CrashDumpElfCore
+                          : BackendKind::LiveNativeReadOnly;
+        tid.pid = session.pid();
+        tid.creation_identity =
+            session.is_crash_dump() ? std::nullopt : query_process_creation_identity(session.pid());
+        tid.image_sha256 = report.disk_sha256;
+        tid.build_id_or_pdb_guid = report.backing_identity.live_identifier;
+        report.live_capture_stamp = CaptureStamp::capture_now(
+            tid,
+            1u,
+            session.is_suspended(),
+            CaptureAvailability::Complete);
+    }
+
     auto find_module_for_va = [&](std::uint64_t va) -> const ModuleInfo* {
         for (const ModuleInfo& m : all_modules) {
             if (m.size > 0u && va >= m.base_address && va < m.base_address + m.size) {
@@ -2136,9 +2161,17 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
     report_progress(3u, 3u, "Live integrity comparison complete");
 
     if (!any_readable) {
+        report.live_capture_stamp.availability = CaptureAvailability::Unavailable;
         report.status = SubsystemStatus::unavailable(
             "live_module_diff", "Unable to read mapped sections from live process memory");
+    } else if (report.backing_identity.has_mismatch()) {
+        report.live_capture_stamp.availability = CaptureAvailability::Partial;
+        report.status = SubsystemStatus::partial(
+            "live_module_diff",
+            std::format("Backing image identity mismatch ({}); diffs may reflect a different build rather than runtime hooks",
+                        report.backing_identity.summary));
     } else if (report.unreadable_live_bytes > 0u) {
+        report.live_capture_stamp.availability = CaptureAvailability::Partial;
         report.status = SubsystemStatus::partial(
             "live_module_diff",
             std::format("Compared live module with {} unreadable byte(s) skipped",

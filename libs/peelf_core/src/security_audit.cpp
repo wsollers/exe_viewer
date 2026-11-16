@@ -1740,6 +1740,32 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
             report.security = audit_live_process_security(*report.crash_dump, sec_ptr);
         }
 
+        report.primary_provenance = ProvenanceTag::CrashDump;
+        report.target_profile = derive_target_profile(
+            report.image.get(),
+            report.crash_dump.get(),
+            false,
+            false);
+        report.capabilities = capabilities_for(
+            report.target_profile,
+            ProviderFacts::detect_host_providers());
+        {
+            TargetInstanceId tid;
+            tid.backend = report.target_profile.backend;
+            tid.pid = report.crash_dump->pid();
+            tid.image_sha256 = report.sha256;
+            if (report.image != nullptr) {
+                const BackingImageIdentity bid = extract_backing_image_identity(
+                    *report.image);
+                tid.build_id_or_pdb_guid = bid.primary_identifier();
+            }
+            report.analysis_stamp = CaptureStamp::capture_now(
+                tid,
+                1u,
+                true,
+                CaptureAvailability::Complete);
+        }
+
         if (options.compare_path.has_value()) {
             return make_error("--compare is not supported when the primary input is a crash dump");
         }
@@ -1754,6 +1780,29 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
     }
 
     report.image = std::move(*parsed);
+    report.primary_provenance = ProvenanceTag::DiskFile;
+    report.target_profile = derive_target_profile(
+        report.image.get(),
+        nullptr,
+        false,
+        false);
+    report.capabilities = capabilities_for(
+        report.target_profile,
+        ProviderFacts::detect_host_providers());
+    {
+        const BackingImageIdentity bid = extract_backing_image_identity(
+            *report.image,
+            raw_bytes);
+        TargetInstanceId tid;
+        tid.backend = BackendKind::StaticFile;
+        tid.image_sha256 = report.sha256;
+        tid.build_id_or_pdb_guid = bid.primary_identifier();
+        report.analysis_stamp = CaptureStamp::capture_now(
+            tid,
+            1u,
+            true,
+            CaptureAvailability::Complete);
+    }
 
     DependencyResolveOptions dep_opts;
     dep_opts.root_path = options.binary_path;
@@ -1826,6 +1875,56 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
         out += std::format("    \"image_base\": {}\n", img->image_base());
     }
     out += "  },\n";
+
+    // Target profile, capture provenance, and validated capability matrix (WU-21)
+    out += "  \"target_profile\": {\n";
+    out += "    "; key("format"); append_json_escaped(out, to_string(report.target_profile.format)); out += ",\n";
+    out += "    "; key("architecture"); append_json_escaped(out, to_string(report.target_profile.architecture)); out += ",\n";
+    out += "    "; key("endianness"); append_json_escaped(out, to_string(report.target_profile.endianness)); out += ",\n";
+    out += std::format("    \"address_width_bits\": {},\n",
+                       report.target_profile.address_width == AddressWidth::Bits64 ? 64 : 32);
+    out += "    "; key("abi"); append_json_escaped(out, to_string(report.target_profile.abi)); out += ",\n";
+    out += "    "; key("os"); append_json_escaped(out, to_string(report.target_profile.os)); out += ",\n";
+    out += "    "; key("backend"); append_json_escaped(out, to_string(report.target_profile.backend)); out += ",\n";
+    out += std::format("    \"completely_specified\": {}\n",
+                       report.target_profile.is_completely_specified() ? "true" : "false");
+    out += "  },\n";
+
+    out += "  \"provenance\": {\n";
+    out += "    "; key("primary_source"); append_json_escaped(out, to_string(report.primary_provenance)); out += ",\n";
+    out += std::format("    \"snapshot_revision\": {},\n", report.analysis_stamp.snapshot_revision);
+    out += "    "; key("captured_at_utc"); append_json_escaped(out, report.analysis_stamp.captured_at_utc); out += ",\n";
+    out += std::format("    \"target_paused\": {},\n", report.analysis_stamp.target_paused ? "true" : "false");
+    out += "    "; key("availability"); append_json_escaped(out, to_string(report.analysis_stamp.availability)); out += ",\n";
+    out += "    \"target_instance\": {\n";
+    out += "      "; key("backend"); append_json_escaped(out, to_string(report.analysis_stamp.target_id.backend)); out += ",\n";
+    out += std::format("      \"pid\": {},\n",
+                       report.analysis_stamp.target_id.pid != 0u
+                           ? std::to_string(report.analysis_stamp.target_id.pid)
+                           : "null");
+    out += std::format("      \"creation_identity\": {},\n",
+                       report.analysis_stamp.target_id.creation_identity.has_value()
+                           ? std::to_string(*report.analysis_stamp.target_id.creation_identity)
+                           : "null");
+    out += "      "; key("image_sha256"); append_json_escaped(out, report.analysis_stamp.target_id.image_sha256); out += ",\n";
+    out += "      "; key("build_id_or_pdb_guid"); append_json_escaped(out, report.analysis_stamp.target_id.build_id_or_pdb_guid); out += "\n";
+    out += "    }\n";
+    out += "  },\n";
+
+    out += "  \"capabilities\": [\n";
+    const auto cap_entries = report.capabilities.entries();
+    for (std::size_t i = 0; i < cap_entries.size(); ++i) {
+        const Capability& cap = cap_entries[i];
+        out += "    { ";
+        key("operation"); append_json_escaped(out, to_string(cap.operation)); out += ", ";
+        key("state"); append_json_escaped(out, to_string(cap.state));
+        out += std::format(", \"provider_available\": {}, \"usable_now\": {}, ",
+                           cap.provider_available ? "true" : "false",
+                           cap.is_usable_now() ? "true" : "false");
+        key("reason"); append_json_escaped(out, cap.reason);
+        out += (i + 1u < cap_entries.size()) ? " },\n" : " }\n";
+    }
+    out += "  ],\n";
 
     static const std::vector<Section> kEmptySecs{};
     static const std::vector<ImportEntry> kEmptyImps{};

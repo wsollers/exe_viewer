@@ -1,4 +1,5 @@
 #include "peelf/process.hpp"
+#include "peelf/provenance.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1556,7 +1557,17 @@ Result<std::unique_ptr<IBinaryImage>> load_live_module_image(
     if (disk_bytes) {
         auto rebased = parse_rebased_image(*disk_bytes, module.base_address);
         if (rebased) {
-            return rebased;
+            const BackingIdentityMatchResult id_check = verify_live_module_backing_identity(
+                **rebased,
+                *disk_bytes,
+                session,
+                module,
+                regions);
+            // Only use the on-disk backing file when it does not contradict the in-memory
+            // module's build identity (.note.gnu.build-id / RSDS GUID+Age / PE TimeDateStamp).
+            if (!id_check.has_mismatch()) {
+                return rebased;
+            }
         }
     }
 

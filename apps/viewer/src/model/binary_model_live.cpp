@@ -117,6 +117,7 @@ private:
     void BinaryModel::load_live_module_backing_bytes(const peelf::ModuleInfo& module) {
         live_backing_file_bytes_.clear();
         live_module_snapshot_bytes_.clear();
+        backing_identity_status_ = {};
 
         std::filesystem::path candidate = module.path;
         std::error_code ec;
@@ -131,10 +132,22 @@ private:
             if (!ec && fsize >= 64u && fsize <= kMaxBackingBytes) {
                 std::ifstream in(candidate, std::ios::binary);
                 if (in) {
-                    live_backing_file_bytes_.resize(static_cast<std::size_t>(fsize));
-                    if (!in.read(reinterpret_cast<char*>(live_backing_file_bytes_.data()),
-                                 static_cast<std::streamsize>(live_backing_file_bytes_.size()))) {
-                        live_backing_file_bytes_.clear();
+                    std::vector<std::uint8_t> disk_bytes(static_cast<std::size_t>(fsize));
+                    if (in.read(reinterpret_cast<char*>(disk_bytes.data()),
+                                static_cast<std::streamsize>(disk_bytes.size()))) {
+                        if (session_ != nullptr) {
+                            if (auto parsed_disk = peelf::parse_image(disk_bytes)) {
+                                backing_identity_status_ = peelf::verify_live_module_backing_identity(
+                                    **parsed_disk,
+                                    disk_bytes,
+                                    *session_,
+                                    module,
+                                    regions_);
+                            }
+                        }
+                        if (!backing_identity_status_.has_mismatch()) {
+                            live_backing_file_bytes_ = std::move(disk_bytes);
+                        }
                     }
                 }
             }
@@ -204,6 +217,26 @@ private:
                 session_->info().working_directory);
         }
 
+        target_instance_id_ = peelf::TargetInstanceId{
+            .backend = session_->is_crash_dump()
+                           ? (crash_dump_summary() != nullptr &&
+                                      crash_dump_summary()->kind == peelf::CrashDumpKind::WindowsMinidump
+                                  ? peelf::BackendKind::CrashDumpMinidump
+                                  : peelf::BackendKind::CrashDumpElfCore)
+                           : (session_->is_read_only()
+                                  ? peelf::BackendKind::LiveNativeReadOnly
+                                  : peelf::BackendKind::ActiveDebugger),
+            .pid = session_->pid(),
+            .creation_identity = session_->is_crash_dump()
+                                     ? std::nullopt
+                                     : peelf::query_process_creation_identity(session_->pid()),
+            .image_sha256 = {},
+            .build_id_or_pdb_guid = {},
+        };
+        static_image_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+        process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+
+        in_coordinated_attach_ = true;
         auto map_res = refresh_process_map();
         (void)refresh_threads();
         if (const peelf::CrashDumpSummary* dump = crash_dump_summary(); dump != nullptr) {
@@ -224,6 +257,8 @@ private:
             refresh_process_internals();
         }
         refresh_runtime_and_handlers();
+        in_coordinated_attach_ = false;
+        recompute_capabilities();
         return map_res;
     }
 
@@ -293,9 +328,22 @@ private:
                 session_->info().working_directory);
         }
 
+        target_instance_id_ = peelf::TargetInstanceId{
+            .backend = peelf::BackendKind::ActiveDebugger,
+            .pid = session_->pid(),
+            .creation_identity = peelf::query_process_creation_identity(session_->pid()),
+            .image_sha256 = {},
+            .build_id_or_pdb_guid = {},
+        };
+        static_image_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+        process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+
+        in_coordinated_attach_ = true;
         auto map_res = refresh_process_map();
         refresh_debug_breakpoints();
         (void)sync_debugger_stop_state();
+        in_coordinated_attach_ = false;
+        recompute_capabilities();
         return map_res;
     }
 
@@ -453,6 +501,24 @@ private:
             return std::unexpected(mods.error());
         }
 
+        const bool was_coordinated = in_coordinated_attach_;
+        if (!was_coordinated && !is_process_suspended() && !is_crash_dump()) {
+            mark_live_volatile_stamps_stale(false);
+        }
+        const peelf::CaptureAvailability map_avail =
+            regs->empty() ? peelf::CaptureAvailability::Partial : peelf::CaptureAvailability::Complete;
+        memory_map_stamp_ = peelf::CaptureStamp::capture_now(
+            target_instance_id_,
+            ++next_capture_revision_,
+            is_process_suspended() || is_crash_dump(),
+            map_avail);
+        in_coordinated_attach_ = true;
+        struct CoordReset {
+            bool& flag;
+            bool prev;
+            ~CoordReset() noexcept { flag = prev; }
+        } coord_guard{in_coordinated_attach_, was_coordinated};
+
         regions_ = std::move(*regs);
         modules_ = std::move(*mods);
         memory_summary_ = session_->memory_summary(regions_);
@@ -609,12 +675,28 @@ private:
             if (debug_probe_path.empty() && mod.is_main_module && resolved_exe_path_) {
                 debug_probe_path = *resolved_exe_path_;
             }
-            (void)auto_load_debug_info_for_current_image(debug_probe_path);
+            if (mod.is_main_module && target_instance_id_.build_id_or_pdb_guid.empty()) {
+                target_instance_id_.build_id_or_pdb_guid =
+                    !backing_identity_status_.live_identifier.empty()
+                        ? backing_identity_status_.live_identifier
+                        : peelf::extract_backing_image_identity(
+                              *image_,
+                              analysis_image_bytes())
+                              .primary_identifier();
+            }
+            if (!backing_identity_status_.has_mismatch()) {
+                (void)auto_load_debug_info_for_current_image(debug_probe_path);
+            }
             rebuild_symbol_index();
             if (selected_tid_) {
                 refresh_selected_thread_inspection();
             }
-            last_diagnostic_.clear();
+            recompute_capabilities();
+            if (backing_identity_status_.has_mismatch()) {
+                last_diagnostic_ = backing_identity_status_.summary;
+            } else {
+                last_diagnostic_.clear();
+            }
             return {};
         }
 
@@ -630,6 +712,7 @@ private:
         symbol_index_ = {};
         function_index_ = {};
         refresh_runtime_and_handlers();
+        recompute_capabilities();
 
         file_info_.path = !mod.path.empty() ? mod.path.string() : mod.name;
         file_info_.format_str = "Raw Module (Live RAM)";
@@ -682,6 +765,7 @@ private:
         image_.reset();
         live_backing_file_bytes_.clear();
         live_module_snapshot_bytes_.clear();
+        backing_identity_status_ = {};
         sections_.clear();
         symbol_index_ = {};
         function_index_ = {};
@@ -721,6 +805,7 @@ private:
         if (!image_) {
             refresh_runtime_and_handlers();
         }
+        recompute_capabilities();
 
         const std::string region_name = !reg.pathname.empty()
             ? reg.pathname
@@ -816,6 +901,9 @@ private:
         if (!st.ok() && !st.detail.empty()) {
             last_diagnostic_ = st.detail;
         }
+        if (st.ok()) {
+            mark_live_volatile_stamps_stale(false);
+        }
         (void)refresh_threads();
         refresh_runtime_and_handlers();
         return st;
@@ -831,6 +919,9 @@ private:
             : peelf::SubsystemStatus::unavailable("process", res.error().message);
         if (!st.ok() && !st.detail.empty()) {
             last_diagnostic_ = st.detail;
+        }
+        if (st.ok()) {
+            mark_live_volatile_stamps_stale(true);
         }
         (void)refresh_threads();
         refresh_runtime_and_handlers();
@@ -857,6 +948,9 @@ private:
         const peelf::SubsystemStatus st = res
             ? peelf::SubsystemStatus::available("thread", "Thread resumed")
             : peelf::SubsystemStatus::unavailable("thread", res.error().message);
+        if (st.ok()) {
+            mark_live_volatile_stamps_stale(true);
+        }
         (void)refresh_threads();
         return st;
     }
@@ -865,6 +959,8 @@ private:
         if (!is_live_process()) {
             threads_.clear();
             threads_status_ = peelf::SubsystemStatus::unavailable("process", "Not attached to a live process");
+            threads_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+            selected_thread_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
             selected_tid_.reset();
             selected_thread_context_ = {};
             selected_thread_stack_ = {};
@@ -880,6 +976,8 @@ private:
         if (!listed) {
             threads_.clear();
             threads_status_ = peelf::SubsystemStatus::unavailable("process", listed.error().message);
+            threads_stamp_ = advance_live_capture_stamp(peelf::CaptureAvailability::Unavailable);
+            selected_thread_stamp_ = threads_stamp_;
             selected_tid_.reset();
             selected_thread_context_ = {};
             selected_thread_stack_ = {};
@@ -896,6 +994,7 @@ private:
         threads_status_ = peelf::SubsystemStatus::available(
             "process",
             std::to_string(threads_.size()) + " thread(s) discovered");
+        threads_stamp_ = advance_live_capture_stamp(peelf::CaptureAvailability::Complete);
 
         bool keep_selected = false;
         if (selected_tid_) {
@@ -915,8 +1014,12 @@ private:
         }
 
         if (selected_tid_) {
+            const bool was_coordinated = in_coordinated_attach_;
+            in_coordinated_attach_ = true;
             refresh_selected_thread_inspection();
+            in_coordinated_attach_ = was_coordinated;
         } else {
+            selected_thread_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
             selected_thread_context_ = {};
             selected_thread_stack_ = {};
             selected_thread_locals_ = {};
@@ -936,6 +1039,7 @@ private:
 
     void BinaryModel::refresh_selected_thread_inspection() {
         if (!is_live_process() || !selected_tid_) {
+            selected_thread_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
             selected_thread_context_ = {};
             selected_thread_stack_ = {};
             selected_thread_locals_ = {};
@@ -949,6 +1053,12 @@ private:
             .value = ctx,
             .status = ctx.status,
         };
+        const peelf::CaptureAvailability ctx_avail =
+            ctx.status.availability == peelf::Availability::Available
+                ? peelf::CaptureAvailability::Complete
+                : (ctx.status.has_data() ? peelf::CaptureAvailability::Partial
+                                         : peelf::CaptureAvailability::Unavailable);
+        selected_thread_stamp_ = advance_live_capture_stamp(ctx_avail);
 
         const peelf::ThreadInfo* matched_tinfo = nullptr;
         for (const peelf::ThreadInfo& th : threads_) {
@@ -1138,6 +1248,13 @@ private:
                 "security_audit",
                 "Open a PE/ELF image or attach to a process to evaluate security rules");
         }
+        if (is_live_process() && session_ != nullptr) {
+            const peelf::CaptureAvailability rt_avail =
+                process_env_.core_status.availability == peelf::Availability::Available
+                    ? peelf::CaptureAvailability::Complete
+                    : peelf::CaptureAvailability::Partial;
+            runtime_stamp_ = advance_live_capture_stamp(rt_avail);
+        }
     }
 
     void BinaryModel::refresh_process_internals() {
@@ -1150,10 +1267,23 @@ private:
             process_internals_.security.status = peelf::SubsystemStatus::unavailable(
                 "process", "Not attached to a live process");
             process_internals_loaded_ = false;
+            process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
             return;
         }
         process_internals_ = peelf::inspect_process_internals(*session_);
         process_internals_loaded_ = true;
+        const bool all_ok =
+            process_internals_.handles.status.availability == peelf::Availability::Available &&
+            process_internals_.sockets.status.availability == peelf::Availability::Available &&
+            process_internals_.security.status.availability == peelf::Availability::Available;
+        const bool any_data =
+            process_internals_.handles.has_value() ||
+            process_internals_.sockets.has_value() ||
+            process_internals_.security.has_value();
+        process_internals_stamp_ = advance_live_capture_stamp(
+            all_ok ? peelf::CaptureAvailability::Complete
+                   : (any_data ? peelf::CaptureAvailability::Partial
+                               : peelf::CaptureAvailability::Unavailable));
         const peelf::ProcessSecurityProfile* cached_sec =
             process_internals_.security.has_value() ? &(*process_internals_.security.value) : nullptr;
         if (image_ != nullptr) {

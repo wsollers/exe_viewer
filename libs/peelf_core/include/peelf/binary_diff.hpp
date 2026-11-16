@@ -15,6 +15,7 @@
 #include <peelf/error.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/process.hpp>
+#include <peelf/provenance.hpp>
 
 namespace peelf {
 
@@ -285,6 +286,10 @@ struct LiveModuleIntegrityReport {
     std::uint64_t live_base_address{0};
     std::int64_t aslr_load_bias{0};
     std::string disk_sha256{};
+    ProvenanceTag disk_provenance{ProvenanceTag::DiskFile};
+    ProvenanceTag live_provenance{ProvenanceTag::LiveMemory};
+    CaptureStamp live_capture_stamp{};
+    BackingIdentityMatchResult backing_identity{};
 
     std::size_t normalized_relocation_count{0};
     std::size_t normalized_loader_slot_count{0};

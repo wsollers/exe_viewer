@@ -1,4 +1,5 @@
 #include "ui_panels_process_internals.hpp"
+#include "ui_panels_capabilities.hpp"
 
 #include <imgui.h>
 
@@ -80,6 +81,7 @@ void ProcessInternalsPanel::draw_contents() {
         ImGui::SameLine();
         ImGui::TextDisabled("| Total OS Handles/FDs: %" PRIu32, *snap.total_os_handle_count);
     }
+    ui_provenance::draw_capture_stamp_badge("Internals", model_.process_internals_stamp());
 
     ImGui::Separator();
 

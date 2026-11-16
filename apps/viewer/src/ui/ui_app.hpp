@@ -22,6 +22,7 @@
 #include "ui_panels_dependencies.hpp"
 #include "ui_panels_diff.hpp"
 #include "ui_panels_debugger.hpp"
+#include "ui_panels_capabilities.hpp"
 #include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
@@ -174,6 +175,7 @@ namespace viewer {
         DependenciesPanel dependencies_panel_;
         BinaryDiffPanel binary_diff_panel_;
         DebuggerPanel   debugger_panel_;
+        CapabilityMatrixPanel capabilities_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;

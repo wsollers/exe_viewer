@@ -471,7 +471,8 @@ void enrich_symbol_index(
     SymbolIndex& symbol_index,
     const std::string& name,
     std::uint64_t va,
-    std::uint64_t size) {
+    std::uint64_t size,
+    bool heuristic_discovered = false) {
     const std::uint64_t lookup_va =
         image.architecture() == peelf::Architecture::ARM
             ? (va & ~std::uint64_t{1u})
@@ -485,6 +486,7 @@ void enrich_symbol_index(
         .size = size,
         .dynamic = false,
         .external = false,
+        .heuristic_discovered = heuristic_discovered,
         .function = true,
         .library = {},
     });
@@ -920,7 +922,7 @@ FunctionIndex FunctionIndex::discover(
                                     !by_va.contains(callee_va) &&
                                     is_executable_address(image, callee_va)) {
                                     std::string sub_name = std::format("sub_{:X}", callee_va);
-                                    enrich_symbol_index(image, symbol_index, sub_name, callee_va, 0u);
+                                    enrich_symbol_index(image, symbol_index, sub_name, callee_va, 0u, true);
                                     upsert_function(
                                         by_va,
                                         build_entry(

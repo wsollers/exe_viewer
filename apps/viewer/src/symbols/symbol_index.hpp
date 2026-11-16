@@ -40,6 +40,7 @@ struct SymbolRecord {
     std::uint64_t size = 0;
     bool dynamic = false;
     bool external = false;
+    bool heuristic_discovered = false;
     // Known PDB/DWARF classification; other symbol formats use executable section membership.
     std::optional<bool> function{};
     std::string library{};

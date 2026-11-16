@@ -64,6 +64,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
           [this](std::uint64_t address, PreferredView view) { navigate_to_address(address, view); },
           [this]() { on_process_attached(); },
           [this]() { open_attach_process_modal(); })
+    , capabilities_panel_(model)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -75,6 +76,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     process_internals_panel_.set_visible(false);
     binary_diff_panel_.set_visible(false);
     debugger_panel_.set_visible(false);
+    capabilities_panel_.set_visible(false);
     dependencies_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
@@ -569,6 +571,11 @@ void UiApp::render() {
             }
         }
         ImGui::SameLine();
+        if (ImGui::Button("Capabilities")) {
+            capabilities_panel_.set_visible(true);
+            activate_panel(capabilities_panel_.name().c_str());
+        }
+        ImGui::SameLine();
         ImGui::BeginDisabled(!model_.has_file());
         if (ImGui::Button("Functions")) {
             functions_panel_.set_visible(true);
@@ -710,6 +717,7 @@ void UiApp::render() {
     dependencies_panel_.draw();
     binary_diff_panel_.draw();
     debugger_panel_.draw();
+    capabilities_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());

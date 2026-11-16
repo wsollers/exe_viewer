@@ -103,7 +103,67 @@ using detail::utf8_path;
         process_internals_ = {};
         process_internals_loaded_ = false;
         thread_cpu_tracker_.reset();
+        target_profile_ = {};
+        capability_matrix_ = peelf::capabilities_for(target_profile_, provider_facts_);
+        target_instance_id_ = {};
+        backing_identity_status_ = {};
+        next_capture_revision_ = 0;
+        in_coordinated_attach_ = false;
+        static_image_stamp_ = {};
+        memory_map_stamp_ = {};
+        threads_stamp_ = {};
+        selected_thread_stamp_ = {};
+        runtime_stamp_ = {};
+        process_internals_stamp_ = {};
         last_diagnostic_.clear();
+    }
+
+    void BinaryModel::recompute_capabilities() noexcept {
+        const bool dbg_active = debug_session_ != nullptr ||
+                                (session_ != nullptr && !session_->is_read_only() && !session_->is_crash_dump());
+        target_profile_ = peelf::derive_target_profile(
+            image_.get(),
+            is_live_process() ? session_.get() : nullptr,
+            dbg_active,
+            false);
+        if (!is_live_process() && source_kind_ == BinarySourceKind::None) {
+            target_profile_ = {};
+        }
+        capability_matrix_ = peelf::capabilities_for(target_profile_, provider_facts_);
+    }
+
+    void BinaryModel::set_provider_facts(peelf::ProviderFacts facts) noexcept {
+        provider_facts_ = facts;
+        recompute_capabilities();
+    }
+
+    void BinaryModel::mark_live_volatile_stamps_stale(bool include_paused_stamps) noexcept {
+        auto degrade = [include_paused_stamps](peelf::CaptureStamp& stamp) noexcept {
+            if (stamp.availability == peelf::CaptureAvailability::Complete ||
+                stamp.availability == peelf::CaptureAvailability::Partial) {
+                if (include_paused_stamps || !stamp.target_paused) {
+                    stamp.availability = peelf::CaptureAvailability::Stale;
+                }
+            }
+        };
+        degrade(memory_map_stamp_);
+        degrade(threads_stamp_);
+        degrade(selected_thread_stamp_);
+        degrade(runtime_stamp_);
+        degrade(process_internals_stamp_);
+    }
+
+    peelf::CaptureStamp BinaryModel::advance_live_capture_stamp(
+        peelf::CaptureAvailability availability) noexcept {
+        const bool paused = is_process_suspended() || is_crash_dump();
+        if (!in_coordinated_attach_ && !paused) {
+            mark_live_volatile_stamps_stale(false);
+        }
+        return peelf::CaptureStamp::capture_now(
+            target_instance_id_,
+            ++next_capture_revision_,
+            paused,
+            availability);
     }
 
     std::string BinaryModel::current_debug_symbol_key() const {
@@ -272,6 +332,7 @@ using detail::utf8_path;
             rec.size = fn.size;
             rec.source = SymbolSource::DebugSymbol;
             rec.function = true;
+            rec.heuristic_discovered = true;
             symbol_index_.add_discovered_symbol(std::move(rec));
         }
 
@@ -338,8 +399,32 @@ using detail::utf8_path;
                 if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
+                const peelf::BackingImageIdentity bid = peelf::extract_backing_image_identity(
+                    *image_, bytes_);
+                target_instance_id_ = peelf::TargetInstanceId{
+                    .backend = peelf::BackendKind::StaticFile,
+                    .pid = 0u,
+                    .creation_identity = std::nullopt,
+                    .image_sha256 = content_sha256(),
+                    .build_id_or_pdb_guid = bid.primary_identifier(),
+                };
+                static_image_stamp_ = peelf::CaptureStamp::capture_now(
+                    target_instance_id_,
+                    ++next_capture_revision_,
+                    true,
+                    peelf::CaptureAvailability::Complete);
+                memory_map_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                threads_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                selected_thread_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
                 (void)auto_load_debug_info_for_current_image(utf8_path(path));
                 rebuild_symbol_index();
+                runtime_stamp_ = peelf::CaptureStamp::capture_now(
+                    target_instance_id_,
+                    ++next_capture_revision_,
+                    true,
+                    peelf::CaptureAvailability::Partial);
+                recompute_capabilities();
             }
             return loaded;
         }
@@ -353,8 +438,32 @@ using detail::utf8_path;
                 if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
+                const peelf::BackingImageIdentity bid = peelf::extract_backing_image_identity(
+                    *image_, bytes_);
+                target_instance_id_ = peelf::TargetInstanceId{
+                    .backend = peelf::BackendKind::StaticFile,
+                    .pid = 0u,
+                    .creation_identity = std::nullopt,
+                    .image_sha256 = content_sha256(),
+                    .build_id_or_pdb_guid = bid.primary_identifier(),
+                };
+                static_image_stamp_ = peelf::CaptureStamp::capture_now(
+                    target_instance_id_,
+                    ++next_capture_revision_,
+                    true,
+                    peelf::CaptureAvailability::Complete);
+                memory_map_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                threads_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                selected_thread_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
                 (void)auto_load_debug_info_for_current_image(utf8_path(path));
                 rebuild_symbol_index();
+                runtime_stamp_ = peelf::CaptureStamp::capture_now(
+                    target_instance_id_,
+                    ++next_capture_revision_,
+                    true,
+                    peelf::CaptureAvailability::Partial);
+                recompute_capabilities();
             }
             return loaded;
         }
@@ -448,6 +557,217 @@ using detail::utf8_path;
         }
 
         return {};
+    }
+
+    peelf::Observed<ResolvedSymbolInfo> BinaryModel::resolve_symbol_with_provenance(
+        std::uint64_t virtual_address) const {
+        const peelf::CaptureStamp& base_stamp =
+            is_live_process() ? memory_map_stamp_ : static_image_stamp_;
+        const peelf::ProvenanceTag base_tag =
+            is_crash_dump() ? peelf::ProvenanceTag::CrashDump
+                            : (is_live_process() ? peelf::ProvenanceTag::LiveMemory
+                                                 : peelf::ProvenanceTag::DiskFile);
+        if (virtual_address == 0) {
+            return peelf::Observed<ResolvedSymbolInfo>::unavailable(
+                base_tag,
+                "Virtual address 0x0 does not correspond to a resolved symbol",
+                base_stamp);
+        }
+
+        std::string module_prefix;
+        if (is_live_process()) {
+            if (const peelf::ModuleInfo* act = active_module()) {
+                if (virtual_address >= act->base_address &&
+                    virtual_address < act->base_address + std::max<std::uint64_t>(act->size, live_window_size_)) {
+                    module_prefix = !act->name.empty() ? act->name : act->path.filename().string();
+                }
+            }
+        }
+
+        const peelf::ProvenanceTag live_tag =
+            is_crash_dump() ? peelf::ProvenanceTag::CrashDump : peelf::ProvenanceTag::LiveMemory;
+
+        if (const SymbolRecord* sym = symbol_index_.find_containing_address(virtual_address);
+            sym != nullptr && sym->virtual_address.has_value()) {
+            const std::uint64_t delta = virtual_address - *sym->virtual_address;
+            const std::uint64_t limit = sym->size != 0 ? sym->size : 0x4000u;
+            if (delta == 0 || delta < limit) {
+                const std::string& sname = sym->display_name(demangle_symbols_);
+                std::string label = module_prefix.empty() ? sname : (module_prefix + "!" + sname);
+                if (delta != 0) {
+                    label += "+" + format_hex_addr(delta);
+                }
+
+                ResolvedSymbolInfo info;
+                info.display_label = std::move(label);
+                info.symbol_name = sname;
+                info.module_name = module_prefix;
+                info.source = sym->source;
+                info.symbol_va = *sym->virtual_address;
+                info.offset = delta;
+                info.heuristic_discovered = sym->heuristic_discovered;
+                info.backing_identity_verified = !backing_identity_status_.has_mismatch();
+
+                peelf::ProvenanceTag primary_tag = peelf::ProvenanceTag::DiskFile;
+                std::vector<peelf::Evidence> evidence;
+                if (sym->heuristic_discovered) {
+                    primary_tag = peelf::ProvenanceTag::HeuristicInference;
+                    evidence.push_back(peelf::Evidence{
+                        .tag = peelf::ProvenanceTag::HeuristicInference,
+                        .source = "symbol_index_heuristic",
+                        .detail = "Heuristically discovered function boundary (prologue/call-target scan)",
+                        .virtual_address = *sym->virtual_address,
+                    });
+                } else if (sym->source == SymbolSource::DebugSymbol) {
+                    primary_tag = peelf::ProvenanceTag::DebugSymbols;
+                    evidence.push_back(peelf::Evidence{
+                        .tag = peelf::ProvenanceTag::DebugSymbols,
+                        .source = "dwarf_pdb_symbols",
+                        .detail = "Resolved from DWARF/PDB debug symbol table",
+                        .virtual_address = *sym->virtual_address,
+                    });
+                } else {
+                    const bool from_disk = !is_live_process() || !live_backing_file_bytes_.empty();
+                    primary_tag = from_disk ? peelf::ProvenanceTag::DiskFile : live_tag;
+                    evidence.push_back(peelf::Evidence{
+                        .tag = primary_tag,
+                        .source = from_disk ? "disk_symbol_table" : "mapped_symbol_table",
+                        .detail = from_disk
+                                      ? "Resolved from on-disk PE/ELF symbol/export table"
+                                      : "Resolved from mapped module symbol/export table",
+                        .virtual_address = *sym->virtual_address,
+                    });
+                }
+
+                if (is_live_process()) {
+                    evidence.push_back(peelf::Evidence{
+                        .tag = live_tag,
+                        .source = "live_module_rebase",
+                        .detail = "Rebased to live module load address",
+                        .virtual_address = virtual_address,
+                    });
+                }
+
+                if (backing_identity_status_.has_mismatch()) {
+                    return peelf::Observed<ResolvedSymbolInfo>::partial(
+                        std::move(info),
+                        primary_tag,
+                        backing_identity_status_.summary,
+                        base_stamp,
+                        std::move(evidence));
+                }
+
+                peelf::Observed<ResolvedSymbolInfo> out;
+                out.value = std::move(info);
+                out.provenance = primary_tag;
+                out.availability = base_stamp.availability;
+                out.stamp = base_stamp;
+                out.evidence = std::move(evidence);
+                if (base_stamp.availability == peelf::CaptureAvailability::Stale) {
+                    out.note = "Underlying module map capture is stale relative to newer process activity";
+                }
+                return out;
+            }
+        }
+
+        if (const FunctionEntry* fn = function_index_.find_containing(virtual_address);
+            fn != nullptr && fn->virtual_address != 0u) {
+            const std::uint64_t delta = virtual_address - fn->virtual_address;
+            const std::string& sname = fn->display_name(demangle_symbols_);
+            std::string label = module_prefix.empty() ? sname : (module_prefix + "!" + sname);
+            if (delta != 0u) {
+                label += "+" + format_hex_addr(delta);
+            }
+
+            const bool is_heuristic = (fn->origin == FunctionOrigin::CallTargetDiscovery);
+            ResolvedSymbolInfo info;
+            info.display_label = std::move(label);
+            info.symbol_name = sname;
+            info.module_name = module_prefix;
+            info.source = SymbolSource::ImageSymbol;
+            info.symbol_va = fn->virtual_address;
+            info.offset = delta;
+            info.heuristic_discovered = is_heuristic;
+            info.backing_identity_verified = !backing_identity_status_.has_mismatch();
+
+            const peelf::ProvenanceTag primary_tag = is_heuristic
+                ? peelf::ProvenanceTag::HeuristicInference
+                : (!is_live_process() || !live_backing_file_bytes_.empty()
+                       ? peelf::ProvenanceTag::DiskFile
+                       : live_tag);
+            std::vector<peelf::Evidence> evidence;
+            evidence.push_back(peelf::Evidence{
+                .tag = primary_tag,
+                .source = is_heuristic ? "function_index_call_target" : "function_index",
+                .detail = std::string(to_string(fn->origin)),
+                .virtual_address = fn->virtual_address,
+            });
+            if (is_live_process()) {
+                evidence.push_back(peelf::Evidence{
+                    .tag = live_tag,
+                    .source = "live_module_rebase",
+                    .detail = "Rebased to live module load address",
+                    .virtual_address = virtual_address,
+                });
+            }
+            if (backing_identity_status_.has_mismatch()) {
+                return peelf::Observed<ResolvedSymbolInfo>::partial(
+                    std::move(info),
+                    primary_tag,
+                    backing_identity_status_.summary,
+                    base_stamp,
+                    std::move(evidence));
+            }
+            peelf::Observed<ResolvedSymbolInfo> out;
+            out.value = std::move(info);
+            out.provenance = primary_tag;
+            out.availability = base_stamp.availability;
+            out.stamp = base_stamp;
+            out.evidence = std::move(evidence);
+            if (base_stamp.availability == peelf::CaptureAvailability::Stale) {
+                out.note = "Underlying module map capture is stale relative to newer process activity";
+            }
+            return out;
+        }
+
+        if (is_live_process()) {
+            for (const peelf::ModuleInfo& mod : modules_) {
+                if (virtual_address >= mod.base_address &&
+                    virtual_address < mod.base_address + std::max<std::uint64_t>(mod.size, 1u)) {
+                    const std::string mname = !mod.name.empty()
+                        ? mod.name
+                        : (!mod.path.empty() ? mod.path.filename().string() : "module");
+                    const std::uint64_t rva = virtual_address - mod.base_address;
+                    ResolvedSymbolInfo info;
+                    info.display_label = rva == 0 ? mname : (mname + "+" + format_hex_addr(rva));
+                    info.symbol_name = {};
+                    info.module_name = mname;
+                    info.symbol_va = mod.base_address;
+                    info.offset = rva;
+                    info.backing_identity_verified = !backing_identity_status_.has_mismatch();
+
+                    const peelf::ProvenanceTag mod_tag = is_crash_dump()
+                        ? peelf::ProvenanceTag::CrashDump
+                        : peelf::ProvenanceTag::ProcOrOsApi;
+                    return peelf::Observed<ResolvedSymbolInfo>::partial(
+                        std::move(info),
+                        mod_tag,
+                        "No symbol table entry covers this virtual address",
+                        base_stamp,
+                        {peelf::Evidence{
+                            .tag = mod_tag,
+                            .source = "module_map",
+                            .detail = "Module base offset only (no matching symbol record)",
+                            .virtual_address = virtual_address,
+                        }});
+                }
+            }
+        }
+
+        return peelf::Observed<ResolvedSymbolInfo>::unavailable(
+            base_tag,
+            "No symbol or mapped module covers this virtual address",
+            base_stamp);
     }
 
     void BinaryModel::add_debug_symbols(std::span<const DebugSymbol> symbols) {

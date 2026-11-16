@@ -2,12 +2,14 @@
 
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
+#include <peelf/capability_matrix.hpp>
 #include <peelf/crash_dump.hpp>
 #include <peelf/dependency_tree.hpp>
 #include <peelf/error.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
+#include <peelf/provenance.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -162,6 +164,10 @@ struct HeadlessAnalysisReport {
     std::uint64_t file_size{0};
     std::unique_ptr<IBinaryImage> image{};
     std::unique_ptr<ICrashDumpSession> crash_dump{};
+    TargetProfile target_profile{};
+    TargetCapabilityMatrix capabilities{};
+    CaptureStamp analysis_stamp{};
+    ProvenanceTag primary_provenance{ProvenanceTag::DiskFile};
     DependencyGraph dependencies{};
     SecurityAuditReport security{};
     bool strings_included{false};

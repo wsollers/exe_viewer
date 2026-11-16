@@ -1,4 +1,5 @@
 #include "ui_panels_diff.hpp"
+#include "ui_panels_capabilities.hpp"
 
 #include "logger.hpp"
 
@@ -521,6 +522,16 @@ void BinaryDiffPanel::draw_overview_tab() {
         }
     } else if (mode_ == ActiveDiffMode::DiskVsLiveRam && live_report_.has_value()) {
         const auto& lr = *live_report_;
+        ImGui::TextDisabled("Sources:");
+        ImGui::SameLine();
+        ui_provenance::draw_provenance_badge(lr.disk_provenance, lr.disk_path);
+        ImGui::SameLine();
+        ImGui::TextDisabled("vs");
+        ImGui::SameLine();
+        ui_provenance::draw_provenance_badge(lr.live_provenance, lr.module_name);
+        ImGui::SameLine();
+        ui_provenance::draw_capture_stamp_badge("LiveDiff", lr.live_capture_stamp);
+        ui_provenance::draw_backing_identity_banner(lr.backing_identity);
         ImGui::Text("Module: %s", lr.module_name.c_str());
         ImGui::Text("Backing Disk File: %s", lr.disk_path.c_str());
         ImGui::Text("Disk SHA-256: %s", lr.disk_sha256.c_str());

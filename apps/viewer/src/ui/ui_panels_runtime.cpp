@@ -1,4 +1,5 @@
 #include "ui_panels.hpp"
+#include "ui_panels_capabilities.hpp"
 
 #include <imgui.h>
 
@@ -97,6 +98,8 @@ void RuntimeAndFlagsPanel::draw_contents() {
     if (ImGui::SmallButton("Refresh")) {
         model_.refresh_runtime_and_handlers();
     }
+    ImGui::SameLine();
+    ui_provenance::draw_capture_stamp_badge("Runtime", model_.runtime_stamp());
 
     if (ImGui::BeginTabBar("RuntimeAndFlagsTabs")) {
         if (ImGui::BeginTabItem("Security Audit (BinSkim)")) {

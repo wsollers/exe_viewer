@@ -17,6 +17,7 @@
 #include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_image.hpp>
+#include <peelf/capability_matrix.hpp>
 #include <peelf/crash_dump.hpp>
 #include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
@@ -27,6 +28,7 @@
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
+#include <peelf/provenance.hpp>
 #include <peelf/runtime_structures.hpp>
 #include <peelf/security_audit.hpp>
 #include <peelf/stack_tls.hpp>
@@ -71,6 +73,17 @@ namespace viewer {
         std::uint64_t size_bytes = 0;
         std::uint64_t entry_point = 0;
         std::vector<std::string> flags;
+    };
+
+    struct ResolvedSymbolInfo {
+        std::string display_label{};
+        std::string symbol_name{};
+        std::string module_name{};
+        SymbolSource source{SymbolSource::ImageSymbol};
+        std::uint64_t symbol_va{0};
+        std::uint64_t offset{0};
+        bool heuristic_discovered{false};
+        bool backing_identity_verified{true};
     };
 
     class BinaryModel {
@@ -330,6 +343,47 @@ namespace viewer {
         }
         [[nodiscard]] const std::string& content_sha256() const;
 
+        // Target capability matrix & per-collection provenance envelope (WU-21).
+        [[nodiscard]] peelf::Observed<ResolvedSymbolInfo> resolve_symbol_with_provenance(
+            std::uint64_t virtual_address) const;
+        [[nodiscard]] const peelf::TargetProfile& target_profile() const noexcept {
+            return target_profile_;
+        }
+        [[nodiscard]] const peelf::ProviderFacts& provider_facts() const noexcept {
+            return provider_facts_;
+        }
+        void set_provider_facts(peelf::ProviderFacts facts) noexcept;
+        [[nodiscard]] const peelf::TargetCapabilityMatrix& capability_matrix() const noexcept {
+            return capability_matrix_;
+        }
+        [[nodiscard]] const peelf::TargetInstanceId& target_instance_id() const noexcept {
+            return target_instance_id_;
+        }
+        [[nodiscard]] const peelf::BackingIdentityMatchResult& backing_identity_status() const noexcept {
+            return backing_identity_status_;
+        }
+        [[nodiscard]] const peelf::CaptureStamp& static_image_stamp() const noexcept {
+            return static_image_stamp_;
+        }
+        [[nodiscard]] const peelf::CaptureStamp& memory_map_stamp() const noexcept {
+            return memory_map_stamp_;
+        }
+        [[nodiscard]] const peelf::CaptureStamp& threads_stamp() const noexcept {
+            return threads_stamp_;
+        }
+        [[nodiscard]] const peelf::CaptureStamp& selected_thread_stamp() const noexcept {
+            return selected_thread_stamp_;
+        }
+        [[nodiscard]] const peelf::CaptureStamp& runtime_stamp() const noexcept {
+            return runtime_stamp_;
+        }
+        [[nodiscard]] const peelf::CaptureStamp& process_internals_stamp() const noexcept {
+            return process_internals_stamp_;
+        }
+        [[nodiscard]] std::uint64_t current_capture_revision() const noexcept {
+            return next_capture_revision_;
+        }
+
     private:
         BinarySourceKind source_kind_ = BinarySourceKind::None;
         LiveViewTargetKind live_target_kind_ = LiveViewTargetKind::None;
@@ -403,12 +457,31 @@ namespace viewer {
         bool process_internals_loaded_{false};
         peelf::ThreadCpuTracker thread_cpu_tracker_{};
 
+        peelf::ProviderFacts provider_facts_{peelf::ProviderFacts::detect_host_providers()};
+        peelf::TargetProfile target_profile_{};
+        peelf::TargetCapabilityMatrix capability_matrix_{
+            peelf::capabilities_for(peelf::TargetProfile{}, provider_facts_)};
+        peelf::TargetInstanceId target_instance_id_{};
+        peelf::BackingIdentityMatchResult backing_identity_status_{};
+        std::uint64_t next_capture_revision_{0};
+        bool in_coordinated_attach_{false};
+        peelf::CaptureStamp static_image_stamp_{};
+        peelf::CaptureStamp memory_map_stamp_{};
+        peelf::CaptureStamp threads_stamp_{};
+        peelf::CaptureStamp selected_thread_stamp_{};
+        peelf::CaptureStamp runtime_stamp_{};
+        peelf::CaptureStamp process_internals_stamp_{};
+
         mutable std::string last_diagnostic_;
         mutable std::string cached_content_sha256_;
         mutable std::uint64_t cached_sha256_generation_ = std::numeric_limits<std::uint64_t>::max();
         mutable std::uint64_t cached_sha256_revision_ = std::numeric_limits<std::uint64_t>::max();
 
         void reset_all();
+        void recompute_capabilities() noexcept;
+        [[nodiscard]] peelf::CaptureStamp advance_live_capture_stamp(
+            peelf::CaptureAvailability availability) noexcept;
+        void mark_live_volatile_stamps_stale(bool include_paused_stamps) noexcept;
         [[nodiscard]] std::string current_debug_symbol_key() const;
         void store_debug_symbol_result_for_key(const std::string& key, const DebugSymbolLoadResult& result);
         bool auto_load_debug_info_for_current_image(const std::filesystem::path& image_path);

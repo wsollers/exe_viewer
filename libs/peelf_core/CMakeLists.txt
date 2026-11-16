@@ -47,12 +47,17 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/debugger_common.cpp
   src/debugger_linux.cpp
   src/debugger_win32.cpp
+  src/provenance.cpp
+  src/capability_matrix.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
   include/peelf/error.hpp
   include/peelf/sha256.hpp
   include/peelf/forgiving.hpp
+  include/peelf/provenance.hpp
+  include/peelf/capability_matrix.hpp
+  include/peelf/capabilities.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
   include/peelf/binary_diff.hpp

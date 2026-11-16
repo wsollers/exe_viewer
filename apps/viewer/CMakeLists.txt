@@ -85,6 +85,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_diff.cpp
         src/ui/ui_panels_debugger.hpp
         src/ui/ui_panels_debugger.cpp
+        src/ui/ui_panels_capabilities.hpp
+        src/ui/ui_panels_capabilities.cpp
         src/analysis/async_binary_diff.hpp
         src/analysis/async_binary_diff.cpp
         src/analysis/function_index.hpp

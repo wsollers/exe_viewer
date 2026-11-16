@@ -1,4 +1,5 @@
 #include "ui_panels.hpp"
+#include "ui_panels_capabilities.hpp"
 
 #include <cinttypes>
 #include <cstdint>
@@ -164,6 +165,18 @@ void SelectionDetailsPanel::draw_contents() {
                     }
                     if (!sym->library.empty()) {
                         ImGui::TextWrapped("Unit / Library: %s", sym->library.c_str());
+                    }
+                    const auto resolved = model_->resolve_symbol_with_provenance(va);
+                    if (!resolved.evidence.empty()) {
+                        ImGui::TextDisabled("Provenance:");
+                        ImGui::SameLine();
+                        ui_provenance::draw_evidence_badges(resolved.evidence);
+                    }
+                    ui_provenance::draw_capture_stamp_badge("SymbolStamp", resolved.stamp);
+                    if (!resolved.note.empty()) {
+                        ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.28f, 1.0f),
+                                           "Note: %s",
+                                           resolved.note.c_str());
                     }
                 }
                 if (src != nullptr) {

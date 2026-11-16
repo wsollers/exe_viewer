@@ -366,7 +366,8 @@ void UiApp::render_main_menu() {
                 symbols_panel_.set_visible(v);
         }
 
-        for (UiPanel* extra : {static_cast<UiPanel*>(&debugger_panel_),
+        for (UiPanel* extra : {static_cast<UiPanel*>(&capabilities_panel_),
+                               static_cast<UiPanel*>(&debugger_panel_),
                                static_cast<UiPanel*>(&binary_diff_panel_),
                                static_cast<UiPanel*>(&dependencies_panel_),
                                static_cast<UiPanel*>(&functions_panel_),
@@ -499,6 +500,7 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
     ImGui::DockBuilderDockWindow("Data Structures", left_id);
 
     ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), right_id);
+    ImGui::DockBuilderDockWindow(capabilities_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(threads_panel_.name().c_str(), right_id);
     ImGui::DockBuilderDockWindow(thread_locals_panel_.name().c_str(), right_id);

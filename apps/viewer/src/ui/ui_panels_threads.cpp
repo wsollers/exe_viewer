@@ -1,4 +1,5 @@
 #include "ui_panels.hpp"
+#include "ui_panels_capabilities.hpp"
 
 #include <imgui.h>
 
@@ -121,6 +122,11 @@ void ThreadsAndStackPanel::draw_contents() {
     }
 
     draw_status_banner("Threads", model_.threads_status());
+    ui_provenance::draw_capture_stamp_badge("Threads", model_.threads_stamp());
+    if (model_.selected_thread_id().has_value()) {
+        ImGui::SameLine();
+        ui_provenance::draw_capture_stamp_badge("Context", model_.selected_thread_stamp());
+    }
     if (!status_note_.empty()) {
         ImGui::TextWrapped("%s", status_note_.c_str());
     }
