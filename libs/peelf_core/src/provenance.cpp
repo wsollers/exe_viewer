@@ -155,16 +155,27 @@ std::optional<std::uint64_t> query_process_creation_identity(ProcessId pid) noex
         return std::nullopt;
     }
 #elif defined(_WIN32)
-    HANDLE proc = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
-    if (proc == nullptr) {
+    struct ScopedWinHandle {
+        HANDLE handle{nullptr};
+        explicit ScopedWinHandle(HANDLE h) noexcept : handle(h) {}
+        ~ScopedWinHandle() noexcept {
+            if (handle != nullptr && handle != INVALID_HANDLE_VALUE) {
+                ::CloseHandle(handle);
+            }
+        }
+        ScopedWinHandle(const ScopedWinHandle&) = delete;
+        ScopedWinHandle& operator=(const ScopedWinHandle&) = delete;
+    };
+    const ScopedWinHandle proc(
+        ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid)));
+    if (proc.handle == nullptr || proc.handle == INVALID_HANDLE_VALUE) {
         return std::nullopt;
     }
     FILETIME creation_ft{};
     FILETIME exit_ft{};
     FILETIME kernel_ft{};
     FILETIME user_ft{};
-    const BOOL ok = ::GetProcessTimes(proc, &creation_ft, &exit_ft, &kernel_ft, &user_ft);
-    ::CloseHandle(proc);
+    const BOOL ok = ::GetProcessTimes(proc.handle, &creation_ft, &exit_ft, &kernel_ft, &user_ft);
     if (!ok) {
         return std::nullopt;
     }

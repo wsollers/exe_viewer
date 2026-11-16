@@ -96,6 +96,29 @@ namespace {
     return tid > 0 ? static_cast<ThreadId>(tid) : 0u;
 }
 
+struct ScopedFd {
+    int fd{-1};
+    ScopedFd() noexcept = default;
+    explicit ScopedFd(int f) noexcept : fd(f) {}
+    ~ScopedFd() noexcept { reset(); }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept : fd(std::exchange(other.fd, -1)) {}
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.fd, -1));
+        }
+        return *this;
+    }
+    [[nodiscard]] explicit operator bool() const noexcept { return fd >= 0; }
+    void reset(int next = -1) noexcept {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        fd = next;
+    }
+};
+
 struct ProcReadResult {
     std::vector<std::uint8_t> bytes;
     int err{0};
@@ -106,8 +129,8 @@ struct ProcReadResult {
                                               std::size_t max_bytes = 1024u * 1024u) {
     ProcReadResult res;
     const std::string pstr = path.string();
-    const int fd = ::open(pstr.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    const ScopedFd fd(::open(pstr.c_str(), O_RDONLY | O_CLOEXEC));
+    if (!fd) {
         res.err = errno;
         return res;
     }
@@ -115,13 +138,12 @@ struct ProcReadResult {
     std::array<std::uint8_t, 4096> chunk{};
     while (res.bytes.size() < max_bytes) {
         const std::size_t to_read = std::min(chunk.size(), max_bytes - res.bytes.size());
-        const ssize_t got = ::read(fd, chunk.data(), to_read);
+        const ssize_t got = ::read(fd.fd, chunk.data(), to_read);
         if (got < 0) {
             if (errno == EINTR) {
                 continue;
             }
             res.err = errno;
-            ::close(fd);
             return res;
         }
         if (got == 0) {
@@ -132,7 +154,6 @@ struct ProcReadResult {
                          chunk.begin() + static_cast<std::ptrdiff_t>(got));
     }
 
-    ::close(fd);
     res.ok = true;
     return res;
 }
@@ -228,13 +249,12 @@ struct ProcReadResult {
                                              bool& out_is64,
                                              Endianness& out_endian) {
     const std::string pstr = exe_path.string();
-    const int fd = ::open(pstr.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    const ScopedFd fd(::open(pstr.c_str(), O_RDONLY | O_CLOEXEC));
+    if (!fd) {
         return false;
     }
     std::array<std::uint8_t, 512> hdr{};
-    const ssize_t n = ::read(fd, hdr.data(), hdr.size());
-    ::close(fd);
+    const ssize_t n = ::read(fd.fd, hdr.data(), hdr.size());
     if (n < 20) {
         return false;
     }

@@ -68,16 +68,77 @@ using GetExtendedUdpTableFn = DWORD(WINAPI*)(PVOID, PDWORD, BOOL, ULONG, UDP_TAB
 
 struct ScopedHandle {
     HANDLE h{nullptr};
-    ScopedHandle() = default;
+    ScopedHandle() noexcept = default;
     explicit ScopedHandle(HANDLE in) noexcept : h(in) {}
-    ~ScopedHandle() {
-        if (h != nullptr && h != INVALID_HANDLE_VALUE) {
-            ::CloseHandle(h);
-        }
-    }
+    ~ScopedHandle() noexcept { reset(); }
     ScopedHandle(const ScopedHandle&) = delete;
     ScopedHandle& operator=(const ScopedHandle&) = delete;
+    ScopedHandle(ScopedHandle&& other) noexcept : h(std::exchange(other.h, nullptr)) {}
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.h, nullptr));
+        }
+        return *this;
+    }
     [[nodiscard]] bool valid() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
+    void reset(HANDLE next = nullptr) noexcept {
+        if (valid()) {
+            ::CloseHandle(h);
+        }
+        h = next;
+    }
+};
+
+class ScopedModule {
+public:
+    ScopedModule() noexcept = default;
+    explicit ScopedModule(HMODULE mod) noexcept : mod_(mod) {}
+    ~ScopedModule() noexcept { reset(); }
+    ScopedModule(const ScopedModule&) = delete;
+    ScopedModule& operator=(const ScopedModule&) = delete;
+    ScopedModule(ScopedModule&& other) noexcept : mod_(std::exchange(other.mod_, nullptr)) {}
+    ScopedModule& operator=(ScopedModule&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.mod_, nullptr));
+        }
+        return *this;
+    }
+    [[nodiscard]] HMODULE get() const noexcept { return mod_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return mod_ != nullptr; }
+    void reset(HMODULE next = nullptr) noexcept {
+        if (mod_ != nullptr) {
+            ::FreeLibrary(mod_);
+        }
+        mod_ = next;
+    }
+
+private:
+    HMODULE mod_{nullptr};
+};
+
+class ScopedLocalMem {
+public:
+    ScopedLocalMem() noexcept = default;
+    explicit ScopedLocalMem(HLOCAL ptr) noexcept : ptr_(ptr) {}
+    ~ScopedLocalMem() noexcept { reset(); }
+    ScopedLocalMem(const ScopedLocalMem&) = delete;
+    ScopedLocalMem& operator=(const ScopedLocalMem&) = delete;
+    ScopedLocalMem(ScopedLocalMem&& other) noexcept : ptr_(std::exchange(other.ptr_, nullptr)) {}
+    ScopedLocalMem& operator=(ScopedLocalMem&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.ptr_, nullptr));
+        }
+        return *this;
+    }
+    void reset(HLOCAL next = nullptr) noexcept {
+        if (ptr_ != nullptr) {
+            ::LocalFree(ptr_);
+        }
+        ptr_ = next;
+    }
+
+private:
+    HLOCAL ptr_{nullptr};
 };
 
 [[nodiscard]] std::string wide_to_utf8_len(const wchar_t* wstr, int wlen) {
@@ -323,14 +384,14 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
 
     // 2. Network Sockets (iphlpapi.dll GetExtendedTcpTable / GetExtendedUdpTable)
     {
-        HMODULE iphlp = ::LoadLibraryW(L"iphlpapi.dll");
-        const auto get_tcp = iphlp != nullptr
+        const ScopedModule iphlp(::LoadLibraryW(L"iphlpapi.dll"));
+        const auto get_tcp = iphlp
             ? reinterpret_cast<GetExtendedTcpTableFn>(
-                  reinterpret_cast<void*>(::GetProcAddress(iphlp, "GetExtendedTcpTable")))
+                  reinterpret_cast<void*>(::GetProcAddress(iphlp.get(), "GetExtendedTcpTable")))
             : nullptr;
-        const auto get_udp = iphlp != nullptr
+        const auto get_udp = iphlp
             ? reinterpret_cast<GetExtendedUdpTableFn>(
-                  reinterpret_cast<void*>(::GetProcAddress(iphlp, "GetExtendedUdpTable")))
+                  reinterpret_cast<void*>(::GetProcAddress(iphlp.get(), "GetExtendedUdpTable")))
             : nullptr;
 
         if (get_tcp == nullptr || get_udp == nullptr) {
@@ -437,9 +498,6 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
             snap.sockets.status = SubsystemStatus::available(
                 "iphlpapi", std::to_string(s_count) + " TCP/UDP endpoints");
         }
-        if (iphlp != nullptr) {
-            ::FreeLibrary(iphlp);
-        }
     }
 
     // 3. Security Token, Integrity, Privileges & Mitigations
@@ -463,8 +521,8 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
                     LPWSTR sid_str = nullptr;
                     std::string sid_utf8;
                     if (::ConvertSidToStringSidW(tu->User.Sid, &sid_str) != FALSE && sid_str != nullptr) {
+                        const ScopedLocalMem sid_guard(sid_str);
                         sid_utf8 = wide_to_utf8_z(sid_str);
-                        ::LocalFree(sid_str);
                     }
                     std::array<wchar_t, 256> name_buf{};
                     std::array<wchar_t, 256> dom_buf{};

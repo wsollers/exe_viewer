@@ -314,14 +314,40 @@ void clear_x86_dr6(ThreadId) noexcept {}
 #endif
 
 [[nodiscard]] std::vector<ThreadId> list_proc_tids(ProcessId pid) {
+    class ScopedDir {
+    public:
+        explicit ScopedDir(DIR* d) noexcept : dir_(d) {}
+        ~ScopedDir() noexcept { reset(); }
+        ScopedDir(const ScopedDir&) = delete;
+        ScopedDir& operator=(const ScopedDir&) = delete;
+        ScopedDir(ScopedDir&& other) noexcept : dir_(std::exchange(other.dir_, nullptr)) {}
+        ScopedDir& operator=(ScopedDir&& other) noexcept {
+            if (this != &other) {
+                reset(std::exchange(other.dir_, nullptr));
+            }
+            return *this;
+        }
+        [[nodiscard]] DIR* get() const noexcept { return dir_; }
+        [[nodiscard]] explicit operator bool() const noexcept { return dir_ != nullptr; }
+        void reset(DIR* next = nullptr) noexcept {
+            if (dir_ != nullptr) {
+                ::closedir(dir_);
+            }
+            dir_ = next;
+        }
+
+    private:
+        DIR* dir_{nullptr};
+    };
+
     std::vector<ThreadId> out;
     const std::string dir_path = std::format("/proc/{}/task", pid);
-    DIR* dir = ::opendir(dir_path.c_str());
-    if (dir == nullptr) {
+    const ScopedDir dir(::opendir(dir_path.c_str()));
+    if (!dir) {
         out.push_back(pid);
         return out;
     }
-    while (dirent* ent = ::readdir(dir)) {
+    while (dirent* ent = ::readdir(dir.get())) {
         if (ent->d_name[0] == '.') {
             continue;
         }
@@ -331,7 +357,6 @@ void clear_x86_dr6(ThreadId) noexcept {}
             out.push_back(static_cast<ThreadId>(v));
         }
     }
-    ::closedir(dir);
     if (out.empty()) {
         out.push_back(pid);
     }

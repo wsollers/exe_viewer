@@ -66,15 +66,6 @@ namespace {
     return b > std::numeric_limits<std::uint64_t>::max() - a;
 }
 
-[[nodiscard]] constexpr std::optional<std::uint64_t> checked_add_u64(
-    std::uint64_t a,
-    std::uint64_t b) noexcept {
-    if (add_u64_overflows(a, b)) {
-        return std::nullopt;
-    }
-    return a + b;
-}
-
 [[nodiscard]] constexpr std::uint64_t saturating_add_u64(
     std::uint64_t a,
     std::uint64_t b) noexcept {

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "disasm/disassembler.hpp"
+#include "peelf/endian_reader.hpp"
 
 namespace viewer {
 using detail::format_hex;
@@ -137,14 +138,15 @@ void recover_cfg_jump_tables(
     default: return;
     }
 
-    csh handle = 0;
-    if (cs_open(cs_target, static_cast<cs_mode>(cs_mode_flags), &handle) != CS_ERR_OK) return;
-    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    ScopedCsHandle handle;
+    if (cs_open(cs_target, static_cast<cs_mode>(cs_mode_flags), handle.put()) != CS_ERR_OK) return;
+    cs_option(handle.get(), CS_OPT_DETAIL, CS_OPT_ON);
 
-    cs_insn* raw = nullptr;
-    const std::size_t count_insns = cs_disasm(handle, function_bytes.data(), function_bytes.size(), virtual_address, 0, &raw);
-    if (count_insns == 0 || raw == nullptr) {
-        cs_close(&handle);
+    cs_insn* raw_ptr = nullptr;
+    const std::size_t count_insns = cs_disasm(
+        handle.get(), function_bytes.data(), function_bytes.size(), virtual_address, 0, &raw_ptr);
+    const ScopedCsInsn raw(raw_ptr, count_insns);
+    if (count_insns == 0 || !raw) {
         return;
     }
 
@@ -303,7 +305,10 @@ void recover_cfg_jump_tables(
                             d.operands[1].type == X86_OP_MEM &&
                             d.operands[1].mem.base == X86_REG_RIP &&
                             d.operands[1].mem.index == X86_REG_INVALID) {
-                            anchor_va = ins.address + ins.size + static_cast<std::uint64_t>(d.operands[1].mem.disp);
+                            if (const auto next_pc = peelf::checked_add_u64(ins.address, ins.size)) {
+                                anchor_va =
+                                    peelf::checked_apply_signed_displacement(*next_pc, d.operands[1].mem.disp);
+                            }
                             break;
                         }
                         if (d.op_count >= 1 && d.operands[0].type == X86_OP_REG &&
@@ -316,30 +321,41 @@ void recover_cfg_jump_tables(
                     std::size_t guard_idx = 0;
                     const auto count = find_x86_guard(movsxd_pos, matched_idx, guard_idx);
                     if (anchor_va && count && !has_direct_bypass(guard_idx, i)) {
-                        const auto table_va = static_cast<std::uint64_t>(
-                            static_cast<std::int64_t>(*anchor_va) + extra_disp);
-                        const auto bytes = read_table(table_va, *count * 4u);
-                        if (!bytes.empty()) {
-                            std::vector<std::uint64_t> targets;
-                            targets.reserve(*count);
-                            for (std::size_t c = 0; c < *count; ++c) {
-                                const std::int64_t rel = cfg_read_sint(bytes.data() + c * 4u, 4u, endianness);
-                                const auto dst = static_cast<std::uint64_t>(
-                                    static_cast<std::int64_t>(*anchor_va) + rel);
-                                if (!instruction_by_address.contains(dst)) { targets.clear(); break; }
-                                targets.push_back(dst);
-                            }
-                            if (!targets.empty()) {
-                                for (const auto t : targets) leaders.insert(t);
-                                recovery_notes.push_back(IndirectRecoveryNote{
-                                    .source_address = dispatch.address,
-                                    .table_or_slot_address = table_va,
-                                    .target_count = targets.size(),
-                                    .confidence = "IndirectTable",
-                                    .evidence = std::format("RIP-relative i32 jump table @ 0x{:X} ({} cases)",
-                                                            table_va, targets.size()),
-                                });
-                                jump_tables.emplace(i, std::move(targets));
+                        const auto table_va =
+                            peelf::checked_apply_signed_displacement(*anchor_va, extra_disp);
+                        const auto table_bytes_len = peelf::checked_mul_u64(*count, 4u);
+                        if (table_va && table_bytes_len &&
+                            *table_bytes_len <= std::numeric_limits<std::size_t>::max()) {
+                            const auto bytes =
+                                read_table(*table_va, static_cast<std::size_t>(*table_bytes_len));
+                            if (!bytes.empty()) {
+                                std::vector<std::uint64_t> targets;
+                                targets.reserve(*count);
+                                for (std::size_t c = 0; c < *count; ++c) {
+                                    const std::int64_t rel =
+                                        cfg_read_sint(bytes.data() + c * 4u, 4u, endianness);
+                                    const auto dst =
+                                        peelf::checked_apply_signed_displacement(*anchor_va, rel);
+                                    if (!dst || !instruction_by_address.contains(*dst)) {
+                                        targets.clear();
+                                        break;
+                                    }
+                                    targets.push_back(*dst);
+                                }
+                                if (!targets.empty()) {
+                                    for (const auto t : targets) leaders.insert(t);
+                                    recovery_notes.push_back(IndirectRecoveryNote{
+                                        .source_address = dispatch.address,
+                                        .table_or_slot_address = *table_va,
+                                        .target_count = targets.size(),
+                                        .confidence = "IndirectTable",
+                                        .evidence = std::format(
+                                            "RIP-relative i32 jump table @ 0x{:X} ({} cases)",
+                                            *table_va,
+                                            targets.size()),
+                                    });
+                                    jump_tables.emplace(i, std::move(targets));
+                                }
                             }
                         }
                     }
@@ -533,26 +549,40 @@ void recover_cfg_jump_tables(
                                 const auto anchor_va = (anchor_r == base_r) ? table_va : resolve_a64_va(p, anchor_r);
                                 std::size_t guard_idx = 0;
                                 const auto count = find_a64_guard(lp, idx_r, guard_idx);
-                                if (table_va && anchor_va && count && !has_direct_bypass(guard_idx, i)) {
-                                    const auto bytes = read_table(*table_va, *count * esz);
+                                if (table_va && anchor_va && count && shift < 64u &&
+                                    !has_direct_bypass(guard_idx, i)) {
+                                    const auto table_bytes_len = peelf::checked_mul_u64(*count, esz);
+                                    const auto bytes =
+                                        (table_bytes_len &&
+                                         *table_bytes_len <= std::numeric_limits<std::size_t>::max())
+                                            ? read_table(*table_va, static_cast<std::size_t>(*table_bytes_len))
+                                            : std::vector<std::uint8_t>{};
                                     if (!bytes.empty()) {
                                         std::vector<std::uint64_t> targets;
                                         targets.reserve(*count);
                                         for (std::size_t c = 0; c < *count; ++c) {
-                                            std::uint64_t dst = 0;
+                                            std::optional<std::uint64_t> dst_opt;
                                             if (is_signed) {
-                                                const std::int64_t rel =
-                                                    cfg_read_sint(bytes.data() + c * esz, esz, endianness) *
-                                                    (std::int64_t{1} << shift);
-                                                dst = static_cast<std::uint64_t>(
-                                                    static_cast<std::int64_t>(*anchor_va) + rel);
+                                                const auto scaled = peelf::checked_scale_signed_displacement(
+                                                    cfg_read_sint(bytes.data() + c * esz, esz, endianness),
+                                                    shift);
+                                                if (scaled.has_value()) {
+                                                    dst_opt = peelf::checked_apply_signed_displacement(
+                                                        *anchor_va, *scaled);
+                                                }
                                             } else {
-                                                const std::uint64_t rel =
-                                                    cfg_read_uint(bytes.data() + c * esz, esz, endianness) << shift;
-                                                dst = *anchor_va + rel;
+                                                const std::uint64_t uval =
+                                                    cfg_read_uint(bytes.data() + c * esz, esz, endianness);
+                                                if (shift == 0u ||
+                                                    uval <= (std::numeric_limits<std::uint64_t>::max() >> shift)) {
+                                                    dst_opt = peelf::checked_add_u64(*anchor_va, uval << shift);
+                                                }
                                             }
-                                            if (!instruction_by_address.contains(dst)) { targets.clear(); break; }
-                                            targets.push_back(dst);
+                                            if (!dst_opt || !instruction_by_address.contains(*dst_opt)) {
+                                                targets.clear();
+                                                break;
+                                            }
+                                            targets.push_back(*dst_opt);
                                         }
                                         if (!targets.empty()) {
                                             for (const auto t : targets) leaders.insert(t);
@@ -577,9 +607,6 @@ void recover_cfg_jump_tables(
             }
         }
     }
-
-    cs_free(raw, count_insns);
-    cs_close(&handle);
 }
 
 } // namespace

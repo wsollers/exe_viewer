@@ -1,5 +1,7 @@
 #include "decompile/structured_decompiler.hpp"
 
+#include <peelf/endian_reader.hpp>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -298,11 +300,18 @@ struct ResolvedSymbol {
     if (ec != std::errc{} || ptr != text.data() + text.size()) {
         return std::nullopt;
     }
-    if (!negative && mag > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-        return static_cast<std::int64_t>(mag);
+    if (negative) {
+        constexpr std::uint64_t kMaxNegMag =
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ULL;
+        if (mag > kMaxNegMag) {
+            return std::nullopt;
+        }
+        if (mag == kMaxNegMag) {
+            return std::numeric_limits<std::int64_t>::min();
+        }
+        return -static_cast<std::int64_t>(mag);
     }
-    const auto signed_mag = static_cast<std::int64_t>(mag);
-    return negative ? -signed_mag : signed_mag;
+    return static_cast<std::int64_t>(mag);
 }
 
 [[nodiscard]] std::optional<std::uint64_t> parse_unsigned_addr(std::string_view text) noexcept {
@@ -392,10 +401,31 @@ struct ResolvedSymbol {
     if (pc_pos == std::string::npos) {
         return std::nullopt;
     }
-    const std::uint64_t next_pc = insn_addr + insn_size;
     const std::string_view rest = trim_sv(inside.substr(pc_pos + 3u));
+    if (is_eip) {
+        const std::uint64_t next_pc = (insn_addr + insn_size) & 0xFFFF'FFFFULL;
+        if (rest.empty()) {
+            return next_pc;
+        }
+        if (rest.front() != '+' && rest.front() != '-') {
+            return std::nullopt;
+        }
+        const bool neg = rest.front() == '-';
+        const auto disp = parse_signed_int(rest.substr(1u));
+        if (!disp.has_value()) {
+            return std::nullopt;
+        }
+        const std::uint64_t udisp = peelf::unsigned_magnitude_of_signed(*disp);
+        const bool eff_neg = neg != (*disp < 0);
+        return (eff_neg ? (next_pc - udisp) : (next_pc + udisp)) & 0xFFFF'FFFFULL;
+    }
+
+    const auto next_pc = peelf::checked_add_u64(insn_addr, insn_size);
+    if (!next_pc.has_value()) {
+        return std::nullopt;
+    }
     if (rest.empty()) {
-        return next_pc;
+        return *next_pc;
     }
     if (rest.front() != '+' && rest.front() != '-') {
         return std::nullopt;
@@ -405,12 +435,15 @@ struct ResolvedSymbol {
     if (!disp.has_value()) {
         return std::nullopt;
     }
-    const auto udisp = static_cast<std::uint64_t>(*disp < 0 ? -*disp : *disp);
-    std::uint64_t target = neg ? (next_pc - udisp) : (next_pc + udisp);
-    if (is_eip) {
-        target &= 0xFFFF'FFFFULL;
+    const std::uint64_t udisp = peelf::unsigned_magnitude_of_signed(*disp);
+    const bool eff_neg = neg != (*disp < 0);
+    if (eff_neg) {
+        if (udisp > *next_pc) {
+            return std::nullopt;
+        }
+        return *next_pc - udisp;
     }
-    return target;
+    return peelf::checked_add_u64(*next_pc, udisp);
 }
 
 [[nodiscard]] std::string pointer_width_c_type(
@@ -475,7 +508,7 @@ struct ResolvedSymbol {
         if (!is_frame && !is_sp) {
             return std::nullopt;
         }
-        const std::uint64_t mag = static_cast<std::uint64_t>(offset < 0 ? -offset : offset);
+        const std::uint64_t mag = peelf::unsigned_magnitude_of_signed(offset);
         if (mag > 0x10000ULL) {
             return std::nullopt;
         }
@@ -513,6 +546,9 @@ struct ResolvedSymbol {
             const std::string_view base = trim_sv(inside_addr.substr(0u, op_pos));
             const std::string_view disp = trim_sv(inside_addr.substr(op_pos + 1u));
             if (const auto off = parse_signed_int(disp)) {
+                if (neg && *off == std::numeric_limits<std::int64_t>::min()) {
+                    return std::nullopt;
+                }
                 return try_base_offset(base, neg ? -*off : *off);
             }
         } else {
@@ -592,10 +628,11 @@ struct ResolvedSymbol {
             const std::string_view disp_sv = trim_sv(op.substr(0u, lp));
             const std::string_view base_sv = trim_sv(op.substr(lp + 1u, rp - lp - 1u));
             const std::int64_t disp = disp_sv.empty() ? 0 : parse_signed_int(disp_sv).value_or(0);
-            const std::string combined = disp < 0
-                                             ? std::format("{} - 0x{:X}", clean_atom(base_sv), static_cast<std::uint64_t>(-disp))
-                                             : (disp > 0 ? std::format("{} + 0x{:X}", clean_atom(base_sv), static_cast<std::uint64_t>(disp))
-                                                         : clean_atom(base_sv));
+            const std::string combined =
+                disp < 0
+                    ? std::format("{} - 0x{:X}", clean_atom(base_sv), peelf::unsigned_magnitude_of_signed(disp))
+                    : (disp > 0 ? std::format("{} + 0x{:X}", clean_atom(base_sv), static_cast<std::uint64_t>(disp))
+                                : clean_atom(base_sv));
             if (const auto stack_var = try_stack_variable(combined, stack_locals)) {
                 return address_only ? ("&" + *stack_var) : *stack_var;
             }

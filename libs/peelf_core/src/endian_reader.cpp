@@ -34,24 +34,9 @@ template <typename UInt>
     return out;
 }
 
-void append_utf8_codepoint(std::string& out, std::uint32_t cp) {
-    if (cp <= 0x7Fu) {
-        out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7FFu) {
-        out.push_back(static_cast<char>(0xC0u | ((cp >> 6) & 0x1Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0xFFFFu) {
-        out.push_back(static_cast<char>(0xE0u | ((cp >> 12) & 0x0Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0x10FFFFu) {
-        out.push_back(static_cast<char>(0xF0u | ((cp >> 18) & 0x07u)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else {
-        append_utf8_codepoint(out, 0xFFFDu);
-    }
+[[nodiscard]] std::uint16_t read_u16_unaligned(const std::uint8_t* src,
+                                               Endianness endianness) noexcept {
+    return adjust_from_target(load_native_unaligned<std::uint16_t>(src), endianness);
 }
 
 [[nodiscard]] std::uint32_t decode_next_utf8_codepoint(std::string_view text, std::size_t& idx) noexcept {
@@ -217,39 +202,102 @@ Result<std::string> EndianReader::read_c_string(std::size_t offset, std::size_t 
     return out;
 }
 
+void append_utf8_codepoint(std::string& out, std::uint32_t cp) {
+    if (cp >= 0xD800u && cp <= 0xDFFFu) {
+        cp = 0xFFFDu;
+    }
+    if (cp <= 0x7Fu) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp <= 0x7FFu) {
+        out.push_back(static_cast<char>(0xC0u | ((cp >> 6) & 0x1Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0xFFFFu) {
+        out.push_back(static_cast<char>(0xE0u | ((cp >> 12) & 0x0Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else if (cp <= 0x10FFFFu) {
+        out.push_back(static_cast<char>(0xF0u | ((cp >> 18) & 0x07u)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 12) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+    } else {
+        out.append("\xEF\xBF\xBD", 3u);
+    }
+}
+
+std::string decode_utf16_to_utf8(std::span<const std::uint8_t> bytes,
+                                 Endianness endianness,
+                                 bool stop_at_nul,
+                                 std::size_t max_code_units,
+                                 Utf16DecodeDiagnostics* diagnostics) {
+    if (diagnostics != nullptr) {
+        *diagnostics = Utf16DecodeDiagnostics{};
+        if ((bytes.size() & 1u) != 0u) {
+            diagnostics->odd_trailing_byte = true;
+        }
+    }
+
+    const std::size_t total_units = bytes.size() / 2u;
+    const std::size_t unit_limit = std::min(total_units, max_code_units);
+    std::string out;
+    out.reserve(unit_limit);
+
+    bool hit_nul = false;
+    for (std::size_t i = 0; i < unit_limit; ++i) {
+        const std::uint16_t u0 = read_u16_unaligned(bytes.data() + i * 2u, endianness);
+        if (u0 == 0u) {
+            if (stop_at_nul) {
+                hit_nul = true;
+                break;
+            }
+            continue;
+        }
+        if (u0 >= 0xD800u && u0 <= 0xDBFFu) {
+            if (i + 1u < unit_limit) {
+                const std::uint16_t u1 =
+                    read_u16_unaligned(bytes.data() + (i + 1u) * 2u, endianness);
+                if (u1 >= 0xDC00u && u1 <= 0xDFFFu) {
+                    const std::uint32_t cp =
+                        0x10000u + (((static_cast<std::uint32_t>(u0) - 0xD800u) << 10u) |
+                                    (static_cast<std::uint32_t>(u1) - 0xDC00u));
+                    append_utf8_codepoint(out, cp);
+                    ++i;
+                    continue;
+                }
+            }
+            if (diagnostics != nullptr) {
+                ++diagnostics->unpaired_high_surrogates;
+            }
+            out.append("\xEF\xBF\xBD", 3u);
+        } else if (u0 >= 0xDC00u && u0 <= 0xDFFFu) {
+            if (diagnostics != nullptr) {
+                ++diagnostics->unpaired_low_surrogates;
+            }
+            out.append("\xEF\xBF\xBD", 3u);
+        } else {
+            append_utf8_codepoint(out, u0);
+        }
+    }
+
+    if (diagnostics != nullptr && !hit_nul && total_units > max_code_units) {
+        if (!stop_at_nul ||
+            read_u16_unaligned(bytes.data() + unit_limit * 2u, endianness) != 0u) {
+            diagnostics->truncated_at_max_units = true;
+        }
+    }
+    return out;
+}
+
 Result<std::string> EndianReader::read_utf16_string(std::size_t offset,
                                                     std::size_t max_code_units) const {
     if (offset > bytes_.size()) {
         return make_error("read_utf16_string out of bounds");
     }
     const std::size_t avail_units = std::min(max_code_units, (bytes_.size() - offset) / 2u);
-    std::string out;
-    for (std::size_t i = 0; i < avail_units; ++i) {
-        const auto cu = read_u16(offset + i * 2u);
-        if (!cu || *cu == 0) {
-            break;
-        }
-        const std::uint16_t u = *cu;
-        if (u >= 0xD800u && u <= 0xDBFFu) {
-            if (i + 1 < avail_units) {
-                const auto low = read_u16(offset + (i + 1) * 2u);
-                if (low && *low >= 0xDC00u && *low <= 0xDFFFu) {
-                    const std::uint32_t cp =
-                        0x10000u + (((static_cast<std::uint32_t>(u) - 0xD800u) << 10) |
-                                    (static_cast<std::uint32_t>(*low) - 0xDC00u));
-                    append_utf8_codepoint(out, cp);
-                    ++i;
-                    continue;
-                }
-            }
-            append_utf8_codepoint(out, 0xFFFDu);
-        } else if (u >= 0xDC00u && u <= 0xDFFFu) {
-            append_utf8_codepoint(out, 0xFFFDu);
-        } else {
-            append_utf8_codepoint(out, u);
-        }
-    }
-    return out;
+    return decode_utf16_to_utf8(bytes_.subspan(offset, avail_units * 2u),
+                                layout_.endianness,
+                                /*stop_at_nul=*/true,
+                                avail_units);
 }
 
 std::vector<std::uint8_t> encode_u8(std::uint8_t value) {

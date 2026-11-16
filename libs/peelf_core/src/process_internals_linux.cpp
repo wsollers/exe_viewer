@@ -62,9 +62,35 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
 
     // 1. Open file descriptors (/proc/<pid>/fd + /proc/<pid>/fdinfo/<fd>)
     {
+        class ScopedDir {
+        public:
+            explicit ScopedDir(DIR* d) noexcept : dir_(d) {}
+            ~ScopedDir() noexcept { reset(); }
+            ScopedDir(const ScopedDir&) = delete;
+            ScopedDir& operator=(const ScopedDir&) = delete;
+            ScopedDir(ScopedDir&& other) noexcept : dir_(std::exchange(other.dir_, nullptr)) {}
+            ScopedDir& operator=(ScopedDir&& other) noexcept {
+                if (this != &other) {
+                    reset(std::exchange(other.dir_, nullptr));
+                }
+                return *this;
+            }
+            [[nodiscard]] DIR* get() const noexcept { return dir_; }
+            [[nodiscard]] explicit operator bool() const noexcept { return dir_ != nullptr; }
+            void reset(DIR* next = nullptr) noexcept {
+                if (dir_ != nullptr) {
+                    ::closedir(dir_);
+                }
+                dir_ = next;
+            }
+
+        private:
+            DIR* dir_{nullptr};
+        };
+
         const std::string fd_dir_path = proc_root + "/fd";
-        DIR* dir = ::opendir(fd_dir_path.c_str());
-        if (dir == nullptr) {
+        const ScopedDir dir(::opendir(fd_dir_path.c_str()));
+        if (!dir) {
             snap.handles.status = SubsystemStatus::unavailable(
                 "/proc/<pid>/fd", "unable to open fd directory (permission denied or exited)");
         } else {
@@ -73,7 +99,7 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
             bool capped = false;
             bool any_partial = false;
 
-            while (dirent* ent = ::readdir(dir)) {
+            while (dirent* ent = ::readdir(dir.get())) {
                 const std::string_view name(ent->d_name);
                 if (name == "." || name == "..") {
                     continue;
@@ -111,7 +137,6 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
 
                 handles.push_back(build_linux_fd_entry(fd_num, target, fdinfo_text, is_dir));
             }
-            ::closedir(dir);
 
             std::ranges::sort(handles, {}, &ProcessHandleEntry::handle_or_fd);
             snap.total_os_handle_count = total_seen;

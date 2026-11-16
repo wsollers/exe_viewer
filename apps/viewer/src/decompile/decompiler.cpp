@@ -114,24 +114,39 @@ BackendProcessResult BackendRunner::run(const std::filesystem::path& executable,
     auto command=quote(executable.wstring());
     for(const auto& arg:arguments) { command+=L' '; command+=quote(std::filesystem::path(arg).wstring()); }
     STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION process{};
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    if (!job) return {};
+    struct ScopedWinHandle {
+        HANDLE h{nullptr};
+        ScopedWinHandle() noexcept = default;
+        explicit ScopedWinHandle(HANDLE in) noexcept : h(in) {}
+        ~ScopedWinHandle() noexcept { reset(); }
+        ScopedWinHandle(const ScopedWinHandle&) = delete;
+        ScopedWinHandle& operator=(const ScopedWinHandle&) = delete;
+        [[nodiscard]] bool valid() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
+        void reset(HANDLE next = nullptr) noexcept {
+            if (valid()) { CloseHandle(h); }
+            h = next;
+        }
+    };
+    ScopedWinHandle job(CreateJobObjectW(nullptr, nullptr));
+    if (!job.valid()) return {};
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) { CloseHandle(job); return {}; }
-    if(!CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW | CREATE_SUSPENDED,nullptr,nullptr,&startup,&process)) { CloseHandle(job); return {}; }
-    if (!AssignProcessToJobObject(job, process.hProcess) || ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
-        TerminateProcess(process.hProcess, 1); CloseHandle(process.hThread); CloseHandle(process.hProcess); CloseHandle(job); return {};
+    if (!SetInformationJobObject(job.h, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) { return {}; }
+    if(!CreateProcessW(nullptr,command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW | CREATE_SUSPENDED,nullptr,nullptr,&startup,&process)) { return {}; }
+    ScopedWinHandle proc_handle(process.hProcess);
+    ScopedWinHandle thread_handle(process.hThread);
+    if (!AssignProcessToJobObject(job.h, proc_handle.h) || ResumeThread(thread_handle.h) == static_cast<DWORD>(-1)) {
+        TerminateProcess(proc_handle.h, 1); return {};
     }
-    CloseHandle(process.hThread);
+    thread_handle.reset();
     auto deadline=std::chrono::steady_clock::now()+timeout; BackendProcessResult result;
-    while(WaitForSingleObject(process.hProcess,25)==WAIT_TIMEOUT) {
+    while(WaitForSingleObject(proc_handle.h,25)==WAIT_TIMEOUT) {
         if(stop.stop_requested() || std::chrono::steady_clock::now()>=deadline) {
             result.cancelled=stop.stop_requested(); result.timed_out=!result.cancelled;
-            TerminateJobObject(job,1); WaitForSingleObject(process.hProcess,5000); CloseHandle(process.hProcess); CloseHandle(job); return result;
+            TerminateJobObject(job.h,1); WaitForSingleObject(proc_handle.h,5000); return result;
         }
     }
-    DWORD exit=1; GetExitCodeProcess(process.hProcess,&exit); CloseHandle(process.hProcess); CloseHandle(job); result.exit_code=static_cast<int>(exit); return result;
+    DWORD exit=1; GetExitCodeProcess(proc_handle.h,&exit); result.exit_code=static_cast<int>(exit); return result;
 #else
     std::vector<std::string> owned{executable.string()}; owned.insert(owned.end(),arguments.begin(),arguments.end());
     std::vector<char*> argv; for(auto& s:owned) argv.push_back(s.data()); argv.push_back(nullptr);

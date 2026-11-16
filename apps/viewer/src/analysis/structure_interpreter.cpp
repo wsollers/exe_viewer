@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -73,6 +74,7 @@ struct ParsedTypeExpr {
     std::string base_name{};
     std::string inner_type{};
     std::uint64_t array_count = 0;
+    bool array_count_overflow = false;
 };
 
 [[nodiscard]] ParsedTypeExpr parse_type_expr(std::string_view raw_type) {
@@ -94,38 +96,37 @@ struct ParsedTypeExpr {
             const std::size_t close = s.find(']', i + 1);
             if (close != std::string::npos) {
                 const std::string count_str = trim_ascii(std::string_view(s).substr(i + 1, close - i - 1));
-                std::uint64_t count = 0;
-                bool ok = !count_str.empty();
-                if (count_str.starts_with("0x") || count_str.starts_with("0X")) {
-                    ok = count_str.size() > 2;
-                    for (std::size_t k = 2; k < count_str.size() && ok; ++k) {
-                        const char c = count_str[k];
-                        std::uint64_t d = 0;
-                        if (c >= '0' && c <= '9') d = static_cast<std::uint64_t>(c - '0');
-                        else if (c >= 'a' && c <= 'f') d = static_cast<std::uint64_t>(10 + c - 'a');
-                        else if (c >= 'A' && c <= 'F') d = static_cast<std::uint64_t>(10 + c - 'A');
-                        else ok = false;
-                        count = (count << 4u) | d;
-                    }
-                } else {
-                    for (const char c : count_str) {
-                        if (c < '0' || c > '9') {
-                            ok = false;
-                            break;
-                        }
-                        count = count * 10u + static_cast<std::uint64_t>(c - '0');
-                    }
+                std::string_view digits = count_str;
+                int base = 10;
+                if (digits.starts_with("0x") || digits.starts_with("0X")) {
+                    base = 16;
+                    digits.remove_prefix(2u);
                 }
-                if (ok) {
+                if (!digits.empty() && digits.front() != '+' && digits.front() != '-') {
+                    std::uint64_t count = 0;
+                    const auto [ptr, ec] =
+                        std::from_chars(digits.data(), digits.data() + digits.size(), count, base);
                     const std::string elem =
                         trim_ascii(std::string_view(s).substr(0, i)) +
                         trim_ascii(std::string_view(s).substr(close + 1));
-                    return ParsedTypeExpr{
-                        .kind = ParsedTypeExpr::Kind::Array,
-                        .base_name = {},
-                        .inner_type = elem,
-                        .array_count = count,
-                    };
+                    if (ec == std::errc{} && ptr == digits.data() + digits.size()) {
+                        return ParsedTypeExpr{
+                            .kind = ParsedTypeExpr::Kind::Array,
+                            .base_name = {},
+                            .inner_type = elem,
+                            .array_count = count,
+                            .array_count_overflow = false,
+                        };
+                    }
+                    if (ec == std::errc::result_out_of_range && ptr == digits.data() + digits.size()) {
+                        return ParsedTypeExpr{
+                            .kind = ParsedTypeExpr::Kind::Array,
+                            .base_name = {},
+                            .inner_type = elem,
+                            .array_count = 0,
+                            .array_count_overflow = true,
+                        };
+                    }
                 }
             }
             break;
@@ -277,29 +278,72 @@ struct ScalarInfo {
     return {ScalarKind::None, 0};
 }
 
-[[nodiscard]] std::uint64_t compute_type_size(const StructureCatalog& catalog,
-                                              std::string_view type_expr,
-                                              const peelf::TargetLayout& layout,
-                                              std::size_t depth = 0) {
+[[nodiscard]] constexpr bool address_range_fits_u64(std::uint64_t address,
+                                                    std::uint64_t byte_size) noexcept {
+    return byte_size <= 1u || address <= std::numeric_limits<std::uint64_t>::max() - (byte_size - 1u);
+}
+
+[[nodiscard]] std::optional<std::uint64_t> compute_type_size_checked(
+    const StructureCatalog& catalog,
+    std::string_view type_expr,
+    const peelf::TargetLayout& layout,
+    std::size_t depth = 0);
+
+[[nodiscard]] std::optional<std::uint64_t> compute_record_size_checked(
+    const StructureCatalog& catalog,
+    const DataTypeRecord& rec,
+    const peelf::TargetLayout& layout,
+    std::size_t depth = 0) {
     if (depth > 8) {
-        return 0;
+        return rec.size;
+    }
+    std::uint64_t max_end = rec.size;
+    for (const DataMember& m : rec.members) {
+        const auto type_sz = compute_type_size_checked(catalog, m.type, layout, depth + 1);
+        if (!type_sz.has_value()) {
+            return std::nullopt;
+        }
+        const std::uint64_t eff_sz = (m.size != 0) ? m.size : *type_sz;
+        const std::uint64_t member_off = rec.is_union ? 0u : m.offset;
+        const auto member_end = peelf::checked_add_u64(member_off, eff_sz);
+        if (!member_end.has_value()) {
+            return std::nullopt;
+        }
+        max_end = std::max(max_end, *member_end);
+    }
+    return max_end;
+}
+
+[[nodiscard]] std::optional<std::uint64_t> compute_type_size_checked(
+    const StructureCatalog& catalog,
+    std::string_view type_expr,
+    const peelf::TargetLayout& layout,
+    std::size_t depth) {
+    if (depth > 8) {
+        return std::uint64_t{0};
     }
     const ParsedTypeExpr parsed = parse_type_expr(type_expr);
     if (parsed.kind == ParsedTypeExpr::Kind::Pointer) {
         return static_cast<std::uint64_t>(layout.pointer_size());
     }
     if (parsed.kind == ParsedTypeExpr::Kind::Array) {
-        const std::uint64_t elem_sz = compute_type_size(catalog, parsed.inner_type, layout, depth + 1);
-        return elem_sz * parsed.array_count;
+        if (parsed.array_count_overflow) {
+            return std::nullopt;
+        }
+        const auto elem_sz = compute_type_size_checked(catalog, parsed.inner_type, layout, depth + 1);
+        if (!elem_sz.has_value()) {
+            return std::nullopt;
+        }
+        return peelf::checked_mul_u64(*elem_sz, parsed.array_count);
     }
     const ScalarInfo sc = classify_scalar(parsed.base_name, layout);
     if (sc.kind != ScalarKind::None) {
         return sc.byte_size;
     }
     if (const DataTypeRecord* rec = catalog.find(parsed.base_name)) {
-        return rec->size;
+        return compute_record_size_checked(catalog, *rec, layout, depth + 1);
     }
-    return 0;
+    return std::uint64_t{0};
 }
 
 [[nodiscard]] std::string escape_ascii_preview(std::span<const std::uint8_t> bytes,
@@ -354,8 +398,8 @@ struct ScalarInfo {
                                                peelf::Endianness endianness,
                                                bool stop_at_nul,
                                                std::size_t max_units = 64) {
-    std::string out = "L\"";
     const peelf::EndianReader reader(bytes, endianness);
+    std::size_t readable_bytes = 0;
     std::size_t units = 0;
     bool truncated = false;
     for (std::size_t off = 0; off + 1 < bytes.size(); off += 2) {
@@ -368,38 +412,51 @@ struct ScalarInfo {
         }
         const std::uint16_t cu = *cu_res;
         if (cu == 0) {
-            if (stop_at_nul) {
-                break;
-            }
             break;
         }
         if (units >= max_units) {
             truncated = true;
             break;
         }
-        if (cu == '\\') {
-            out += "\\\\";
-        } else if (cu == '"') {
-            out += "\\\"";
-        } else if (cu == '\n') {
-            out += "\\n";
-        } else if (cu == '\r') {
-            out += "\\r";
-        } else if (cu == '\t') {
-            out += "\\t";
-        } else if (cu >= 0x20 && cu < 0x7F) {
-            out.push_back(static_cast<char>(cu));
-        } else if (cu < 0x800) {
-            out.push_back(static_cast<char>(0xC0u | (cu >> 6u)));
-            out.push_back(static_cast<char>(0x80u | (cu & 0x3Fu)));
-        } else if (cu >= 0xD800 && cu <= 0xDFFF) {
-            out += std::format("\\u{:04X}", cu);
-        } else {
-            out.push_back(static_cast<char>(0xE0u | (cu >> 12u)));
-            out.push_back(static_cast<char>(0x80u | ((cu >> 6u) & 0x3Fu)));
-            out.push_back(static_cast<char>(0x80u | (cu & 0x3Fu)));
-        }
+        readable_bytes = off + 2u;
         ++units;
+        if (units == max_units && cu >= 0xD800u && cu <= 0xDBFFu && off + 3u < bytes.size()) {
+            const bool low_valid =
+                (off + 3u >= valid.size()) || (valid[off + 2u] != 0 && valid[off + 3u] != 0);
+            if (low_valid) {
+                if (const auto low_res = reader.read_u16(off + 2u);
+                    low_res && *low_res >= 0xDC00u && *low_res <= 0xDFFFu) {
+                    readable_bytes = off + 4u;
+                    off += 2u;
+                }
+            }
+        }
+    }
+
+    const std::string decoded = peelf::decode_utf16_to_utf8(
+        bytes.subspan(0, readable_bytes),
+        endianness,
+        stop_at_nul);
+
+    std::string out = "L\"";
+    out.reserve(decoded.size() + 6u);
+    for (const char raw_ch : decoded) {
+        const auto ch = static_cast<unsigned char>(raw_ch);
+        if (ch == '\\') {
+            out += "\\\\";
+        } else if (ch == '"') {
+            out += "\\\"";
+        } else if (ch == '\n') {
+            out += "\\n";
+        } else if (ch == '\r') {
+            out += "\\r";
+        } else if (ch == '\t') {
+            out += "\\t";
+        } else if (ch < 0x20u || ch == 0x7Fu) {
+            out += std::format("\\x{:02X}", ch);
+        } else {
+            out.push_back(raw_ch);
+        }
     }
     out.push_back('"');
     if (truncated) {
@@ -964,6 +1021,9 @@ peelf::MemorySample SpanStructureByteSource::read_bytes(std::uint64_t address,
     }
 
     for (std::size_t i = 0; i < size; ++i) {
+        if (!is_file_offset && address > std::numeric_limits<std::uint64_t>::max() - i) {
+            break;
+        }
         if (offset > std::numeric_limits<std::uint64_t>::max() - i) {
             break;
         }
@@ -991,7 +1051,7 @@ std::optional<std::uint64_t> SpanStructureByteSource::to_virtual_address(
     if (address >= bytes_.size()) {
         return std::nullopt;
     }
-    return base_va_ + address;
+    return peelf::checked_add_u64(base_va_, address);
 }
 
 std::optional<std::uint64_t> SpanStructureByteSource::to_window_offset(
@@ -1347,17 +1407,31 @@ void populate_record_children(EvalContext& ctx,
     bool any_unavail = false;
     for (const DataMember& m : record.members) {
         const std::uint64_t member_off = record.is_union ? 0u : m.offset;
-        const std::uint64_t member_addr = base_address + member_off;
-        const std::uint64_t eff_size = m.size != 0
-                                           ? m.size
-                                           : compute_type_size(ctx.catalog, m.type, ctx.options.layout);
+        const auto member_addr_opt = peelf::checked_add_u64(base_address, member_off);
+        const auto member_rel_opt = peelf::checked_add_u64(out_parent.relative_offset, member_off);
+        const auto eff_size_opt =
+            m.size != 0 ? std::optional<std::uint64_t>{m.size}
+                        : compute_type_size_checked(ctx.catalog, m.type, ctx.options.layout);
+        if (!member_addr_opt.has_value() || !member_rel_opt.has_value() || !eff_size_opt.has_value()) {
+            EvaluatedField child;
+            child.name = m.name;
+            child.type_name = trim_ascii(m.type);
+            child.address = member_addr_opt.value_or(std::numeric_limits<std::uint64_t>::max());
+            child.relative_offset = member_rel_opt.value_or(member_off);
+            child.size = eff_size_opt.value_or(0);
+            child.decoded_value = eff_size_opt.has_value() ? "<address overflow>" : "<array size overflow>";
+            child.availability = peelf::Availability::Unavailable;
+            any_unavail = true;
+            out_parent.children.push_back(std::move(child));
+            continue;
+        }
         EvaluatedField child = evaluate_field_impl(
             ctx,
             m.name,
             m.type,
-            member_addr,
-            out_parent.relative_offset + member_off,
-            eff_size,
+            *member_addr_opt,
+            *member_rel_opt,
+            *eff_size_opt,
             is_file_offset,
             depth + 1,
             ptr_depth);
@@ -1431,6 +1505,12 @@ void populate_record_children(EvalContext& ctx,
         field.size = ptr_sz;
         field.is_pointer = true;
         field.pointee_type_name = canonical_type_key(parsed.inner_type);
+
+        if (!address_range_fits_u64(address, ptr_sz)) {
+            field.decoded_value = "<address overflow>";
+            field.availability = peelf::Availability::Unavailable;
+            return field;
+        }
 
         const peelf::MemorySample sample =
             ctx.source.read_bytes(address, is_file_offset, static_cast<std::size_t>(ptr_sz));
@@ -1527,12 +1607,32 @@ void populate_record_children(EvalContext& ctx,
 
     // 2. Fixed-size array `T[N]`
     if (parsed.kind == ParsedTypeExpr::Kind::Array) {
-        std::uint64_t elem_sz = compute_type_size(ctx.catalog, parsed.inner_type, layout);
+        field.is_aggregate = true;
+        if (parsed.array_count_overflow) {
+            field.size = declared_size;
+            field.availability = peelf::Availability::Unavailable;
+            field.decoded_value = "<array size overflow>";
+            return field;
+        }
+        const auto elem_sz_opt = compute_type_size_checked(ctx.catalog, parsed.inner_type, layout);
+        if (!elem_sz_opt.has_value()) {
+            field.size = declared_size;
+            field.availability = peelf::Availability::Unavailable;
+            field.decoded_value = "<array size overflow>";
+            return field;
+        }
+        std::uint64_t elem_sz = *elem_sz_opt;
         if (elem_sz == 0 && parsed.array_count > 0 && declared_size >= parsed.array_count) {
             elem_sz = declared_size / parsed.array_count;
         }
-        field.size = declared_size != 0 ? declared_size : (elem_sz * parsed.array_count);
-        field.is_aggregate = true;
+        const auto total_arr_sz = peelf::checked_mul_u64(elem_sz, parsed.array_count);
+        if (!total_arr_sz.has_value()) {
+            field.size = declared_size;
+            field.availability = peelf::Availability::Unavailable;
+            field.decoded_value = "<array size overflow>";
+            return field;
+        }
+        field.size = declared_size != 0 ? declared_size : *total_arr_sz;
 
         const std::size_t preview_bytes =
             static_cast<std::size_t>(std::min<std::uint64_t>(field.size, 256u));
@@ -1564,13 +1664,29 @@ void populate_record_children(EvalContext& ctx,
                 std::min<std::uint64_t>(parsed.array_count, ctx.options.max_array_elements));
             field.children.reserve(cap);
             for (std::size_t idx = 0; idx < cap; ++idx) {
-                const std::uint64_t elem_off = static_cast<std::uint64_t>(idx) * elem_sz;
+                const auto elem_off = peelf::checked_mul_u64(static_cast<std::uint64_t>(idx), elem_sz);
+                const auto elem_addr = elem_off ? peelf::checked_add_u64(address, *elem_off) : std::nullopt;
+                const auto elem_rel =
+                    elem_off ? peelf::checked_add_u64(relative_offset, *elem_off) : std::nullopt;
+                if (!elem_addr.has_value() || !elem_rel.has_value()) {
+                    EvaluatedField elem;
+                    elem.name = std::format("[{}]", idx);
+                    elem.type_name = parsed.inner_type;
+                    elem.address = std::numeric_limits<std::uint64_t>::max();
+                    elem.relative_offset = elem_off.value_or(0);
+                    elem.size = elem_sz;
+                    elem.decoded_value = "<address overflow>";
+                    elem.availability = peelf::Availability::Unavailable;
+                    field.availability = merge_availability(field.availability, elem.availability);
+                    field.children.push_back(std::move(elem));
+                    continue;
+                }
                 EvaluatedField elem = evaluate_field_impl(
                     ctx,
                     std::format("[{}]", idx),
                     parsed.inner_type,
-                    address + elem_off,
-                    relative_offset + elem_off,
+                    *elem_addr,
+                    *elem_rel,
                     elem_sz,
                     is_file_offset,
                     depth + 1,
@@ -1617,6 +1733,11 @@ void populate_record_children(EvalContext& ctx,
     const ScalarInfo scalar = classify_scalar(parsed.base_name, layout, declared_size);
     if (scalar.kind != ScalarKind::None) {
         field.size = scalar.byte_size;
+        if (!address_range_fits_u64(address, field.size)) {
+            field.decoded_value = "<address overflow>";
+            field.availability = peelf::Availability::Unavailable;
+            return field;
+        }
         const peelf::MemorySample sample =
             ctx.source.read_bytes(address, is_file_offset, static_cast<std::size_t>(field.size));
         field.raw_bytes_hex = format_raw_hex(sample);
@@ -1742,6 +1863,11 @@ void populate_record_children(EvalContext& ctx,
 
     // 5. Fallback opaque / enum / unknown fixed-size field
     field.size = declared_size;
+    if (field.size > 0 && !address_range_fits_u64(address, field.size)) {
+        field.decoded_value = "<address overflow>";
+        field.availability = peelf::Availability::Unavailable;
+        return field;
+    }
     const std::size_t read_sz =
         static_cast<std::size_t>(std::min<std::uint64_t>(field.size, 64u));
     const peelf::MemorySample sample = ctx.source.read_bytes(address, is_file_offset, read_sz);
@@ -1782,7 +1908,19 @@ peelf::Result<EvaluatedStructure> evaluate_structure(const StructureCatalog& cat
     }
 
     const DataTypeRecord& rec = entry->record;
+    const auto stride_opt = compute_record_size_checked(catalog, rec, options.layout);
+    if (!stride_opt.has_value()) {
+        return peelf::make_error(
+            std::format("Structure '{}' layout or member array size overflows 64-bit range", rec.name));
+    }
+    const std::uint64_t effective_stride = *stride_opt;
     const std::uint32_t clamped_count = std::clamp<std::uint32_t>(options.count, 1u, 256u);
+    const auto total_size_opt =
+        peelf::checked_mul_u64(effective_stride, static_cast<std::uint64_t>(clamped_count));
+    if (!total_size_opt.has_value()) {
+        return peelf::make_error(
+            std::format("Structure '{}' total size overflows 64-bit range", rec.name));
+    }
 
     EvaluatedStructure result;
     result.type_name = rec.name;
@@ -1790,8 +1928,8 @@ peelf::Result<EvaluatedStructure> evaluate_structure(const StructureCatalog& cat
     result.base_address = address;
     result.is_file_offset = is_file_offset;
     result.count = clamped_count;
-    result.stride = rec.size;
-    result.total_size = rec.size * static_cast<std::uint64_t>(clamped_count);
+    result.stride = effective_stride;
+    result.total_size = *total_size_opt;
     result.layout = options.layout;
 
     EvalContext ctx{
@@ -1809,7 +1947,7 @@ peelf::Result<EvaluatedStructure> evaluate_structure(const StructureCatalog& cat
         root.type_name = rec.name;
         root.address = address;
         root.relative_offset = 0;
-        root.size = rec.size;
+        root.size = effective_stride;
         populate_record_children(ctx, rec, address, is_file_offset, 0, 0, root);
         result.availability = root.availability;
         result.fields = std::move(root.children);
@@ -1820,19 +1958,34 @@ peelf::Result<EvaluatedStructure> evaluate_structure(const StructureCatalog& cat
     bool any_avail = false;
     bool any_unavail = false;
     for (std::uint32_t idx = 0; idx < clamped_count; ++idx) {
-        const std::uint64_t elem_off = static_cast<std::uint64_t>(idx) * rec.size;
-        const std::uint64_t elem_addr = address + elem_off;
+        const auto elem_off =
+            peelf::checked_mul_u64(static_cast<std::uint64_t>(idx), effective_stride);
+        const auto elem_addr = elem_off ? peelf::checked_add_u64(address, *elem_off) : std::nullopt;
+        if (!elem_addr.has_value()) {
+            EvaluatedField elem;
+            elem.name = std::format("[{}]", idx);
+            elem.type_name = rec.name;
+            elem.address = std::numeric_limits<std::uint64_t>::max();
+            elem.relative_offset = elem_off.value_or(0);
+            elem.size = effective_stride;
+            elem.is_aggregate = true;
+            elem.decoded_value = "<address overflow>";
+            elem.availability = peelf::Availability::Unavailable;
+            any_unavail = true;
+            result.fields.push_back(std::move(elem));
+            continue;
+        }
         EvaluatedField elem;
         elem.name = std::format("[{}]", idx);
         elem.type_name = rec.name;
-        elem.address = elem_addr;
-        elem.relative_offset = elem_off;
+        elem.address = *elem_addr;
+        elem.relative_offset = *elem_off;
         elem.size = rec.size;
-        elem.virtual_address = source.to_virtual_address(elem_addr, is_file_offset);
-        elem.window_offset = source.to_window_offset(elem_addr, is_file_offset);
+        elem.virtual_address = source.to_virtual_address(*elem_addr, is_file_offset);
+        elem.window_offset = source.to_window_offset(*elem_addr, is_file_offset);
         const std::size_t preview_sz = static_cast<std::size_t>(std::min<std::uint64_t>(rec.size, 16u));
-        elem.raw_bytes_hex = format_raw_hex(source.read_bytes(elem_addr, is_file_offset, preview_sz));
-        populate_record_children(ctx, rec, elem_addr, is_file_offset, 0, 0, elem);
+        elem.raw_bytes_hex = format_raw_hex(source.read_bytes(*elem_addr, is_file_offset, preview_sz));
+        populate_record_children(ctx, rec, *elem_addr, is_file_offset, 0, 0, elem);
         if (elem.availability == peelf::Availability::Available) {
             any_avail = true;
         } else if (elem.availability == peelf::Availability::Unavailable) {

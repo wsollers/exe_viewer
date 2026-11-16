@@ -1,10 +1,13 @@
 #include "image_internal.hpp"
 
+#include <peelf/endian_reader.hpp>
+
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <limits>
 #include <optional>
 #include <span>
@@ -358,13 +361,51 @@ void parse_pe_bound_imports(std::span<const std::uint8_t> b,
     }
 }
 
+[[nodiscard]] std::string read_pe_resource_dir_string(
+    std::span<const std::uint8_t> b,
+    std::uint64_t directory_file_offset,
+    std::uint32_t directory_size,
+    std::uint32_t relative_string_offset,
+    std::vector<std::string>& warnings_out,
+    bool& warned_utf16_surrogate) {
+    if (!fits_range(relative_string_offset, 2u, directory_size)) {
+        return {};
+    }
+    const std::uint64_t str_hdr_off = directory_file_offset + relative_string_offset;
+    if (!fits_range(str_hdr_off, 2u, static_cast<std::uint64_t>(b.size()))) {
+        return {};
+    }
+    constexpr std::uint16_t kMaxResourceNameUnits = 512u;
+    const std::uint16_t raw_units = rd16(b, static_cast<std::size_t>(str_hdr_off), false);
+    const std::uint16_t units = std::min<std::uint16_t>(raw_units, kMaxResourceNameUnits);
+    const std::uint64_t byte_len = static_cast<std::uint64_t>(units) * 2u;
+    if (!fits_range(static_cast<std::uint64_t>(relative_string_offset) + 2u, byte_len, directory_size) ||
+        !fits_range(str_hdr_off + 2u, byte_len, static_cast<std::uint64_t>(b.size()))) {
+        return {};
+    }
+    Utf16DecodeDiagnostics diag{};
+    std::string decoded = decode_utf16_to_utf8(
+        b.subspan(static_cast<std::size_t>(str_hdr_off + 2u), static_cast<std::size_t>(byte_len)),
+        Endianness::Little,
+        /*stop_at_nul=*/false,
+        units,
+        &diag);
+    if (diag.had_errors() && !warned_utf16_surrogate) {
+        warned_utf16_surrogate = true;
+        warnings_out.emplace_back(
+            "PE resource directory contains unpaired UTF-16 surrogate in resource name; replaced with U+FFFD");
+    }
+    return decoded;
+}
+
 void parse_pe_resource_directory(std::span<const std::uint8_t> b,
                                  const std::vector<Section>& sections,
                                  std::uint64_t image_base,
                                  std::uint32_t directory_rva,
                                  std::uint32_t directory_size,
                                  std::optional<PeResourceDirectory>& resource_out,
-                                 std::vector<PeResourceDataEntry>& data_entries_out) {
+                                 std::vector<PeResourceDataEntry>& data_entries_out,
+                                 std::vector<std::string>& warnings_out) {
     if (directory_rva == 0 || directory_size < 16) {
         return;
     }
@@ -373,6 +414,9 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
     if (!directory_off || !fits_range(*directory_off, 16, static_cast<std::uint64_t>(b.size()))) {
         return;
     }
+
+    constexpr std::size_t kMaxPeResourceVisits = 4096u;
+    constexpr std::size_t kMaxPeResourceDataEntries = 4096u;
 
     const std::size_t off = static_cast<std::size_t>(*directory_off);
     PeResourceDirectory resource;
@@ -385,10 +429,15 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
     resource.named_entry_count = rd16(b, off + 0x0C, false);
     resource.id_entry_count = rd16(b, off + 0x0E, false);
 
+    bool warned_utf16_surrogate = false;
     const std::uint64_t total_entries = static_cast<std::uint64_t>(resource.named_entry_count) +
                                         static_cast<std::uint64_t>(resource.id_entry_count);
     const std::uint64_t max_entries = directory_size >= 16 ? (directory_size - 16u) / 8u : 0;
-    const std::uint64_t parsed_entries = std::min(total_entries, max_entries);
+    const std::uint64_t parsed_entries = std::min<std::uint64_t>({
+        total_entries,
+        max_entries,
+        kMaxPeResourceVisits,
+    });
     resource.entries.reserve(static_cast<std::size_t>(parsed_entries));
     for (std::uint64_t i = 0; i < parsed_entries; ++i) {
         const std::uint64_t entry_off = *directory_off + 16u + i * 8u;
@@ -401,12 +450,32 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
         entry.offset_to_data_or_directory = rd32(b, entry_pos + 0x04, false);
         entry.name_is_string = (entry.name_or_id & 0x8000'0000u) != 0;
         entry.data_is_directory = (entry.offset_to_data_or_directory & 0x8000'0000u) != 0;
-        resource.entries.push_back(entry);
+        if (entry.name_is_string) {
+            entry.name = read_pe_resource_dir_string(
+                b,
+                *directory_off,
+                directory_size,
+                entry.name_or_id & 0x7FFF'FFFFu,
+                warnings_out,
+                warned_utf16_surrogate);
+        }
+        resource.entries.push_back(std::move(entry));
     }
 
     std::size_t visited_budget = 0u;
-    constexpr std::size_t kMaxResourceEntriesVisited = 16384u;
+    bool budget_capped = false;
+    bool warned_cycle = false;
+    bool warned_depth = false;
     std::array<std::uint64_t, 4> active_dir_offsets{};
+
+    auto mark_budget_capped = [&]() {
+        if (!budget_capped) {
+            budget_capped = true;
+            warnings_out.push_back(std::format(
+                "PE resource directory traversal capped at {} visited nodes/entries",
+                kMaxPeResourceVisits));
+        }
+    };
 
     auto parse_resource_level = [&](auto&& self,
                                     std::uint64_t relative_directory_offset,
@@ -414,16 +483,34 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
                                     std::uint32_t type_id,
                                     std::uint32_t name_id,
                                     std::uint32_t language_id) -> void {
-        if (depth > 2 || visited_budget >= kMaxResourceEntriesVisited ||
-            relative_directory_offset > directory_size ||
+        if (budget_capped) {
+            return;
+        }
+        if (depth > 2) {
+            if (!warned_depth) {
+                warned_depth = true;
+                warnings_out.emplace_back("PE resource directory exceeds 3-level hierarchy depth");
+            }
+            return;
+        }
+        if (visited_budget >= kMaxPeResourceVisits) {
+            mark_budget_capped();
+            return;
+        }
+        if (relative_directory_offset > directory_size ||
             directory_size - relative_directory_offset < 16) {
             return;
         }
         for (std::uint32_t d = 0; d < depth; ++d) {
             if (active_dir_offsets[d] == relative_directory_offset) {
+                if (!warned_cycle) {
+                    warned_cycle = true;
+                    warnings_out.emplace_back("Cycle detected in PE resource directory tree");
+                }
                 return;
             }
         }
+        ++visited_budget;
         active_dir_offsets[depth] = relative_directory_offset;
 
         const std::uint64_t directory_file_offset = *directory_off + relative_directory_offset;
@@ -437,7 +524,12 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
         const std::uint64_t entry_count = static_cast<std::uint64_t>(named_count) +
                                           static_cast<std::uint64_t>(id_count);
         for (std::uint64_t i = 0; i < entry_count; ++i) {
-            if (visited_budget >= kMaxResourceEntriesVisited) {
+            if (budget_capped) {
+                break;
+            }
+            if (visited_budget >= kMaxPeResourceVisits ||
+                data_entries_out.size() >= kMaxPeResourceDataEntries) {
+                mark_budget_capped();
                 break;
             }
             ++visited_budget;
@@ -450,6 +542,15 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
             const std::uint32_t raw_name = rd32(b, entry_pos + 0x00, false);
             const std::uint32_t raw_target = rd32(b, entry_pos + 0x04, false);
             const std::uint32_t id = raw_name & 0x7FFF'FFFFu;
+            if ((raw_name & 0x8000'0000u) != 0u && depth > 0u) {
+                (void)read_pe_resource_dir_string(
+                    b,
+                    *directory_off,
+                    directory_size,
+                    id,
+                    warnings_out,
+                    warned_utf16_surrogate);
+            }
             const std::uint32_t next_type = depth == 0 ? id : type_id;
             const std::uint32_t next_name = depth == 1 ? id : name_id;
             const std::uint32_t next_language = depth == 2 ? id : language_id;
@@ -1081,7 +1182,7 @@ Result<std::unique_ptr<PeImage>> PeImage::parse(std::span<const std::uint8_t> b)
                            bound_import_dir_size, img->bound_imports_);
     parse_pe_resource_directory(b, img->sections_, image_base, resource_dir_rva,
                                 resource_dir_size, img->resource_directory_,
-                                img->resource_data_entries_);
+                                img->resource_data_entries_, img->parse_warnings_);
     parse_pe_clr_header(b, img->sections_, image_base, clr_dir_rva, clr_dir_size,
                         img->clr_header_);
 

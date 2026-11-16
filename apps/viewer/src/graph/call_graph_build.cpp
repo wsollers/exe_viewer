@@ -14,6 +14,7 @@
 #include <utility>
 
 #include <peelf/demangle.hpp>
+#include <peelf/endian_reader.hpp>
 
 #include "disasm/disassembler.hpp"
 
@@ -95,24 +96,26 @@ using detail::format_hex;
             ++i;
         }
 
-        std::int64_t value = 0;
-        std::string_view token = operands.substr(begin, i - begin);
-        if (base == 16 && negative) {
-            token.remove_prefix(3);
-            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 16);
-            if (ec == std::errc{} && ptr == token.data() + token.size()) {
-                result = -value;
-            }
-        } else if (base == 16) {
-            token.remove_prefix(2);
-            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 16);
-            if (ec == std::errc{} && ptr == token.data() + token.size()) {
-                result = value;
-            }
-        } else {
-            const auto [ptr, ec] = std::from_chars(token.data(), token.data() + token.size(), value, 10);
-            if (ec == std::errc{} && ptr == token.data() + token.size()) {
-                result = value;
+        std::uint64_t mag = 0;
+        std::string_view digits = operands.substr(begin, i - begin);
+        if (negative) {
+            digits.remove_prefix(1u);
+        }
+        if (base == 16) {
+            digits.remove_prefix(2u);
+        }
+        const auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), mag, base);
+        if (ec == std::errc{} && ptr == digits.data() + digits.size()) {
+            constexpr std::uint64_t kMaxNegMag =
+                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ULL;
+            if (negative) {
+                if (mag == kMaxNegMag) {
+                    result = std::numeric_limits<std::int64_t>::min();
+                } else if (mag < kMaxNegMag) {
+                    result = -static_cast<std::int64_t>(mag);
+                }
+            } else if (mag <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+                result = static_cast<std::int64_t>(mag);
             }
         }
     }
@@ -129,12 +132,15 @@ using detail::format_hex;
     if (!high || !low) {
         return std::nullopt;
     }
-    const std::int64_t target =
-        static_cast<std::int64_t>(previous.address) + (*high << 12) + *low;
-    if (target < 0) {
+    const auto hi_disp = peelf::checked_scale_signed_displacement(*high, 12u);
+    if (!hi_disp.has_value()) {
         return std::nullopt;
     }
-    return static_cast<std::uint64_t>(target);
+    const auto page_va = peelf::checked_apply_signed_displacement(previous.address, *hi_disp);
+    if (!page_va.has_value()) {
+        return std::nullopt;
+    }
+    return peelf::checked_apply_signed_displacement(*page_va, *low);
 }
 
 [[nodiscard]] std::optional<std::uint64_t> parse_direct_call_target(const Instruction& instruction) {
@@ -149,12 +155,7 @@ using detail::format_hex;
     constexpr std::int64_t relative_immediate_limit = 0x100000;
     if ((instruction.mnemonic == "bal" || instruction.mnemonic == "jal" || instruction.mnemonic == "j") &&
         *decimal_target > -relative_immediate_limit && *decimal_target < relative_immediate_limit) {
-        const std::int64_t absolute =
-            static_cast<std::int64_t>(instruction.address) + *decimal_target;
-        if (absolute < 0) {
-            return std::nullopt;
-        }
-        return static_cast<std::uint64_t>(absolute);
+        return peelf::checked_apply_signed_displacement(instruction.address, *decimal_target);
     }
     if (*decimal_target < 0) {
         return std::nullopt;

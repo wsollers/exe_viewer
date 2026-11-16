@@ -101,6 +101,7 @@ struct PeResourceDirectoryEntry {
     std::uint32_t offset_to_data_or_directory = 0;
     bool name_is_string = false;
     bool data_is_directory = false;
+    std::string name{};
 };
 
 struct PeResourceDirectory {

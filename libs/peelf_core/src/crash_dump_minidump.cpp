@@ -84,24 +84,6 @@ struct DumpMemorySlice {
     return std::string(full_path.substr(slash + 1u));
 }
 
-void append_utf8_codepoint(std::string& out, std::uint32_t cp) {
-    if (cp <= 0x7Fu) {
-        out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7FFu) {
-        out.push_back(static_cast<char>(0xC0u | ((cp >> 6u) & 0x1Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0xFFFFu) {
-        out.push_back(static_cast<char>(0xE0u | ((cp >> 12u) & 0x0Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0x10FFFFu) {
-        out.push_back(static_cast<char>(0xF0u | ((cp >> 18u) & 0x07u)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    }
-}
-
 [[nodiscard]] std::optional<std::string> read_minidump_string(const EndianReader& rd,
                                                               std::uint32_t rva) {
     if (rva == 0u || !rd.can_read(rva, 4u)) {
@@ -116,30 +98,12 @@ void append_utf8_codepoint(std::string& out, std::uint32_t cp) {
         return std::nullopt;
     }
     const std::size_t units = static_cast<std::size_t>(byte_len / 2u);
-    std::string out;
-    out.reserve(units);
     const std::size_t base = static_cast<std::size_t>(rva) + 4u;
-    for (std::size_t i = 0; i < units; ++i) {
-        const auto cu_res = rd.read_u16(base + i * 2u);
-        if (!cu_res || *cu_res == 0u) {
-            break;
-        }
-        const std::uint16_t u = *cu_res;
-        if (u >= 0xD800u && u <= 0xDBFFu && (i + 1u) < units) {
-            const auto lo_res = rd.read_u16(base + (i + 1u) * 2u);
-            if (lo_res && *lo_res >= 0xDC00u && *lo_res <= 0xDFFFu) {
-                const std::uint32_t cp =
-                    0x10000u +
-                    ((static_cast<std::uint32_t>(u - 0xD800u) << 10u) |
-                     static_cast<std::uint32_t>(*lo_res - 0xDC00u));
-                append_utf8_codepoint(out, cp);
-                ++i;
-                continue;
-            }
-        }
-        append_utf8_codepoint(out, u);
-    }
-    return out;
+    return decode_utf16_to_utf8(
+        rd.bytes().subspan(base, units * 2u),
+        rd.endianness(),
+        /*stop_at_nul=*/true,
+        units);
 }
 
 [[nodiscard]] MemoryProtection decode_win32_protect(std::uint32_t protect,

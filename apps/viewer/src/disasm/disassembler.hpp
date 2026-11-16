@@ -8,9 +8,88 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace viewer {
+
+class ScopedCsHandle {
+public:
+    ScopedCsHandle() noexcept = default;
+    explicit ScopedCsHandle(csh handle) noexcept : handle_(handle) {}
+    ~ScopedCsHandle() noexcept { reset(); }
+
+    ScopedCsHandle(const ScopedCsHandle&) = delete;
+    ScopedCsHandle& operator=(const ScopedCsHandle&) = delete;
+
+    ScopedCsHandle(ScopedCsHandle&& other) noexcept
+        : handle_(std::exchange(other.handle_, csh{0})) {}
+
+    ScopedCsHandle& operator=(ScopedCsHandle&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.handle_, csh{0}));
+        }
+        return *this;
+    }
+
+    [[nodiscard]] csh get() const noexcept { return handle_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return handle_ != 0; }
+
+    [[nodiscard]] csh* put() noexcept {
+        reset();
+        return &handle_;
+    }
+
+    void reset(csh next = 0) noexcept {
+        if (handle_ != 0) {
+            cs_close(&handle_);
+        }
+        handle_ = next;
+    }
+
+private:
+    csh handle_{0};
+};
+
+class ScopedCsInsn {
+public:
+    ScopedCsInsn() noexcept = default;
+    ScopedCsInsn(cs_insn* ptr, std::size_t count) noexcept : ptr_(ptr), count_(count) {}
+    ~ScopedCsInsn() noexcept { reset(); }
+
+    ScopedCsInsn(const ScopedCsInsn&) = delete;
+    ScopedCsInsn& operator=(const ScopedCsInsn&) = delete;
+
+    ScopedCsInsn(ScopedCsInsn&& other) noexcept
+        : ptr_(std::exchange(other.ptr_, nullptr)),
+          count_(std::exchange(other.count_, 0u)) {}
+
+    ScopedCsInsn& operator=(ScopedCsInsn&& other) noexcept {
+        if (this != &other) {
+            reset();
+            ptr_ = std::exchange(other.ptr_, nullptr);
+            count_ = std::exchange(other.count_, 0u);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] cs_insn* get() const noexcept { return ptr_; }
+    [[nodiscard]] std::size_t count() const noexcept { return count_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return ptr_ != nullptr; }
+    [[nodiscard]] const cs_insn& operator[](std::size_t index) const noexcept { return ptr_[index]; }
+
+    void reset(cs_insn* next_ptr = nullptr, std::size_t next_count = 0u) noexcept {
+        if (ptr_ != nullptr) {
+            cs_free(ptr_, count_);
+        }
+        ptr_ = next_ptr;
+        count_ = next_count;
+    }
+
+private:
+    cs_insn* ptr_{nullptr};
+    std::size_t count_{0};
+};
 
 enum class Architecture {
     X86_32,
@@ -66,24 +145,19 @@ public:
     Disassembler& operator=(const Disassembler&) = delete;
 
     Disassembler(Disassembler&& other) noexcept
-        : handle_(other.handle_)
+        : handle_(std::move(other.handle_))
         , arch_(other.arch_)
         , endian_(other.endian_)
-        , initialized_(other.initialized_)
-    {
-        other.handle_ = 0;
-        other.initialized_ = false;
-    }
+        , initialized_(std::exchange(other.initialized_, false))
+    {}
 
     Disassembler& operator=(Disassembler&& other) noexcept {
         if (this != &other) {
             close();
-            handle_ = other.handle_;
+            handle_ = std::move(other.handle_);
             arch_ = other.arch_;
             endian_ = other.endian_;
-            initialized_ = other.initialized_;
-            other.handle_ = 0;
-            other.initialized_ = false;
+            initialized_ = std::exchange(other.initialized_, false);
         }
         return *this;
     }
@@ -145,21 +219,18 @@ public:
                 return false;
         }
 
-        if (cs_open(cs_architecture, cs_mode_flags, &handle_) != CS_ERR_OK) {
+        if (cs_open(cs_architecture, cs_mode_flags, handle_.put()) != CS_ERR_OK) {
             return false;
         }
 
-        cs_option(handle_, CS_OPT_DETAIL, CS_OPT_ON);
+        cs_option(handle_.get(), CS_OPT_DETAIL, CS_OPT_ON);
 
         initialized_ = true;
         return true;
     }
 
-    void close() {
-        if (initialized_ && handle_ != 0) {
-            cs_close(&handle_);
-        }
-        handle_ = 0;
+    void close() noexcept {
+        handle_.reset();
         initialized_ = false;
     }
 
@@ -171,10 +242,11 @@ public:
         std::vector<Instruction> result;
         if (!initialized_) return result;
 
-        cs_insn* insn;
-        std::size_t count = cs_disasm(handle_, code, size, address, 0, &insn);
+        cs_insn* raw_insn = nullptr;
+        const std::size_t count = cs_disasm(handle_.get(), code, size, address, 0, &raw_insn);
+        const ScopedCsInsn insn(raw_insn, count);
 
-        if (count > 0) {
+        if (count > 0 && insn) {
             result.reserve(count);
             for (std::size_t i = 0; i < count; ++i) {
                 Instruction inst;
@@ -192,7 +264,6 @@ public:
                      inst.mnemonic == "bgtzl" || inst.mnemonic == "bltzl" || inst.mnemonic == "bgezl");
                 result.push_back(std::move(inst));
             }
-            cs_free(insn, count);
         }
 
         return result;
@@ -203,10 +274,11 @@ public:
         std::vector<Instruction> result;
         if (!initialized_) return result;
 
-        cs_insn* insn;
-        std::size_t actual = cs_disasm(handle_, code, size, address, count, &insn);
+        cs_insn* raw_insn = nullptr;
+        const std::size_t actual = cs_disasm(handle_.get(), code, size, address, count, &raw_insn);
+        const ScopedCsInsn insn(raw_insn, actual);
 
-        if (actual > 0) {
+        if (actual > 0 && insn) {
             result.reserve(actual);
             for (std::size_t i = 0; i < actual; ++i) {
                 Instruction inst;
@@ -224,7 +296,6 @@ public:
                      inst.mnemonic == "bgtzl" || inst.mnemonic == "bltzl" || inst.mnemonic == "bgezl");
                 result.push_back(std::move(inst));
             }
-            cs_free(insn, actual);
         }
 
         return result;
@@ -232,14 +303,14 @@ public:
 
     [[nodiscard]] const char* get_error() const {
         if (!initialized_) return "Not initialized";
-        return cs_strerror(cs_errno(handle_));
+        return cs_strerror(cs_errno(handle_.get()));
     }
 
     bool set_thumb_mode(bool enable) {
         if (!initialized_ || arch_ != Architecture::ARM32) return false;
         const auto mode = static_cast<cs_mode>((enable ? CS_MODE_THUMB : CS_MODE_ARM) |
             (endian_ == Endianness::Big ? CS_MODE_BIG_ENDIAN : CS_MODE_LITTLE_ENDIAN));
-        return cs_option(handle_, CS_OPT_MODE, mode) == CS_ERR_OK;
+        return cs_option(handle_.get(), CS_OPT_MODE, mode) == CS_ERR_OK;
     }
 
     static bool is_simd_instruction(const Instruction& inst) {
@@ -404,7 +475,7 @@ private:
         }
         return target;
     }
-    csh handle_ = 0;
+    ScopedCsHandle handle_;
     Architecture arch_ = Architecture::X86_64;
     Endianness endian_ = Endianness::Little;
     bool initialized_ = false;

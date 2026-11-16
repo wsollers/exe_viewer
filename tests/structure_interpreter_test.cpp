@@ -497,3 +497,156 @@ TEST(StructureInterpreterTest, DecodesRealBinMatrixElfAndPeHeadersAndPersistsMod
     ASSERT_NE(e_magic, nullptr);
     EXPECT_NE(e_magic->decoded_value.find("0x5A4D"), std::string::npos);
 }
+
+TEST(StructureInterpreterTest, RejectsOverflowingArrayCountsAndGuardsNearUint64MaxAddresses) {
+    DataTypeRecord ovf_2pow64{};
+    ovf_2pow64.name = "OverflowArray2Pow64";
+    ovf_2pow64.size = 0;
+    ovf_2pow64.members = {
+        {.name = "header", .type = "uint32_t", .offset = 0, .size = 4},
+        {.name = "huge", .type = "uint32_t[18446744073709551616]", .offset = 4, .size = 0},
+    };
+
+    DataTypeRecord ovf_byte_mul{};
+    ovf_byte_mul.name = "OverflowArrayByteMul";
+    ovf_byte_mul.size = 0;
+    ovf_byte_mul.members = {
+        {.name = "items", .type = "uint64_t[4611686018427387904]", .offset = 0, .size = 0},
+    };
+
+    DataTypeRecord huge_stride{};
+    huge_stride.name = "HugeStrideStruct";
+    huge_stride.size = (std::uint64_t{1} << 60u) + 8ULL;
+    huge_stride.members = {
+        {.name = "first", .type = "uint64_t", .offset = 0, .size = 8},
+    };
+
+    DataTypeRecord pair_u64{};
+    pair_u64.name = "PairU64";
+    pair_u64.size = 16;
+    pair_u64.members = {
+        {.name = "first", .type = "uint64_t", .offset = 0, .size = 8},
+        {.name = "second", .type = "uint64_t", .offset = 8, .size = 8},
+    };
+
+    DataTypeRecord wide_preview{};
+    wide_preview.name = "WidePreviewSample";
+    wide_preview.size = 12;
+    wide_preview.members = {
+        {.name = "text", .type = "wchar_t[6]", .offset = 0, .size = 12},
+    };
+
+    const std::array<DataTypeRecord, 5> user_types{{
+        ovf_2pow64,
+        ovf_byte_mul,
+        huge_stride,
+        pair_u64,
+        wide_preview,
+    }};
+    const StructureCatalog catalog = StructureCatalog::build(user_types, {}, false);
+
+    std::array<std::uint8_t, 64> backing{};
+    backing[0] = 0x78u;
+    backing[1] = 0x56u;
+    backing[2] = 0x34u;
+    backing[3] = 0x12u;
+    SpanStructureByteSource span_src(backing, /*base_va=*/0ULL);
+    StructureEvalOptions opts{};
+    opts.layout = peelf::TargetLayout{
+        .architecture = peelf::Architecture::X86_64,
+        .address_width = peelf::AddressWidth::Bits64,
+        .endianness = peelf::Endianness::Little,
+    };
+
+    // 1. Array count >= 2^64 must NOT wrap mod 2^64 to 0!
+    const auto ovf_count =
+        evaluate_structure(catalog, "OverflowArray2Pow64", 0, true, span_src, opts);
+    EXPECT_FALSE(ovf_count.has_value());
+
+    // 2. Array element_size * count overflowing uint64_t (8 * 2^62 == 2^65) must be rejected!
+    const auto ovf_mul =
+        evaluate_structure(catalog, "OverflowArrayByteMul", 0, true, span_src, opts);
+    EXPECT_FALSE(ovf_mul.has_value());
+
+    // 3. Top-level `stride * opts.count` multiplication overflow ((2^60 + 8) * 32) must be rejected!
+    StructureEvalOptions huge_count_opts = opts;
+    huge_count_opts.count = 32u;
+    const auto ovf_top_count =
+        evaluate_structure(catalog, "HugeStrideStruct", 0, true, span_src, huge_count_opts);
+    EXPECT_FALSE(ovf_top_count.has_value());
+
+    // 4. `base_address` near UINT64_MAX (`0xFFFFFFFFFFFFFFF8`):
+    //    `first` ([FFF8..FFFF], 8 bytes) fits in uint64_t;
+    //    `second` (offset +8 -> wraps to 0x0 if unchecked!) MUST be marked Unavailable and
+    //    must NEVER wrap around to read low address 0x0!
+    class HighBoundaryByteSource final : public IStructureByteSource {
+    public:
+        [[nodiscard]] peelf::MemorySample read_bytes(
+            std::uint64_t address,
+            bool /*is_file_offset*/,
+            std::size_t size) const override {
+            peelf::MemorySample out;
+            out.bytes.assign(size, 0u);
+            out.valid.assign(size, 0u);
+            for (std::size_t i = 0; i < size; ++i) {
+                if (i > std::numeric_limits<std::uint64_t>::max() - address) {
+                    break;
+                }
+                const std::uint64_t cur = address + i;
+                if (cur >= 0xFFFF'FFFF'FFFF'FFF8ULL) {
+                    out.bytes[i] = 0xAAu;
+                    out.valid[i] = 1u;
+                    ++out.readable_count;
+                } else if (cur < 16ULL) {
+                    // Trap bytes at low VA 0x0..0xF to catch any uint64 wraparound!
+                    out.bytes[i] = 0xFEu;
+                    out.valid[i] = 1u;
+                    ++out.readable_count;
+                }
+            }
+            return out;
+        }
+    };
+
+    HighBoundaryByteSource high_src;
+    const auto near_max = evaluate_structure(
+        catalog, "PairU64", 0xFFFF'FFFF'FFFF'FFF8ULL, false, high_src, opts);
+    ASSERT_TRUE(near_max.has_value()) << near_max.error().message;
+    const auto* first_f = find_field(near_max->fields, "first");
+    const auto* second_f = find_field(near_max->fields, "second");
+    ASSERT_NE(first_f, nullptr);
+    ASSERT_NE(second_f, nullptr);
+    EXPECT_EQ(first_f->availability, peelf::Availability::Available);
+    EXPECT_NE(first_f->decoded_value.find("0xAAAAAAAAAAAAAAAA"), std::string::npos);
+    EXPECT_EQ(second_f->availability, peelf::Availability::Unavailable);
+    EXPECT_EQ(second_f->decoded_value.find("0xFEFE"), std::string::npos);
+
+    // Also verify SpanStructureByteSource rejects overflowing base+size near UINT64_MAX.
+    SpanStructureByteSource high_span_src(backing, 0xFFFF'FFFF'FFFF'FFF8ULL);
+    const auto span_near_max = evaluate_structure(
+        catalog, "PairU64", 0xFFFF'FFFF'FFFF'FFF8ULL, false, high_span_src, opts);
+    ASSERT_TRUE(span_near_max.has_value());
+    const auto* span_second = find_field(span_near_max->fields, "second");
+    ASSERT_NE(span_second, nullptr);
+    EXPECT_EQ(span_second->availability, peelf::Availability::Unavailable);
+
+    // 5. UTF-16 `wchar_t[]` preview decodes valid surrogate pair U+1F680 and replaces lone surrogate with U+FFFD.
+    std::vector<std::uint8_t> wide_bytes;
+    for (const std::uint16_t cu : {std::uint16_t{0xD83Du},
+                                   std::uint16_t{0xDE80u}, // U+1F680 🚀
+                                   std::uint16_t{0xD83Du}, // lone high surrogate -> U+FFFD
+                                   std::uint16_t{'!'},
+                                   std::uint16_t{0u},
+                                   std::uint16_t{0u}}) {
+        wide_bytes.push_back(static_cast<std::uint8_t>(cu & 0xFFu));
+        wide_bytes.push_back(static_cast<std::uint8_t>((cu >> 8u) & 0xFFu));
+    }
+    SpanStructureByteSource wide_src(wide_bytes, 0ULL);
+    const auto wide_res =
+        evaluate_structure(catalog, "WidePreviewSample", 0, true, wide_src, opts);
+    ASSERT_TRUE(wide_res.has_value()) << wide_res.error().message;
+    const auto* text_field = find_field(wide_res->fields, "text");
+    ASSERT_NE(text_field, nullptr);
+    EXPECT_EQ(text_field->string_preview, "L\"\xF0\x9F\x9A\x80\xEF\xBF\xBD!\"");
+}
+

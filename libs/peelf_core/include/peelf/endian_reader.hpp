@@ -5,6 +5,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -19,6 +21,90 @@ enum class AddressWidth : std::uint8_t {
 
 [[nodiscard]] constexpr std::string_view to_string(AddressWidth width) noexcept {
     return width == AddressWidth::Bits64 ? "64-bit" : "32-bit";
+}
+
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_add_u64(
+    std::uint64_t a,
+    std::uint64_t b) noexcept {
+    if (b > std::numeric_limits<std::uint64_t>::max() - a) {
+        return std::nullopt;
+    }
+    return a + b;
+}
+
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_mul_u64(
+    std::uint64_t a,
+    std::uint64_t b) noexcept {
+    if (a != 0u && b > std::numeric_limits<std::uint64_t>::max() / a) {
+        return std::nullopt;
+    }
+    return a * b;
+}
+
+/// Returns `|value|` as `std::uint64_t` with zero `INT64_MIN` negation UB.
+[[nodiscard]] constexpr std::uint64_t unsigned_magnitude_of_signed(
+    std::int64_t value) noexcept {
+    return value < 0
+               ? (std::uint64_t{0} - static_cast<std::uint64_t>(value))
+               : static_cast<std::uint64_t>(value);
+}
+
+/// Applies signed `displacement` to unsigned `base` without signed-overflow UB.
+/// Returns `std::nullopt` if the target underflows `0` or exceeds `width`.
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_apply_signed_displacement(
+    std::uint64_t base,
+    std::int64_t displacement,
+    AddressWidth width = AddressWidth::Bits64) noexcept {
+    const std::uint64_t max_addr = (width == AddressWidth::Bits32)
+                                       ? std::uint64_t{0xFFFF'FFFFu}
+                                       : std::numeric_limits<std::uint64_t>::max();
+    if (base > max_addr) {
+        return std::nullopt;
+    }
+    if (displacement >= 0) {
+        const auto mag = static_cast<std::uint64_t>(displacement);
+        if (mag > max_addr - base) {
+            return std::nullopt;
+        }
+        return base + mag;
+    }
+    const auto mag = unsigned_magnitude_of_signed(displacement);
+    if (mag > base) {
+        return std::nullopt;
+    }
+    return base - mag;
+}
+
+/// Computes `value * 2^shift` in `std::int64_t` without signed-shift UB.
+[[nodiscard]] constexpr std::optional<std::int64_t> checked_scale_signed_displacement(
+    std::int64_t value,
+    unsigned shift) noexcept {
+    if (shift == 0u) {
+        return value;
+    }
+    if (shift >= 63u) {
+        return value == 0 ? std::optional<std::int64_t>{0} : std::nullopt;
+    }
+    if (value >= 0) {
+        const auto u = static_cast<std::uint64_t>(value);
+        const std::uint64_t max_u =
+            static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) >> shift;
+        if (u > max_u) {
+            return std::nullopt;
+        }
+        return static_cast<std::int64_t>(u << shift);
+    }
+    const std::uint64_t mag = unsigned_magnitude_of_signed(value);
+    constexpr std::uint64_t kMaxNegMag =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) + 1ULL;
+    if (mag > (kMaxNegMag >> shift)) {
+        return std::nullopt;
+    }
+    const std::uint64_t scaled_mag = mag << shift;
+    if (scaled_mag == kMaxNegMag) {
+        return std::numeric_limits<std::int64_t>::min();
+    }
+    return -static_cast<std::int64_t>(scaled_mag);
 }
 
 struct TargetLayout {
@@ -106,6 +192,38 @@ private:
     std::span<const std::uint8_t> bytes_;
     TargetLayout layout_;
 };
+
+struct Utf16DecodeDiagnostics {
+    bool odd_trailing_byte = false;
+    std::size_t unpaired_high_surrogates = 0;
+    std::size_t unpaired_low_surrogates = 0;
+    bool truncated_at_max_units = false;
+
+    [[nodiscard]] constexpr bool had_errors() const noexcept {
+        return odd_trailing_byte ||
+               unpaired_high_surrogates > 0 ||
+               unpaired_low_surrogates > 0;
+    }
+};
+
+/// Appends a single Unicode scalar value (`U+0000..U+10FFFF`, excluding
+/// UTF-16 surrogates) as valid UTF-8, replacing out-of-range or surrogate
+/// values with `U+FFFD` (`\xEF\xBF\xBD`).
+void append_utf8_codepoint(std::string& out, std::uint32_t codepoint);
+
+/// Decodes UTF-16LE or UTF-16BE bytes into valid UTF-8:
+/// - Valid surrogate pairs (`0xD800..0xDBFF` + `0xDC00..0xDFFF`) produce
+///   4-byte UTF-8 (`U+10000..U+10FFFF`).
+/// - Lone/unpaired surrogates produce `U+FFFD` (`\xEF\xBF\xBD`) without
+///   consuming a following non-low-surrogate code unit.
+/// - When `stop_at_nul` is true, decoding stops at the first `0x0000` unit;
+///   when false, embedded `0x0000` units are skipped.
+[[nodiscard]] std::string decode_utf16_to_utf8(
+    std::span<const std::uint8_t> bytes,
+    Endianness endianness = Endianness::Little,
+    bool stop_at_nul = true,
+    std::size_t max_code_units = std::numeric_limits<std::size_t>::max(),
+    Utf16DecodeDiagnostics* diagnostics = nullptr);
 
 [[nodiscard]] std::vector<std::uint8_t> encode_u8(std::uint8_t value);
 [[nodiscard]] std::vector<std::uint8_t> encode_i8(std::int8_t value);

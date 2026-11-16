@@ -1,11 +1,14 @@
 #include "analysis/async_binary_diff.hpp"
 #include "analysis/function_index.hpp"
+#include "decompile/structured_decompiler.hpp"
+#include "graph/call_graph.hpp"
 #include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
 #include <peelf/debugger.hpp>
 #include <peelf/dependency_tree.hpp>
+#include <peelf/endian_reader.hpp>
 #include <peelf/peelf.hpp>
 #include <peelf/security_audit.hpp>
 
@@ -18,6 +21,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <new>
 #include <span>
 #include <stdexcept>
@@ -759,4 +763,92 @@ TEST(ReviewBugsRegression, AsyncBinaryDifferWorkerContainsExceptionsWithoutTermi
 
     std::filesystem::remove_all(temp_dir, ec);
 }
+
+TEST(ReviewBugsRegressionTest, Int64MinImmediateParsingAndHighVaSignedDisplacementBoundaries) {
+    // 1. Checked signed magnitude / displacement / shift helpers have zero INT64_MIN UB.
+    constexpr std::int64_t kInt64Min = std::numeric_limits<std::int64_t>::min();
+    constexpr std::uint64_t kInt64MinMag = std::uint64_t{1} << 63u;
+    EXPECT_EQ(peelf::unsigned_magnitude_of_signed(kInt64Min), kInt64MinMag);
+    EXPECT_EQ(peelf::unsigned_magnitude_of_signed(-1), 1ULL);
+    EXPECT_EQ(peelf::unsigned_magnitude_of_signed(0), 0ULL);
+
+    EXPECT_EQ(peelf::checked_scale_signed_displacement(kInt64Min / 4, 2u),
+              std::optional<std::int64_t>{kInt64Min});
+    EXPECT_EQ(peelf::checked_scale_signed_displacement(kInt64Min, 1u), std::nullopt);
+
+    // High-VA positive & negative displacement boundaries (64-bit and 32-bit).
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0xFFFF'FFFF'FFFF'FFF0ULL, 0x0F),
+              std::optional<std::uint64_t>{0xFFFF'FFFF'FFFF'FFFFULL});
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0xFFFF'FFFF'FFFF'FFF0ULL, 0x10),
+              std::nullopt);
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x8000'0000'0000'0005ULL, kInt64Min),
+              std::optional<std::uint64_t>{5ULL});
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x7FFF'FFFF'FFFF'FFFFULL, kInt64Min),
+              std::nullopt);
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(
+                  0xFFFF'FFF0ULL, 0x20, peelf::AddressWidth::Bits32),
+              std::nullopt);
+
+    // 2. Real x86-64 machine code at high VA (0xFFFF'FFFF'FFFF'FF00):
+    //    - `movabs rax, -0x8000000000000000` (48 B8 00..80)
+    //    - forward conditional branch (`74 07` -> +7 inside high-VA function)
+    //    - overflowing RIP load (`48 8B 0D 00 02 00 00` -> RIP + 0x200 > UINT64_MAX, must NOT wrap to low VA!)
+    //    - backward conditional branch (`75 F7` -> -9 inside high-VA function)
+    const std::array<std::uint8_t, 22> code{
+        0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, // movabs rax, -0x8000000000000000
+        0x74, 0x07,                                                 // je +7 (to 0xFFFFFFFFFFFFFF13)
+        0x48, 0x8B, 0x0D, 0x00, 0x02, 0x00, 0x00,                   // mov rcx, [rip + 0x200] (overflows UINT64_MAX)
+        0x75, 0xF7,                                                 // jne -9 (to 0xFFFFFFFFFFFFFF0C)
+        0xC3,                                                       // ret
+    };
+    constexpr std::uint64_t kHighFnVa = 0xFFFF'FFFF'FFFF'FF00ULL;
+    viewer::CallGraph cfg = viewer::build_function_cfg_call_graph(
+        code,
+        kHighFnVa,
+        peelf::Architecture::X86_64,
+        peelf::Endianness::Little,
+        0x200u,
+        "high_va_fn");
+    ASSERT_FALSE(cfg.nodes.empty());
+
+    // Also feed explicit `-0x8000000000000000` and decimal `-9223372036854775808` operands
+    // through StructuredPseudoCDecompiler to guarantee zero INT64_MIN negation UB.
+    cfg.nodes.front().instructions.push_back(viewer::GraphInstruction{
+        .address = kHighFnVa + 0x20u,
+        .mnemonic = "mov",
+        .operands = "rdx, -9223372036854775808",
+    });
+    cfg.nodes.front().instructions.push_back(viewer::GraphInstruction{
+        .address = kHighFnVa + 0x2Au,
+        .mnemonic = "mov",
+        .operands = "rsi, qword ptr [rbp - 0x8000000000000000]",
+    });
+
+    viewer::DecompileRequest req{};
+    req.address = kHighFnVa;
+    req.architecture = peelf::Architecture::X86_64;
+    req.endianness = peelf::Endianness::Little;
+    req.fallback_graph = std::move(cfg);
+    // Low-VA symbol at wrapped address (kHighFnVa + 19 + 0x200) mod 2^64 = 0x113 MUST NOT match!
+    req.symbols.push_back(viewer::SymbolRecord{
+        .name = "wrapped_low_va_trap",
+        .virtual_address = 0x113ULL,
+        .size = 8u,
+        .function = false,
+    });
+
+    const viewer::StructuredPseudoCDecompiler decompiler;
+    const viewer::DecompiledUnit unit = decompiler.decompile(req);
+    ASSERT_EQ(unit.status, viewer::DecompileStatus::Ready) << unit.diagnostic;
+
+    std::string combined;
+    for (const auto& line : unit.lines) {
+        combined += line.text;
+        combined.push_back('\n');
+    }
+    EXPECT_EQ(combined.find("wrapped_low_va_trap"), std::string::npos)
+        << "Overflowing high-VA RIP displacement wrapped to low VA:\n"
+        << combined;
+}
+
 

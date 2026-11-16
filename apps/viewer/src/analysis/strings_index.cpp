@@ -1,5 +1,7 @@
 #include "analysis/strings_index.hpp"
 
+#include <peelf/endian_reader.hpp>
+
 #include <algorithm>
 #include <array>
 #include <format>
@@ -10,23 +12,7 @@
 namespace viewer {
 namespace {
 
-void append_utf8_codepoint(std::string& out, std::uint32_t cp) {
-    if (cp <= 0x7Fu) {
-        out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7FFu) {
-        out.push_back(static_cast<char>(0xC0u | (cp >> 6u)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0xFFFFu) {
-        out.push_back(static_cast<char>(0xE0u | (cp >> 12u)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0x10FFFFu) {
-        out.push_back(static_cast<char>(0xF0u | (cp >> 18u)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    }
-}
+using peelf::append_utf8_codepoint;
 
 [[nodiscard]] constexpr bool is_graphic_codepoint(std::uint32_t cp) noexcept {
     if (cp <= 0x20u || cp == 0x7Fu) {
@@ -555,7 +541,7 @@ StringsIndex StringsIndex::extract(
     index.min_length_ = std::max<std::size_t>(options.min_length, 1u);
     std::size_t remaining_budget = options.byte_budget;
 
-    const auto sections = image.sections();
+    const auto& sections = image.sections();
     bool scanned_any_section = false;
     for (std::size_t idx = 0; idx < sections.size(); ++idx) {
         if (stop.stop_requested()) {
@@ -606,7 +592,7 @@ StringsIndex StringsIndex::extract(
     }
 
     if (!scanned_any_section) {
-        const auto segments = image.segments();
+        const auto& segments = image.segments();
         for (std::size_t idx = 0; idx < segments.size(); ++idx) {
             if (stop.stop_requested()) {
                 index.incomplete_ = true;
@@ -671,6 +657,9 @@ StringsIndex StringsIndex::extract_live(
     std::size_t remaining_budget = options.byte_budget;
     const std::size_t chunk_sz = std::max<std::size_t>(options.chunk_bytes, 4096u);
     constexpr std::size_t kChunkOverlap = 256u;
+    constexpr std::size_t kMaxConsecutiveFailedReads = 64u;
+    constexpr std::size_t kMaxTotalFailedReads = 256u;
+    std::size_t total_failed_reads = 0u;
 
     const peelf::Endianness endian = active_image != nullptr
         ? active_image->endianness()
@@ -707,7 +696,7 @@ StringsIndex StringsIndex::extract_live(
                 continue;
             }
         }
-        if (remaining_budget == 0) {
+        if (remaining_budget == 0 || total_failed_reads >= kMaxTotalFailedReads) {
             index.incomplete_ = true;
             break;
         }
@@ -715,12 +704,19 @@ StringsIndex StringsIndex::extract_live(
         const std::string region_label = format_region_name(region, active_image, active_module_base);
         const std::uint64_t reg_size = region.size();
         std::uint64_t offset = 0;
+        std::size_t consecutive_failed_reads = 0u;
 
         while (offset < reg_size && remaining_budget > 0) {
             if (stop.stop_requested()) {
                 index.incomplete_ = true;
                 break;
             }
+            const auto slice_va_opt = peelf::checked_add_u64(region.start_address, offset);
+            if (!slice_va_opt) {
+                index.incomplete_ = true;
+                break;
+            }
+            const std::uint64_t slice_va = *slice_va_opt;
             const std::uint64_t to_advance = std::min<std::uint64_t>({
                 chunk_sz,
                 reg_size - offset,
@@ -730,10 +726,10 @@ StringsIndex StringsIndex::extract_live(
                 reg_size - offset,
                 to_advance + kChunkOverlap);
             buffer.resize(static_cast<std::size_t>(read_len));
-            auto read_res = session.read_memory(region.start_address + offset, buffer);
+            auto read_res = session.read_memory(slice_va, buffer);
             if (read_res && *read_res > 0) {
+                consecutive_failed_reads = 0u;
                 buffer.resize(*read_res);
-                const std::uint64_t slice_va = region.start_address + offset;
                 const std::optional<std::uint64_t> slice_file_off =
                     active_image != nullptr ? active_image->virtual_address_to_file_offset(slice_va) : std::nullopt;
                 extract_slice_into(
@@ -753,9 +749,20 @@ StringsIndex StringsIndex::extract_live(
                 offset += step;
                 remaining_budget -= std::min(remaining_budget, step);
             } else {
-                // Skip unreadable 4 KiB page gracefully without aborting the region scan.
+                // Charge unreadable gaps against the byte budget and cap failed reads so
+                // sparse or inaccessible VMAs cannot cause unbounded read_memory calls.
+                index.incomplete_ = true;
                 const std::uint64_t skip = std::min<std::uint64_t>(4096u, reg_size - offset);
                 offset += skip;
+                const std::size_t budget_charge = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(skip, remaining_budget));
+                remaining_budget -= budget_charge;
+                ++consecutive_failed_reads;
+                ++total_failed_reads;
+                if (consecutive_failed_reads >= kMaxConsecutiveFailedReads ||
+                    total_failed_reads >= kMaxTotalFailedReads) {
+                    break;
+                }
             }
         }
         if (offset < reg_size) {

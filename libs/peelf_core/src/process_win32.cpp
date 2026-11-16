@@ -886,8 +886,18 @@ public:
                 if (desc_fn != nullptr) {
                     PWSTR raw_desc = nullptr;
                     if (SUCCEEDED(desc_fn(th.get(), &raw_desc)) && raw_desc != nullptr) {
+                        struct ScopedLocalStr {
+                            HLOCAL ptr{nullptr};
+                            explicit ScopedLocalStr(HLOCAL p) noexcept : ptr(p) {}
+                            ~ScopedLocalStr() noexcept {
+                                if (ptr != nullptr) {
+                                    ::LocalFree(ptr);
+                                }
+                            }
+                            ScopedLocalStr(const ScopedLocalStr&) = delete;
+                            ScopedLocalStr& operator=(const ScopedLocalStr&) = delete;
+                        } const desc_guard(raw_desc);
                         ti.name = wide_to_utf8(raw_desc);
-                        ::LocalFree(raw_desc);
                     }
                 }
                 if (const auto teb = query_win32_thread_teb(th.get(), info_.is_64bit)) {

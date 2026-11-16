@@ -1,4 +1,5 @@
 #include "reference_index.hpp"
+#include "disasm/disassembler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -132,8 +133,7 @@ struct ReferenceScanSnapshot {
 namespace {
 
 struct Decoder {
-    csh handle = 0;
-    ~Decoder() { if (handle) cs_close(&handle); }
+    ScopedCsHandle handle;
 };
 
 bool open_decoder(Decoder& decoder, peelf::Architecture arch, peelf::Endianness endian, bool thumb) {
@@ -163,8 +163,8 @@ bool open_decoder(Decoder& decoder, peelf::Architecture arch, peelf::Endianness 
         break;
     default: return false;
     }
-    return cs_open(target, static_cast<cs_mode>(mode), &decoder.handle) == CS_ERR_OK &&
-           cs_option(decoder.handle, CS_OPT_DETAIL, CS_OPT_ON) == CS_ERR_OK;
+    return cs_open(target, static_cast<cs_mode>(mode), decoder.handle.put()) == CS_ERR_OK &&
+           cs_option(decoder.handle.get(), CS_OPT_DETAIL, CS_OPT_ON) == CS_ERR_OK;
 }
 
 [[nodiscard]] std::size_t arch_alignment(peelf::Architecture arch, bool thumb) noexcept {
@@ -410,7 +410,7 @@ SliceScanResult scan_code_slice(
         status.decode_incomplete = true;
         return status;
     }
-    cs_insn* instruction = cs_malloc(decoder.handle);
+    const ScopedCsInsn instruction(cs_malloc(decoder.handle.get()), 1u);
     if (!instruction) {
         status.decode_incomplete = true;
         return status;
@@ -428,7 +428,7 @@ SliceScanResult scan_code_slice(
             break;
         }
 
-        if (!cs_disasm_iter(decoder.handle, &data, &remaining, &pc, instruction)) {
+        if (!cs_disasm_iter(decoder.handle.get(), &data, &remaining, &pc, instruction.get())) {
             status.decode_incomplete = true;
             history.clear();
             const auto skip = std::min(remaining, alignment);
@@ -440,7 +440,7 @@ SliceScanResult scan_code_slice(
         }
         status.bytes_consumed = bytes.size() - remaining;
 
-        const auto& insn = *instruction;
+        const auto& insn = *instruction.get();
         const auto& detail = *insn.detail;
         bool call = false;
         bool branch = false;
@@ -535,8 +535,18 @@ SliceScanResult scan_code_slice(
                     continue;
                 }
                 if (operand.mem.base == X86_REG_RIP || operand.mem.base == X86_REG_EIP) {
-                    auto target = insn.address + insn.size + static_cast<std::uint64_t>(operand.mem.disp);
-                    if (operand.mem.base == X86_REG_EIP) target &= 0xFFFFFFFFULL;
+                    std::optional<std::uint64_t> target_opt;
+                    if (operand.mem.base == X86_REG_EIP) {
+                        target_opt =
+                            (insn.address + insn.size + static_cast<std::uint64_t>(operand.mem.disp)) &
+                            0xFFFFFFFFULL;
+                    } else if (const auto next_pc = peelf::checked_add_u64(insn.address, insn.size)) {
+                        target_opt = peelf::checked_apply_signed_displacement(*next_pc, operand.mem.disp);
+                    }
+                    if (!target_opt.has_value()) {
+                        continue;
+                    }
+                    const std::uint64_t target = *target_opt;
                     if (call || branch) {
                         emit(target,
                              call ? ReferenceKind::Call : ReferenceKind::Branch,
@@ -695,24 +705,38 @@ SliceScanResult scan_code_slice(
                     }
                     const auto count = find_guarded_case_count(prefix, matched_idx);
                     if (anchor_va && count) {
-                        const auto table_va = static_cast<std::uint64_t>(
-                            static_cast<std::int64_t>(*anchor_va) + table_extra_disp);
-                        std::vector<std::uint8_t> table_bytes(*count * 4u);
-                        if (read_va(table_va, table_bytes)) {
-                            std::vector<std::uint64_t> targets;
-                            targets.reserve(*count);
-                            for (std::size_t c = 0; c < *count; ++c) {
-                                const std::int64_t rel = read_sint_endian(table_bytes.data() + c * 4u, 4u, endian);
-                                const auto target = static_cast<std::uint64_t>(
-                                    static_cast<std::int64_t>(*anchor_va) + rel);
-                                if (!is_exec_va(target)) { targets.clear(); break; }
-                                targets.push_back(target);
-                            }
-                            if (!targets.empty()) {
-                                const std::string ev = std::format(
-                                    "RIP-relative i32 jump table @ 0x{:X} ({} cases)", table_va, *count);
-                                for (const auto target : targets) {
-                                    emit(target, ReferenceKind::Branch, ReferenceConfidence::IndirectTable, ev);
+                        const auto table_va =
+                            peelf::checked_apply_signed_displacement(*anchor_va, table_extra_disp);
+                        const auto table_bytes_len = peelf::checked_mul_u64(*count, 4u);
+                        if (table_va && table_bytes_len &&
+                            *table_bytes_len <= std::numeric_limits<std::size_t>::max()) {
+                            std::vector<std::uint8_t> table_bytes(
+                                static_cast<std::size_t>(*table_bytes_len));
+                            if (read_va(*table_va, table_bytes)) {
+                                std::vector<std::uint64_t> targets;
+                                targets.reserve(*count);
+                                for (std::size_t c = 0; c < *count; ++c) {
+                                    const std::int64_t rel =
+                                        read_sint_endian(table_bytes.data() + c * 4u, 4u, endian);
+                                    const auto target =
+                                        peelf::checked_apply_signed_displacement(*anchor_va, rel);
+                                    if (!target || !is_exec_va(*target)) {
+                                        targets.clear();
+                                        break;
+                                    }
+                                    targets.push_back(*target);
+                                }
+                                if (!targets.empty()) {
+                                    const std::string ev = std::format(
+                                        "RIP-relative i32 jump table @ 0x{:X} ({} cases)",
+                                        *table_va,
+                                        *count);
+                                    for (const auto target : targets) {
+                                        emit(target,
+                                             ReferenceKind::Branch,
+                                             ReferenceConfidence::IndirectTable,
+                                             ev);
+                                    }
                                 }
                             }
                         }
@@ -811,9 +835,11 @@ SliceScanResult scan_code_slice(
                 const unsigned imm_op = reg_op + 1u;
                 const std::uint64_t shift = a64.operands[imm_op].shift.type == ARM64_SFT_LSL
                     ? a64.operands[imm_op].shift.value : 0u;
-                recent.cmp_reg = norm_arm64_gpr(a64.operands[reg_op].reg);
-                recent.cmp_imm = static_cast<std::uint64_t>(a64.operands[imm_op].imm) << shift;
-                recent.has_cmp_imm = recent.cmp_reg >= 0;
+                if (shift < 64u) {
+                    recent.cmp_reg = norm_arm64_gpr(a64.operands[reg_op].reg);
+                    recent.cmp_imm = static_cast<std::uint64_t>(a64.operands[imm_op].imm) << shift;
+                    recent.has_cmp_imm = recent.cmp_reg >= 0;
+                }
             } else if (insn.id == ARM64_INS_B && (a64.cc == ARM64_CC_HI || a64.cc == ARM64_CC_HS)) {
                 recent.is_unsigned_upper_guard = true;
                 recent.guard_strict_above = (a64.cc == ARM64_CC_HI);
@@ -832,12 +858,16 @@ SliceScanResult scan_code_slice(
                        a64.operands[2].type == ARM64_OP_IMM && a64.operands[2].imm >= 0) {
                 const std::uint64_t shift = a64.operands[2].shift.type == ARM64_SFT_LSL
                     ? a64.operands[2].shift.value : 0u;
-                recent.add_imm_dst = norm_arm64_gpr(a64.operands[0].reg);
-                recent.add_imm_base = norm_arm64_gpr(a64.operands[1].reg);
-                recent.add_imm_val = static_cast<std::uint64_t>(a64.operands[2].imm) << shift;
-                if (recent.add_imm_val != 0) {
-                    if (const auto base_va = resolve_arm64_reg_va(history, 0, recent.add_imm_base)) {
-                        emit(*base_va + recent.add_imm_val, ReferenceKind::Data, ReferenceConfidence::Direct);
+                if (shift < 64u) {
+                    recent.add_imm_dst = norm_arm64_gpr(a64.operands[0].reg);
+                    recent.add_imm_base = norm_arm64_gpr(a64.operands[1].reg);
+                    recent.add_imm_val = static_cast<std::uint64_t>(a64.operands[2].imm) << shift;
+                    if (recent.add_imm_val != 0) {
+                        if (const auto base_va = resolve_arm64_reg_va(history, 0, recent.add_imm_base)) {
+                            if (const auto target_va = peelf::checked_add_u64(*base_va, recent.add_imm_val)) {
+                                emit(*target_va, ReferenceKind::Data, ReferenceConfidence::Direct);
+                            }
+                        }
                     }
                 }
             } else if (insn.id == ARM64_INS_ADD && a64.op_count == 3 &&
@@ -862,12 +892,13 @@ SliceScanResult scan_code_slice(
                 if (mem.base != ARM64_REG_INVALID && mem.index == ARM64_REG_INVALID && insn.id == ARM64_INS_LDR) {
                     const int base_r = norm_arm64_gpr(mem.base);
                     if (const auto page_va = resolve_arm64_reg_va(history, 0, base_r)) {
-                        const auto slot_va = static_cast<std::uint64_t>(
-                            static_cast<std::int64_t>(*page_va) + mem.disp);
-                        recent.ptr_slot_dst = norm_arm64_gpr(a64.operands[0].reg);
-                        recent.ptr_slot_va = slot_va;
-                        if (mem.disp != 0) {
-                            emit(slot_va, ReferenceKind::Data, ReferenceConfidence::Direct);
+                        if (const auto slot_va =
+                                peelf::checked_apply_signed_displacement(*page_va, mem.disp)) {
+                            recent.ptr_slot_dst = norm_arm64_gpr(a64.operands[0].reg);
+                            recent.ptr_slot_va = *slot_va;
+                            if (mem.disp != 0) {
+                                emit(*slot_va, ReferenceKind::Data, ReferenceConfidence::Direct);
+                            }
                         }
                     }
                 } else if (mem.base != ARM64_REG_INVALID && mem.index != ARM64_REG_INVALID && mem.disp == 0) {
@@ -922,40 +953,56 @@ SliceScanResult scan_code_slice(
                                         prefix.push_back(history[k]);
                                     }
                                     const auto count = find_guarded_case_count(prefix, lit->table_load_index);
-                                    if (table_va && anchor_va && count) {
+                                    if (table_va && anchor_va && count && shift < 64u) {
                                         const std::size_t esz = lit->table_entry_bytes;
                                         const bool is_signed = lit->table_entry_signed ||
                                             (add_signed && add_ext_bytes == esz);
-                                        std::vector<std::uint8_t> table_bytes(*count * esz);
-                                        if (read_va(*table_va, table_bytes)) {
-                                            std::vector<std::uint64_t> targets;
-                                            targets.reserve(*count);
-                                            for (std::size_t c = 0; c < *count; ++c) {
-                                                std::uint64_t target = 0;
-                                                if (is_signed) {
-                                                    const std::int64_t rel =
-                                                        read_sint_endian(table_bytes.data() + c * esz, esz, endian) *
-                                                        (std::int64_t{1} << shift);
-                                                    target = static_cast<std::uint64_t>(
-                                                        static_cast<std::int64_t>(*anchor_va) + rel);
-                                                } else {
-                                                    const std::uint64_t rel =
-                                                        read_uint_endian(table_bytes.data() + c * esz, esz, endian) << shift;
-                                                    target = *anchor_va + rel;
+                                        const auto table_bytes_len = peelf::checked_mul_u64(*count, esz);
+                                        if (table_bytes_len &&
+                                            *table_bytes_len <= std::numeric_limits<std::size_t>::max()) {
+                                            std::vector<std::uint8_t> table_bytes(
+                                                static_cast<std::size_t>(*table_bytes_len));
+                                            if (read_va(*table_va, table_bytes)) {
+                                                std::vector<std::uint64_t> targets;
+                                                targets.reserve(*count);
+                                                for (std::size_t c = 0; c < *count; ++c) {
+                                                    std::optional<std::uint64_t> target_opt;
+                                                    if (is_signed) {
+                                                        const auto scaled =
+                                                            peelf::checked_scale_signed_displacement(
+                                                                read_sint_endian(
+                                                                    table_bytes.data() + c * esz, esz, endian),
+                                                                shift);
+                                                        if (scaled.has_value()) {
+                                                            target_opt =
+                                                                peelf::checked_apply_signed_displacement(
+                                                                    *anchor_va, *scaled);
+                                                        }
+                                                    } else {
+                                                        const std::uint64_t uval = read_uint_endian(
+                                                            table_bytes.data() + c * esz, esz, endian);
+                                                        if (shift == 0u ||
+                                                            uval <= (std::numeric_limits<std::uint64_t>::max() >>
+                                                                     shift)) {
+                                                            target_opt =
+                                                                peelf::checked_add_u64(*anchor_va, uval << shift);
+                                                        }
+                                                    }
+                                                    if (!target_opt || (*target_opt & 3ULL) != 0 ||
+                                                        !is_exec_va(*target_opt)) {
+                                                        targets.clear();
+                                                        break;
+                                                    }
+                                                    targets.push_back(*target_opt);
                                                 }
-                                                if ((target & 3ULL) != 0 || !is_exec_va(target)) {
-                                                    targets.clear();
-                                                    break;
+                                                if (!targets.empty()) {
+                                                    const std::string ev = std::format(
+                                                        "ARM64 jump table @ 0x{:X} ({} cases)", *table_va, *count);
+                                                    for (const auto t : targets) {
+                                                        emit(t, ReferenceKind::Branch, ReferenceConfidence::IndirectTable, ev);
+                                                    }
+                                                    resolved_table = true;
                                                 }
-                                                targets.push_back(target);
-                                            }
-                                            if (!targets.empty()) {
-                                                const std::string ev = std::format(
-                                                    "ARM64 jump table @ 0x{:X} ({} cases)", *table_va, *count);
-                                                for (const auto t : targets) {
-                                                    emit(t, ReferenceKind::Branch, ReferenceConfidence::IndirectTable, ev);
-                                                }
-                                                resolved_table = true;
                                             }
                                         }
                                     }
@@ -971,23 +1018,28 @@ SliceScanResult scan_code_slice(
                             for (std::size_t k = 0; k + pos < history.size(); ++k) prefix.push_back(history[k]);
                             const auto count = find_guarded_case_count(prefix, it->table_load_index);
                             if (table_va && count) {
-                                std::vector<std::uint8_t> table_bytes(*count * 8u);
-                                if (read_va(*table_va, table_bytes)) {
-                                    std::vector<std::uint64_t> targets;
-                                    targets.reserve(*count);
-                                    for (std::size_t c = 0; c < *count; ++c) {
-                                        const std::uint64_t t =
-                                            read_uint_endian(table_bytes.data() + c * 8u, 8u, endian);
-                                        if ((t & 3ULL) != 0 || !is_exec_va(t)) { targets.clear(); break; }
-                                        targets.push_back(t);
-                                    }
-                                    if (!targets.empty()) {
-                                        const std::string ev = std::format(
-                                            "ARM64 u64 jump table @ 0x{:X} ({} cases)", *table_va, *count);
-                                        for (const auto t : targets) {
-                                            emit(t, ReferenceKind::Branch, ReferenceConfidence::IndirectTable, ev);
+                                const auto table_bytes_len = peelf::checked_mul_u64(*count, 8u);
+                                if (table_bytes_len &&
+                                    *table_bytes_len <= std::numeric_limits<std::size_t>::max()) {
+                                    std::vector<std::uint8_t> table_bytes(
+                                        static_cast<std::size_t>(*table_bytes_len));
+                                    if (read_va(*table_va, table_bytes)) {
+                                        std::vector<std::uint64_t> targets;
+                                        targets.reserve(*count);
+                                        for (std::size_t c = 0; c < *count; ++c) {
+                                            const std::uint64_t t =
+                                                read_uint_endian(table_bytes.data() + c * 8u, 8u, endian);
+                                            if ((t & 3ULL) != 0 || !is_exec_va(t)) { targets.clear(); break; }
+                                            targets.push_back(t);
                                         }
-                                        resolved_table = true;
+                                        if (!targets.empty()) {
+                                            const std::string ev = std::format(
+                                                "ARM64 u64 jump table @ 0x{:X} ({} cases)", *table_va, *count);
+                                            for (const auto t : targets) {
+                                                emit(t, ReferenceKind::Branch, ReferenceConfidence::IndirectTable, ev);
+                                            }
+                                            resolved_table = true;
+                                        }
                                     }
                                 }
                             }
@@ -1058,7 +1110,6 @@ SliceScanResult scan_code_slice(
         }
     }
 
-    cs_free(instruction, 1);
     return status;
 }
 

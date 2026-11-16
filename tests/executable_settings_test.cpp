@@ -794,4 +794,147 @@ TEST(ExecutableSettingsTest, DefaultEnvironmentSecretRedactionPolicyGuardsCreden
     EXPECT_EQ(opt_in.display_value, "ghp_super_secret_token_12345");
 }
 
+TEST(ExecutableSettingsTest, CapsPeResourceDagFanOutBombAndRecordsParseWarning) {
+    // Construct a compact (~4 KiB `.rsrc`) 3-level DAG fan-out bomb with zero cycles:
+    //   Root (rel 0x000) -> 64 entries all pointing to Level-1 dir (rel 0x220)
+    //   Level-1 (rel 0x220) -> 64 entries all pointing to Level-2 dir (rel 0x440)
+    //   Level-2 (rel 0x440) -> 256 leaf entries all pointing to DATA_ENTRY (rel 0xC60)
+    // Unbounded expansion would yield 64 * 64 * 256 = 1,048,576 leaves from 4 KiB!
+    std::vector<std::uint8_t> pe = make_synthetic_pe64_with_metadata({}, {}, false, false);
+    const std::size_t opt = 0x98u;
+    const std::size_t dd_rsrc = opt + 112u + (2u * 8u);
+    write_u32_le(pe, dd_rsrc + 0u, 0x2000u);
+    write_u32_le(pe, dd_rsrc + 4u, 0x1800u);
+
+    const std::size_t rsrc_base = 0x600u;
+    constexpr std::uint32_t kLevel1Rel = 0x220u;
+    constexpr std::uint32_t kLevel2Rel = 0x440u;
+    constexpr std::uint32_t kDataEntryRel = 0xC60u;
+    constexpr std::uint32_t kPayloadRel = 0xC80u;
+
+    // Root directory: 64 ID entries -> Level 1
+    write_u16_le(pe, rsrc_base + 14u, 64u);
+    for (std::uint32_t i = 0; i < 64u; ++i) {
+        const std::size_t off = rsrc_base + 16u + i * 8u;
+        write_u32_le(pe, off + 0u, i + 1u);
+        write_u32_le(pe, off + 4u, 0x80000000u | kLevel1Rel);
+    }
+
+    // Level-1 directory: 64 ID entries -> Level 2
+    write_u16_le(pe, rsrc_base + kLevel1Rel + 14u, 64u);
+    for (std::uint32_t i = 0; i < 64u; ++i) {
+        const std::size_t off = rsrc_base + kLevel1Rel + 16u + i * 8u;
+        write_u32_le(pe, off + 0u, i + 1u);
+        write_u32_le(pe, off + 4u, 0x80000000u | kLevel2Rel);
+    }
+
+    // Level-2 directory: 256 leaf entries -> shared IMAGE_RESOURCE_DATA_ENTRY
+    write_u16_le(pe, rsrc_base + kLevel2Rel + 14u, 256u);
+    for (std::uint32_t i = 0; i < 256u; ++i) {
+        const std::size_t off = rsrc_base + kLevel2Rel + 16u + i * 8u;
+        write_u32_le(pe, off + 0u, 0x0409u + i);
+        write_u32_le(pe, off + 4u, kDataEntryRel);
+    }
+
+    // Shared IMAGE_RESOURCE_DATA_ENTRY -> RVA inside `.rsrc`
+    write_u32_le(pe, rsrc_base + kDataEntryRel + 0u, 0x2000u + kPayloadRel);
+    write_u32_le(pe, rsrc_base + kDataEntryRel + 4u, 8u);
+
+    auto parsed = peelf::parse_image(pe);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_LE((*parsed)->pe_resource_data_entries().size(), 4096u);
+    EXPECT_GT((*parsed)->pe_resource_data_entries().size(), 0u);
+
+    const auto warnings = (*parsed)->parse_warnings();
+    const bool has_cap_warning = std::ranges::any_of(warnings, [](const std::string& w) {
+        return w.find("capped") != std::string::npos;
+    });
+    EXPECT_TRUE(has_cap_warning);
+
+    const peelf::ExecutableSettingsReport rep = peelf::extract_executable_settings(**parsed, pe);
+    EXPECT_EQ(rep.declared_in_file.availability, peelf::CaptureAvailability::Partial);
+    ASSERT_TRUE(rep.declared_in_file.has_value());
+    EXPECT_EQ(rep.declared_in_file.value->pe_manifest_state, peelf::MetadataFieldState::Malformed);
+    EXPECT_NE(rep.declared_in_file.value->pe_manifest.note.find("budget"), std::string::npos);
+}
+
+TEST(ExecutableSettingsTest, SharedUtf16DecoderHandlesSurrogatePairsAndLoneSurrogates) {
+    // 1. Direct LE & BE surrogate-pair (U+1F680, U+10000, U+10FFFF) + lone-surrogate (U+FFFD) checks.
+    {
+        std::vector<std::uint8_t> le_bytes;
+        // [0xD83D, 0xDE80] -> U+1F680 (\xF0\x9F\x9A\x80)
+        // [0xD83D, 'A']    -> U+FFFD + 'A' (unpaired high surrogate does NOT consume 'A')
+        // [0xDE80, 'B']    -> U+FFFD + 'B' (lone low surrogate)
+        // [0xD83D, 0xD83D, 0xDE80] -> U+FFFD + U+1F680
+        for (const std::uint16_t u : {
+                 std::uint16_t{0xD83Du}, std::uint16_t{0xDE80u},
+                 std::uint16_t{0xD83Du}, std::uint16_t{'A'},
+                 std::uint16_t{0xDE80u}, std::uint16_t{'B'},
+                 std::uint16_t{0xD83Du}, std::uint16_t{0xD83Du}, std::uint16_t{0xDE80u},
+                 std::uint16_t{0u}}) {
+            append_u16_le(le_bytes, u);
+        }
+
+        peelf::Utf16DecodeDiagnostics diag{};
+        const std::string decoded_le = peelf::decode_utf16_to_utf8(
+            le_bytes, peelf::Endianness::Little, /*stop_at_nul=*/true, 1024u, &diag);
+        EXPECT_EQ(decoded_le,
+                  "\xF0\x9F\x9A\x80"
+                  "\xEF\xBF\xBD" "A"
+                  "\xEF\xBF\xBD" "B"
+                  "\xEF\xBF\xBD" "\xF0\x9F\x9A\x80");
+        EXPECT_EQ(diag.unpaired_high_surrogates, 2u);
+        EXPECT_EQ(diag.unpaired_low_surrogates, 1u);
+        EXPECT_FALSE(diag.odd_trailing_byte);
+
+        // Same sequence via EndianReader::read_utf16_string in Big-Endian!
+        std::vector<std::uint8_t> be_bytes;
+        for (std::size_t i = 0; i + 1 < le_bytes.size(); i += 2) {
+            be_bytes.push_back(le_bytes[i + 1]);
+            be_bytes.push_back(le_bytes[i]);
+        }
+        const peelf::EndianReader be_reader(be_bytes, peelf::Endianness::Big);
+        const auto be_res = be_reader.read_utf16_string(0u, 1024u);
+        ASSERT_TRUE(be_res.has_value()) << be_res.error().message;
+        EXPECT_EQ(*be_res, decoded_le);
+    }
+
+    // 2. Named PE `.rsrc` IMAGE_RESOURCE_DIR_STRING_U with U+1F680 + lone surrogate -> decoded & warned.
+    {
+        std::vector<std::uint8_t> pe = make_synthetic_pe64_with_metadata({}, {}, false, false);
+        const std::size_t opt = 0x98u;
+        const std::size_t dd_rsrc = opt + 112u + (2u * 8u);
+        write_u32_le(pe, dd_rsrc + 0u, 0x2000u);
+        write_u32_le(pe, dd_rsrc + 4u, 0x200u);
+
+        const std::size_t rsrc_base = 0x600u;
+        write_u16_le(pe, rsrc_base + 12u, 1u); // NumberOfNamedEntries = 1
+        write_u32_le(pe, rsrc_base + 16u, 0x80000040u); // NameIsString @ +0x40
+        write_u32_le(pe, rsrc_base + 20u, 0x00000080u); // Leaf data entry @ +0x80
+
+        // IMAGE_RESOURCE_DIR_STRING_U @ +0x40: Length = 4 WCHARs: 'R', 0xD83D, 0xDE80, 0xDC00
+        write_u16_le(pe, rsrc_base + 0x40u, 4u);
+        write_u16_le(pe, rsrc_base + 0x42u, 'R');
+        write_u16_le(pe, rsrc_base + 0x44u, 0xD83Du);
+        write_u16_le(pe, rsrc_base + 0x46u, 0xDE80u);
+        write_u16_le(pe, rsrc_base + 0x48u, 0xDC00u); // lone low surrogate
+
+        write_u32_le(pe, rsrc_base + 0x80u, 0x2100u);
+        write_u32_le(pe, rsrc_base + 0x84u, 4u);
+
+        auto parsed = peelf::parse_image(pe);
+        ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+        const auto* rdir = (*parsed)->pe_resource_directory();
+        ASSERT_NE(rdir, nullptr);
+        ASSERT_EQ(rdir->entries.size(), 1u);
+        EXPECT_TRUE(rdir->entries[0].name_is_string);
+        EXPECT_EQ(rdir->entries[0].name, "R\xF0\x9F\x9A\x80\xEF\xBF\xBD");
+        const bool has_surrogate_warn =
+            std::ranges::any_of((*parsed)->parse_warnings(), [](const std::string& w) {
+                return w.find("U+FFFD") != std::string::npos;
+            });
+        EXPECT_TRUE(has_surrogate_warn);
+    }
+}
+
 } // namespace

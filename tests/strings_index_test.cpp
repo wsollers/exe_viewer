@@ -435,3 +435,134 @@ TEST(StringsIndexTest, LiveProcessChunkedExtractionHandlesChunkStraddlingAndCanc
     EXPECT_EQ(cancelled.size(), 0u);
     EXPECT_TRUE(cancelled.incomplete());
 }
+
+TEST(StringsIndexTest, LiveFailedReadConsumesBudgetCapsSyscallsAndMarksIncomplete) {
+    class CountingHoleProcessSession final : public peelf::IProcessSession {
+    public:
+        CountingHoleProcessSession(std::vector<peelf::MemoryRegion> regions,
+                                   std::uint64_t readable_page_va,
+                                   std::vector<std::uint8_t> readable_page)
+            : regions_(std::move(regions)),
+              readable_page_va_(readable_page_va),
+              readable_page_(std::move(readable_page)) {}
+
+        [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override {
+            return info_;
+        }
+        [[nodiscard]] bool is_alive() const noexcept override {
+            return true;
+        }
+        [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
+            return regions_;
+        }
+        [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
+            return std::vector<peelf::ModuleInfo>{};
+        }
+        [[nodiscard]] peelf::Result<std::size_t> read_memory(
+            std::uint64_t address,
+            std::span<std::uint8_t> buffer) override {
+            ++read_calls;
+            if (!readable_page_.empty() &&
+                address >= readable_page_va_ &&
+                address < readable_page_va_ + readable_page_.size()) {
+                const auto off = static_cast<std::size_t>(address - readable_page_va_);
+                const std::size_t avail = std::min(buffer.size(), readable_page_.size() - off);
+                std::memcpy(buffer.data(), readable_page_.data() + off, avail);
+                return avail;
+            }
+            return peelf::make_error("unreadable page");
+        }
+
+        std::size_t read_calls = 0;
+
+    private:
+        peelf::ProcessInfo info_{
+            .pid = 7777,
+            .name = "hole_target",
+            .architecture = peelf::Architecture::X86_64,
+            .is_64bit = true,
+            .access = peelf::ProcessAccessStatus::ReadOnly,
+        };
+        std::vector<peelf::MemoryRegion> regions_;
+        std::uint64_t readable_page_va_ = 0;
+        std::vector<std::uint8_t> readable_page_;
+    };
+
+    // 1. Unreadable 4 KiB hole followed by a readable 4 KiB page:
+    //    must extract the trailing page's string AND set `incomplete() == true`!
+    {
+        std::vector<std::uint8_t> page2(4096u, 0u);
+        const std::string marker = "RecoveredAfterUnreadableGap";
+        std::memcpy(page2.data() + 64u, marker.data(), marker.size());
+
+        const std::vector<peelf::MemoryRegion> regions{
+            peelf::MemoryRegion{
+                .start_address = 0x50000000ULL,
+                .end_address = 0x50002000ULL, // 8 KiB: [0x50000000..0x50001000) fails, [0x50001000..0x50002000) succeeds
+                .protection = {.readable = true, .writable = true},
+                .kind = peelf::MemoryRegionKind::Heap,
+                .pathname = "[heap]",
+            },
+        };
+        CountingHoleProcessSession session(regions, 0x50001000ULL, std::move(page2));
+
+        viewer::StringScanOptions opts;
+        opts.include_all_live_regions = true;
+        opts.chunk_bytes = 4096u;
+        const viewer::StringsIndex live = viewer::StringsIndex::extract_live(
+            session, regions, nullptr, std::nullopt, opts);
+        EXPECT_TRUE(live.incomplete());
+        ASSERT_EQ(live.size(), 1u);
+        EXPECT_EQ(live.entries()[0].preview, marker);
+    }
+
+    // 2. Huge 1 GiB unreadable region:
+    //    - Small byte_budget (16 KiB) stops after 4 failed 4 KiB skips!
+    //    - Large byte_budget (64 MiB) is bounded by consecutive failed-read cap (<= 64 calls)!
+    {
+        const std::vector<peelf::MemoryRegion> huge_unreadable{
+            peelf::MemoryRegion{
+                .start_address = 0x80000000ULL,
+                .end_address = 0x80000000ULL + (1ULL << 30u), // 1 GiB
+                .protection = {.readable = true},
+                .kind = peelf::MemoryRegionKind::Anonymous,
+                .pathname = "[sparse]",
+            },
+        };
+
+        CountingHoleProcessSession small_budget_sess(huge_unreadable, 0ULL, {});
+        viewer::StringScanOptions small_opts;
+        small_opts.include_all_live_regions = true;
+        small_opts.byte_budget = 16u * 1024u;
+        const viewer::StringsIndex res_small = viewer::StringsIndex::extract_live(
+            small_budget_sess, huge_unreadable, nullptr, std::nullopt, small_opts);
+        EXPECT_TRUE(res_small.incomplete());
+        EXPECT_EQ(small_budget_sess.read_calls, 4u);
+
+        CountingHoleProcessSession cap_sess(huge_unreadable, 0ULL, {});
+        viewer::StringScanOptions big_opts;
+        big_opts.include_all_live_regions = true;
+        big_opts.byte_budget = 64u * 1024u * 1024u;
+        const viewer::StringsIndex res_cap = viewer::StringsIndex::extract_live(
+            cap_sess, huge_unreadable, nullptr, std::nullopt, big_opts);
+        EXPECT_TRUE(res_cap.incomplete());
+        EXPECT_LE(cap_sess.read_calls, 64u);
+    }
+
+    // 3. UTF-16LE string containing supplementary surrogate pair U+1F680 decodes to 4-byte UTF-8.
+    {
+        std::vector<std::uint8_t> rodata;
+        append_utf16le(rodata, u"Launch\U0001F680Now");
+        const std::array<std::uint8_t, 1> stub_text{0xC3u};
+        const SyntheticElfLayout elf = build_test_elf64(stub_text, rodata);
+        const auto parsed = peelf::parse_image(elf.bytes);
+        ASSERT_TRUE(parsed.has_value());
+        const viewer::StringsIndex idx = viewer::StringsIndex::extract(**parsed, elf.bytes);
+        const auto* s = idx.find_containing(elf.rodata_va);
+        ASSERT_NE(s, nullptr);
+        EXPECT_EQ(s->encoding, viewer::StringEncoding::Utf16Le);
+        EXPECT_EQ(s->char_length, 10u);
+        EXPECT_EQ(s->preview, "Launch\xF0\x9F\x9A\x80Now");
+    }
+}
+

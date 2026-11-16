@@ -357,21 +357,74 @@ private:
 
 using DllGetClassObjectFn = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, LPVOID*);
 
+class ScopedDiaModule {
+public:
+    ScopedDiaModule() noexcept = default;
+    explicit ScopedDiaModule(HMODULE mod) noexcept : module_(mod) {}
+    ~ScopedDiaModule() noexcept { reset(); }
+
+    ScopedDiaModule(const ScopedDiaModule&) = delete;
+    ScopedDiaModule& operator=(const ScopedDiaModule&) = delete;
+
+    ScopedDiaModule(ScopedDiaModule&& other) noexcept
+        : module_(std::exchange(other.module_, nullptr)) {}
+
+    ScopedDiaModule& operator=(ScopedDiaModule&& other) noexcept {
+        if (this != &other) {
+            reset(std::exchange(other.module_, nullptr));
+        }
+        return *this;
+    }
+
+    [[nodiscard]] HMODULE get() const noexcept { return module_; }
+    [[nodiscard]] explicit operator bool() const noexcept { return module_ != nullptr; }
+
+    HMODULE release() noexcept { return std::exchange(module_, nullptr); }
+
+    void reset(HMODULE next = nullptr) noexcept {
+        if (module_ != nullptr) {
+            FreeLibrary(module_);
+        }
+        module_ = next;
+    }
+
+private:
+    HMODULE module_{nullptr};
+};
+
+class ScopedCoInit {
+public:
+    explicit ScopedCoInit(bool should_uninitialize) noexcept
+        : should_uninitialize_(should_uninitialize) {}
+
+    ~ScopedCoInit() noexcept {
+        if (should_uninitialize_) {
+            CoUninitialize();
+        }
+    }
+
+    ScopedCoInit(const ScopedCoInit&) = delete;
+    ScopedCoInit& operator=(const ScopedCoInit&) = delete;
+
+private:
+    bool should_uninitialize_{false};
+};
+
 [[nodiscard]] bool create_dia_source_from_dll(ComPtr<IDiaDataSource>& source,
-                                              HMODULE& module,
+                                              ScopedDiaModule& module,
                                               std::string& diagnostic) {
 #ifdef PEELF_DIA_DLL_PATH
     const std::filesystem::path dll_path(PEELF_DIA_DLL_PATH);
-    HMODULE loaded = LoadLibraryW(dll_path.wstring().c_str());
-    if (loaded == nullptr) {
+    ScopedDiaModule loaded(LoadLibraryW(dll_path.wstring().c_str()));
+    if (!loaded) {
         diagnostic = last_error_message("LoadLibraryW(" + dll_path.string() + ")");
         return false;
     }
 
-    const auto get_class_object = reinterpret_cast<DllGetClassObjectFn>(GetProcAddress(loaded, "DllGetClassObject"));
+    const auto get_class_object =
+        reinterpret_cast<DllGetClassObjectFn>(GetProcAddress(loaded.get(), "DllGetClassObject"));
     if (get_class_object == nullptr) {
         diagnostic = last_error_message("GetProcAddress(DllGetClassObject)");
-        FreeLibrary(loaded);
         return false;
     }
 
@@ -380,18 +433,16 @@ using DllGetClassObjectFn = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, LPVOID*);
                                   reinterpret_cast<void**>(factory.put()));
     if (FAILED(hr) || !factory) {
         diagnostic = "DllGetClassObject for DiaSource failed with HRESULT " + format_hresult(hr);
-        FreeLibrary(loaded);
         return false;
     }
 
     hr = factory->CreateInstance(nullptr, __uuidof(IDiaDataSource), reinterpret_cast<void**>(source.put()));
     if (FAILED(hr) || !source) {
         diagnostic = "DIA class factory CreateInstance failed with HRESULT " + format_hresult(hr);
-        FreeLibrary(loaded);
         return false;
     }
 
-    module = loaded;
+    module = std::move(loaded);
     diagnostic = "loaded DIA from " + dll_path.string();
     return true;
 #else
@@ -403,7 +454,7 @@ using DllGetClassObjectFn = HRESULT(STDAPICALLTYPE*)(REFCLSID, REFIID, LPVOID*);
 }
 
 [[nodiscard]] bool create_dia_source(ComPtr<IDiaDataSource>& source,
-                                     HMODULE& module,
+                                     ScopedDiaModule& module,
                                      std::string& diagnostic) {
     HRESULT hr = CoCreateInstance(__uuidof(DiaSource), nullptr, CLSCTX_INPROC_SERVER,
                                   __uuidof(IDiaDataSource), reinterpret_cast<void**>(source.put()));
@@ -609,26 +660,17 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
         };
     }
 
+    // Declare COM and DIA DLL guards strictly BEFORE ComPtr interfaces so
+    // reverse-order destruction releases every DIA COM interface prior to
+    // FreeLibrary(dia_module) and CoUninitialize().
+    const ScopedCoInit com_guard(should_uninitialize);
+    ScopedDiaModule dia_module;
     ComPtr<IDiaDataSource> source;
     ComPtr<IDiaSession> session;
     ComPtr<IDiaSymbol> global;
-    HMODULE dia_module = nullptr;
-    const auto cleanup_com = [&]() noexcept {
-        global.reset();
-        session.reset();
-        source.reset();
-        if (dia_module != nullptr) {
-            FreeLibrary(dia_module);
-            dia_module = nullptr;
-        }
-        if (should_uninitialize) {
-            CoUninitialize();
-        }
-    };
 
     std::string source_diagnostic;
     if (!create_dia_source(source, dia_module, source_diagnostic)) {
-        cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendUnavailable,
             .symbols = {},
@@ -639,7 +681,6 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     const std::wstring wide_path = to_wstring(pdb_path);
     HRESULT hr = source->loadDataFromPdb(wide_path.c_str());
     if (FAILED(hr)) {
-        cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
             .symbols = {},
@@ -649,7 +690,6 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
 
     hr = source->openSession(session.put());
     if (FAILED(hr) || !session) {
-        cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
             .symbols = {},
@@ -659,7 +699,6 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
 
     hr = session->get_globalScope(global.put());
     if (FAILED(hr) || !global) {
-        cleanup_com();
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
             .symbols = {},
@@ -674,24 +713,24 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     add_dia_children(*global.get(), SymTagData, image_base, false, result.symbols);
     add_dia_types(*global.get(), result.types);
     std::map<std::uint64_t,std::string> libraries_by_address;
-    ComPtr<IDiaEnumSymbols> compilands;
-    if (SUCCEEDED(global->findChildren(SymTagCompiland,nullptr,nsNone,compilands.put())) && compilands) {
-        ComPtr<IDiaSymbol> compiland; ULONG fetched=0;
-        while (SUCCEEDED(compilands->Next(1,compiland.put(),&fetched)) && fetched==1) {
-            Bstr library_name;
-            if (FAILED(compiland->get_libraryName(library_name.put())) || !library_name.get()) continue;
-            const auto library=to_utf8(library_name.get());
-            auto extension=std::filesystem::path(library).extension().string();
-            std::ranges::transform(extension,extension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
-            if (extension!=".lib" && extension!=".a") continue;
-            std::vector<DebugSymbol> members;
-            add_dia_children(*compiland.get(),SymTagFunction,image_base,true,members);
-            add_dia_children(*compiland.get(),SymTagData,image_base,false,members);
-            for (const auto& member : members) libraries_by_address.try_emplace(member.virtual_address,library);
+    {
+        ComPtr<IDiaEnumSymbols> compilands;
+        if (SUCCEEDED(global->findChildren(SymTagCompiland,nullptr,nsNone,compilands.put())) && compilands) {
+            ComPtr<IDiaSymbol> compiland; ULONG fetched=0;
+            while (SUCCEEDED(compilands->Next(1,compiland.put(),&fetched)) && fetched==1) {
+                Bstr library_name;
+                if (FAILED(compiland->get_libraryName(library_name.put())) || !library_name.get()) continue;
+                const auto library=to_utf8(library_name.get());
+                auto extension=std::filesystem::path(library).extension().string();
+                std::ranges::transform(extension,extension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+                if (extension!=".lib" && extension!=".a") continue;
+                std::vector<DebugSymbol> members;
+                add_dia_children(*compiland.get(),SymTagFunction,image_base,true,members);
+                add_dia_children(*compiland.get(),SymTagData,image_base,false,members);
+                for (const auto& member : members) libraries_by_address.try_emplace(member.virtual_address,library);
+            }
         }
     }
-
-    compilands.reset(); // Release DIA objects before cleanup_com unloads the provider DLL.
     for (auto& symbol : result.symbols)
         if (const auto it=libraries_by_address.find(symbol.virtual_address); it!=libraries_by_address.end()) symbol.library=it->second;
 
@@ -702,8 +741,6 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
 
     result.status = DebugSymbolLoadStatus::Loaded;
     result.diagnostic = pdb_path.string();
-
-    cleanup_com();
     return result;
 #else
     (void)image;

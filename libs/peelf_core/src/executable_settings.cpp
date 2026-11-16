@@ -21,7 +21,7 @@ namespace peelf {
 namespace {
 
 constexpr std::size_t kMaxManifestBytes = 1024u * 1024u; // 1 MiB cap
-constexpr std::size_t kMaxResourceNodes = 4096u;
+constexpr std::size_t kMaxResourceVisits = 4096u;
 constexpr std::uint32_t kPeRtVersion = 16u;
 constexpr std::uint32_t kPeRtManifest = 24u;
 constexpr std::uint32_t kVsFixedFileInfoSignature = 0xFEEF04BDu;
@@ -48,14 +48,6 @@ constexpr std::uint32_t kClrMetadataSignatureBsjb = 0x424A5342u;
     return static_cast<std::uint16_t>(
         static_cast<std::uint16_t>(bytes[offset]) |
         static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[offset + 1u]) << 8u));
-}
-
-[[nodiscard]] constexpr std::uint16_t rd16_be(
-    std::span<const std::uint8_t> bytes,
-    std::size_t offset) noexcept {
-    return static_cast<std::uint16_t>(
-        static_cast<std::uint16_t>(static_cast<std::uint16_t>(bytes[offset]) << 8u) |
-        static_cast<std::uint16_t>(bytes[offset + 1u]));
 }
 
 [[nodiscard]] constexpr std::uint32_t rd32_le(
@@ -88,69 +80,27 @@ constexpr std::uint32_t kClrMetadataSignatureBsjb = 0x424A5342u;
     return sv;
 }
 
-void append_utf8_codepoint(std::string& out, std::uint32_t cp) {
-    if (cp <= 0x7Fu) {
-        out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7FFu) {
-        out.push_back(static_cast<char>(0xC0u | ((cp >> 6u) & 0x1Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0xFFFFu) {
-        out.push_back(static_cast<char>(0xE0u | ((cp >> 12u) & 0x0Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else if (cp <= 0x10FFFFu) {
-        out.push_back(static_cast<char>(0xF0u | ((cp >> 18u) & 0x07u)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 12u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | ((cp >> 6u) & 0x3Fu)));
-        out.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
-    } else {
-        append_utf8_codepoint(out, 0xFFFDu);
-    }
-}
-
 [[nodiscard]] std::string decode_utf16_units_to_utf8(
     std::span<const std::uint8_t> bytes,
     bool big_endian,
     bool stop_at_nul,
     std::vector<std::string>* warnings = nullptr) {
-    std::string out;
-    out.reserve(bytes.size() / 2u);
-
-    if ((bytes.size() & 1u) != 0u && warnings != nullptr) {
-        warnings->emplace_back("UTF-16 byte span has odd length; trailing odd byte ignored");
-    }
-
-    const std::size_t unit_count = bytes.size() / 2u;
-    for (std::size_t i = 0u; i < unit_count; ++i) {
-        const std::uint16_t u1 = big_endian ? rd16_be(bytes, i * 2u) : rd16_le(bytes, i * 2u);
-        if (stop_at_nul && u1 == 0u) {
-            break;
+    Utf16DecodeDiagnostics diag{};
+    std::string out = decode_utf16_to_utf8(
+        bytes,
+        big_endian ? Endianness::Big : Endianness::Little,
+        stop_at_nul,
+        std::numeric_limits<std::size_t>::max(),
+        warnings != nullptr ? &diag : nullptr);
+    if (warnings != nullptr) {
+        if (diag.odd_trailing_byte) {
+            warnings->emplace_back("UTF-16 byte span has odd length; trailing odd byte ignored");
         }
-        if (u1 >= 0xD800u && u1 <= 0xDBFFu) {
-            if (i + 1u < unit_count) {
-                const std::uint16_t u2 =
-                    big_endian ? rd16_be(bytes, (i + 1u) * 2u) : rd16_le(bytes, (i + 1u) * 2u);
-                if (u2 >= 0xDC00u && u2 <= 0xDFFFu) {
-                    const std::uint32_t cp =
-                        0x10000u +
-                        ((static_cast<std::uint32_t>(u1 - 0xD800u) << 10u) |
-                         static_cast<std::uint32_t>(u2 - 0xDC00u));
-                    append_utf8_codepoint(out, cp);
-                    ++i;
-                    continue;
-                }
-            }
-            if (warnings != nullptr) {
-                warnings->emplace_back("Unpaired UTF-16 high surrogate replaced with U+FFFD");
-            }
-            append_utf8_codepoint(out, 0xFFFDu);
-        } else if (u1 >= 0xDC00u && u1 <= 0xDFFFu) {
-            if (warnings != nullptr) {
-                warnings->emplace_back("Unpaired UTF-16 low surrogate replaced with U+FFFD");
-            }
-            append_utf8_codepoint(out, 0xFFFDu);
-        } else if (u1 != 0u) {
-            append_utf8_codepoint(out, u1);
+        for (std::size_t i = 0u; i < diag.unpaired_high_surrogates; ++i) {
+            warnings->emplace_back("Unpaired UTF-16 high surrogate replaced with U+FFFD");
+        }
+        for (std::size_t i = 0u; i < diag.unpaired_low_surrogates; ++i) {
+            warnings->emplace_back("Unpaired UTF-16 low surrogate replaced with U+FFFD");
         }
     }
     return out;
@@ -244,8 +194,18 @@ struct PeResourceWalkResult {
     }
 
     const std::uint64_t root_off = *res.directory_file_offset;
-    std::size_t visited_nodes = 0u;
+    std::size_t visited_steps = 0u;
+    bool budget_exceeded = false;
     std::array<std::uint64_t, 8> path_offsets{};
+
+    auto mark_budget_exceeded = [&]() {
+        if (!budget_exceeded) {
+            budget_exceeded = true;
+            res.directory_malformed = true;
+            res.warnings.emplace_back(
+                "PE resource directory exceeded maximum node/entry traversal budget");
+        }
+    };
 
     auto walk = [&](auto&& self,
                     std::uint64_t rel_dir_off,
@@ -255,6 +215,9 @@ struct PeResourceWalkResult {
                     std::uint32_t name_id,
                     bool name_named,
                     std::uint32_t lang_id) -> void {
+        if (budget_exceeded) {
+            return;
+        }
         if (depth > 3u) {
             res.directory_malformed = true;
             res.warnings.emplace_back("PE resource directory exceeds 3-level hierarchy depth");
@@ -267,12 +230,11 @@ struct PeResourceWalkResult {
                 return;
             }
         }
-        if (visited_nodes >= kMaxResourceNodes) {
-            res.directory_malformed = true;
-            res.warnings.emplace_back("PE resource directory exceeded maximum node traversal budget");
+        if (visited_steps >= kMaxResourceVisits) {
+            mark_budget_exceeded();
             return;
         }
-        ++visited_nodes;
+        ++visited_steps;
         path_offsets[depth] = rel_dir_off;
 
         if (!fits_range(rel_dir_off, 16u, res.directory_size) ||
@@ -289,11 +251,14 @@ struct PeResourceWalkResult {
             static_cast<std::uint64_t>(named_count) + static_cast<std::uint64_t>(id_count);
 
         for (std::uint64_t i = 0u; i < total_entries; ++i) {
-            if (visited_nodes >= kMaxResourceNodes) {
-                res.directory_malformed = true;
-                res.warnings.emplace_back("PE resource directory exceeded entry traversal budget");
+            if (budget_exceeded) {
                 break;
             }
+            if (visited_steps >= kMaxResourceVisits) {
+                mark_budget_exceeded();
+                break;
+            }
+            ++visited_steps;
             const std::uint64_t rel_entry_off = rel_dir_off + 16u + i * 8u;
             if (!fits_range(rel_entry_off, 8u, res.directory_size) ||
                 !fits_range(root_off, rel_entry_off + 8u, raw_bytes.size())) {
@@ -894,14 +859,17 @@ void extract_pe_manifest(
     }
 
     const bool xml_ok = parse_manifest_xml_into(info.raw_xml, info);
-    if (truncated) {
+    for (const std::string& w : rsrc.warnings) {
+        info.warnings.push_back(w);
+    }
+    if (truncated || rsrc.directory_truncated) {
         state_out = MetadataFieldState::Truncated;
         const std::string note = info.warnings.empty() ? "Truncated RT_MANIFEST" : info.warnings.front();
         out = Observed<PeManifestInfo>::partial(
             std::move(info), prov_tag, note, stamp, std::move(evidence));
         return;
     }
-    if (!xml_ok || encoding_malformed) {
+    if (!xml_ok || encoding_malformed || rsrc.directory_malformed) {
         state_out = MetadataFieldState::Malformed;
         const std::string note = info.warnings.empty() ? "Malformed RT_MANIFEST XML" : info.warnings.front();
         out = Observed<PeManifestInfo>::partial(
