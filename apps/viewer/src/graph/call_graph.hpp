@@ -16,13 +16,13 @@
 namespace viewer {
 
 struct GraphAddress {
-    std::optional<std::uint64_t> virtual_address;
-    std::optional<std::uint64_t> relative_virtual_address;
-    std::optional<std::uint64_t> file_offset;
+    std::optional<std::uint64_t> virtual_address{};
+    std::optional<std::uint64_t> relative_virtual_address{};
+    std::optional<std::uint64_t> file_offset{};
 };
 
 struct GraphByteRange {
-    GraphAddress start;
+    GraphAddress start{};
     std::uint64_t size = 0;
 };
 
@@ -54,9 +54,9 @@ enum class CallGraphEdgeKind : std::uint8_t {
 
 struct GraphInstruction {
     std::uint64_t address = 0;
-    std::string mnemonic;
-    std::string operands;
-    std::optional<std::uint64_t> branch_target;
+    std::string mnemonic{};
+    std::string operands{};
+    std::optional<std::uint64_t> branch_target{};
 };
 
 enum class FunctionExtentSource : std::uint8_t { Symbol, RuntimeMetadata, NextSymbol, ExecutableRegion };
@@ -76,21 +76,21 @@ struct FunctionExtent {
 [[nodiscard]] std::string_view function_extent_source_name(FunctionExtentSource source) noexcept;
 
 struct CallGraphNode {
-    std::string id;
-    std::string label;
+    std::string id{};
+    std::string label{};
     CallGraphNodeKind kind = CallGraphNodeKind::Unknown;
-    GraphByteRange bytes;
-    std::optional<GraphSymbolRef> symbol;
+    GraphByteRange bytes{};
+    std::optional<GraphSymbolRef> symbol{};
     std::uint64_t first_instruction_index = 0;
     std::uint64_t instruction_count = 0;
-    std::vector<GraphInstruction> instructions;
+    std::vector<GraphInstruction> instructions{};
 };
 
 struct CallGraphEdge {
-    std::string from_node_id;
-    std::string to_node_id;
+    std::string from_node_id{};
+    std::string to_node_id{};
     CallGraphEdgeKind kind = CallGraphEdgeKind::Unknown;
-    std::string label;
+    std::string label{};
 };
 
 struct IndirectRecoveryNote {

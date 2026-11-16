@@ -27,6 +27,17 @@ namespace viewer {
 
         constexpr float kUiFontSize = 16.0f;
 
+        void check_imgui_vk_result(VkResult err) {
+            if (err == VK_SUCCESS) {
+                return;
+            }
+            if (err < 0) {
+                Log().error("ImGui Vulkan error: VkResult={}", static_cast<int>(err));
+                throw std::runtime_error("Fatal ImGui Vulkan backend error");
+            }
+            Log().warn("ImGui Vulkan non-fatal status: VkResult={}", static_cast<int>(err));
+        }
+
         std::filesystem::path find_monospace_font() {
 #ifdef _WIN32
             constexpr std::array<std::wstring_view, 5> candidates{
@@ -177,7 +188,7 @@ namespace viewer {
         ImGui_ImplGlfw_InitForVulkan(window_, true);
 
         ImGui_ImplVulkan_InitInfo init_info{};
-        init_info.ApiVersion = VK_API_VERSION_1_3; // or your app's version
+        init_info.ApiVersion = vulkan_.api_version();
         init_info.Instance = vulkan_.instance();
         init_info.PhysicalDevice = vulkan_.physical_device();
         init_info.Device = vulkan_.device();
@@ -185,23 +196,20 @@ namespace viewer {
         init_info.Queue = vulkan_.graphics_queue();
         init_info.DescriptorPool = vulkan_.descriptor_pool();
         init_info.DescriptorPoolSize = 0; // use external pool
-        init_info.MinImageCount = vulkan_.image_count();
+        init_info.MinImageCount = vulkan_.min_image_count();
         init_info.ImageCount = vulkan_.image_count();
         init_info.PipelineCache = VK_NULL_HANDLE;
 
-        // --- THIS IS THE CRITICAL PART ---
-        // Fill PipelineInfoMain so the backend can create its pipeline.
         init_info.PipelineInfoMain = {};
         init_info.PipelineInfoMain.RenderPass = vulkan_.render_pass();
         init_info.PipelineInfoMain.Subpass = 0;
         init_info.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 
-        // For now, mirror main pipeline info for secondary viewports
         init_info.PipelineInfoForViewports = init_info.PipelineInfoMain;
 
         init_info.UseDynamicRendering = false;
         init_info.Allocator = nullptr;
-        init_info.CheckVkResultFn = nullptr;
+        init_info.CheckVkResultFn = check_imgui_vk_result;
         init_info.MinAllocationSize = 0;
         init_info.CustomShaderVertCreateInfo = {};
         init_info.CustomShaderFragCreateInfo = {};
@@ -209,13 +217,8 @@ namespace viewer {
         if (!ImGui_ImplVulkan_Init(&init_info)) {
             throw std::runtime_error("ImGui_ImplVulkan_Init failed");
         }
-
-        // --- FONTS ---
-        // Your backend version DOES NOT use ImGui_ImplVulkan_CreateFontsTexture(cmd)
-        // Instead, it uses the NEW internal upload mechanism:
-        //    ImGui_ImplVulkan_CreateFontsTexture(); // <-- NO ARGUMENT VERSION
-
-        // After this, the backend has a valid font texture and descriptor set.
+        // Dear ImGui 1.92+ uses ImGuiBackendFlags_RendererHasTextures and uploads
+        // ImTextureData font atlases automatically during ImGui_ImplVulkan_RenderDrawData.
     }
 
     void Application::shutdown_imgui() {

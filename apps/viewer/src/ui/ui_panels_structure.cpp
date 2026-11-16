@@ -43,16 +43,6 @@ namespace {
     return "Unknown";
 }
 
-[[nodiscard]] const char* preferred_view_name(PreferredView view) {
-    switch (view) {
-        case PreferredView::Details:     return "Details";
-        case PreferredView::Hex:         return "Hex";
-        case PreferredView::Disassembly: return "Disassembly";
-        case PreferredView::Graph:       return "Flow Graph";
-    }
-    return "Details";
-}
-
 [[nodiscard]] bool same_selection(const ViewerSelection& lhs, const ViewerSelection& rhs) {
     return lhs.kind == rhs.kind &&
            lhs.object_index == rhs.object_index &&

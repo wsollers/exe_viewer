@@ -50,6 +50,195 @@ namespace {
            bytes.starts_with("Microsoft C/C++ program database");
 }
 
+struct MsfPdbIdentity {
+    std::array<std::uint8_t, 16> guid{};
+    std::uint32_t info_age = 0;
+    std::optional<std::uint32_t> dbi_age{};
+};
+
+[[nodiscard]] std::uint32_t read_u32_le(std::span<const std::uint8_t> bytes,
+                                        std::size_t offset) noexcept {
+    return static_cast<std::uint32_t>(bytes[offset]) |
+           (static_cast<std::uint32_t>(bytes[offset + 1u]) << 8u) |
+           (static_cast<std::uint32_t>(bytes[offset + 2u]) << 16u) |
+           (static_cast<std::uint32_t>(bytes[offset + 3u]) << 24u);
+}
+
+[[nodiscard]] std::optional<MsfPdbIdentity> read_msf7_pdb_identity(
+    const std::filesystem::path& path) {
+    std::error_code ec;
+    const auto raw_file_size = std::filesystem::file_size(path, ec);
+    if (ec || raw_file_size < 56u) {
+        return std::nullopt;
+    }
+    const auto file_size = static_cast<std::uint64_t>(raw_file_size);
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return std::nullopt;
+    }
+
+    std::array<std::uint8_t, 56> superblock{};
+    if (!file.read(reinterpret_cast<char*>(superblock.data()),
+                   static_cast<std::streamsize>(superblock.size()))) {
+        return std::nullopt;
+    }
+
+    const std::string_view magic(reinterpret_cast<const char*>(superblock.data()), 24u);
+    if (magic != "Microsoft C/C++ MSF 7.00") {
+        return std::nullopt;
+    }
+
+    const std::uint32_t block_size = read_u32_le(superblock, 32u);
+    if (block_size != 512u && block_size != 1024u && block_size != 2048u &&
+        block_size != 4096u && block_size != 8192u) {
+        return std::nullopt;
+    }
+
+    const std::uint32_t num_blocks = read_u32_le(superblock, 40u);
+    const std::uint32_t num_dir_bytes = read_u32_le(superblock, 44u);
+    const std::uint32_t block_map_addr = read_u32_le(superblock, 52u);
+    if (num_blocks == 0u || block_map_addr >= num_blocks || num_dir_bytes < 12u ||
+        num_dir_bytes > 64u * 1024u * 1024u ||
+        static_cast<std::uint64_t>(num_blocks) * block_size > file_size) {
+        return std::nullopt;
+    }
+
+    const std::size_t num_dir_blocks =
+        (static_cast<std::size_t>(num_dir_bytes) + block_size - 1u) / block_size;
+    const std::uint64_t block_map_offset =
+        static_cast<std::uint64_t>(block_map_addr) * block_size;
+    if (num_dir_blocks == 0u ||
+        block_map_offset + static_cast<std::uint64_t>(num_dir_blocks) * 4u > file_size) {
+        return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> dir_map_bytes(num_dir_blocks * 4u);
+    file.seekg(static_cast<std::streamoff>(block_map_offset), std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(dir_map_bytes.data()),
+                   static_cast<std::streamsize>(dir_map_bytes.size()))) {
+        return std::nullopt;
+    }
+
+    std::vector<std::uint8_t> dir_bytes(static_cast<std::size_t>(num_dir_bytes));
+    std::size_t copied = 0;
+    for (std::size_t i = 0; i < num_dir_blocks; ++i) {
+        const std::uint32_t blk = read_u32_le(dir_map_bytes, i * 4u);
+        if (blk >= num_blocks) {
+            return std::nullopt;
+        }
+        const std::size_t to_read =
+            std::min<std::size_t>(block_size, dir_bytes.size() - copied);
+        file.seekg(static_cast<std::streamoff>(static_cast<std::uint64_t>(blk) * block_size),
+                   std::ios::beg);
+        if (!file.read(reinterpret_cast<char*>(dir_bytes.data() + copied),
+                       static_cast<std::streamsize>(to_read))) {
+            return std::nullopt;
+        }
+        copied += to_read;
+    }
+
+    const std::uint32_t num_streams = read_u32_le(dir_bytes, 0u);
+    if (num_streams < 2u ||
+        4ull + static_cast<std::uint64_t>(num_streams) * 4ull > dir_bytes.size()) {
+        return std::nullopt;
+    }
+
+    const std::uint32_t stream0_size = read_u32_le(dir_bytes, 4u);
+    const std::uint32_t stream1_size = read_u32_le(dir_bytes, 8u);
+    if (stream1_size == 0xFFFFFFFFu || stream1_size < 28u) {
+        return std::nullopt;
+    }
+
+    const auto stream_blocks = [block_size](std::uint32_t size) noexcept -> std::uint64_t {
+        if (size == 0xFFFFFFFFu || size == 0u) {
+            return 0ull;
+        }
+        return (static_cast<std::uint64_t>(size) + block_size - 1ull) / block_size;
+    };
+
+    const std::uint64_t stream0_blocks = stream_blocks(stream0_size);
+    const std::uint64_t stream1_blk_off =
+        4ull + static_cast<std::uint64_t>(num_streams) * 4ull + stream0_blocks * 4ull;
+    if (stream1_blk_off + 4ull > dir_bytes.size()) {
+        return std::nullopt;
+    }
+
+    const std::uint32_t stream1_first_block =
+        read_u32_le(dir_bytes, static_cast<std::size_t>(stream1_blk_off));
+    if (stream1_first_block >= num_blocks) {
+        return std::nullopt;
+    }
+
+    std::array<std::uint8_t, 28> info_hdr{};
+    file.seekg(static_cast<std::streamoff>(
+                   static_cast<std::uint64_t>(stream1_first_block) * block_size),
+               std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(info_hdr.data()),
+                   static_cast<std::streamsize>(info_hdr.size()))) {
+        return std::nullopt;
+    }
+
+    MsfPdbIdentity id{};
+    id.info_age = read_u32_le(info_hdr, 8u);
+    std::copy_n(info_hdr.data() + 12u, 16u, id.guid.data());
+
+    if (num_streams >= 4u) {
+        const std::uint32_t stream2_size = read_u32_le(dir_bytes, 12u);
+        const std::uint32_t stream3_size = read_u32_le(dir_bytes, 16u);
+        if (stream3_size != 0xFFFFFFFFu && stream3_size >= 12u) {
+            const std::uint64_t stream1_blocks = stream_blocks(stream1_size);
+            const std::uint64_t stream2_blocks = stream_blocks(stream2_size);
+            const std::uint64_t stream3_blk_off =
+                stream1_blk_off + (stream1_blocks + stream2_blocks) * 4ull;
+            if (stream3_blk_off + 4ull <= dir_bytes.size()) {
+                const std::uint32_t stream3_first_block =
+                    read_u32_le(dir_bytes, static_cast<std::size_t>(stream3_blk_off));
+                if (stream3_first_block < num_blocks) {
+                    std::array<std::uint8_t, 12> dbi_hdr{};
+                    file.seekg(static_cast<std::streamoff>(
+                                   static_cast<std::uint64_t>(stream3_first_block) * block_size),
+                               std::ios::beg);
+                    if (file.read(reinterpret_cast<char*>(dbi_hdr.data()),
+                                  static_cast<std::streamsize>(dbi_hdr.size()))) {
+                        id.dbi_age = read_u32_le(dbi_hdr, 8u);
+                    }
+                }
+            }
+        }
+    }
+
+    return id;
+}
+
+[[nodiscard]] bool pdb_matches_codeview_entry(const std::filesystem::path& pdb_path,
+                                              const peelf::PeDebugDirectory& debug) {
+    if (!has_native_pdb_signature(pdb_path)) {
+        return false;
+    }
+    const bool has_rsds_guid = std::ranges::any_of(
+        debug.codeview_guid, [](std::uint8_t b) { return b != 0u; });
+    if (!has_rsds_guid) {
+        return true;
+    }
+    const auto pdb_id = read_msf7_pdb_identity(pdb_path);
+    if (!pdb_id.has_value()) {
+        return false;
+    }
+    if (!std::ranges::equal(pdb_id->guid, debug.codeview_guid)) {
+        return false;
+    }
+    if (debug.codeview_age != 0u) {
+        const bool age_matches =
+            (pdb_id->info_age == debug.codeview_age) ||
+            (pdb_id->dbi_age.has_value() && *pdb_id->dbi_age == debug.codeview_age);
+        if (!age_matches) {
+            return false;
+        }
+    }
+    return true;
+}
+
 [[maybe_unused]] [[nodiscard]] std::uint64_t resolve_pe_image_base(
     const peelf::IBinaryImage& image) noexcept {
     if (image.image_base() != 0) {
@@ -365,13 +554,21 @@ std::optional<std::filesystem::path> find_local_codeview_pdb(const peelf::IBinar
         }
 
         std::filesystem::path pdb_path(debug.codeview_pdb_path);
-        if (pdb_path.is_absolute() && std::filesystem::exists(pdb_path)) {
+        if (pdb_path.is_absolute() && std::filesystem::exists(pdb_path) &&
+            pdb_matches_codeview_entry(pdb_path, debug)) {
             return pdb_path;
         }
 
-        const std::filesystem::path sibling = image_path.parent_path() / pdb_path.filename();
-        if (std::filesystem::exists(sibling)) {
-            return sibling;
+        const std::string_view raw_cv_path = debug.codeview_pdb_path;
+        const std::size_t sep = raw_cv_path.find_last_of("/\\");
+        const std::string_view leaf =
+            (sep == std::string_view::npos) ? raw_cv_path : raw_cv_path.substr(sep + 1u);
+        if (!leaf.empty()) {
+            const std::filesystem::path sibling = image_path.parent_path() / leaf;
+            if (std::filesystem::exists(sibling) &&
+                pdb_matches_codeview_entry(sibling, debug)) {
+                return sibling;
+            }
         }
     }
     return std::nullopt;

@@ -34,15 +34,15 @@ enum class DecompileCacheSource : std::uint8_t {
 
 struct CodeRange { std::uint64_t address{}, size{}; };
 struct DecompiledLine {
-    std::optional<std::uint64_t> address;
-    std::string text;
-    std::vector<CodeRange> ranges;
+    std::optional<std::uint64_t> address{};
+    std::string text{};
+    std::vector<CodeRange> ranges{};
 };
 struct DecompiledUnit {
     DecompileStatus status = DecompileStatus::Failed;
-    std::string provider, diagnostic;
-    std::vector<DecompiledLine> lines;
-    std::vector<DataTypeRecord> types;
+    std::string provider{}, diagnostic{};
+    std::vector<DecompiledLine> lines{};
+    std::vector<DataTypeRecord> types{};
     DecompileCacheSource cache_source = DecompileCacheSource::FreshAnalysis;
 };
 struct DecompileRequest {

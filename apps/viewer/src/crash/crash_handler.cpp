@@ -360,7 +360,8 @@ void install_signal_handler(int signal) noexcept {
     struct sigaction action {};
     action.sa_sigaction = signal_handler;
     sigemptyset(&action.sa_mask);
-    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    action.sa_flags = static_cast<int>(static_cast<unsigned int>(SA_SIGINFO) |
+                                       static_cast<unsigned int>(SA_RESETHAND));
     sigaction(signal, &action, nullptr);
 }
 

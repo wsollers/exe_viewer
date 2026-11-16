@@ -187,10 +187,11 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
     HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
     const auto nt_query_sys = ntdll != nullptr
         ? reinterpret_cast<NtQuerySystemInformationFn>(
-              ::GetProcAddress(ntdll, "NtQuerySystemInformation"))
+              reinterpret_cast<void*>(::GetProcAddress(ntdll, "NtQuerySystemInformation")))
         : nullptr;
     const auto nt_query_obj = ntdll != nullptr
-        ? reinterpret_cast<NtQueryObjectFn>(::GetProcAddress(ntdll, "NtQueryObject"))
+        ? reinterpret_cast<NtQueryObjectFn>(
+              reinterpret_cast<void*>(::GetProcAddress(ntdll, "NtQueryObject")))
         : nullptr;
 
     ScopedHandle proc_dup(::OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
@@ -327,11 +328,11 @@ ProcessInternalsSnapshot inspect_process_internals(IProcessSession& session) {
         HMODULE iphlp = ::LoadLibraryW(L"iphlpapi.dll");
         const auto get_tcp = iphlp != nullptr
             ? reinterpret_cast<GetExtendedTcpTableFn>(
-                  ::GetProcAddress(iphlp, "GetExtendedTcpTable"))
+                  reinterpret_cast<void*>(::GetProcAddress(iphlp, "GetExtendedTcpTable")))
             : nullptr;
         const auto get_udp = iphlp != nullptr
             ? reinterpret_cast<GetExtendedUdpTableFn>(
-                  ::GetProcAddress(iphlp, "GetExtendedUdpTable"))
+                  reinterpret_cast<void*>(::GetProcAddress(iphlp, "GetExtendedUdpTable")))
             : nullptr;
 
         if (get_tcp == nullptr || get_udp == nullptr) {

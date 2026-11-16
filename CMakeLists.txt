@@ -25,10 +25,24 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND CMAKE_CXX_FLAGS MATCHES "-stdlib=li
   add_link_options(-fexperimental-library)
 endif()
 
+if(MSVC)
+  # Prevent C1041 vc14x.pdb write contention across parallel C/C++ compilations
+  # (including FetchContent dependencies built under Ninja/MSBuild).
+  add_compile_options(/FS)
+endif()
+
+option(PEELF_WARNINGS_AS_ERRORS "Treat warnings as errors on peelf project targets" ON)
+option(PEELF_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
 include(cmake/ProjectOptions.cmake)  # <-- Add here, once
 
+if(WIN32)
+  set(_peelf_default_shared OFF)
+else()
+  set(_peelf_default_shared ON)
+endif()
 option(PEELF_BUILD_VIEWER "Build the GUI viewer application" ON)
-option(PEELF_BUILD_SHARED "Build peelf_core as a shared library" ON)
+option(PEELF_BUILD_SHARED "Build peelf_core as a shared library" ${_peelf_default_shared})
 option(PEELF_BUILD_TESTS "Build unit tests (GoogleTest)" ON)
 option(PEELF_ENABLE_CLANG_TIDY "Run clang-tidy on peelf targets during build (Ninja/Makefile generators only)" OFF)
 option(PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST "Register the Docker-backed bin-matrix refresh test with CTest" OFF)
@@ -115,7 +129,7 @@ if(PEELF_ENABLE_CLANG_TIDY)
     find_program(PEELF_CLANG_TIDY_EXE NAMES clang-tidy)
     if(PEELF_CLANG_TIDY_EXE)
         message(STATUS "clang-tidy enabled: ${PEELF_CLANG_TIDY_EXE}")
-        foreach(_tgt peelf_core peelf_viewer peelf_tests)
+        foreach(_tgt peelf_core peelf_gui peelf_viewer peelf_tests)
             if(TARGET ${_tgt})
                 set_target_properties(${_tgt} PROPERTIES CXX_CLANG_TIDY "${PEELF_CLANG_TIDY_EXE}")
             endif()

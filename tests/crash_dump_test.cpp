@@ -61,8 +61,9 @@ void append_u32_be(std::vector<std::uint8_t>& buf, std::uint32_t v) {
 }
 
 void write_u32_be_at(std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t v) {
-    for (int i = 3; i >= 0; --i) {
-        buf[off + (3 - i)] = static_cast<std::uint8_t>((v >> (static_cast<unsigned>(i) * 8u)) & 0xFFu);
+    for (std::size_t i = 0; i < 4u; ++i) {
+        const auto shift = static_cast<unsigned>((3u - i) * 8u);
+        buf[off + i] = static_cast<std::uint8_t>((v >> shift) & 0xFFu);
     }
 }
 

@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux-clang18:
+    name: Linux Clang 18 (${{ matrix.preset }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [clang18-debug, clang18-release]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang 18 and GUI/Vulkan dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 \
+            clang-format-18 \
+            clang-tidy-18 \
+            libc++-18-dev \
+            libc++abi-18-dev \
+            libclang-rt-18-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            graphviz \
+            libgtk-3-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            xorg-dev
+
+      - name: Configure (${{ matrix.preset }})
+        run: cmake --preset ${{ matrix.preset }} -DPEELF_WARNINGS_AS_ERRORS=ON
+
+      - name: Build (${{ matrix.preset }})
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Run CTest suite (${{ matrix.preset }})
+        run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure --parallel "$(nproc)"
+
+      - name: Verify headless CLI JSON & SARIF output
+        run: |
+          ./out/build/${{ matrix.preset }}/apps/viewer/peelf_viewer \
+            --headless tests/fixtures/hello.elf \
+            --format json --output /tmp/hello_report.json
+          ./out/build/${{ matrix.preset }}/apps/viewer/peelf_viewer \
+            --headless tests/fixtures/hello.elf \
+            --format sarif --output /tmp/hello_report.sarif
+          test -s /tmp/hello_report.json
+          test -s /tmp/hello_report.sarif
+
+  linux-asan-ubsan:
+    name: Linux Clang 18 (ASan + UBSan)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Clang 18 sanitizer runtime and dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 \
+            libc++-18-dev \
+            libc++abi-18-dev \
+            libclang-rt-18-dev \
+            cmake \
+            ninja-build \
+            pkg-config \
+            graphviz \
+            libgtk-3-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxrandr-dev \
+            xorg-dev
+
+      - name: Configure (clang18-asan-ubsan)
+        run: >
+          cmake --preset clang18-asan-ubsan
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DPEELF_WARNINGS_AS_ERRORS=ON
+
+      - name: Build (clang18-asan-ubsan)
+        run: cmake --build --preset clang18-asan-ubsan --parallel
+
+      - name: Run CTest suite under ASan + UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --parallel "$(nproc)"
+
+  windows-msvc:
+    name: Windows MSVC 2022 (${{ matrix.build_type }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure MSVC x64 Developer Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup LunarG Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.0
+        with:
+          vulkan-version: 1.3.296.0
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          cache: true
+
+      - name: Configure CMake (${{ matrix.build_type }})
+        run: >
+          cmake -S . -B out/build/msvc-${{ matrix.build_type }}
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DPEELF_WARNINGS_AS_ERRORS=ON
+
+      - name: Build (${{ matrix.build_type }})
+        run: cmake --build out/build/msvc-${{ matrix.build_type }} --parallel
+
+      - name: Run CTest suite (${{ matrix.build_type }})
+        run: ctest --test-dir out/build/msvc-${{ matrix.build_type }} --output-on-failure --parallel
+
+      - name: Verify headless CLI JSON & SARIF output
+        shell: pwsh
+        run: |
+          $exe = "out/build/msvc-${{ matrix.build_type }}/apps/viewer/peelf_viewer.exe"
+          $jsonOut = "out/build/msvc-${{ matrix.build_type }}/hello_report.json"
+          $sarifOut = "out/build/msvc-${{ matrix.build_type }}/hello_report.sarif"
+          & $exe --headless tests/fixtures/hello.elf --format json --output $jsonOut
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $jsonOut)) { throw "Headless JSON failed" }
+          & $exe --headless tests/fixtures/hello.elf --format sarif --output $sarifOut
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $sarifOut)) { throw "Headless SARIF failed" }

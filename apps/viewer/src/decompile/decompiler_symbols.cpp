@@ -34,7 +34,9 @@ std::optional<SymbolRecord> containing_function(const peelf::IBinaryImage& image
 std::string encode_decompiler_symbols(const DecompileRequest& request) {
     const auto hex=[](std::string_view text) {
         std::string encoded;
-        for (unsigned char c : text) encoded += std::format("{:02x}",c);
+        for (const char ch : text) {
+            encoded += std::format("{:02x}", static_cast<unsigned char>(ch));
+        }
         return encoded.empty() ? "-" : encoded;
     };
     std::ostringstream out;

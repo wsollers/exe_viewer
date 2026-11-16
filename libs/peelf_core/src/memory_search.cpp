@@ -561,7 +561,8 @@ void scan_window_into_report(std::span<const std::uint8_t> window,
 }
 
 [[nodiscard]] bool is_heap_candidate(const MemoryRegion& reg) noexcept {
-    if (!reg.protection.readable || reg.protection.guarded || reg.size() == 0u) {
+    if (!reg.protection.readable || reg.protection.guarded ||
+        reg.usage.is_reserved_only || reg.size() == 0u) {
         return false;
     }
     if (reg.kind == MemoryRegionKind::Heap) {
@@ -571,6 +572,17 @@ void scan_window_into_report(std::span<const std::uint8_t> window,
            reg.protection.readable &&
            reg.protection.writable &&
            !reg.protection.executable;
+}
+
+[[nodiscard]] bool is_untouched_large_anonymous_reservation(const MemoryRegion& reg) noexcept {
+    static constexpr std::uint64_t kLargeAnonThreshold = 16ull * 1024ull * 1024ull;
+    if (reg.kind != MemoryRegionKind::Anonymous || reg.size() < kLargeAnonThreshold) {
+        return false;
+    }
+    if (!reg.usage.rss_bytes.has_value()) {
+        return false;
+    }
+    return *reg.usage.rss_bytes == 0u && reg.usage.swap_bytes.value_or(0u) == 0u;
 }
 
 }  // namespace
@@ -778,12 +790,19 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
     std::vector<MemoryRegion> candidates;
     std::optional<std::uint64_t> active_module_base;
 
+    MemorySearchReport report;
+
     switch (query.scope) {
         case SearchScope::Heap:
             for (const MemoryRegion& reg : regions) {
-                if (is_heap_candidate(reg)) {
-                    candidates.push_back(reg);
+                if (!is_heap_candidate(reg) || is_untouched_large_anonymous_reservation(reg)) {
+                    continue;
                 }
+                if (query.max_region_bytes > 0u && reg.size() > query.max_region_bytes) {
+                    ++report.regions_skipped_oversized;
+                    continue;
+                }
+                candidates.push_back(reg);
             }
             break;
 
@@ -793,6 +812,7 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
             }
             if (selected_region->protection.readable &&
                 !selected_region->protection.guarded &&
+                !selected_region->usage.is_reserved_only &&
                 selected_region->size() > 0u) {
                 candidates.push_back(*selected_region);
             }
@@ -807,7 +827,8 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
             active_module_base = mod_start;
 
             for (const MemoryRegion& reg : regions) {
-                if (!reg.protection.readable || reg.protection.guarded || reg.size() == 0u) {
+                if (!reg.protection.readable || reg.protection.guarded ||
+                    reg.usage.is_reserved_only || reg.size() == 0u) {
                     continue;
                 }
                 const std::uint64_t clamped_start = std::max(reg.start_address, mod_start);
@@ -827,14 +848,20 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
 
         case SearchScope::AllReadable:
             for (const MemoryRegion& reg : regions) {
-                if (reg.protection.readable && !reg.protection.guarded && reg.size() > 0u) {
-                    candidates.push_back(reg);
+                if (!reg.protection.readable || reg.protection.guarded ||
+                    reg.usage.is_reserved_only || reg.size() == 0u ||
+                    is_untouched_large_anonymous_reservation(reg)) {
+                    continue;
                 }
+                if (query.max_region_bytes > 0u && reg.size() > query.max_region_bytes) {
+                    ++report.regions_skipped_oversized;
+                    continue;
+                }
+                candidates.push_back(reg);
             }
             break;
     }
 
-    MemorySearchReport report;
     if (candidates.empty()) {
         report.status = SubsystemStatus::available(
             "process_memory_search",
@@ -899,7 +926,14 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
 
         std::uint64_t cursor = reg.start_address;
         while (cursor < reg.end_address && !report.truncated) {
-            const std::uint64_t rem_bytes = reg.end_address - cursor;
+            if (query.max_total_bytes > 0u && report.bytes_scanned >= query.max_total_bytes) {
+                report.truncated = true;
+                break;
+            }
+            const std::uint64_t rem_budget =
+                (query.max_total_bytes > 0u) ? (query.max_total_bytes - report.bytes_scanned)
+                                             : (reg.end_address - cursor);
+            const std::uint64_t rem_bytes = std::min(reg.end_address - cursor, rem_budget);
             const auto req_size = static_cast<std::size_t>(
                 std::min<std::uint64_t>(static_cast<std::uint64_t>(chunk_cap), rem_bytes));
 

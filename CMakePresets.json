@@ -43,6 +43,20 @@
       }
     },
     {
+      "name": "clang18-asan-ubsan",
+      "displayName": "Clang 18 ASan + UBSan (Ninja)",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "clang-18",
+        "CMAKE_CXX_COMPILER": "clang++-18",
+        "CMAKE_CXX_FLAGS": "-stdlib=libc++",
+        "CMAKE_EXE_LINKER_FLAGS": "-stdlib=libc++",
+        "CMAKE_SHARED_LINKER_FLAGS": "-stdlib=libc++",
+        "PEELF_ENABLE_SANITIZERS": "ON"
+      }
+    },
+    {
       "name": "msvc-debug",
       "displayName": "MSVC 2022 Debug",
       "generator": "Visual Studio 17 2022",
@@ -50,7 +64,7 @@
       "cacheVariables": {
         "CMAKE_CONFIGURATION_TYPES": "Debug;Release",
         "PEELF_BUILD_VIEWER": "ON",
-        "PEELF_BUILD_SHARED": "ON"
+        "PEELF_BUILD_SHARED": "OFF"
       }
     }
   ],
@@ -64,10 +78,30 @@
       "configurePreset": "clang18-release"
     },
     {
+      "name": "clang18-asan-ubsan",
+      "configurePreset": "clang18-asan-ubsan"
+    },
+    {
       "name": "msvc-debug",
       "configurePreset": "msvc-debug",
       "configuration": "Debug"
     }
   ],
-  "testPresets": []
+  "testPresets": [
+    {
+      "name": "clang18-debug",
+      "configurePreset": "clang18-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang18-release",
+      "configurePreset": "clang18-release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "clang18-asan-ubsan",
+      "configurePreset": "clang18-asan-ubsan",
+      "output": { "outputOnFailure": true }
+    }
+  ]
 }

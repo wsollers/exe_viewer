@@ -33,10 +33,10 @@ struct PatchSpanSnapshot {
 
 struct PatchEdit {
     std::uint64_t offset{};
-    std::vector<std::uint8_t> before;
-    std::vector<std::uint8_t> after;
-    std::vector<PatchSpanSnapshot> spans;
-    std::string label;
+    std::vector<std::uint8_t> before{};
+    std::vector<std::uint8_t> after{};
+    std::vector<PatchSpanSnapshot> spans{};
+    std::string label{};
 };
 
 struct PendingPatchWrite {

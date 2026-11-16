@@ -29,7 +29,7 @@ add_executable(peelf_callgraph_fixture
 )
 target_compile_features(peelf_callgraph_fixture PRIVATE cxx_std_23)
 if(MSVC)
-  target_compile_options(peelf_callgraph_fixture PRIVATE /Od /Ob0 /Zi)
+  target_compile_options(peelf_callgraph_fixture PRIVATE /Od /Ob0 /Zi /FS)
   target_link_options(peelf_callgraph_fixture PRIVATE /DEBUG /INCREMENTAL:NO)
   set(PEELF_CALLGRAPH_FIXTURE_PDB_PATH "$<TARGET_PDB_FILE:peelf_callgraph_fixture>")
 else()
@@ -74,6 +74,7 @@ add_executable(peelf_tests
   multiarch_subsystems_test.cpp
   live_child_inspection_test.cpp
   review_bugs_regression_test.cpp
+  malformed_inputs_matrix_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
@@ -112,27 +113,29 @@ if(MSVC)
   # Keep function pointers equal to PDB function RVAs in the live ASLR self-test.
   # Incremental linking otherwise routes pointers through ILT jump thunks.
   target_link_options(peelf_tests PRIVATE /INCREMENTAL:NO)
-  find_path(PEELF_DIA_INCLUDE_DIR dia2.h
-    PATHS
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/include"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/include"
-  )
-  find_library(PEELF_DIA_GUIDS_LIBRARY diaguids
-    PATHS
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib"
-  )
-  find_file(PEELF_DIA_DLL msdia140.dll
-    PATHS
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/bin/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/bin/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/bin"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/bin"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/Common7/IDE"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/Common7/IDE"
-  )
+
+  set(_peelf_vs_dia_roots "")
+  if(DEFINED ENV{VSINSTALLDIR} AND NOT "$ENV{VSINSTALLDIR}" STREQUAL "")
+    list(APPEND _peelf_vs_dia_roots "$ENV{VSINSTALLDIR}")
+  endif()
+  foreach(_vs_ver IN ITEMS 18 2022)
+    foreach(_vs_ed IN ITEMS Enterprise Professional Community BuildTools)
+      list(APPEND _peelf_vs_dia_roots "$ENV{ProgramFiles}/Microsoft Visual Studio/${_vs_ver}/${_vs_ed}")
+    endforeach()
+  endforeach()
+
+  set(_peelf_dia_inc_hints "")
+  set(_peelf_dia_lib_hints "")
+  set(_peelf_dia_dll_hints "")
+  foreach(_root IN LISTS _peelf_vs_dia_roots)
+    list(APPEND _peelf_dia_inc_hints "${_root}/DIA SDK/include")
+    list(APPEND _peelf_dia_lib_hints "${_root}/DIA SDK/lib/amd64" "${_root}/DIA SDK/lib")
+    list(APPEND _peelf_dia_dll_hints "${_root}/DIA SDK/bin/amd64" "${_root}/DIA SDK/bin" "${_root}/Common7/IDE")
+  endforeach()
+
+  find_path(PEELF_DIA_INCLUDE_DIR dia2.h PATHS ${_peelf_dia_inc_hints})
+  find_library(PEELF_DIA_GUIDS_LIBRARY diaguids PATHS ${_peelf_dia_lib_hints})
+  find_file(PEELF_DIA_DLL msdia140.dll PATHS ${_peelf_dia_dll_hints})
   if(PEELF_DIA_INCLUDE_DIR AND PEELF_DIA_GUIDS_LIBRARY)
     target_include_directories(peelf_tests PRIVATE ${PEELF_DIA_INCLUDE_DIR})
     target_link_libraries(peelf_tests PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)
@@ -179,6 +182,16 @@ if(TARGET peelf_viewer)
     PEELF_VIEWER_EXE="$<TARGET_FILE:peelf_viewer>"
   )
   add_dependencies(peelf_tests peelf_viewer)
+  if(WIN32 AND PEELF_BUILD_SHARED)
+    add_custom_command(TARGET peelf_tests POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:peelf_core>
+        $<TARGET_FILE_DIR:peelf_tests>
+    )
+    set(_peelf_isolated_core_dll_arg "-DCORE_DLL=$<TARGET_FILE:peelf_core>")
+  else()
+    set(_peelf_isolated_core_dll_arg "")
+  endif()
   add_test(NAME Startup.Headless COMMAND peelf_viewer --headless)
   add_test(NAME Startup.Help COMMAND peelf_viewer --help)
   add_test(NAME Headless.FixtureJson
@@ -187,6 +200,7 @@ if(TARGET peelf_viewer)
     COMMAND peelf_viewer --headless $<TARGET_FILE:peelf_callgraph_fixture> --format sarif --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture.sarif)
   add_test(NAME Startup.WithoutGuiModule COMMAND ${CMAKE_COMMAND}
     -DLAUNCHER=$<TARGET_FILE:peelf_viewer>
+    ${_peelf_isolated_core_dll_arg}
     -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-isolated
     -P ${CMAKE_CURRENT_SOURCE_DIR}/startup_without_gui.cmake)
 endif()

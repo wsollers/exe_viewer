@@ -3,6 +3,7 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include <array>
 #include <vector>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,8 @@ struct VulkanConfig {
 
 class VulkanManager {
 public:
+    static constexpr std::size_t kMaxFramesInFlight = 2;
+
     struct Texture {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -51,16 +54,18 @@ public:
     void destroy_texture(Texture& texture);
 
     // Accessors for ImGui initialization
-    [[nodiscard]] VkInstance instance() const { return instance_; }
-    [[nodiscard]] VkPhysicalDevice physical_device() const { return physical_device_; }
-    [[nodiscard]] VkDevice device() const { return device_; }
-    [[nodiscard]] VkQueue graphics_queue() const { return graphics_queue_; }
-    [[nodiscard]] uint32_t graphics_family() const { return graphics_family_; }
-    [[nodiscard]] VkRenderPass render_pass() const { return render_pass_; }
-    [[nodiscard]] VkDescriptorPool descriptor_pool() const { return descriptor_pool_; }
-    [[nodiscard]] uint32_t image_count() const { return static_cast<uint32_t>(swapchain_images_.size()); }
-    [[nodiscard]] VkCommandBuffer current_command_buffer() const { return command_buffers_[current_image_index_]; }
-    [[nodiscard]] VkExtent2D swapchain_extent() const { return swapchain_extent_; }
+    [[nodiscard]] uint32_t api_version() const noexcept { return api_version_; }
+    [[nodiscard]] VkInstance instance() const noexcept { return instance_; }
+    [[nodiscard]] VkPhysicalDevice physical_device() const noexcept { return physical_device_; }
+    [[nodiscard]] VkDevice device() const noexcept { return device_; }
+    [[nodiscard]] VkQueue graphics_queue() const noexcept { return graphics_queue_; }
+    [[nodiscard]] uint32_t graphics_family() const noexcept { return graphics_family_; }
+    [[nodiscard]] VkRenderPass render_pass() const noexcept { return render_pass_; }
+    [[nodiscard]] VkDescriptorPool descriptor_pool() const noexcept { return descriptor_pool_; }
+    [[nodiscard]] uint32_t min_image_count() const noexcept { return min_image_count_; }
+    [[nodiscard]] uint32_t image_count() const noexcept { return static_cast<uint32_t>(swapchain_images_.size()); }
+    [[nodiscard]] VkCommandBuffer current_command_buffer() const noexcept { return frame_command_buffers_[current_frame_]; }
+    [[nodiscard]] VkExtent2D swapchain_extent() const noexcept { return swapchain_extent_; }
 
 private:
     void create_instance(const VulkanConfig& config);
@@ -83,31 +88,36 @@ private:
     static void check_vk(VkResult result, const char* msg);
 
     // Vulkan handles
+    uint32_t api_version_ = VK_API_VERSION_1_0;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    uint32_t min_image_count_ = 2;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkRenderPass render_pass_ = VK_NULL_HANDLE;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
+    std::array<VkCommandPool, kMaxFramesInFlight> frame_command_pools_{};
+    std::array<VkCommandBuffer, kMaxFramesInFlight> frame_command_buffers_{};
     VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
 
     std::vector<VkImage> swapchain_images_;
     std::vector<VkImageView> swapchain_image_views_;
     std::vector<VkFramebuffer> framebuffers_;
-    std::vector<VkCommandBuffer> command_buffers_;
 
     VkFormat swapchain_format_ = VK_FORMAT_B8G8R8A8_SRGB;
     VkExtent2D swapchain_extent_ = {};
     uint32_t graphics_family_ = 0;
+    uint32_t current_frame_ = 0;
     uint32_t current_image_index_ = 0;
 
-    VkSemaphore image_available_semaphore_ = VK_NULL_HANDLE;
+    std::array<VkSemaphore, kMaxFramesInFlight> image_available_semaphores_{};
     std::vector<VkSemaphore> render_finished_semaphores_;
+    std::array<VkFence, kMaxFramesInFlight> in_flight_fences_{};
+    std::vector<VkFence> images_in_flight_;
     GLFWwindow* window_ = nullptr;
     bool swapchain_dirty_ = false;
-    VkFence in_flight_fence_ = VK_NULL_HANDLE;
 
     bool initialized_ = false;
 };

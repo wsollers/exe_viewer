@@ -22,6 +22,13 @@ endif()
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)
 peelf_apply_project_warnings(peelf_viewer)
 target_link_libraries(peelf_viewer PRIVATE peelf::core ${CMAKE_DL_LIBS})
+if(WIN32 AND PEELF_BUILD_SHARED)
+  add_custom_command(TARGET peelf_viewer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      $<TARGET_FILE:peelf_core>
+      $<TARGET_FILE_DIR:peelf_viewer>
+  )
+endif()
 if(NOT PEELF_BUILD_GUI)
   return()
 endif()
@@ -141,27 +148,28 @@ endif()
 if(MSVC)
   target_link_libraries(peelf_gui PRIVATE Dbghelp)
 
-  find_path(PEELF_DIA_INCLUDE_DIR dia2.h
-    PATHS
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/include"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/include"
-  )
-  find_library(PEELF_DIA_GUIDS_LIBRARY diaguids
-    PATHS
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/lib"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/lib"
-  )
-  find_file(PEELF_DIA_DLL msdia140.dll
-    PATHS
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/bin/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/bin/amd64"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/DIA SDK/bin"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/DIA SDK/bin"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/18/Community/Common7/IDE"
-      "$ENV{ProgramFiles}/Microsoft Visual Studio/2022/Community/Common7/IDE"
-  )
+  set(_peelf_vs_dia_roots "")
+  if(DEFINED ENV{VSINSTALLDIR} AND NOT "$ENV{VSINSTALLDIR}" STREQUAL "")
+    list(APPEND _peelf_vs_dia_roots "$ENV{VSINSTALLDIR}")
+  endif()
+  foreach(_vs_ver IN ITEMS 18 2022)
+    foreach(_vs_ed IN ITEMS Enterprise Professional Community BuildTools)
+      list(APPEND _peelf_vs_dia_roots "$ENV{ProgramFiles}/Microsoft Visual Studio/${_vs_ver}/${_vs_ed}")
+    endforeach()
+  endforeach()
+
+  set(_peelf_dia_inc_hints "")
+  set(_peelf_dia_lib_hints "")
+  set(_peelf_dia_dll_hints "")
+  foreach(_root IN LISTS _peelf_vs_dia_roots)
+    list(APPEND _peelf_dia_inc_hints "${_root}/DIA SDK/include")
+    list(APPEND _peelf_dia_lib_hints "${_root}/DIA SDK/lib/amd64" "${_root}/DIA SDK/lib")
+    list(APPEND _peelf_dia_dll_hints "${_root}/DIA SDK/bin/amd64" "${_root}/DIA SDK/bin" "${_root}/Common7/IDE")
+  endforeach()
+
+  find_path(PEELF_DIA_INCLUDE_DIR dia2.h PATHS ${_peelf_dia_inc_hints})
+  find_library(PEELF_DIA_GUIDS_LIBRARY diaguids PATHS ${_peelf_dia_lib_hints})
+  find_file(PEELF_DIA_DLL msdia140.dll PATHS ${_peelf_dia_dll_hints})
   if(PEELF_DIA_INCLUDE_DIR AND PEELF_DIA_GUIDS_LIBRARY)
     target_include_directories(peelf_gui PRIVATE ${PEELF_DIA_INCLUDE_DIR})
     target_link_libraries(peelf_gui PRIVATE ${PEELF_DIA_GUIDS_LIBRARY} ole32 oleaut32)

@@ -92,12 +92,6 @@ void activate_panel(const char* name) {
     return it != haystack.end();
 }
 
-struct BmpImage {
-    std::uint32_t width = 0;
-    std::uint32_t height = 0;
-    std::vector<std::uint8_t> rgba;
-};
-
 struct GraphLayoutBounds {
     double min_x = 0.0;
     double min_y = 0.0;
@@ -156,21 +150,6 @@ struct GraphLayoutBounds {
     return bounds;
 }
 
-[[nodiscard]] std::uint16_t read_u16_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-    return static_cast<std::uint16_t>(bytes[offset] | (bytes[offset + 1] << 8u));
-}
-
-[[nodiscard]] std::uint32_t read_u32_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-    return static_cast<std::uint32_t>(bytes[offset] |
-                                      (bytes[offset + 1] << 8u) |
-                                      (bytes[offset + 2] << 16u) |
-                                      (bytes[offset + 3] << 24u));
-}
-
-[[nodiscard]] std::int32_t read_i32_le(const std::vector<std::uint8_t>& bytes, std::size_t offset) {
-    return static_cast<std::int32_t>(read_u32_le(bytes, offset));
-}
-
 [[nodiscard]] std::optional<std::vector<std::uint8_t>> read_binary_file(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -199,95 +178,6 @@ struct GraphLayoutBounds {
         return std::nullopt;
     }
     return std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size());
-}
-
-[[nodiscard]] std::optional<BmpImage> load_bmp_rgba(const std::filesystem::path& path) {
-    const std::optional<std::vector<std::uint8_t>> loaded_bytes = read_binary_file(path);
-    if (!loaded_bytes) {
-        return std::nullopt;
-    }
-    const std::vector<std::uint8_t>& bytes = *loaded_bytes;
-    if (bytes.size() < 54 || bytes[0] != 'B' || bytes[1] != 'M') {
-        return std::nullopt;
-    }
-
-    const std::uint32_t pixel_offset = read_u32_le(bytes, 10);
-    const std::uint32_t dib_size = read_u32_le(bytes, 14);
-    if (dib_size < 40 || pixel_offset >= bytes.size()) {
-        return std::nullopt;
-    }
-
-    const std::int32_t raw_width = read_i32_le(bytes, 18);
-    const std::int32_t raw_height = read_i32_le(bytes, 22);
-    const std::uint16_t planes = read_u16_le(bytes, 26);
-    const std::uint16_t bits_per_pixel = read_u16_le(bytes, 28);
-    const std::uint32_t compression = read_u32_le(bytes, 30);
-    if (raw_width <= 0 || raw_height == 0 || planes != 1 || compression != 0 ||
-        (bits_per_pixel != 24 && bits_per_pixel != 32)) {
-        return std::nullopt;
-    }
-
-    const bool top_down = raw_height < 0;
-    const std::uint32_t width = static_cast<std::uint32_t>(raw_width);
-    const std::uint32_t height = static_cast<std::uint32_t>(top_down ? -raw_height : raw_height);
-    const std::uint32_t bytes_per_pixel = bits_per_pixel / 8u;
-    const std::uint32_t source_stride = ((width * bytes_per_pixel + 3u) / 4u) * 4u;
-    if (pixel_offset + static_cast<std::size_t>(source_stride) * height > bytes.size()) {
-        return std::nullopt;
-    }
-
-    BmpImage image{
-        .width = width,
-        .height = height,
-        .rgba = std::vector<std::uint8_t>(static_cast<std::size_t>(width) * height * 4u),
-    };
-
-    for (std::uint32_t y = 0; y < height; ++y) {
-        const std::uint32_t source_y = top_down ? y : (height - 1u - y);
-        const std::size_t source_row = pixel_offset + static_cast<std::size_t>(source_y) * source_stride;
-        const std::size_t dest_row = static_cast<std::size_t>(y) * width * 4u;
-        for (std::uint32_t x = 0; x < width; ++x) {
-            const std::size_t source = source_row + static_cast<std::size_t>(x) * bytes_per_pixel;
-            const std::size_t dest = dest_row + static_cast<std::size_t>(x) * 4u;
-            image.rgba[dest + 0] = bytes[source + 2];
-            image.rgba[dest + 1] = bytes[source + 1];
-            image.rgba[dest + 2] = bytes[source + 0];
-            image.rgba[dest + 3] = bits_per_pixel == 32 ? bytes[source + 3] : 255u;
-        }
-    }
-    return image;
-}
-
-[[nodiscard]] std::optional<std::filesystem::path> find_graphs_dir() {
-    std::filesystem::path current = std::filesystem::current_path();
-    for (std::uint32_t depth = 0; depth < 10; ++depth) {
-        const std::array<std::filesystem::path, 2> candidates{
-            current / "out" / "graphs",
-            current / "apps" / "viewer" / "assets" / "graphs",
-        };
-        for (const std::filesystem::path& candidate : candidates) {
-            if (std::filesystem::exists(candidate)) {
-                return candidate;
-            }
-        }
-        if (!current.has_parent_path() || current == current.parent_path()) {
-            break;
-        }
-        current = current.parent_path();
-    }
-    return std::nullopt;
-}
-
-[[nodiscard]] const char* graph_dot_name(UiApp::CallGraphSample sample) {
-    switch (sample) {
-        case UiApp::CallGraphSample::LoadedImage:
-            return "loaded_image_call_graph.dot";
-        case UiApp::CallGraphSample::PeStartup:
-            return "pe_x64_startup_to_winmain.dot";
-        case UiApp::CallGraphSample::ElfStartup:
-            return "linux_elf_startup_to_main.dot";
-    }
-    return "pe_x64_startup_to_winmain.dot";
 }
 
 [[nodiscard]] const char* graph_bmp_name(UiApp::CallGraphSample sample) {

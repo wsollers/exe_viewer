@@ -234,9 +234,6 @@ namespace viewer {
 
     private:
         BinaryModel& model_;
-        std::size_t selected_instr_ = 0;
-
-
     };
 
     class SymbolsPanel : public UiPanel {

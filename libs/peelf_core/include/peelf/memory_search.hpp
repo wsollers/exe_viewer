@@ -76,6 +76,8 @@ struct MemorySearchQuery {
     bool case_sensitive{true};
     std::size_t alignment{1};
     std::size_t max_results{4096};
+    std::uint64_t max_region_bytes{512ull * 1024ull * 1024ull};
+    std::uint64_t max_total_bytes{2ull * 1024ull * 1024ull * 1024ull};
 };
 
 struct WildcardByte {
@@ -100,6 +102,7 @@ struct MemorySearchHit {
 struct MemorySearchReport {
     std::vector<MemorySearchHit> hits;
     std::size_t regions_scanned{0};
+    std::size_t regions_skipped_oversized{0};
     std::uint64_t bytes_scanned{0};
     bool truncated{false};
     SubsystemStatus status{};

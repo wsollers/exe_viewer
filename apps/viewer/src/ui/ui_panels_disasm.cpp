@@ -8,7 +8,7 @@
 namespace viewer {
 
     DisassemblyPanel::DisassemblyPanel(BinaryModel& model, std::vector<Instruction>& instructions)
-        : UiPanel("Disassembly"), model_(model), current_instructions_(instructions)
+        : UiPanel("Disassembly"), current_instructions_(instructions), model_(model)
     {}
 
     void DisassemblyPanel::draw_contents() {

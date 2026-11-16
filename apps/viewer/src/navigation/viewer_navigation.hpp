@@ -56,14 +56,14 @@ enum class SelectionKind : std::uint8_t {
 
 struct ViewerSelection {
     SelectionKind kind = SelectionKind::None;
-    std::string label;
-    std::optional<std::uint64_t> file_offset;
-    std::optional<std::uint64_t> virtual_address;
+    std::string label{};
+    std::optional<std::uint64_t> file_offset{};
+    std::optional<std::uint64_t> virtual_address{};
     std::uint64_t size = 0;
     std::uint64_t object_index = 0;
     PreferredView preferred_view = PreferredView::Details;
     // Keep the analysis origin independently of the selected interior instruction.
-    std::optional<SymbolRecord> graph_root;
+    std::optional<SymbolRecord> graph_root{};
 };
 
 // Headless navigation state. Revisiting the current address does not add noise;

@@ -21,12 +21,12 @@ enum class SymbolSource : std::uint8_t {
 };
 
 struct DebugSymbol {
-    std::string name;
+    std::string name{};
     std::uint64_t relative_virtual_address = 0;
     std::uint64_t virtual_address = 0;
     std::uint64_t size = 0;
     bool function = false;
-    std::string library;
+    std::string library{};
 };
 
 struct SymbolRecord {

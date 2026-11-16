@@ -24,6 +24,7 @@ RUN apt-get update \
         git \
         graphviz \
         libgtk-3-dev \
+        libclang-rt-18-dev \
         libc++-18-dev \
         libc++abi-18-dev \
         libc6-dev-i386-cross \

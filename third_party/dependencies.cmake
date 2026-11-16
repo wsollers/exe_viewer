@@ -54,7 +54,7 @@ add_library(imgui STATIC
         ${imgui_src_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
-target_include_directories(imgui PUBLIC
+target_include_directories(imgui SYSTEM PUBLIC
         ${imgui_src_SOURCE_DIR}
         ${imgui_src_SOURCE_DIR}/backends
 )
@@ -93,6 +93,13 @@ set(CAPSTONE_PPC_SUPPORT ON CACHE BOOL "" FORCE)      # PowerPC/PowerPC64
 set(CAPSTONE_RISCV_SUPPORT ON CACHE BOOL "" FORCE)    # RISC-V RV32/RV64
 
 FetchContent_MakeAvailable(capstone)
+if(TARGET capstone)
+        get_target_property(_capstone_inc capstone INTERFACE_INCLUDE_DIRECTORIES)
+        if(_capstone_inc)
+                set_target_properties(capstone PROPERTIES
+                        INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_capstone_inc}")
+        endif()
+endif()
 
 # AsmJit + AsmTK
 #
@@ -118,6 +125,13 @@ if(PEELF_ENABLE_ASMTK)
                 DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         )
         FetchContent_MakeAvailable(asmjit_src)
+        if(TARGET asmjit)
+                get_target_property(_asmjit_inc asmjit INTERFACE_INCLUDE_DIRECTORIES)
+                if(_asmjit_inc)
+                        set_target_properties(asmjit PROPERTIES
+                                INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_asmjit_inc}")
+                endif()
+        endif()
 
         FetchContent_Declare(
                 asmtk_src

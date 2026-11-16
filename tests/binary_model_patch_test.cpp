@@ -104,7 +104,9 @@ TEST_P(InstructionPatchRoundTrip, DecodeUndoRedoExportReopenPreservesOriginal) {
     EXPECT_EQ(exported.front().mnemonic, test.mnemonic);
     EXPECT_EQ(exported.front().bytes, test.replacement);
     auto expected_file = original_file;
-    std::copy(test.replacement.begin(), test.replacement.end(), expected_file.begin() + *offset);
+    std::copy(test.replacement.begin(),
+              test.replacement.end(),
+              expected_file.begin() + static_cast<std::ptrdiff_t>(*offset));
     EXPECT_EQ(reopened.bytes(), expected_file);
     EXPECT_EQ(model.bytes(), original_file);
     viewer::BinaryModel source_reopened;
