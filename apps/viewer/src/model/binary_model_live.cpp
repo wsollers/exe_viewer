@@ -1255,6 +1255,79 @@ private:
                     : peelf::CaptureAvailability::Partial;
             runtime_stamp_ = advance_live_capture_stamp(rt_avail);
         }
+
+        recompute_capabilities();
+        if (!is_live_process()) {
+            if (image_ != nullptr) {
+                executable_settings_ = peelf::extract_executable_settings(
+                    *image_,
+                    analysis_image_bytes(),
+                    static_image_stamp_);
+                executable_settings_.target_profile = target_profile_;
+            } else {
+                const peelf::CaptureStamp unavail_stamp =
+                    peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                executable_settings_ = {};
+                executable_settings_.target_profile = target_profile_;
+                executable_settings_.declared_in_file =
+                    peelf::Observed<peelf::DeclaredSettings>::unavailable(
+                        peelf::ProvenanceTag::DiskFile,
+                        "No binary image loaded",
+                        unavail_stamp);
+                executable_settings_.launch_environment =
+                    peelf::Observed<peelf::LaunchEnvironmentSettings>::unavailable(
+                        peelf::ProvenanceTag::ProcOrOsApi,
+                        "No binary or live process loaded",
+                        unavail_stamp);
+                executable_settings_.observed_runtime =
+                    peelf::Observed<peelf::ObservedRuntimeConfiguration>::unavailable(
+                        peelf::ProvenanceTag::ProcOrOsApi,
+                        "No binary or live process loaded",
+                        unavail_stamp);
+            }
+        } else {
+            if (!live_backing_file_bytes_.empty()) {
+                if (auto parsed_disk = peelf::parse_image(live_backing_file_bytes_)) {
+                    peelf::CaptureStamp disk_stamp = memory_map_stamp_;
+                    disk_stamp.target_id.backend = peelf::BackendKind::StaticFile;
+                    executable_settings_ = peelf::extract_executable_settings(
+                        **parsed_disk,
+                        live_backing_file_bytes_,
+                        disk_stamp);
+                } else if (image_ != nullptr) {
+                    executable_settings_ = peelf::extract_executable_settings(
+                        *image_,
+                        analysis_image_bytes(),
+                        memory_map_stamp_);
+                }
+            } else if (image_ != nullptr) {
+                executable_settings_ = peelf::extract_executable_settings(
+                    *image_,
+                    analysis_image_bytes(),
+                    memory_map_stamp_);
+            } else {
+                const peelf::CaptureStamp unavail_stamp =
+                    peelf::CaptureStamp::unavailable_for(target_instance_id_);
+                executable_settings_ = {};
+                executable_settings_.declared_in_file =
+                    peelf::Observed<peelf::DeclaredSettings>::unavailable(
+                        is_crash_dump() ? peelf::ProvenanceTag::CrashDump
+                                        : peelf::ProvenanceTag::LiveMemory,
+                        "Active memory selection does not map a parsed PE/ELF module",
+                        unavail_stamp);
+                executable_settings_.launch_environment =
+                    peelf::Observed<peelf::LaunchEnvironmentSettings>::unavailable(
+                        peelf::ProvenanceTag::ProcOrOsApi,
+                        "Runtime launch environment not captured",
+                        unavail_stamp);
+                executable_settings_.observed_runtime =
+                    peelf::Observed<peelf::ObservedRuntimeConfiguration>::unavailable(
+                        peelf::ProvenanceTag::ProcOrOsApi,
+                        "Observed runtime configuration not captured",
+                        unavail_stamp);
+            }
+            executable_settings_.target_profile = target_profile_;
+        }
     }
 
     void BinaryModel::refresh_process_internals() {

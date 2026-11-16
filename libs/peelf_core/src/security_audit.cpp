@@ -1766,6 +1766,33 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
                 CaptureAvailability::Complete);
         }
 
+        if (report.image != nullptr) {
+            report.executable_settings = extract_executable_settings(
+                *report.image,
+                {},
+                report.analysis_stamp);
+            report.executable_settings.target_profile = report.target_profile;
+        } else {
+            CaptureStamp unavail_stamp = report.analysis_stamp;
+            unavail_stamp.availability = CaptureAvailability::Unavailable;
+            report.executable_settings.target_profile = report.target_profile;
+            report.executable_settings.declared_in_file =
+                Observed<DeclaredSettings>::unavailable(
+                    ProvenanceTag::CrashDump,
+                    "No hydrated PE/ELF module image available in crash dump",
+                    unavail_stamp);
+            report.executable_settings.launch_environment =
+                Observed<LaunchEnvironmentSettings>::unavailable(
+                    ProvenanceTag::CrashDump,
+                    "Crash dump launch environment hydration requires runtime settings capture",
+                    unavail_stamp);
+            report.executable_settings.observed_runtime =
+                Observed<ObservedRuntimeConfiguration>::unavailable(
+                    ProvenanceTag::CrashDump,
+                    "Crash dump runtime configuration hydration requires runtime settings capture",
+                    unavail_stamp);
+        }
+
         if (options.compare_path.has_value()) {
             return make_error("--compare is not supported when the primary input is a crash dump");
         }
@@ -1810,6 +1837,11 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
     report.dependencies = build_dependency_graph(*report.image, dep_opts);
 
     report.security = audit_security(*report.image, raw_bytes);
+    report.executable_settings = extract_executable_settings(
+        *report.image,
+        raw_bytes,
+        report.analysis_stamp);
+    report.executable_settings.target_profile = report.target_profile;
 
     if (options.include_strings) {
         report.strings_included = true;
@@ -2129,6 +2161,11 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
         }
         out += "]\n  },\n";
     }
+
+    // Unified Executable & Settings Overview (`WU-22` / `WU-23`)
+    out += "  \"executable_settings\": ";
+    out += format_executable_settings_json(report.executable_settings, 2u);
+    out += ",\n";
 
     // Security Audit (`WU-13`)
     out += "  \"security_audit\": {\n";

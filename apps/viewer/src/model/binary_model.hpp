@@ -21,6 +21,7 @@
 #include <peelf/crash_dump.hpp>
 #include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
+#include <peelf/executable_settings.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/handlers.hpp>
 #include <peelf/memory_search.hpp>
@@ -383,6 +384,9 @@ namespace viewer {
         [[nodiscard]] std::uint64_t current_capture_revision() const noexcept {
             return next_capture_revision_;
         }
+        [[nodiscard]] const peelf::ExecutableSettingsReport& executable_settings() const noexcept {
+            return executable_settings_;
+        }
 
     private:
         BinarySourceKind source_kind_ = BinarySourceKind::None;
@@ -453,6 +457,7 @@ namespace viewer {
         peelf::ThreadEnvironmentSnapshot thread_env_;
         peelf::HandlersReport handlers_report_;
         peelf::SecurityAuditReport security_audit_;
+        peelf::ExecutableSettingsReport executable_settings_{};
         peelf::ProcessInternalsSnapshot process_internals_{};
         bool process_internals_loaded_{false};
         peelf::ThreadCpuTracker thread_cpu_tracker_{};

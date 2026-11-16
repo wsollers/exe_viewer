@@ -404,16 +404,27 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
         resource.entries.push_back(entry);
     }
 
+    std::size_t visited_budget = 0u;
+    constexpr std::size_t kMaxResourceEntriesVisited = 16384u;
+    std::array<std::uint64_t, 4> active_dir_offsets{};
+
     auto parse_resource_level = [&](auto&& self,
                                     std::uint64_t relative_directory_offset,
                                     std::uint32_t depth,
                                     std::uint32_t type_id,
                                     std::uint32_t name_id,
                                     std::uint32_t language_id) -> void {
-        if (depth > 2 || relative_directory_offset > directory_size ||
+        if (depth > 2 || visited_budget >= kMaxResourceEntriesVisited ||
+            relative_directory_offset > directory_size ||
             directory_size - relative_directory_offset < 16) {
             return;
         }
+        for (std::uint32_t d = 0; d < depth; ++d) {
+            if (active_dir_offsets[d] == relative_directory_offset) {
+                return;
+            }
+        }
+        active_dir_offsets[depth] = relative_directory_offset;
 
         const std::uint64_t directory_file_offset = *directory_off + relative_directory_offset;
         if (!fits_range(directory_file_offset, 16, static_cast<std::uint64_t>(b.size()))) {
@@ -426,6 +437,10 @@ void parse_pe_resource_directory(std::span<const std::uint8_t> b,
         const std::uint64_t entry_count = static_cast<std::uint64_t>(named_count) +
                                           static_cast<std::uint64_t>(id_count);
         for (std::uint64_t i = 0; i < entry_count; ++i) {
+            if (visited_budget >= kMaxResourceEntriesVisited) {
+                break;
+            }
+            ++visited_budget;
             const std::uint64_t entry_off = directory_file_offset + 16u + i * 8u;
             if (!fits_range(entry_off, 8, static_cast<std::uint64_t>(b.size()))) {
                 break;

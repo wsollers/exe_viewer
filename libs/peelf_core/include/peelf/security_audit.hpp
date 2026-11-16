@@ -6,6 +6,7 @@
 #include <peelf/crash_dump.hpp>
 #include <peelf/dependency_tree.hpp>
 #include <peelf/error.hpp>
+#include <peelf/executable_settings.hpp>
 #include <peelf/forgiving.hpp>
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
@@ -169,6 +170,7 @@ struct HeadlessAnalysisReport {
     CaptureStamp analysis_stamp{};
     ProvenanceTag primary_provenance{ProvenanceTag::DiskFile};
     DependencyGraph dependencies{};
+    ExecutableSettingsReport executable_settings{};
     SecurityAuditReport security{};
     bool strings_included{false};
     std::vector<HeadlessExtractedString> strings{};

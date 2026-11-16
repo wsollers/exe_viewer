@@ -116,7 +116,7 @@ Full data structures, capability defaults, security rules, and sandboxing contra
 
 - [x] **WU-21** — **`TargetProfile`, `ProviderFacts`, `TargetCapabilityMatrix` & First-Class Provenance.** *(Depends on: `WU-19d`)*
   - `SupportState` (`SupportedValidated` / `SupportedExperimental` / `Partial` / `Unsupported` — defaulting strictly to `Unsupported` without validation evidence) + `ProvenanceTag`, `CaptureAvailability` (avoiding `peelf/forgiving.hpp` `Availability` collision), per-collection `CaptureStamp` with `TargetInstanceId` + `snapshot_revision`, `Evidence`, `Observed<T>`, `BackingImageIdentity` verification, docked `Target Capabilities` panel, and `--headless` JSON capability/provenance output.
-- [ ] **WU-22** — **Unified Executable & Settings Overview — Static Declared Metadata.** *(Depends on: `WU-21`)*
+- [x] **WU-22** — **Unified Executable & Settings Overview — Static Declared Metadata.** *(Depends on: `WU-21`)*
   - Bounded PE `RT_MANIFEST` XML, `RT_VERSION` `VS_FIXEDFILEINFO` + multi-locale `StringFileInfo`, and CLR `BSJB` metadata summary; ELF `PT_INTERP`, `.note.ABI-tag`, `.note.gnu.build-id`, `DT_SONAME`/`DT_RPATH`/`DT_RUNPATH`, and `DT_FLAGS`/`DF_1_*` in GUI + versioned `--headless` JSON.
 - [ ] **WU-23** — **Timestamped `ProcessStateSnapshot`, Interval/Identity `SnapshotDiff` & Observed Runtime Settings.** *(Depends on: `WU-21`, `WU-22`)*
   - Point-in-time `ProcessStateSnapshot` capture, default secret redaction for observed environment variables, and `TargetInstanceId`-verified `SnapshotDiff` across modules, split/merged/RWX memory regions, threads/stacks, handles/FDs (detecting FD reuse), and sockets with partial-capture uncertainty propagation.

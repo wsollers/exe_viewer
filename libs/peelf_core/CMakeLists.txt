@@ -49,6 +49,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/debugger_win32.cpp
   src/provenance.cpp
   src/capability_matrix.cpp
+  src/executable_settings.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
@@ -58,6 +59,8 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/provenance.hpp
   include/peelf/capability_matrix.hpp
   include/peelf/capabilities.hpp
+  include/peelf/executable_settings.hpp
+  include/peelf/executable_overview.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
   include/peelf/binary_diff.hpp

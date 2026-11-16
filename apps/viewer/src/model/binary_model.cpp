@@ -100,6 +100,7 @@ using detail::utf8_path;
         thread_env_ = {};
         handlers_report_ = {};
         security_audit_ = {};
+        executable_settings_ = {};
         process_internals_ = {};
         process_internals_loaded_ = false;
         thread_cpu_tracker_.reset();

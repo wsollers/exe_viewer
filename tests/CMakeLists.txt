@@ -76,6 +76,7 @@ add_executable(peelf_tests
   review_bugs_regression_test.cpp
   malformed_inputs_matrix_test.cpp
   capability_provenance_test.cpp
+  executable_settings_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_dot.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_build.cpp
