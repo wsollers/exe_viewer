@@ -134,6 +134,9 @@ public:
         }
         struct DrainScope {
             bool& active;
+            explicit DrainScope(bool& a) noexcept : active(a) {}
+            DrainScope(const DrainScope&) = delete;
+            DrainScope& operator=(const DrainScope&) = delete;
             ~DrainScope() noexcept { active = false; }
         } scope{draining_};
         draining_ = true;

@@ -1285,18 +1285,19 @@ void ReferenceIndex::reset_for_progressive_scan(std::size_t total_executable_byt
 }
 
 void ReferenceIndex::append_chunk(ReferenceScanChunk&& chunk) {
-    scanned_bytes_ += chunk.bytes_scanned;
-    if (!chunk.references.empty()) {
+    ReferenceScanChunk owned = std::move(chunk);
+    scanned_bytes_ += owned.bytes_scanned;
+    if (!owned.references.empty()) {
         records_.insert(records_.end(),
-                        std::make_move_iterator(chunk.references.begin()),
-                        std::make_move_iterator(chunk.references.end()));
+                        std::make_move_iterator(owned.references.begin()),
+                        std::make_move_iterator(owned.references.end()));
         lookup_dirty_ = true;
     }
-    if (chunk.finished) {
+    if (owned.finished) {
         is_scanning_ = false;
-        incomplete_ = chunk.incomplete;
+        incomplete_ = owned.incomplete;
     } else {
-        incomplete_ = chunk.incomplete || (scanned_bytes_ < total_executable_bytes_);
+        incomplete_ = owned.incomplete || (scanned_bytes_ < total_executable_bytes_);
     }
     ++revision_;
 }
@@ -1608,6 +1609,10 @@ void AsyncReferenceScanner::start(ReferenceIndex& target,
         AsyncReferenceScanner* self;
         ReferenceIndex* target_index;
         bool committed{false};
+        LaunchRollbackGuard(AsyncReferenceScanner* s, ReferenceIndex* t) noexcept
+            : self(s), target_index(t) {}
+        LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (!committed) {
                 {
@@ -1683,6 +1688,13 @@ void AsyncReferenceScanner::resume(ReferenceIndex& target) {
         bool restore_paused{false};
         bool armed{false};
         bool committed{false};
+        LaunchRollbackGuard(AsyncReferenceScanner* s,
+                            ReferenceIndex* t,
+                            bool rp,
+                            bool arm) noexcept
+            : self(s), target_index(t), restore_paused(rp), armed(arm) {}
+        LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (armed && !committed) {
                 {
@@ -1694,7 +1706,7 @@ void AsyncReferenceScanner::resume(ReferenceIndex& target) {
                 self->cv_.notify_all();
             }
         }
-    } launch_guard{this, &target, prev_paused, spawn_worker, false};
+    } launch_guard{this, &target, prev_paused, spawn_worker};
 
     if (finished_worker.joinable()) {
         finished_worker.request_stop();
@@ -1767,6 +1779,20 @@ void AsyncReferenceScanner::scan_full(ReferenceIndex& target) {
         bool restore_paused{false};
         bool armed{false};
         bool committed{false};
+        LaunchRollbackGuard(AsyncReferenceScanner* s,
+                            ReferenceIndex* t,
+                            std::size_t rb,
+                            bool rf,
+                            bool rp,
+                            bool arm) noexcept
+            : self(s),
+              target_index(t),
+              restore_budget(rb),
+              restore_finished(rf),
+              restore_paused(rp),
+              armed(arm) {}
+        LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (armed && !committed) {
                 {
@@ -1780,7 +1806,7 @@ void AsyncReferenceScanner::scan_full(ReferenceIndex& target) {
                 self->cv_.notify_all();
             }
         }
-    } launch_guard{this, &target, prev_budget, prev_finished, prev_paused, spawn_worker, false};
+    } launch_guard{this, &target, prev_budget, prev_finished, prev_paused, spawn_worker};
 
     if (finished_worker.joinable()) {
         finished_worker.request_stop();

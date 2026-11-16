@@ -516,6 +516,9 @@ private:
         struct CoordReset {
             bool& flag;
             bool prev;
+            CoordReset(bool& f, bool p) noexcept : flag(f), prev(p) {}
+            CoordReset(const CoordReset&) = delete;
+            CoordReset& operator=(const CoordReset&) = delete;
             ~CoordReset() noexcept { flag = prev; }
         } coord_guard{in_coordinated_attach_, was_coordinated};
 

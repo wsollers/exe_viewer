@@ -615,7 +615,7 @@ std::optional<std::filesystem::path> find_local_codeview_pdb(const peelf::IBinar
         const std::string_view leaf =
             (sep == std::string_view::npos) ? raw_cv_path : raw_cv_path.substr(sep + 1u);
         if (!leaf.empty()) {
-            const std::filesystem::path sibling = image_path.parent_path() / leaf;
+            std::filesystem::path sibling = image_path.parent_path() / leaf;
             if (std::filesystem::exists(sibling) &&
                 pdb_matches_codeview_entry(sibling, debug)) {
                 return sibling;

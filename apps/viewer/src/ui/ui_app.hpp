@@ -36,6 +36,8 @@ namespace viewer {
     public:
         UiApp(BinaryModel& model, VulkanManager& vulkan);
         ~UiApp();
+        UiApp(const UiApp&) = delete;
+        UiApp& operator=(const UiApp&) = delete;
 
         void render(); // call each frame from Application::render_ui()
         void process_deferred_gpu_work();

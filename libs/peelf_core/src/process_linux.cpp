@@ -1110,7 +1110,7 @@ public:
                 "/proc/<pid>/smaps_rollup",
                 "aggregate RSS/PSS available via smaps_rollup; per-region smaps unavailable");
         }
-        return {std::move(sum), std::move(st)};
+        return {sum, std::move(st)};
     }
 
     [[nodiscard]] Result<std::vector<ModuleInfo>> modules() override {
@@ -1494,6 +1494,9 @@ public:
         if (::ptrace(PTRACE_SEIZE, static_cast<pid_t>(tid), nullptr, nullptr) == 0) {
             struct ScopedDetach {
                 pid_t target_tid;
+                explicit ScopedDetach(pid_t t) noexcept : target_tid(t) {}
+                ScopedDetach(const ScopedDetach&) = delete;
+                ScopedDetach& operator=(const ScopedDetach&) = delete;
                 ~ScopedDetach() { (void)::ptrace(PTRACE_DETACH, target_tid, nullptr, nullptr); }
             } detach_guard{static_cast<pid_t>(tid)};
 

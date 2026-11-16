@@ -98,8 +98,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     references_panel_.set_rebuild_callback([this] { references_dirty_ = true; });
     strings_panel_.set_rebuild_callback([this](std::size_t, bool) { strings_dirty_ = true; });
     strings_panel_.set_string_selected_callback([this](const ExtractedString& s) {
-        const ExtractedString s_copy = s;
-        pending_navigations_.enqueue_custom([this, s_copy]() {
+        pending_navigations_.enqueue_custom([this, s_copy = s]() {
             std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(s_copy.virtual_address);
             if (!nav_offset && !model_.is_live_process()) {
                 nav_offset = s_copy.file_offset;
@@ -168,8 +167,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     });
     strings_panel_.set_referrer_activated_callback(
         [this](const StringReferrer& ref, StringReferrerTargetView target) {
-            const StringReferrer ref_copy = ref;
-            pending_navigations_.enqueue_custom([this, ref_copy, target]() {
+            pending_navigations_.enqueue_custom([this, ref_copy = ref, target]() {
                 if (target == StringReferrerTargetView::FlowGraph) {
                     navigate_to_address(ref_copy.instruction_address, PreferredView::Graph);
                     return;

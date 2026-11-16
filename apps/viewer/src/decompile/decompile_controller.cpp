@@ -64,6 +64,9 @@ DecompileController::DecompileController(WorkFn executor)
     struct LaunchRollbackGuard {
         DecompileController* self;
         bool committed{false};
+        explicit LaunchRollbackGuard(DecompileController* s) noexcept : self(s) {}
+        LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (!committed) {
                 {

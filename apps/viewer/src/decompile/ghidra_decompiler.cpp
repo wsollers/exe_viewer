@@ -44,7 +44,7 @@ bool is_wsl_windows_c_mount(const std::filesystem::path& path) {
 std::filesystem::path safe_scratch_base_directory() {
 #ifndef _WIN32
     std::error_code ec;
-    const auto tmp = std::filesystem::temp_directory_path(ec);
+    auto tmp = std::filesystem::temp_directory_path(ec);
     if (!ec && !tmp.empty() && !is_wsl_windows_c_mount(tmp)) {
         return tmp;
     }
@@ -298,6 +298,9 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
         return failure(DecompileStatus::Failed, "Cannot create Ghidra workspace");
     struct Workspace {
         std::filesystem::path path;
+        explicit Workspace(std::filesystem::path p) : path(std::move(p)) {}
+        Workspace(const Workspace&) = delete;
+        Workspace& operator=(const Workspace&) = delete;
         ~Workspace() {
             std::error_code ignored;
             std::filesystem::remove_all(path, ignored);

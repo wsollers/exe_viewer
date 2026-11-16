@@ -6,9 +6,11 @@
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
 #include <peelf/security_audit.hpp>
+#include <peelf/subprocess.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -21,8 +23,9 @@
 #include <string_view>
 #include <vector>
 
-#ifndef _WIN32
-#include <sys/wait.h>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
 #endif
 
@@ -54,9 +57,17 @@ const peelf::SecurityFinding* find_rule(const peelf::SecurityAuditReport& r, std
     return nullptr;
 }
 
-// Builds a hardened 64-bit PE32+ image satisfying PE1001..PE1008.
-std::vector<std::uint8_t> build_hardened_pe64(std::uint16_t dll_chars_override = 0x41E0u) {
-    // 0x41E0 = HIGH_ENTROPY_VA (0x0020) | DYNAMIC_BASE (0x0040) | FORCE_INTEGRITY (0x0080) |
+enum class PeCertFixtureMode : std::uint8_t {
+    Unsigned,
+    MalformedDummyCert,
+};
+
+// Builds a hardened 64-bit PE32+ image satisfying PE1001..PE1004 and PE1006..PE1008,
+// with deterministic cross-platform PE1005 behavior for unsigned or dummy-cert fixtures.
+std::vector<std::uint8_t> build_hardened_pe64(
+    std::uint16_t dll_chars_override = 0x4160u,
+    PeCertFixtureMode cert_mode = PeCertFixtureMode::Unsigned) {
+    // 0x4160 = HIGH_ENTROPY_VA (0x0020) | DYNAMIC_BASE (0x0040) |
     //          NX_COMPAT (0x0100) | GUARD_CF (0x4000)
     std::vector<std::uint8_t> b(0x1200u, 0u);
     b[0u] = 'M';
@@ -128,22 +139,19 @@ std::vector<std::uint8_t> build_hardened_pe64(std::uint16_t dll_chars_override =
     const std::string_view marker = "PEELF_HEADLESS_MARKER_STRING";
     std::memcpy(&b[0x880u], marker.data(), marker.size());
 
-    // CertificateTable @ file offset 0x1000 (DataDirectory[4] uses file offset, not RVA!)
-    put32(b, 0x1000u, 16u);     // dwLength
-    put16(b, 0x1004u, 0x0200u); // WIN_CERT_REVISION_2_0
-    put16(b, 0x1006u, 0x0002u); // WIN_CERT_TYPE_PKCS_SIGNED_DATA
-    // ASN.1 DER SEQUENCE header (0x30 0x06 ...) for structurally valid PKCS#7 SignedData container
-    b[0x1008u] = 0x30u;
-    b[0x1009u] = 0x06u;
-    b[0x100Au] = 0x06u;
-    b[0x100Bu] = 0x04u;
-    b[0x100Cu] = 0x2Au;
-    b[0x100Du] = 0x86u;
-    b[0x100Eu] = 0x48u;
-    b[0x100Fu] = 0x86u;
-    // DataDirectory[4] = Security / Certificate Table (opt + 0x70 + 4*8 = opt + 0x90)
-    put32(b, opt + 0x90u, 0x1000u);
-    put32(b, opt + 0x94u, 16u);
+    if (cert_mode == PeCertFixtureMode::MalformedDummyCert) {
+        // CertificateTable @ file offset 0x1000 (DataDirectory[4] uses file offset, not RVA!)
+        put32(b, 0x1000u, 16u);     // dwLength
+        put16(b, 0x1004u, 0x0200u); // WIN_CERT_REVISION_2_0
+        put16(b, 0x1006u, 0x0002u); // WIN_CERT_TYPE_PKCS_SIGNED_DATA
+        // Non-ASN.1 DER SEQUENCE payload rejected identically across Windows and Linux.
+        b[0x1008u] = 0xDEu;
+        b[0x1009u] = 0xADu;
+        b[0x100Au] = 0xBEu;
+        b[0x100Bu] = 0xEFu;
+        put32(b, opt + 0x90u, 0x1000u);
+        put32(b, opt + 0x94u, 16u);
+    }
 
     return b;
 }
@@ -444,14 +452,15 @@ private:
 struct TempTestDir {
     std::filesystem::path dir{};
     explicit TempTestDir(std::string_view prefix) {
-        dir = std::filesystem::temp_directory_path() /
-              (std::string(prefix) + "-" + std::to_string(
+        static std::atomic<std::uint64_t> s_seq{0};
+        const std::uint64_t seq = s_seq.fetch_add(1u, std::memory_order_relaxed);
 #ifdef _WIN32
-                   12345
+        const int pid = _getpid();
 #else
-                   static_cast<int>(::getpid())
+        const int pid = static_cast<int>(::getpid());
 #endif
-                   ));
+        dir = std::filesystem::temp_directory_path() /
+              (std::string(prefix) + "-" + std::to_string(pid) + "-" + std::to_string(seq));
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
         std::filesystem::create_directories(dir, ec);
@@ -469,67 +478,13 @@ void write_bytes(const std::filesystem::path& p, std::span<const std::uint8_t> b
     ASSERT_TRUE(static_cast<bool>(ofs));
 }
 
-#ifndef _WIN32
-struct SubprocResult {
-    int exit_code{-1};
-    std::string stdout_text{};
-    std::string stderr_text{};
-};
+#if defined(PEELF_VIEWER_EXECUTABLE_PATH)
+[[nodiscard]] std::filesystem::path configured_viewer_executable_path() {
+    return std::filesystem::path{PEELF_VIEWER_EXECUTABLE_PATH};
+}
 
-SubprocResult run_viewer_subproc(const std::vector<std::string>& cli_args) {
-    int out_pipe[2]{-1, -1};
-    int err_pipe[2]{-1, -1};
-    if (::pipe(out_pipe) != 0) return {};
-    if (::pipe(err_pipe) != 0) {
-        ::close(out_pipe[0]);
-        ::close(out_pipe[1]);
-        return {};
-    }
-
-    const pid_t pid = ::fork();
-    if (pid == 0) {
-        ::close(out_pipe[0]);
-        ::close(err_pipe[0]);
-        ::dup2(out_pipe[1], STDOUT_FILENO);
-        ::dup2(err_pipe[1], STDERR_FILENO);
-        ::close(out_pipe[1]);
-        ::close(err_pipe[1]);
-
-        std::vector<char*> argv_ptrs;
-        std::string exe_path = PEELF_VIEWER_EXE;
-        argv_ptrs.push_back(exe_path.data());
-        std::vector<std::string> copy = cli_args;
-        for (std::string& s : copy) {
-            argv_ptrs.push_back(s.data());
-        }
-        argv_ptrs.push_back(nullptr);
-        ::execv(exe_path.c_str(), argv_ptrs.data());
-        _exit(127);
-    }
-
-    ::close(out_pipe[1]);
-    ::close(err_pipe[1]);
-
-    auto drain_fd = [](int fd) {
-        std::string s;
-        std::array<char, 1024> buf{};
-        for (;;) {
-            const ssize_t n = ::read(fd, buf.data(), buf.size());
-            if (n <= 0) break;
-            s.append(buf.data(), static_cast<std::size_t>(n));
-        }
-        ::close(fd);
-        return s;
-    };
-
-    SubprocResult res;
-    res.stdout_text = drain_fd(out_pipe[0]);
-    res.stderr_text = drain_fd(err_pipe[0]);
-    int status = 0;
-    if (::waitpid(pid, &status, 0) == pid && WIFEXITED(status)) {
-        res.exit_code = WEXITSTATUS(status);
-    }
-    return res;
+[[nodiscard]] peelf::SubprocessResult run_viewer_subproc(std::span<const std::string> cli_args) {
+    return peelf::run_subprocess_bounded(configured_viewer_executable_path(), cli_args);
 }
 #endif
 
@@ -549,7 +504,9 @@ TEST(SecurityAuditTest, HardenedPe64PassesAllPeRules) {
 
     const peelf::SecurityAuditReport audit = peelf::audit_security(**parsed, raw);
     EXPECT_TRUE(audit.status.has_data());
+    EXPECT_EQ(audit.error_count, 0u);
     EXPECT_EQ(audit.warning_count, 0u);
+    EXPECT_EQ(audit.note_count, 1u);
     EXPECT_EQ(audit.pass_count, 7u);
 
     for (std::string_view id : {"PE1001", "PE1002", "PE1003", "PE1004", "PE1006", "PE1007", "PE1008"}) {
@@ -558,28 +515,35 @@ TEST(SecurityAuditTest, HardenedPe64PassesAllPeRules) {
         EXPECT_EQ(f->severity, peelf::SecuritySeverity::Pass) << id << ": " << f->summary << " | " << f->evidence;
     }
 
+    // Unsigned PE without FORCE_INTEGRITY yields identical Note severity on Windows and Linux.
     const auto* pe1005 = find_rule(audit, "PE1005");
     ASSERT_NE(pe1005, nullptr);
-#ifdef _WIN32
-    // Synthetic unsigned DER stub is rejected by offline WinVerifyTrust on Windows.
-    EXPECT_EQ(pe1005->severity, peelf::SecuritySeverity::Error);
-    EXPECT_EQ(audit.error_count, 1u);
-    EXPECT_EQ(audit.note_count, 0u);
-#else
-    // Certificate presence alone never counts as Pass when cryptographic trust cannot be verified on host.
     EXPECT_EQ(pe1005->severity, peelf::SecuritySeverity::Note);
-    EXPECT_EQ(audit.error_count, 0u);
-    EXPECT_EQ(audit.note_count, 1u);
-#endif
 
-    // Without HIGH_ENTROPY_VA on 64-bit, PE1001 degrades to Warning (32-bit entropy ASLR).
-    const auto low_entropy_raw = build_hardened_pe64(0x41C0u); // DYNAMIC_BASE without HIGH_ENTROPY_VA
+    // Malformed dummy certificate yields identical Error severity on Windows and Linux.
+    const auto dummy_cert_raw = build_hardened_pe64(0x41E0u, PeCertFixtureMode::MalformedDummyCert);
+    auto parsed_dummy = peelf::parse_image(dummy_cert_raw);
+    ASSERT_TRUE(parsed_dummy.has_value());
+    const auto dummy_audit = peelf::audit_security(**parsed_dummy, dummy_cert_raw);
+    const auto* dummy_pe1005 = find_rule(dummy_audit, "PE1005");
+    ASSERT_NE(dummy_pe1005, nullptr);
+    EXPECT_EQ(dummy_pe1005->severity, peelf::SecuritySeverity::Error);
+    EXPECT_EQ(dummy_audit.error_count, 1u);
+    EXPECT_EQ(dummy_audit.warning_count, 0u);
+    EXPECT_EQ(dummy_audit.note_count, 0u);
+    EXPECT_EQ(dummy_audit.pass_count, 7u);
+
+    // Without HIGH_ENTROPY_VA on 64-bit, PE1001 degrades to Warning (32-bit entropy ASLR) on all hosts.
+    const auto low_entropy_raw = build_hardened_pe64(0x4140u); // DYNAMIC_BASE without HIGH_ENTROPY_VA
     auto parsed_low = peelf::parse_image(low_entropy_raw);
     ASSERT_TRUE(parsed_low.has_value());
     const auto low_audit = peelf::audit_security(**parsed_low, low_entropy_raw);
     const auto* pe1001 = find_rule(low_audit, "PE1001");
     ASSERT_NE(pe1001, nullptr);
     EXPECT_EQ(pe1001->severity, peelf::SecuritySeverity::Warning);
+    EXPECT_EQ(low_audit.error_count, 0u);
+    EXPECT_EQ(low_audit.warning_count, 1u);
+    EXPECT_EQ(low_audit.note_count, 1u);
 }
 
 TEST(SecurityAuditTest, VulnerablePe32TriggersExpectedRuleViolations) {
@@ -721,10 +685,16 @@ TEST(SecurityHeadlessCliTest, JsonSarifComparePolicyGatesAndBinaryModelIntegrati
     ElfSecuritySpec v2_spec;
     v2_spec.code_imm = 0x7Fu; // modify .text function body for `--compare`
     const auto modified_elf = tmp.dir / "hardened_v2.elf";
+    const auto hardened_pe = tmp.dir / "hardened_unsigned_x64.exe";
+    const auto low_entropy_pe = tmp.dir / "low_entropy_unsigned_x64.exe";
+    const auto dummy_cert_pe = tmp.dir / "dummy_cert_x64.exe";
     const auto vuln_pe = tmp.dir / "vulnerable_x86.exe";
 
     write_bytes(hardened_elf, build_elf64_security_fixture(ElfSecuritySpec{}));
     write_bytes(modified_elf, build_elf64_security_fixture(v2_spec));
+    write_bytes(hardened_pe, build_hardened_pe64());
+    write_bytes(low_entropy_pe, build_hardened_pe64(0x4140u));
+    write_bytes(dummy_cert_pe, build_hardened_pe64(0x41E0u, PeCertFixtureMode::MalformedDummyCert));
     write_bytes(vuln_pe, build_vulnerable_pe32_x86());
 
     // Verify BinaryModel populates `security_audit()` automatically on file load.
@@ -805,11 +775,38 @@ TEST(SecurityHeadlessCliTest, JsonSarifComparePolicyGatesAndBinaryModelIntegrati
         EXPECT_NE(sarif_text.find("\"sha-256\":"), std::string::npos);
     }
 
+    // 3b. Cross-platform PE policy gates (`--fail-on warning` vs `--fail-on error`)
+    //     for unsigned, warning-only, and malformed-cert PE64 images.
+    {
+        auto run_inproc_gate = [](const std::filesystem::path& bin, std::string_view policy) {
+            std::ostringstream out_ss;
+            std::ostringstream err_ss;
+            const std::string bp = bin.string();
+            const std::vector<std::string_view> args{"--headless", bp, "--fail-on", policy};
+            const auto rc = peelf::try_run_headless_or_help_cli(args, out_ss, err_ss);
+            EXPECT_TRUE(rc.has_value()) << err_ss.str();
+            return rc.value_or(-1);
+        };
+
+        // Unsigned hardened PE64 has Note-only PE1005 -> exits 0 under both warning and error gates.
+        EXPECT_EQ(run_inproc_gate(hardened_pe, "error"), 0);
+        EXPECT_EQ(run_inproc_gate(hardened_pe, "warning"), 0);
+
+        // Unsigned low-entropy ASLR PE64 has Warning PE1001 -> exits 0 on error gate, 2 on warning gate.
+        EXPECT_EQ(run_inproc_gate(low_entropy_pe, "error"), 0);
+        EXPECT_EQ(run_inproc_gate(low_entropy_pe, "warning"), 2);
+
+        // Malformed dummy-cert PE64 has Error PE1005 -> exits 2 under both error and warning gates.
+        EXPECT_EQ(run_inproc_gate(dummy_cert_pe, "error"), 2);
+        EXPECT_EQ(run_inproc_gate(dummy_cert_pe, "warning"), 2);
+    }
+
     // 4. Invalid file & invalid flag return exit code 1
     {
         std::ostringstream out_ss;
         std::ostringstream err_ss;
-        const std::vector<std::string_view> bad_file{"--headless", "/nonexistent/missing_binary.exe"};
+        const std::string missing_path = (tmp.dir / "missing_binary.exe").string();
+        const std::vector<std::string_view> bad_file{"--headless", missing_path};
         EXPECT_EQ(*peelf::try_run_headless_or_help_cli(bad_file, out_ss, err_ss), 1);
 
         const std::string p1 = hardened_elf.string();
@@ -817,23 +814,62 @@ TEST(SecurityHeadlessCliTest, JsonSarifComparePolicyGatesAndBinaryModelIntegrati
         EXPECT_EQ(*peelf::try_run_headless_or_help_cli(bad_flag, out_ss, err_ss), 1);
     }
 
-#if !defined(_WIN32) && defined(PEELF_VIEWER_EXE)
-    // 5. End-to-end subprocess execution of the real `peelf_viewer` binary!
+#if defined(PEELF_VIEWER_EXECUTABLE_PATH)
+    // 5. Cross-platform end-to-end subprocess execution of the exact built `peelf_viewer` binary!
     {
-        const auto bare = run_viewer_subproc({"--headless"});
+        const std::filesystem::path viewer_exe = configured_viewer_executable_path();
+        ASSERT_TRUE(std::filesystem::exists(viewer_exe))
+            << "Expected built peelf_viewer at PEELF_VIEWER_EXECUTABLE_PATH: " << viewer_exe.string();
+
+        const std::array<std::string, 1> bare_args{"--headless"};
+        const auto bare = run_viewer_subproc(bare_args);
+        ASSERT_TRUE(bare.launched) << bare.launch_error;
+        EXPECT_FALSE(bare.timed_out);
         EXPECT_EQ(bare.exit_code, 0);
         EXPECT_TRUE(bare.stdout_text.empty());
 
-        const auto ok_json = run_viewer_subproc({"--headless", hardened_elf.string(), "--format", "json"});
+        const std::array<std::string, 4> ok_json_args{
+            "--headless", hardened_elf.string(), "--format", "json"};
+        const auto ok_json = run_viewer_subproc(ok_json_args);
+        ASSERT_TRUE(ok_json.launched) << ok_json.launch_error;
+        EXPECT_FALSE(ok_json.timed_out);
         EXPECT_EQ(ok_json.exit_code, 0) << ok_json.stderr_text;
         EXPECT_NE(ok_json.stdout_text.find("\"security_audit\""), std::string::npos);
 
-        const auto gate_fail = run_viewer_subproc(
-            {"--headless", vuln_pe.string(), "--format", "sarif", "--fail-on", "error"});
+        const std::array<std::string, 4> pe_ok_args{
+            "--headless", hardened_pe.string(), "--fail-on", "warning"};
+        const auto pe_ok = run_viewer_subproc(pe_ok_args);
+        ASSERT_TRUE(pe_ok.launched) << pe_ok.launch_error;
+        EXPECT_FALSE(pe_ok.timed_out);
+        EXPECT_EQ(pe_ok.exit_code, 0) << pe_ok.stderr_text;
+
+        const std::array<std::string, 4> pe_warn_err_gate_args{
+            "--headless", low_entropy_pe.string(), "--fail-on", "error"};
+        const auto pe_warn_err_gate = run_viewer_subproc(pe_warn_err_gate_args);
+        ASSERT_TRUE(pe_warn_err_gate.launched) << pe_warn_err_gate.launch_error;
+        EXPECT_FALSE(pe_warn_err_gate.timed_out);
+        EXPECT_EQ(pe_warn_err_gate.exit_code, 0) << pe_warn_err_gate.stderr_text;
+
+        const std::array<std::string, 4> pe_warn_gate_args{
+            "--headless", low_entropy_pe.string(), "--fail-on", "warning"};
+        const auto pe_warn_gate = run_viewer_subproc(pe_warn_gate_args);
+        ASSERT_TRUE(pe_warn_gate.launched) << pe_warn_gate.launch_error;
+        EXPECT_FALSE(pe_warn_gate.timed_out);
+        EXPECT_EQ(pe_warn_gate.exit_code, 2);
+
+        const std::array<std::string, 6> gate_fail_args{
+            "--headless", vuln_pe.string(), "--format", "sarif", "--fail-on", "error"};
+        const auto gate_fail = run_viewer_subproc(gate_fail_args);
+        ASSERT_TRUE(gate_fail.launched) << gate_fail.launch_error;
+        EXPECT_FALSE(gate_fail.timed_out);
         EXPECT_EQ(gate_fail.exit_code, 2);
         EXPECT_NE(gate_fail.stdout_text.find("\"version\": \"2.1.0\""), std::string::npos);
 
-        const auto missing = run_viewer_subproc({"--headless", (tmp.dir / "does_not_exist.bin").string()});
+        const std::array<std::string, 2> missing_args{
+            "--headless", (tmp.dir / "does_not_exist.bin").string()};
+        const auto missing = run_viewer_subproc(missing_args);
+        ASSERT_TRUE(missing.launched) << missing.launch_error;
+        EXPECT_FALSE(missing.timed_out);
         EXPECT_EQ(missing.exit_code, 1);
     }
 #endif

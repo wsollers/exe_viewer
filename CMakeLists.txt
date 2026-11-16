@@ -126,10 +126,10 @@ endif()
 # clang18 presets. This block runs after the targets are defined above.
 # ---------------------------------------------------------------------------
 if(PEELF_ENABLE_CLANG_TIDY)
-    find_program(PEELF_CLANG_TIDY_EXE NAMES clang-tidy)
+    find_program(PEELF_CLANG_TIDY_EXE NAMES clang-tidy-18 clang-tidy)
     if(PEELF_CLANG_TIDY_EXE)
         message(STATUS "clang-tidy enabled: ${PEELF_CLANG_TIDY_EXE}")
-        foreach(_tgt peelf_core peelf_gui peelf_viewer peelf_tests)
+        foreach(_tgt peelf_core peelf_gui peelf_viewer)
             if(TARGET ${_tgt})
                 set_target_properties(${_tgt} PROPERTIES CXX_CLANG_TIDY "${PEELF_CLANG_TIDY_EXE}")
             endif()
@@ -137,6 +137,16 @@ if(PEELF_ENABLE_CLANG_TIDY)
     else()
         message(WARNING "PEELF_ENABLE_CLANG_TIDY=ON but clang-tidy was not found in PATH")
     endif()
+endif()
+
+find_program(PEELF_RUN_CLANG_TIDY_EXE NAMES run-clang-tidy-18 run-clang-tidy)
+if(PEELF_RUN_CLANG_TIDY_EXE AND CMAKE_EXPORT_COMPILE_COMMANDS)
+    add_custom_target(clang-tidy
+        COMMAND ${PEELF_RUN_CLANG_TIDY_EXE} -p ${CMAKE_BINARY_DIR} -quiet
+                libs/peelf_core apps/viewer
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "clang-tidy: checking first-party sources under libs/peelf_core and apps/viewer"
+        VERBATIM)
 endif()
 
 # clang-format helper targets: `format` (rewrite in place) and `format-check`

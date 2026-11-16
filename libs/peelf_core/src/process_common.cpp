@@ -676,11 +676,11 @@ std::optional<std::filesystem::path> resolve_executable_from_command_line(
         }
         const std::string cand_str = candidate.string();
         if (windows_rules && !has_windows_exec_extension(cand_str)) {
-            const std::filesystem::path with_exe(cand_str + ".exe");
+            std::filesystem::path with_exe(cand_str + ".exe");
             if (file_exists_fn(with_exe)) {
                 return with_exe;
             }
-            const std::filesystem::path with_com(cand_str + ".com");
+            std::filesystem::path with_com(cand_str + ".com");
             if (file_exists_fn(with_com)) {
                 return with_com;
             }
@@ -1279,7 +1279,7 @@ ForgivingValue<ProcessMemorySummary> IProcessSession::memory_summary(
                                    : SubsystemStatus::partial(
                                          "vmmap",
                                          "physical RSS/PSS unavailable; showing virtual map only");
-    return {std::move(summary), st};
+    return {summary, st};
 }
 
 std::vector<ModuleInfo> derive_modules_from_regions(std::vector<MemoryRegion>& regions,

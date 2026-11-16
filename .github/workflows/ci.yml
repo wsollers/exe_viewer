@@ -54,6 +54,16 @@ jobs:
       - name: Build (${{ matrix.preset }})
         run: cmake --build --preset ${{ matrix.preset }} --parallel
 
+      - name: Run clang-tidy CppCoreGuidelines gate
+        if: matrix.preset == 'clang18-debug'
+        run: >
+          run-clang-tidy-18
+          -j "$(nproc)"
+          -p out/build/${{ matrix.preset }}
+          -quiet
+          libs/peelf_core
+          apps/viewer
+
       - name: Run CTest suite (${{ matrix.preset }})
         run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure --parallel "$(nproc)"
 
@@ -111,7 +121,7 @@ jobs:
         env:
           # Ubuntu 24.04 links libc++abi.so.1 with -Bsymbolic-functions, causing
           # std::system_error::~system_error to bypass ASan's operator delete PLT hook.
-          ASAN_OPTIONS: detect_leaks=0:alloc_dealloc_mismatch=0:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1:alloc_dealloc_mismatch=0:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --parallel 2
 

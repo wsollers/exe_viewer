@@ -143,6 +143,7 @@ void tally_finding(SecurityAuditReport& report, SecurityFinding finding) {
 #ifdef _WIN32
 struct WinVerifyOutcome {
     LONG status{TRUST_E_NOSIGNATURE};
+    bool host_verification_ran{false};
     bool signature_valid{false};
     bool publisher_trusted{false};
 };
@@ -202,6 +203,7 @@ struct WinVerifyOutcome {
     wvt.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
 
     out.status = ::WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_guid, &wvt);
+    out.host_verification_ran = true;
     wvt.dwStateAction = WTD_STATEACTION_CLOSE;
     (void)::WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_guid, &wvt);
 
@@ -470,7 +472,20 @@ void evaluate_pe_rules(const IBinaryImage& image,
             } else {
 #ifdef _WIN32
                 const WinVerifyOutcome wvt = verify_authenticode_offline_win32(raw_bytes);
-                if (wvt.signature_valid && wvt.publisher_trusted) {
+                if (!wvt.host_verification_ran) {
+                    f.severity = SecuritySeverity::Note;
+                    f.summary = std::format(
+                        "Embedded Authenticode CertificateTable present ({} PKCS#7 entry/entries{}; raw file bytes unavailable for offline verification).",
+                        certs.size(),
+                        force_integrity ? ", FORCE_INTEGRITY=1" : "");
+                    f.evidence = std::format(
+                        "presence=present, signature_validity=unverified_host, publisher_trust=unverified_host, Cert[0]@file+0x{:X} (len={} bytes, rev=0x{:04X}, type=0x{:04X}), FORCE_INTEGRITY={}",
+                        certs.front().file_offset,
+                        certs.front().length,
+                        certs.front().revision,
+                        certs.front().certificate_type,
+                        force_integrity ? 1 : 0);
+                } else if (wvt.signature_valid && wvt.publisher_trusted) {
                     f.severity = SecuritySeverity::Pass;
                     f.summary = std::format(
                         "Authenticode signature and publisher trust verified ({} entry/entries{}).",

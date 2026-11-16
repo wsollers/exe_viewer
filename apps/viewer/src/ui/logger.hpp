@@ -43,6 +43,7 @@ namespace viewer {
 
     private:
         Logger() = default;
+        ~Logger() = default;
         Logger(const Logger&) = delete;
         Logger& operator=(const Logger&) = delete;
 

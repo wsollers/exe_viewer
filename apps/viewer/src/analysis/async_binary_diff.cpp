@@ -152,6 +152,9 @@ void AsyncBinaryDiffer::start_file_diff(std::uint64_t expected_revision,
     struct LaunchRollbackGuard {
         AsyncBinaryDiffer* self;
         bool committed{false};
+        explicit LaunchRollbackGuard(AsyncBinaryDiffer* s) noexcept : self(s) {}
+        LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (!committed) {
                 self->rollback_failed_launch();
@@ -261,6 +264,9 @@ void AsyncBinaryDiffer::start_live_integrity_diff(
     struct LaunchRollbackGuard {
         AsyncBinaryDiffer* self;
         bool committed{false};
+        explicit LaunchRollbackGuard(AsyncBinaryDiffer* s) noexcept : self(s) {}
+        LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (!committed) {
                 self->rollback_failed_launch();

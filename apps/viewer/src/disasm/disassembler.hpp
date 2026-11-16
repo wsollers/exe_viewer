@@ -167,8 +167,8 @@ public:
         arch_ = arch;
         endian_ = endian;
 
-        cs_arch cs_architecture;
-        cs_mode cs_mode_flags;
+        cs_arch cs_architecture{};
+        cs_mode cs_mode_flags{};
 
         switch (arch) {
             case Architecture::X86_32:

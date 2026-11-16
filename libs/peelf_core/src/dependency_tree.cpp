@@ -388,7 +388,7 @@ probe_directory_for_file(const std::filesystem::path& dir,
     if (dir.empty()) {
         return std::nullopt;
     }
-    const std::filesystem::path direct = (dir / filename).lexically_normal();
+    std::filesystem::path direct = (dir / filename).lexically_normal();
     push_unique_path(searched_out, direct);
     std::error_code ec;
     if (std::filesystem::is_regular_file(direct, ec)) {

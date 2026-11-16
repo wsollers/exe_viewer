@@ -561,7 +561,7 @@ struct ResolvedSymbol {
 [[nodiscard]] std::string format_effective_address(std::string_view raw_inside) {
     raw_inside = trim_sv(raw_inside);
     if (const std::size_t comma = raw_inside.find(','); comma != std::string_view::npos) {
-        const std::string base = clean_atom(raw_inside.substr(0u, comma));
+        std::string base = clean_atom(raw_inside.substr(0u, comma));
         const std::string rest = clean_atom(raw_inside.substr(comma + 1u));
         if (rest.empty() || rest == "0" || rest == "0x0") {
             return base;
@@ -612,7 +612,7 @@ struct ResolvedSymbol {
             } else if (const auto stack_var = try_stack_variable(inside, stack_locals)) {
                 return "&" + *stack_var;
             }
-            const std::string addr_expr = format_effective_address(inside);
+            std::string addr_expr = format_effective_address(inside);
             if (address_only) {
                 return addr_expr;
             }
@@ -628,7 +628,7 @@ struct ResolvedSymbol {
             const std::string_view disp_sv = trim_sv(op.substr(0u, lp));
             const std::string_view base_sv = trim_sv(op.substr(lp + 1u, rp - lp - 1u));
             const std::int64_t disp = disp_sv.empty() ? 0 : parse_signed_int(disp_sv).value_or(0);
-            const std::string combined =
+            std::string combined =
                 disp < 0
                     ? std::format("{} - 0x{:X}", clean_atom(base_sv), peelf::unsigned_magnitude_of_signed(disp))
                     : (disp > 0 ? std::format("{} + 0x{:X}", clean_atom(base_sv), static_cast<std::uint64_t>(disp))
@@ -662,7 +662,7 @@ struct ResolvedSymbol {
         return format_memory_access(
             op, mnemonic, insn_addr, insn_size, is_64bit_arch(arch), symbols, stack_locals, false);
     }
-    const std::string atom = clean_atom(op);
+    std::string atom = clean_atom(op);
     if (const auto addr = parse_unsigned_addr(atom); addr.has_value() && *addr >= 0x1000u) {
         if (const auto it = symbols.find(*addr); it != symbols.end()) {
             return std::format("&{} /* 0x{:X} */", it->second.c_ident, *addr);
@@ -1243,7 +1243,7 @@ struct BlockIR {
 
     // Calls
     if (is_call_mnemonic(m, insn.operands, arch)) {
-        const std::string stmt = build_call_statement(
+        std::string stmt = build_call_statement(
             insn, insn_size, ops, arch, symbols, reg_const_va,
             block_written_regs, call_result_unused, has_win_imports);
         const std::string ret_fam = canonical_reg_family(return_register_name(arch), arch);
@@ -2672,6 +2672,9 @@ DecompiledUnit RetDecDecompiler::decompile(
     }
     struct ScopedWorkspace {
         std::filesystem::path path;
+        explicit ScopedWorkspace(std::filesystem::path p) : path(std::move(p)) {}
+        ScopedWorkspace(const ScopedWorkspace&) = delete;
+        ScopedWorkspace& operator=(const ScopedWorkspace&) = delete;
         ~ScopedWorkspace() {
             std::error_code ignored;
             std::filesystem::remove_all(path, ignored);

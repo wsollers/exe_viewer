@@ -36,7 +36,7 @@ DecompiledUnit AnnotatedCodeDecompiler::decompile(const DecompileRequest& reques
 DecompiledUnit parse_decompiler_output(std::string_view text) {
     DecompiledUnit unit; unit.provider="Binary Ninja HLIL";
     if (text.size()>4*1024*1024) { unit.diagnostic="Backend output exceeds 4 MiB"; return unit; }
-    std::istringstream in{std::string(text)}; std::string magic,status; int version;
+    std::istringstream in{std::string(text)}; std::string magic,status; int version = 0;
     const auto read_unsigned = [&in](std::uint64_t& value) {
         std::string token;
         if (!(in >> token)) return false;
@@ -51,7 +51,7 @@ DecompiledUnit parse_decompiler_output(std::string_view text) {
     else if (status=="ready") unit.status=DecompileStatus::Ready;
     else if (status=="timeout") unit.status=DecompileStatus::Timeout;
     else { unit.diagnostic="Unknown backend status"; return unit; }
-    std::size_t count;
+    std::size_t count = 0;
     if (!(in>>count) || count>100000) { unit.status=DecompileStatus::Failed; unit.diagnostic="Invalid backend line count"; return unit; }
     for (std::size_t i=0;i<count;++i) {
         if (version == 3) {
@@ -176,7 +176,13 @@ DecompiledUnit BinaryNinjaDecompiler::decompile(const DecompileRequest& request,
     static std::atomic<std::uint64_t> serial{};
     auto directory=std::filesystem::temp_directory_path()/std::format("peelf-decompile-{}-{}",std::chrono::steady_clock::now().time_since_epoch().count(),++serial);
     std::error_code ec; if(!std::filesystem::create_directory(directory,ec)) return failure(DecompileStatus::Failed,"Cannot create backend workspace");
-    struct Cleanup { std::filesystem::path path; ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path,ignored); } } cleanup{directory};
+    struct Cleanup {
+        std::filesystem::path path;
+        explicit Cleanup(std::filesystem::path p) : path(std::move(p)) {}
+        Cleanup(const Cleanup&) = delete;
+        Cleanup& operator=(const Cleanup&) = delete;
+        ~Cleanup() { std::error_code ignored; std::filesystem::remove_all(path, ignored); }
+    } cleanup{directory};
     const auto input=directory/"input.bin", output=directory/"output.txt";
     { std::ofstream file(input,std::ios::binary); file.write(reinterpret_cast<const char*>(request.image_bytes.data()),static_cast<std::streamsize>(request.image_bytes.size())); if(!file) return failure(DecompileStatus::Failed,"Cannot write analysis snapshot"); }
     const auto process=runner_.run(python_,{bridge_.string(),input.string(),output.string(),std::to_string(request.address)},std::chrono::seconds(60),stop);
@@ -269,6 +275,9 @@ void DecompileCache::put(const DecompileCacheKey& key, DecompiledUnit unit) {
     struct LruInsertRollback {
         std::list<Entry>& list;
         bool committed{false};
+        explicit LruInsertRollback(std::list<Entry>& l) noexcept : list(l) {}
+        LruInsertRollback(const LruInsertRollback&) = delete;
+        LruInsertRollback& operator=(const LruInsertRollback&) = delete;
         ~LruInsertRollback() noexcept {
             if (!committed) {
                 list.pop_front();

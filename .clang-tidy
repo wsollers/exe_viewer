@@ -1,33 +1,72 @@
-# clang-tidy configuration for peelf_explorer (ToDo.md P0-10).
+# clang-tidy C++ Core Guidelines & bug-prevention gate for peelf_explorer (CA-06).
 #
-# This is a starting baseline. It is NOT gating yet: diagnostics are surfaced but
-# not turned into errors (WarningsAsErrors is empty). P7-4 tightens the check set
-# and works through the backlog; P7-3 runs it in CI.
+# Selects high-signal, zero-noise C++ Core Guidelines, bugprone, and move/copy
+# performance checks enforced as errors in CI across first-party sources under
+# `libs/peelf_core` and `apps/viewer`.
 #
-# clang-tidy runs via the Ninja-based clang18 presets (the Visual Studio generator
-# ignores CXX_CLANG_TIDY). Enable with: cmake --preset clang18-debug -DPEELF_ENABLE_CLANG_TIDY=ON
-#
-# HeaderFilterRegex restricts diagnostics to our own headers so third-party code
-# pulled in via FetchContent (glfw/imgui/capstone/nfd/gtest) is not reported.
+# HeaderFilterRegex is scoped strictly to first-party `libs/peelf_core` and
+# `apps/viewer` headers so FetchContent / third-party `_deps/` headers are never
+# diagnosed.
 
 Checks: >
   -*,
-  bugprone-*,
-  performance-*,
-  portability-*,
-  modernize-*,
-  misc-*,
-  clang-analyzer-*,
-  readability-*,
-  -modernize-use-trailing-return-type,
-  -modernize-use-nodiscard,
-  -readability-identifier-length,
-  -readability-magic-numbers,
-  -readability-braces-around-statements,
-  -misc-non-private-member-variables-in-classes,
-  -misc-include-cleaner,
-  -bugprone-easily-swappable-parameters
+  bugprone-assert-side-effect,
+  bugprone-bool-pointer-implicit-conversion,
+  bugprone-copy-constructor-init,
+  bugprone-dangling-handle,
+  bugprone-forwarding-reference-overload,
+  bugprone-inaccurate-erase,
+  bugprone-infinite-loop,
+  bugprone-move-forwarding-reference,
+  bugprone-multiple-new-in-one-expression,
+  bugprone-posix-return,
+  bugprone-redundant-branch-condition,
+  bugprone-shared-ptr-array-mismatch,
+  bugprone-signed-char-misuse,
+  bugprone-sizeof-container,
+  bugprone-standalone-empty,
+  bugprone-string-constructor,
+  bugprone-string-integer-assignment,
+  bugprone-stringview-nullptr,
+  bugprone-suspicious-memset-usage,
+  bugprone-suspicious-missing-comma,
+  bugprone-suspicious-semicolon,
+  bugprone-swapped-arguments,
+  bugprone-terminating-continue,
+  bugprone-throw-keyword-missing,
+  bugprone-undelegated-constructor,
+  bugprone-unhandled-self-assignment,
+  bugprone-unique-ptr-array-mismatch,
+  bugprone-unused-raii,
+  bugprone-use-after-move,
+  cppcoreguidelines-avoid-capturing-lambda-coroutines,
+  cppcoreguidelines-avoid-reference-coroutine-parameters,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-misleading-capture-default-by-value,
+  cppcoreguidelines-no-suspend-with-lock,
+  cppcoreguidelines-noexcept-destructor,
+  cppcoreguidelines-noexcept-swap,
+  cppcoreguidelines-rvalue-reference-param-not-moved,
+  cppcoreguidelines-slicing,
+  cppcoreguidelines-special-member-functions,
+  cppcoreguidelines-virtual-class-destructor,
+  performance-for-range-copy,
+  performance-implicit-conversion-in-loop,
+  performance-move-const-arg,
+  performance-move-constructor-init,
+  performance-no-automatic-move,
+  performance-noexcept-destructor,
+  performance-noexcept-move-constructor,
+  performance-noexcept-swap,
+  performance-trivially-destructible,
+  performance-unnecessary-copy-initialization
 
-WarningsAsErrors: ''
-HeaderFilterRegex: '(libs/peelf_core|apps/viewer/src|tests)/.*'
+WarningsAsErrors: '*'
+HeaderFilterRegex: '[\\/](libs[\\/]peelf_core|apps[\\/]viewer)[\\/]'
 FormatStyle: file
+
+CheckOptions:
+  - key: cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor
+    value: true
+  - key: cppcoreguidelines-special-member-functions.AllowMissingMoveFunctionsWhenCopyIsDeleted
+    value: true

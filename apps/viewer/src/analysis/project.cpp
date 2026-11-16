@@ -584,6 +584,9 @@ peelf::Result<void> write_analysis_file(const std::filesystem::path& path, std::
     struct TempFileGuard {
         std::filesystem::path path;
         bool active{true};
+        explicit TempFileGuard(std::filesystem::path p) : path(std::move(p)) {}
+        TempFileGuard(const TempFileGuard&) = delete;
+        TempFileGuard& operator=(const TempFileGuard&) = delete;
         ~TempFileGuard() {
             if (active && !path.empty()) {
                 std::error_code rm_ec;
@@ -684,7 +687,7 @@ peelf::Result<std::filesystem::path> write_recovery_journal(
     }
     AnalysisProject stamped = project;
     stamped.saved_unix_ms = std::max(stamped.saved_unix_ms, next_project_timestamp_ms());
-    const auto journal_path = project_recovery_journal_path(key_path, recovery_dir);
+    auto journal_path = project_recovery_journal_path(key_path, recovery_dir);
     if (auto res = write_analysis_file(journal_path, encode_project(stamped)); !res) {
         return std::unexpected(res.error());
     }

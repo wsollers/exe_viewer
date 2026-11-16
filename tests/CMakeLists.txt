@@ -186,6 +186,7 @@ if(Python3_Interpreter_FOUND)
 endif()
 if(TARGET peelf_viewer)
   target_compile_definitions(peelf_tests PRIVATE
+    PEELF_VIEWER_EXECUTABLE_PATH="$<TARGET_FILE:peelf_viewer>"
     PEELF_VIEWER_EXE="$<TARGET_FILE:peelf_viewer>"
   )
   add_dependencies(peelf_tests peelf_viewer)
@@ -199,15 +200,15 @@ if(TARGET peelf_viewer)
   else()
     set(_peelf_isolated_core_dll_arg "")
   endif()
-  add_test(NAME Startup.Headless COMMAND peelf_viewer --headless)
-  add_test(NAME Startup.Help COMMAND peelf_viewer --help)
+  add_test(NAME Startup.Headless COMMAND $<TARGET_FILE:peelf_viewer> --headless)
+  add_test(NAME Startup.Help COMMAND $<TARGET_FILE:peelf_viewer> --help)
   add_test(NAME Headless.FixtureJson
-    COMMAND peelf_viewer --headless $<TARGET_FILE:peelf_callgraph_fixture> --format json --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture.json)
+    COMMAND $<TARGET_FILE:peelf_viewer> --headless $<TARGET_FILE:peelf_callgraph_fixture> --format json --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture_$<CONFIG>.json)
   add_test(NAME Headless.FixtureSarif
-    COMMAND peelf_viewer --headless $<TARGET_FILE:peelf_callgraph_fixture> --format sarif --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture.sarif)
+    COMMAND $<TARGET_FILE:peelf_viewer> --headless $<TARGET_FILE:peelf_callgraph_fixture> --format sarif --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture_$<CONFIG>.sarif)
   add_test(NAME Startup.WithoutGuiModule COMMAND ${CMAKE_COMMAND}
     -DLAUNCHER=$<TARGET_FILE:peelf_viewer>
     ${_peelf_isolated_core_dll_arg}
-    -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-isolated
+    -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-isolated-$<CONFIG>
     -P ${CMAKE_CURRENT_SOURCE_DIR}/startup_without_gui.cmake)
 endif()
