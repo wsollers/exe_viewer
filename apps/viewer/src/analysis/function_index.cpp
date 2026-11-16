@@ -382,7 +382,8 @@ void upsert_function(
     if (candidate.virtual_address == 0u) {
         return;
     }
-    auto [it, inserted] = by_va.emplace(candidate.virtual_address, std::move(candidate));
+    const std::uint64_t key = candidate.virtual_address;
+    auto [it, inserted] = by_va.try_emplace(key, std::move(candidate));
     if (inserted) {
         return;
     }

@@ -67,8 +67,8 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
     [[nodiscard]] bool empty() const noexcept { return entries_.empty(); }
 
-    [[nodiscard]] const CatalogTypeEntry* find_entry(std::string_view type_name) const noexcept;
-    [[nodiscard]] const DataTypeRecord* find(std::string_view type_name) const noexcept;
+    [[nodiscard]] const CatalogTypeEntry* find_entry(std::string_view type_name) const;
+    [[nodiscard]] const DataTypeRecord* find(std::string_view type_name) const;
 
 private:
     void add_entry(CatalogTypeEntry entry);

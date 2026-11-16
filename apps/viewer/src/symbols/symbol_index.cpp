@@ -391,7 +391,7 @@ const SymbolRecord* SymbolIndex::find_exact_address(std::uint64_t virtual_addres
     return &records_[it->second];
 }
 
-const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_address) const noexcept {
+const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_address) const {
     ensure_address_spans();
     if (sorted_spans_.empty()) {
         return nullptr;
@@ -425,7 +425,7 @@ const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_a
 }
 
 const SymbolRecord* SymbolIndex::find_nearest_preceding_address(std::uint64_t virtual_address,
-                                                                std::uint64_t max_distance) const noexcept {
+                                                                std::uint64_t max_distance) const {
     ensure_address_spans();
     if (sorted_spans_.empty()) {
         return nullptr;

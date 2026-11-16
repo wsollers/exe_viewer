@@ -205,7 +205,7 @@ struct ResolvedSymbol {
             .source = rec.source,
             .is_function = rec.function.value_or(rec.source == SymbolSource::Import || rec.source == SymbolSource::Export),
         };
-        auto [it, inserted] = table.emplace(va, std::move(resolved));
+        auto [it, inserted] = table.try_emplace(va, std::move(resolved));
         if (!inserted) {
             const bool cur_generic = it->second.raw_name == "Entry Point" || it->second.raw_name.starts_with("sub_");
             const bool cand_generic = rec.name == "Entry Point" || rec.name.starts_with("sub_");
@@ -375,7 +375,7 @@ struct ResolvedSymbol {
 [[nodiscard]] std::optional<std::uint64_t> extract_rip_target(
     std::string_view expr,
     std::uint64_t insn_addr,
-    std::uint64_t insn_size) noexcept {
+    std::uint64_t insn_size) {
     const std::size_t lb = expr.find('[');
     const std::size_t rb = expr.find(']');
     if (lb == std::string_view::npos || rb == std::string_view::npos || rb <= lb) {
@@ -828,7 +828,7 @@ struct FlagState {
     bool valid{false};
 };
 
-[[nodiscard]] std::optional<std::string> condition_code_op(std::string_view cc) noexcept {
+[[nodiscard]] std::optional<std::string_view> condition_code_op(std::string_view cc) noexcept {
     if (cc == "e" || cc == "z" || cc == "eq") return "==";
     if (cc == "ne" || cc == "nz") return "!=";
     if (cc == "l" || cc == "lt" || cc == "nge" || cc == "mi") return "<";
@@ -1009,9 +1009,17 @@ struct BlockIR {
         return true;
     }
     if (m == "jal" || m == "jalr") {
-        const std::string trimmed = to_lower_ascii(trim_sv(ops));
+        const std::string_view trimmed = trim_sv(ops);
+        const auto istarts_with = [](std::string_view sv, std::string_view lower_prefix) noexcept -> bool {
+            if (sv.size() < lower_prefix.size()) return false;
+            for (std::size_t i = 0; i < lower_prefix.size(); ++i) {
+                const char c = (sv[i] >= 'A' && sv[i] <= 'Z') ? static_cast<char>(sv[i] - 'A' + 'a') : sv[i];
+                if (c != lower_prefix[i]) return false;
+            }
+            return true;
+        };
         if ((arch == peelf::Architecture::RISCV32 || arch == peelf::Architecture::RISCV64) &&
-            (trimmed.starts_with("zero,") || trimmed.starts_with("x0,"))) {
+            (istarts_with(trimmed, "zero,") || istarts_with(trimmed, "x0,"))) {
             return false;
         }
         return true;
@@ -2471,7 +2479,7 @@ namespace {
 #endif
 }
 
-[[nodiscard]] bool is_executable_file(const std::filesystem::path& candidate) noexcept {
+[[nodiscard]] bool is_executable_file(const std::filesystem::path& candidate) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(candidate, ec)) {
         return false;

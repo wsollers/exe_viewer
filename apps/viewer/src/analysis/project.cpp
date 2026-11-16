@@ -711,7 +711,7 @@ std::optional<AnalysisProject> check_newer_recovery_journal(
 }
 
 void clear_recovery_journal(const std::filesystem::path& key_path,
-                            const std::filesystem::path& recovery_dir) noexcept {
+                            const std::filesystem::path& recovery_dir) {
     std::error_code ec;
     std::filesystem::remove(project_recovery_journal_path(key_path, recovery_dir), ec);
 }

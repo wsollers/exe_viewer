@@ -10,7 +10,9 @@
 #include <cctype>
 #include <format>
 #include <mutex>
+#include <new>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include "symbols/debug_symbols.hpp"
 using namespace viewer;
@@ -103,13 +105,51 @@ TEST(Decompiler, RealProcessTimeoutCancellationAndArgumentBoundaries) {
 
 TEST(Decompiler, SettingsRoundTripAndValidation) {
     auto path = std::filesystem::temp_directory_path()/"peelf-decompiler-settings-test.ini";
-    DecompilerSettings settings; settings.ghidra_home="path with spaces"; settings.java="custom/java"; settings.timeout_seconds=320;
-    ASSERT_TRUE(save_decompiler_settings(path,settings));
-    auto restored=read_decompiler_settings(path); ASSERT_TRUE(restored);
-    EXPECT_EQ(restored->provider,DecompilerProvider::Ghidra); EXPECT_EQ(restored->ghidra_home,settings.ghidra_home);
-    EXPECT_EQ(restored->java,settings.java); EXPECT_EQ(restored->timeout_seconds,320);
-    { std::ofstream file(path); file << "PEELF_DECOMPILER 1 99 \"\" \"java\" \"python\" 20"; }
-    EXPECT_FALSE(read_decompiler_settings(path)); std::filesystem::remove(path);
+    DecompilerSettings settings;
+    settings.provider = DecompilerProvider::RetDec;
+    settings.ghidra_home = "path with spaces";
+    settings.java = "custom/java";
+    settings.python = "custom/python3";
+    settings.retdec = "/opt/retdec custom/bin/retdec-decompiler";
+    settings.timeout_seconds = 320;
+    settings.cache_directory = "/tmp/peelf cache dir";
+    settings.max_cached_workspaces = 7;
+    settings.reuse_analysis = false;
+    ASSERT_TRUE(save_decompiler_settings(path, settings));
+    auto restored = read_decompiler_settings(path);
+    ASSERT_TRUE(restored);
+    EXPECT_EQ(restored->provider, DecompilerProvider::RetDec);
+    EXPECT_EQ(restored->ghidra_home, settings.ghidra_home);
+    EXPECT_EQ(restored->java, settings.java);
+    EXPECT_EQ(restored->python, settings.python);
+    EXPECT_EQ(restored->retdec, settings.retdec);
+    EXPECT_EQ(restored->timeout_seconds, 320);
+    EXPECT_EQ(restored->cache_directory, settings.cache_directory);
+    EXPECT_EQ(restored->max_cached_workspaces, 7u);
+    EXPECT_FALSE(restored->reuse_analysis);
+
+    // Backward compatibility with legacy v1 settings files (defaults retdec & cache settings).
+    {
+        std::ofstream file(path, std::ios::trunc);
+        file << "PEELF_DECOMPILER 1\n4\n\"/opt/ghidra\"\n\"java\"\n\"python3\"\n240\n";
+    }
+    auto legacy = read_decompiler_settings(path);
+    ASSERT_TRUE(legacy) << legacy.error().message;
+    EXPECT_EQ(legacy->provider, DecompilerProvider::RetDec);
+    EXPECT_EQ(legacy->ghidra_home, std::filesystem::path("/opt/ghidra"));
+    EXPECT_EQ(legacy->retdec, std::filesystem::path("retdec-decompiler"));
+    EXPECT_EQ(legacy->timeout_seconds, 240);
+    EXPECT_EQ(legacy->max_cached_workspaces, 3u);
+    EXPECT_TRUE(legacy->reuse_analysis);
+
+    // Validation rejects out-of-range provider, empty retdec, or invalid cache settings.
+    { std::ofstream file(path, std::ios::trunc); file << "PEELF_DECOMPILER 1 99 \"\" \"java\" \"python\" 20"; }
+    EXPECT_FALSE(read_decompiler_settings(path));
+    { std::ofstream file(path, std::ios::trunc); file << "PEELF_DECOMPILER 2 4 \"\" \"java\" \"python\" \"\" 20 \"\" 3 1"; }
+    EXPECT_FALSE(read_decompiler_settings(path));
+    { std::ofstream file(path, std::ios::trunc); file << "PEELF_DECOMPILER 2 0 \"\" \"java\" \"python\" \"retdec\" 20 \"\" 0 1"; }
+    EXPECT_FALSE(read_decompiler_settings(path));
+    std::filesystem::remove(path);
 }
 
 TEST(Decompiler, GhidraAdapterUsesSnapshotAndHandlesFailures) {
@@ -896,4 +936,125 @@ TEST(DecompileController, CancelResetAndDestructorWhileBusyJoinCleanly) {
         }
     }
 }
+
+TEST(DecompileController, WorkerContainsStdExceptionBadAllocAndUnknownThrows) {
+    const DecompileValidationStamp stamp{
+        .target_identity = "sha256:exception-boundary-test",
+        .file_generation = 1,
+        .edit_revision = 0,
+        .snapshot_revision = 0,
+    };
+
+    DecompileController controller(
+        [](const DecompileJobSpec& job, std::stop_token) -> DecompiledUnit {
+            if (job.request.address == 0x6001u) {
+                throw std::runtime_error("simulated backend runtime_error");
+            }
+            if (job.request.address == 0x6002u) {
+                throw std::bad_alloc{};
+            }
+            if (job.request.address == 0x6003u) {
+                throw 42;
+            }
+            return DecompiledUnit{
+                .status = DecompileStatus::Ready,
+                .provider = "Mock",
+                .diagnostic = "recovered",
+            };
+        });
+
+    auto run_job = [&](std::uint64_t address) -> DecompiledUnit {
+        DecompileJobSpec spec;
+        spec.request.address = address;
+        spec.stamp = stamp;
+        (void)controller.submit(std::move(spec));
+        controller.wait_for_idle();
+        const auto res = controller.poll_completed(stamp);
+        EXPECT_TRUE(res.has_value());
+        return res ? res->unit : DecompiledUnit{};
+    };
+
+    const DecompiledUnit err_std = run_job(0x6001u);
+    EXPECT_EQ(err_std.status, DecompileStatus::Failed);
+    EXPECT_NE(err_std.diagnostic.find("simulated backend runtime_error"), std::string::npos);
+
+    const DecompiledUnit err_oom = run_job(0x6002u);
+    EXPECT_EQ(err_oom.status, DecompileStatus::Failed);
+    EXPECT_NE(err_oom.diagnostic.find("Out of memory"), std::string::npos);
+
+    const DecompiledUnit err_unknown = run_job(0x6003u);
+    EXPECT_EQ(err_unknown.status, DecompileStatus::Failed);
+    EXPECT_NE(err_unknown.diagnostic.find("Unhandled exception"), std::string::npos);
+
+    // Controller worker loop survives all three exception classes and still processes normal jobs.
+    const DecompiledUnit ok = run_job(0x6004u);
+    EXPECT_EQ(ok.status, DecompileStatus::Ready);
+    EXPECT_EQ(ok.diagnostic, "recovered");
+}
+
+TEST(Decompiler, DecompileCacheZeroCapacityAndLruUpdateConsistency) {
+    DecompileRequest base_req;
+    base_req.binary_sha256 = std::string(64, 'c');
+    base_req.architecture = peelf::Architecture::X86_64;
+    base_req.function_size = 32;
+
+    DecompilerSettings settings;
+    settings.provider = DecompilerProvider::RetDec;
+    settings.retdec = "/opt/retdec-a/retdec-decompiler";
+
+    auto make_key = [&](std::uint64_t addr) {
+        auto r = base_req;
+        r.address = addr;
+        return make_decompile_cache_key(r, settings);
+    };
+    auto make_ready = [](std::string text) {
+        DecompiledUnit u;
+        u.status = DecompileStatus::Ready;
+        u.provider = "RetDec";
+        u.lines.push_back(DecompiledLine{0x1000, std::move(text), {}});
+        return u;
+    };
+
+    // Zero-capacity construction clamps to minimum capacity 1, evicting older entry post-insert.
+    DecompileCache min_cache(0);
+    min_cache.put(make_key(0x1000), make_ready("first"));
+    EXPECT_EQ(min_cache.size(), 1u);
+    min_cache.put(make_key(0x2000), make_ready("second"));
+    EXPECT_EQ(min_cache.size(), 1u);
+    EXPECT_FALSE(min_cache.get(make_key(0x1000)).has_value());
+    EXPECT_TRUE(min_cache.get(make_key(0x2000)).has_value());
+
+    // Capacity-3 LRU consistency across insert, in-place overwrite, get promotion, and eviction.
+    DecompileCache cache(3);
+    const auto k1 = make_key(0x1000);
+    const auto k2 = make_key(0x2000);
+    const auto k3 = make_key(0x3000);
+    const auto k4 = make_key(0x4000);
+
+    cache.put(k1, make_ready("v1"));
+    cache.put(k2, make_ready("v2"));
+    cache.put(k3, make_ready("v3"));
+    EXPECT_EQ(cache.size(), 3u);
+
+    // Overwriting k1 promotes k1 to MRU, leaving k2 as LRU.
+    cache.put(k1, make_ready("v1_updated"));
+    EXPECT_EQ(cache.size(), 3u);
+
+    // Inserting k4 evicts k2 (LRU) after inserting k4, keeping k4, k1, k3 intact.
+    cache.put(k4, make_ready("v4"));
+    EXPECT_EQ(cache.size(), 3u);
+    EXPECT_FALSE(cache.get(k2).has_value());
+    ASSERT_TRUE(cache.get(k1).has_value());
+    EXPECT_EQ(cache.get(k1)->lines[0].text, "v1_updated");
+    EXPECT_TRUE(cache.get(k3).has_value());
+    EXPECT_TRUE(cache.get(k4).has_value());
+
+    // Changing RetDec executable path produces a distinct cache key fingerprint.
+    auto alt_settings = settings;
+    alt_settings.retdec = "/opt/retdec-b/retdec-decompiler";
+    auto alt_req = base_req;
+    alt_req.address = 0x1000;
+    EXPECT_FALSE(cache.get(make_decompile_cache_key(alt_req, alt_settings)).has_value());
+}
+
 

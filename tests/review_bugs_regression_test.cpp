@@ -1,4 +1,6 @@
 #include "analysis/async_binary_diff.hpp"
+#include "analysis/function_index.hpp"
+#include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
@@ -16,7 +18,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <new>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -622,3 +626,137 @@ TEST(ReviewBugsRegression, AsyncBinaryDifferSupportsCompletionRevisionGatingAndC
 
     std::filesystem::remove_all(temp_dir, ec);
 }
+
+// CA-04 (A01): FunctionIndex::upsert_function uses try_emplace so duplicate-VA merges preserve
+// non-SSO symbol/demangled/library/section strings on the incoming candidate.
+TEST(ReviewBugsRegression, FunctionIndexDuplicateVaMergePreservesRichFieldsViaTryEmplace) {
+    const auto pe_bytes = make_minimal_pe64_with_cert(0x30u);
+    auto parsed = peelf::parse_image(pe_bytes);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    ASSERT_NE(*parsed, nullptr);
+
+    const std::uint64_t entry_va = (*parsed)->entry_point();
+    ASSERT_EQ(entry_va, 0x140001000ULL);
+
+    // SymbolIndex::build seeds "Entry Point" at entry_va first (generic name, lower origin priority).
+    viewer::SymbolIndex sym_index = viewer::SymbolIndex::build(**parsed);
+
+    // Append a higher-priority DebugSymbol at the exact same VA with >32-byte strings (exceeding SSO)
+    // so moving `candidate` during a failed `.emplace(...)` would empty its strings before merge.
+    const std::string mangled_name =
+        "_ZN5peelf15ca04_regression37duplicate_va_rich_entry_symbol_targetEii";
+    const std::string rich_library =
+        "libca04_duplicate_va_rich_debug_origin_module_name.dll";
+
+    viewer::DebugSymbol debug_sym{};
+    debug_sym.name = mangled_name;
+    debug_sym.library = rich_library;
+    debug_sym.virtual_address = entry_va;
+    debug_sym.size = 0x18u;
+    debug_sym.function = true;
+    const viewer::DebugSymbol debug_syms[] = {debug_sym};
+    sym_index.add_debug_symbols(**parsed, debug_syms);
+
+    const viewer::FunctionIndex fn_index =
+        viewer::FunctionIndex::discover(**parsed, sym_index, pe_bytes);
+    const viewer::FunctionEntry* merged = fn_index.find_exact(entry_va);
+    ASSERT_NE(merged, nullptr);
+
+    EXPECT_EQ(merged->origin, viewer::FunctionOrigin::DebugInfo);
+    EXPECT_EQ(merged->raw_name, mangled_name);
+    EXPECT_FALSE(merged->name.empty());
+    EXPECT_NE(merged->name.find("duplicate_va_rich_entry_symbol_target"), std::string::npos);
+    EXPECT_FALSE(merged->demangled_name.empty());
+    EXPECT_NE(
+        merged->demangled_name.find(
+            "peelf::ca04_regression::duplicate_va_rich_entry_symbol_target"),
+        std::string::npos);
+    EXPECT_EQ(merged->library, rich_library);
+    EXPECT_EQ(merged->section_name, ".text");
+    EXPECT_EQ(merged->size, 0x18u);
+}
+
+// CA-04 (A02/A03): AsyncBinaryDiffer worker catches std::exception, std::bad_alloc, and unknown
+// exceptions without std::terminate or wait_for_idle() deadlock.
+TEST(ReviewBugsRegression, AsyncBinaryDifferWorkerContainsExceptionsWithoutTerminate) {
+    const auto lhs_pe = make_minimal_pe64_with_cert(0x30u);
+    const std::filesystem::path temp_dir =
+        std::filesystem::temp_directory_path() /
+        ("peelf-async-diff-exc-test-" + std::to_string(
+#ifdef _WIN32
+             7778
+#else
+             static_cast<int>(::getpid())
+#endif
+             ));
+    std::error_code ec;
+    std::filesystem::create_directories(temp_dir, ec);
+    const std::filesystem::path rhs_path = temp_dir / "rhs.exe";
+    {
+        std::ofstream ofs(rhs_path, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(static_cast<bool>(ofs));
+        ofs.write(reinterpret_cast<const char*>(lhs_pe.data()),
+                  static_cast<std::streamsize>(lhs_pe.size()));
+    }
+
+    // 1. std::runtime_error inside worker progress callback -> structured Failed outcome.
+    {
+        viewer::AsyncBinaryDiffer differ;
+        peelf::BinaryDiffOptions opts{};
+        opts.progress_callback = [](std::size_t, std::size_t, std::string_view) {
+            throw std::runtime_error("simulated diff callback failure");
+        };
+        differ.start_file_diff(11u, lhs_pe, rhs_path, opts);
+        differ.wait_for_idle();
+        EXPECT_FALSE(differ.is_running());
+
+        const auto done = differ.poll_completed(11u);
+        ASSERT_TRUE(done.has_value());
+        EXPECT_EQ(done->status, viewer::AsyncDiffStatus::Failed);
+        EXPECT_NE(done->error_message.find("simulated diff callback failure"), std::string::npos);
+    }
+
+    // 2. std::bad_alloc inside worker -> pre-allocated non-allocating OOM outcome.
+    {
+        viewer::AsyncBinaryDiffer differ;
+        peelf::BinaryDiffOptions opts{};
+        opts.progress_callback = [](std::size_t, std::size_t, std::string_view) {
+            throw std::bad_alloc{};
+        };
+        differ.start_file_diff(12u, lhs_pe, rhs_path, opts);
+        differ.wait_for_idle();
+        EXPECT_FALSE(differ.is_running());
+
+        const auto done = differ.poll_completed(12u);
+        ASSERT_TRUE(done.has_value());
+        EXPECT_EQ(done->status, viewer::AsyncDiffStatus::Failed);
+        EXPECT_NE(done->error_message.find("Out of memory"), std::string::npos);
+    }
+
+    // 3. Non-standard exception inside live integrity diff worker -> structured Failed outcome.
+    {
+        auto session = std::make_shared<SlowCancellableMockSession>(lhs_pe, 0x140000000ULL);
+        peelf::ModuleInfo live_mod{};
+        live_mod.name = "rhs.exe";
+        live_mod.path = rhs_path;
+        live_mod.base_address = 0x140000000ULL;
+        live_mod.size = lhs_pe.size();
+
+        viewer::AsyncBinaryDiffer differ;
+        peelf::LiveIntegrityDiffOptions opts{};
+        opts.progress_callback = [](std::size_t, std::size_t, std::string_view) {
+            throw 99;
+        };
+        differ.start_live_integrity_diff(13u, rhs_path, session, live_mod, opts);
+        differ.wait_for_idle();
+        EXPECT_FALSE(differ.is_running());
+
+        const auto done = differ.poll_completed(13u);
+        ASSERT_TRUE(done.has_value());
+        EXPECT_EQ(done->status, viewer::AsyncDiffStatus::Failed);
+        EXPECT_NE(done->error_message.find("Unhandled exception"), std::string::npos);
+    }
+
+    std::filesystem::remove_all(temp_dir, ec);
+}
+

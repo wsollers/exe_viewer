@@ -3,6 +3,7 @@
 #include "decompile/structured_decompiler.hpp"
 
 #include <exception>
+#include <new>
 #include <utility>
 
 namespace viewer {
@@ -50,13 +51,67 @@ DecompiledUnit execute_decompile_job(const DecompileJobSpec& spec, std::stop_tok
 
 DecompileController::DecompileController(WorkFn executor)
     : executor_(executor ? std::move(executor) : WorkFn{execute_decompile_job})
-    , worker_([this](std::stop_token worker_stop) { worker_loop(std::move(worker_stop)); }) {}
+    , fatal_worker_oom_unit_{
+          .status = DecompileStatus::Failed,
+          .provider = "Decompiler",
+          .diagnostic = "Out of memory in decompiler worker.",
+      }
+    , fatal_worker_error_unit_{
+          .status = DecompileStatus::Failed,
+          .provider = "Decompiler",
+          .diagnostic = "Unhandled exception in decompiler worker",
+      } {
+    struct LaunchRollbackGuard {
+        DecompileController* self;
+        bool committed{false};
+        ~LaunchRollbackGuard() noexcept {
+            if (!committed) {
+                {
+                    std::scoped_lock lock(self->mutex_);
+                    self->shutting_down_ = true;
+                    self->active_sequence_ = 0;
+                    self->pending_.reset();
+                }
+                self->cv_.notify_all();
+            }
+        }
+    } launch_guard{this};
+
+    worker_ = std::jthread([this](std::stop_token worker_stop) noexcept {
+        try {
+            worker_loop(std::move(worker_stop));
+        } catch (const std::bad_alloc&) {
+            handle_worker_fatal_failure(/*is_oom=*/true, nullptr);
+        } catch (const std::exception& e) {
+            handle_worker_fatal_failure(/*is_oom=*/false, e.what());
+        } catch (...) {
+            handle_worker_fatal_failure(/*is_oom=*/false, nullptr);
+        }
+    });
+    launch_guard.committed = true;
+}
 
 DecompileController::~DecompileController() noexcept {
     shutdown();
 }
 
 std::uint64_t DecompileController::submit(DecompileJobSpec spec) {
+    DecompiledUnit pre_cancelled{
+        .status = DecompileStatus::Cancelled,
+        .provider = "Decompiler",
+        .diagnostic = "Decompilation cancelled.",
+    };
+    DecompiledUnit pre_oom{
+        .status = DecompileStatus::Failed,
+        .provider = "Decompiler",
+        .diagnostic = "Out of memory during decompilation.",
+    };
+    DecompiledUnit pre_unknown{
+        .status = DecompileStatus::Failed,
+        .provider = "Decompiler",
+        .diagnostic = "Unhandled exception in decompiler worker",
+    };
+
     std::uint64_t seq = 0;
     {
         std::scoped_lock lock(mutex_);
@@ -64,6 +119,9 @@ std::uint64_t DecompileController::submit(DecompileJobSpec spec) {
         pending_ = PendingJob{
             .sequence = seq,
             .spec = std::move(spec),
+            .cancelled_unit = std::move(pre_cancelled),
+            .bad_alloc_unit = std::move(pre_oom),
+            .unknown_error_unit = std::move(pre_unknown),
         };
         completed_.reset();
         stale_result_discarded_ = false;
@@ -88,6 +146,7 @@ void DecompileController::cancel_current() noexcept {
             DecompileValidationStamp cancelled_stamp = std::move(pending_->spec.stamp);
             const bool thumb = pending_->spec.request.thumb;
             std::optional<SymbolRecord> root = std::move(pending_->spec.root_symbol);
+            DecompiledUnit cancelled_unit = std::move(pending_->cancelled_unit);
             pending_.reset();
             completed_ = DecompileJobResult{
                 .sequence = next_sequence_,
@@ -95,11 +154,7 @@ void DecompileController::cancel_current() noexcept {
                 .cache_key = std::nullopt,
                 .root_symbol = std::move(root),
                 .thumb = thumb,
-                .unit = DecompiledUnit{
-                    .status = DecompileStatus::Cancelled,
-                    .provider = "Decompiler",
-                    .diagnostic = "Decompilation cancelled.",
-                },
+                .unit = std::move(cancelled_unit),
             };
         }
         if (active_sequence_ != 0) {
@@ -135,7 +190,10 @@ void DecompileController::shutdown() noexcept {
     worker_.request_stop();
     cv_.notify_all();
     if (worker_.joinable()) {
-        worker_.join();
+        try {
+            worker_.join();
+        } catch (...) {
+        }
     }
 }
 
@@ -212,18 +270,23 @@ void DecompileController::worker_loop(std::stop_token worker_stop) {
         DecompiledUnit unit;
         try {
             unit = executor_(job.spec, job_stop);
+        } catch (const std::bad_alloc&) {
+            unit = std::move(job.bad_alloc_unit);
         } catch (const std::exception& ex) {
-            unit = DecompiledUnit{
-                .status = DecompileStatus::Failed,
-                .provider = "Decompiler",
-                .diagnostic = ex.what(),
-            };
+            try {
+                const char* what_msg = ex.what();
+                unit = DecompiledUnit{
+                    .status = DecompileStatus::Failed,
+                    .provider = std::move(job.unknown_error_unit.provider),
+                    .diagnostic = (what_msg != nullptr && *what_msg != '\0')
+                                      ? std::string(what_msg)
+                                      : std::move(job.unknown_error_unit.diagnostic),
+                };
+            } catch (...) {
+                unit = std::move(job.bad_alloc_unit);
+            }
         } catch (...) {
-            unit = DecompiledUnit{
-                .status = DecompileStatus::Failed,
-                .provider = "Decompiler",
-                .diagnostic = "Unhandled exception in decompiler worker",
-            };
+            unit = std::move(job.unknown_error_unit);
         }
 
         {
@@ -235,11 +298,11 @@ void DecompileController::worker_loop(std::stop_token worker_stop) {
             }
             if (!shutting_down_ && !worker_stop.stop_requested() && job.sequence == next_sequence_) {
                 if (was_cancelled && unit.status != DecompileStatus::Cancelled) {
-                    unit = DecompiledUnit{
-                        .status = DecompileStatus::Cancelled,
-                        .provider = unit.provider.empty() ? "Decompiler" : std::move(unit.provider),
-                        .diagnostic = "Decompilation cancelled.",
-                    };
+                    std::string keep_provider =
+                        unit.provider.empty() ? std::move(job.cancelled_unit.provider)
+                                              : std::move(unit.provider);
+                    unit = std::move(job.cancelled_unit);
+                    unit.provider = std::move(keep_provider);
                 }
                 if (!was_cancelled || user_cancelled_sequence_ == job.sequence) {
                     completed_ = DecompileJobResult{
@@ -255,6 +318,53 @@ void DecompileController::worker_loop(std::stop_token worker_stop) {
         }
         cv_.notify_all();
     }
+}
+
+void DecompileController::handle_worker_fatal_failure(bool is_oom, const char* what_msg) noexcept {
+    {
+        std::scoped_lock lock(mutex_);
+        if (!shutting_down_ && pending_.has_value()) {
+            PendingJob failed_job = std::move(*pending_);
+            pending_.reset();
+            DecompiledUnit unit = is_oom ? std::move(failed_job.bad_alloc_unit)
+                                         : std::move(failed_job.unknown_error_unit);
+            if (!is_oom && what_msg != nullptr && *what_msg != '\0') {
+                try {
+                    unit.diagnostic = what_msg;
+                } catch (...) {
+                    unit = std::move(fatal_worker_oom_unit_);
+                }
+            }
+            if (failed_job.sequence == next_sequence_) {
+                completed_ = DecompileJobResult{
+                    .sequence = failed_job.sequence,
+                    .stamp = std::move(failed_job.spec.stamp),
+                    .cache_key = std::move(failed_job.spec.cache_key),
+                    .root_symbol = std::move(failed_job.spec.root_symbol),
+                    .thumb = failed_job.spec.request.thumb,
+                    .unit = std::move(unit),
+                };
+            }
+        } else if (!shutting_down_ && active_sequence_ != 0 && active_sequence_ == next_sequence_) {
+            DecompiledUnit unit = is_oom ? std::move(fatal_worker_oom_unit_)
+                                         : std::move(fatal_worker_error_unit_);
+            if (!is_oom && what_msg != nullptr && *what_msg != '\0') {
+                try {
+                    unit.diagnostic = what_msg;
+                } catch (...) {
+                    unit = std::move(fatal_worker_oom_unit_);
+                }
+            }
+            completed_ = DecompileJobResult{
+                .sequence = active_sequence_,
+                .unit = std::move(unit),
+            };
+        }
+        active_sequence_ = 0;
+        pending_.reset();
+        shutting_down_ = true;
+    }
+    cv_.notify_all();
 }
 
 } // namespace viewer

@@ -804,7 +804,7 @@ const IAssemblerProvider* AssemblerRegistry::select_provider(
     Architecture architecture,
     Endianness endianness,
     bool is_64bit,
-    bool thumb_mode) const noexcept {
+    bool thumb_mode) const {
     for (const auto& provider : providers_) {
         if (provider &&
             provider->supports_target(architecture, endianness, is_64bit, thumb_mode) &&

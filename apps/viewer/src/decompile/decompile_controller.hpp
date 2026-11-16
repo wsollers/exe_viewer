@@ -80,9 +80,13 @@ private:
     struct PendingJob {
         std::uint64_t sequence = 0;
         DecompileJobSpec spec{};
+        DecompiledUnit cancelled_unit{};
+        DecompiledUnit bad_alloc_unit{};
+        DecompiledUnit unknown_error_unit{};
     };
 
     void worker_loop(std::stop_token worker_stop);
+    void handle_worker_fatal_failure(bool is_oom, const char* what_msg) noexcept;
 
     WorkFn executor_;
     mutable std::mutex mutex_;
@@ -92,6 +96,8 @@ private:
     std::uint64_t user_cancelled_sequence_ = 0;
     std::optional<PendingJob> pending_;
     std::optional<DecompileJobResult> completed_;
+    DecompiledUnit fatal_worker_oom_unit_{};
+    DecompiledUnit fatal_worker_error_unit_{};
     std::stop_source active_job_stop_;
     bool shutting_down_ = false;
     bool stale_result_discarded_ = false;

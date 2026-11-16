@@ -296,7 +296,7 @@ namespace {
            (s[2] == '\\' || s[2] == '/');
 }
 
-[[nodiscard]] bool is_explicit_absolute_path(std::string_view s, bool windows_rules) noexcept {
+[[nodiscard]] bool is_explicit_absolute_path(std::string_view s, bool windows_rules) {
     if (s.empty()) {
         return false;
     }

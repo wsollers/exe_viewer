@@ -97,6 +97,6 @@ struct ProjectBinaryResolution {
     const std::filesystem::path& recovery_dir = default_project_recovery_directory());
 void clear_recovery_journal(
     const std::filesystem::path& key_path,
-    const std::filesystem::path& recovery_dir = default_project_recovery_directory()) noexcept;
+    const std::filesystem::path& recovery_dir = default_project_recovery_directory());
 
 } // namespace viewer

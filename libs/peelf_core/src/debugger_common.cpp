@@ -168,7 +168,7 @@ constexpr void store_u32(std::array<std::uint8_t, 4>& out,
 Result<SoftwareTrapSpec> select_software_trap(
     Architecture arch,
     Endianness endian,
-    bool thumb_mode) noexcept {
+    bool thumb_mode) {
     SoftwareTrapSpec spec{};
     switch (arch) {
         case Architecture::X86:

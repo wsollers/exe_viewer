@@ -926,7 +926,7 @@ StructureCatalog StructureCatalog::build(std::span<const DataTypeRecord> primary
     return cat;
 }
 
-const CatalogTypeEntry* StructureCatalog::find_entry(std::string_view type_name) const noexcept {
+const CatalogTypeEntry* StructureCatalog::find_entry(std::string_view type_name) const {
     const std::string key = canonical_type_key(type_name);
     if (const auto it = by_canonical_name_.find(key); it != by_canonical_name_.end()) {
         return &entries_[it->second];
@@ -934,7 +934,7 @@ const CatalogTypeEntry* StructureCatalog::find_entry(std::string_view type_name)
     return nullptr;
 }
 
-const DataTypeRecord* StructureCatalog::find(std::string_view type_name) const noexcept {
+const DataTypeRecord* StructureCatalog::find(std::string_view type_name) const {
     if (const CatalogTypeEntry* entry = find_entry(type_name)) {
         return &entry->record;
     }

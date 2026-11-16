@@ -5,9 +5,11 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <format>
 #include <functional>
 #include <limits>
+#include <new>
 #include <optional>
 #include <capstone/capstone.h>
 
@@ -1255,6 +1257,12 @@ void ReferenceIndex::set_scanning(bool scanning) noexcept {
     }
 }
 
+void ReferenceIndex::mark_failed_incomplete() noexcept {
+    is_scanning_ = false;
+    incomplete_ = true;
+    ++revision_;
+}
+
 double ReferenceIndex::coverage_percent() const noexcept {
     if (total_executable_bytes_ == 0) {
         return incomplete_ ? 0.0 : 100.0;
@@ -1494,7 +1502,7 @@ bool ReferenceScanJob::run(ReferenceIndex& target, std::stop_token stop) {
     return true;
 }
 
-AsyncReferenceScanner::~AsyncReferenceScanner() {
+AsyncReferenceScanner::~AsyncReferenceScanner() noexcept {
     cancel();
 }
 
@@ -1512,16 +1520,22 @@ void AsyncReferenceScanner::start(ReferenceIndex& target,
     const bool already_finished = next_job.finished();
     const bool incomp = next_job.incomplete();
 
+    std::string reserved_error;
+    reserved_error.reserve(128u);
+
     target.reset_for_progressive_scan(total_exec, !already_finished);
     std::uint64_t gen = 0;
     {
         std::scoped_lock lock(mutex_);
         pending_chunks_.clear();
+        last_error_ = std::move(reserved_error);
         job_ = std::move(next_job);
         desired_budget_ = byte_budget;
         job_scanned_bytes_ = 0;
         job_total_bytes_ = total_exec;
         job_finished_ = already_finished;
+        worker_failed_ = false;
+        pending_failure_incomplete_ = false;
         gen = ++generation_;
         paused_.store(false, std::memory_order_release);
         active_.store(!already_finished, std::memory_order_release);
@@ -1539,9 +1553,36 @@ void AsyncReferenceScanner::start(ReferenceIndex& target,
         return;
     }
 
-    worker_ = std::jthread([this, gen](std::stop_token stop) {
-        worker_loop(stop, gen);
+    struct LaunchRollbackGuard {
+        AsyncReferenceScanner* self;
+        ReferenceIndex* target_index;
+        bool committed{false};
+        ~LaunchRollbackGuard() noexcept {
+            if (!committed) {
+                {
+                    std::scoped_lock lock(self->mutex_);
+                    self->job_finished_ = true;
+                    self->paused_.store(false, std::memory_order_release);
+                    self->active_.store(false, std::memory_order_release);
+                }
+                target_index->mark_failed_incomplete();
+                self->cv_.notify_all();
+            }
+        }
+    } launch_guard{this, &target};
+
+    worker_ = std::jthread([this, gen](std::stop_token stop) noexcept {
+        try {
+            worker_loop(stop, gen);
+        } catch (const std::bad_alloc&) {
+            record_worker_failure(gen, /*is_oom=*/true, nullptr);
+        } catch (const std::exception& e) {
+            record_worker_failure(gen, /*is_oom=*/false, e.what());
+        } catch (...) {
+            record_worker_failure(gen, /*is_oom=*/false, nullptr);
+        }
     });
+    launch_guard.committed = true;
 }
 
 void AsyncReferenceScanner::pause() {
@@ -1554,14 +1595,26 @@ void AsyncReferenceScanner::pause() {
 }
 
 void AsyncReferenceScanner::resume(ReferenceIndex& target) {
+    std::string reserved_error;
+    reserved_error.reserve(128u);
+
     std::jthread finished_worker;
     std::uint64_t new_gen = 0;
     bool spawn_worker = false;
     bool woke = false;
+    bool prev_paused = false;
     {
         std::scoped_lock lock(mutex_);
         if (!job_finished_ && job_scanned_bytes_ < job_total_bytes_) {
             const bool was_active = active_.load(std::memory_order_acquire);
+            prev_paused = paused_.load(std::memory_order_acquire);
+            if (last_error_.capacity() < 128u) {
+                last_error_ = std::move(reserved_error);
+            } else {
+                last_error_.clear();
+            }
+            worker_failed_ = false;
+            pending_failure_incomplete_ = false;
             paused_.store(false, std::memory_order_release);
             active_.store(true, std::memory_order_release);
             woke = true;
@@ -1572,15 +1625,44 @@ void AsyncReferenceScanner::resume(ReferenceIndex& target) {
             }
         }
     }
+
+    struct LaunchRollbackGuard {
+        AsyncReferenceScanner* self;
+        ReferenceIndex* target_index;
+        bool restore_paused{false};
+        bool armed{false};
+        bool committed{false};
+        ~LaunchRollbackGuard() noexcept {
+            if (armed && !committed) {
+                {
+                    std::scoped_lock lock(self->mutex_);
+                    self->paused_.store(restore_paused, std::memory_order_release);
+                    self->active_.store(false, std::memory_order_release);
+                }
+                target_index->set_scanning(false);
+                self->cv_.notify_all();
+            }
+        }
+    } launch_guard{this, &target, prev_paused, spawn_worker, false};
+
     if (finished_worker.joinable()) {
         finished_worker.request_stop();
         cv_.notify_all();
         finished_worker.join();
     }
     if (spawn_worker) {
-        worker_ = std::jthread([this, new_gen](std::stop_token stop) {
-            worker_loop(stop, new_gen);
+        worker_ = std::jthread([this, new_gen](std::stop_token stop) noexcept {
+            try {
+                worker_loop(stop, new_gen);
+            } catch (const std::bad_alloc&) {
+                record_worker_failure(new_gen, /*is_oom=*/true, nullptr);
+            } catch (const std::exception& e) {
+                record_worker_failure(new_gen, /*is_oom=*/false, e.what());
+            } catch (...) {
+                record_worker_failure(new_gen, /*is_oom=*/false, nullptr);
+            }
         });
+        launch_guard.committed = true;
     }
     if (woke) {
         target.set_scanning(true);
@@ -1589,15 +1671,31 @@ void AsyncReferenceScanner::resume(ReferenceIndex& target) {
 }
 
 void AsyncReferenceScanner::scan_full(ReferenceIndex& target) {
+    std::string reserved_error;
+    reserved_error.reserve(128u);
+
     std::jthread finished_worker;
     std::uint64_t new_gen = 0;
     bool spawn_worker = false;
     bool woke = false;
+    bool prev_paused = false;
+    bool prev_finished = true;
+    std::size_t prev_budget = 0;
     {
         std::scoped_lock lock(mutex_);
+        prev_budget = desired_budget_;
+        prev_finished = job_finished_;
         desired_budget_ = std::numeric_limits<std::size_t>::max();
         if (job_scanned_bytes_ < job_total_bytes_) {
             const bool was_active = active_.load(std::memory_order_acquire);
+            prev_paused = paused_.load(std::memory_order_acquire);
+            if (last_error_.capacity() < 128u) {
+                last_error_ = std::move(reserved_error);
+            } else {
+                last_error_.clear();
+            }
+            worker_failed_ = false;
+            pending_failure_incomplete_ = false;
             job_finished_ = false;
             paused_.store(false, std::memory_order_release);
             active_.store(true, std::memory_order_release);
@@ -1609,15 +1707,48 @@ void AsyncReferenceScanner::scan_full(ReferenceIndex& target) {
             }
         }
     }
+
+    struct LaunchRollbackGuard {
+        AsyncReferenceScanner* self;
+        ReferenceIndex* target_index;
+        std::size_t restore_budget{0};
+        bool restore_finished{true};
+        bool restore_paused{false};
+        bool armed{false};
+        bool committed{false};
+        ~LaunchRollbackGuard() noexcept {
+            if (armed && !committed) {
+                {
+                    std::scoped_lock lock(self->mutex_);
+                    self->desired_budget_ = restore_budget;
+                    self->job_finished_ = restore_finished;
+                    self->paused_.store(restore_paused, std::memory_order_release);
+                    self->active_.store(false, std::memory_order_release);
+                }
+                target_index->set_scanning(false);
+                self->cv_.notify_all();
+            }
+        }
+    } launch_guard{this, &target, prev_budget, prev_finished, prev_paused, spawn_worker, false};
+
     if (finished_worker.joinable()) {
         finished_worker.request_stop();
         cv_.notify_all();
         finished_worker.join();
     }
     if (spawn_worker) {
-        worker_ = std::jthread([this, new_gen](std::stop_token stop) {
-            worker_loop(stop, new_gen);
+        worker_ = std::jthread([this, new_gen](std::stop_token stop) noexcept {
+            try {
+                worker_loop(stop, new_gen);
+            } catch (const std::bad_alloc&) {
+                record_worker_failure(new_gen, /*is_oom=*/true, nullptr);
+            } catch (const std::exception& e) {
+                record_worker_failure(new_gen, /*is_oom=*/false, e.what());
+            } catch (...) {
+                record_worker_failure(new_gen, /*is_oom=*/false, nullptr);
+            }
         });
+        launch_guard.committed = true;
     }
     if (woke) {
         target.set_scanning(true);
@@ -1625,15 +1756,19 @@ void AsyncReferenceScanner::scan_full(ReferenceIndex& target) {
     }
 }
 
-void AsyncReferenceScanner::cancel(ReferenceIndex* target) {
+void AsyncReferenceScanner::cancel(ReferenceIndex* target) noexcept {
     if (worker_.joinable()) {
         worker_.request_stop();
         cv_.notify_all();
-        worker_.join();
+        try {
+            worker_.join();
+        } catch (...) {
+        }
     }
     {
         std::scoped_lock lock(mutex_);
         pending_chunks_.clear();
+        pending_failure_incomplete_ = false;
         paused_.store(false, std::memory_order_release);
         active_.store(false, std::memory_order_release);
     }
@@ -1646,9 +1781,11 @@ std::size_t AsyncReferenceScanner::poll(ReferenceIndex& target) {
     std::deque<ReferenceScanChunk> ready;
     bool now_paused = false;
     bool now_active = false;
+    bool mark_failed = false;
     {
         std::scoped_lock lock(mutex_);
         ready.swap(pending_chunks_);
+        mark_failed = std::exchange(pending_failure_incomplete_, false);
         now_paused = paused_.load(std::memory_order_acquire);
         now_active = active_.load(std::memory_order_acquire);
     }
@@ -1657,7 +1794,9 @@ std::size_t AsyncReferenceScanner::poll(ReferenceIndex& target) {
         target.append_chunk(std::move(ready.front()));
         ready.pop_front();
     }
-    if (now_paused || !now_active) {
+    if (mark_failed) {
+        target.mark_failed_incomplete();
+    } else if (now_paused || !now_active) {
         target.set_scanning(false);
     }
     return count;
@@ -1675,7 +1814,57 @@ void AsyncReferenceScanner::wait(ReferenceIndex& target) {
 
 bool AsyncReferenceScanner::has_resumable_work() const noexcept {
     std::scoped_lock lock(mutex_);
-    return job_scanned_bytes_ < job_total_bytes_;
+    return !worker_failed_ && (job_scanned_bytes_ < job_total_bytes_);
+}
+
+bool AsyncReferenceScanner::has_failed() const noexcept {
+    std::scoped_lock lock(mutex_);
+    return worker_failed_;
+}
+
+std::string AsyncReferenceScanner::last_error() const {
+    std::scoped_lock lock(mutex_);
+    return last_error_;
+}
+
+void AsyncReferenceScanner::record_worker_failure(std::uint64_t generation,
+                                                  bool is_oom,
+                                                  const char* what_msg) noexcept {
+    {
+        std::scoped_lock lock(mutex_);
+        if (generation_ == generation) {
+            job_scanned_bytes_ = job_.scanned_bytes();
+            job_finished_ = true;
+            worker_failed_ = true;
+            pending_failure_incomplete_ = true;
+            paused_.store(false, std::memory_order_release);
+            if (is_oom) {
+                constexpr std::string_view kOomMsg = "Out of memory during reference scan";
+                if (last_error_.capacity() >= kOomMsg.size()) {
+                    last_error_.assign(kOomMsg.data(), kOomMsg.size());
+                }
+            } else {
+                const std::string_view msg =
+                    (what_msg != nullptr && *what_msg != '\0')
+                        ? std::string_view(what_msg)
+                        : std::string_view("Unhandled exception in reference scan worker");
+                if (last_error_.capacity() >= msg.size()) {
+                    last_error_.assign(msg.data(), msg.size());
+                } else {
+                    try {
+                        last_error_.assign(msg.data(), msg.size());
+                    } catch (...) {
+                        constexpr std::string_view kFallback = "Reference scan worker failed";
+                        if (last_error_.capacity() >= kFallback.size()) {
+                            last_error_.assign(kFallback.data(), kFallback.size());
+                        }
+                    }
+                }
+            }
+            active_.store(false, std::memory_order_release);
+        }
+    }
+    cv_.notify_all();
 }
 
 void AsyncReferenceScanner::worker_loop(std::stop_token stop, std::uint64_t generation) {

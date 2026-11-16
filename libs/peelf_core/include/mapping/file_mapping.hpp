@@ -173,7 +173,7 @@ public:
         return {reinterpret_cast<const std::uint8_t*>(data_), byte_size_};
     }
 
-    [[nodiscard]] Result<std::span<T>> writable_span() noexcept
+    [[nodiscard]] Result<std::span<T>> writable_span()
     {
         if (!is_open()) {
             return make_error("FileMapping is not open");

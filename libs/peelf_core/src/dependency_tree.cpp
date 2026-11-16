@@ -1469,14 +1469,33 @@ private:
 } // namespace
 
 bool is_windows_api_set_dll(std::string_view dll_name) noexcept {
-    const std::filesystem::path p(dll_name);
-    std::string stem = to_lower_ascii(p.filename().string());
-    if (stem.ends_with(".dll")) {
-        stem.resize(stem.size() - 4);
+    const auto lower_ch = [](char c) noexcept -> char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    const auto istarts_with = [&](std::string_view sv, std::string_view prefix) noexcept -> bool {
+        if (sv.size() < prefix.size()) return false;
+        for (std::size_t i = 0; i < prefix.size(); ++i) {
+            if (lower_ch(sv[i]) != prefix[i]) return false;
+        }
+        return true;
+    };
+    const auto iends_with = [&](std::string_view sv, std::string_view suffix) noexcept -> bool {
+        if (sv.size() < suffix.size()) return false;
+        const std::size_t base = sv.size() - suffix.size();
+        for (std::size_t i = 0; i < suffix.size(); ++i) {
+            if (lower_ch(sv[base + i]) != suffix[i]) return false;
+        }
+        return true;
+    };
+
+    const std::size_t sep = dll_name.find_last_of("/\\");
+    std::string_view stem = (sep == std::string_view::npos) ? dll_name : dll_name.substr(sep + 1u);
+    if (iends_with(stem, ".dll")) {
+        stem.remove_suffix(4u);
     }
-    return stem.starts_with("api-ms-win-") ||
-           stem.starts_with("ext-ms-win-") ||
-           stem.starts_with("api-ms-onecoreuap-");
+    return istarts_with(stem, "api-ms-win-") ||
+           istarts_with(stem, "ext-ms-win-") ||
+           istarts_with(stem, "api-ms-onecoreuap-");
 }
 
 std::string expand_elf_dynamic_tokens(

@@ -80,7 +80,7 @@ struct SoftwareTrapSpec {
 [[nodiscard]] Result<SoftwareTrapSpec> select_software_trap(
     Architecture arch,
     Endianness endian = Endianness::Little,
-    bool thumb_mode = false) noexcept;
+    bool thumb_mode = false);
 
 struct BreakpointDescriptor {
     BreakpointId id{0};

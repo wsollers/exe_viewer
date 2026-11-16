@@ -466,15 +466,18 @@ public:
         return *this;
     }
 
-    ~ScopedProcessPause() { release(); }
+    ~ScopedProcessPause() noexcept { release(); }
 
     [[nodiscard]] bool paused_by_guard() const noexcept { return owns_pause_; }
     [[nodiscard]] const std::optional<Error>& error() const noexcept { return error_; }
 
     void release() noexcept {
         if (session_ != nullptr && owns_pause_) {
-            (void)session_->resume();
             owns_pause_ = false;
+            try {
+                (void)session_->resume();
+            } catch (...) {
+            }
         }
     }
 

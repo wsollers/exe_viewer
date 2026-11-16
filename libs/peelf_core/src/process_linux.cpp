@@ -1663,7 +1663,7 @@ private:
         return find_suspended_tid(tid) != suspended_tids_.end();
     }
 
-    [[nodiscard]] bool is_thread_still_present(ThreadId tid) const noexcept {
+    [[nodiscard]] bool is_thread_still_present(ThreadId tid) const {
         const std::filesystem::path stat_path = std::filesystem::path("/proc") /
                                                 std::to_string(info_.pid) / "task" /
                                                 std::to_string(tid) / "stat";

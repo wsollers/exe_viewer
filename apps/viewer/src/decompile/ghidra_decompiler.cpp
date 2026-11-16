@@ -197,23 +197,66 @@ DecompilerSettings discover_decompilers(const std::filesystem::path& directory) 
 peelf::Result<DecompilerSettings> read_decompiler_settings(const std::filesystem::path& path) {
     auto text = read_project_file(path);
     if (!text) return std::unexpected(text.error());
-    std::istringstream in(*text); std::string magic, home, java, python; int version = 0, provider = -1;
+    std::istringstream in(*text);
+    std::string magic, home, java, python;
+    int version = 0, provider = -1;
     DecompilerSettings settings;
-    if (!(in >> magic >> version >> provider >> std::quoted(home) >> std::quoted(java) >> std::quoted(python) >> settings.timeout_seconds) ||
-        magic != "PEELF_DECOMPILER" || version != 1 || provider < 0 || provider > 4 ||
-        java.empty() || python.empty() || settings.timeout_seconds < 10 || settings.timeout_seconds > 3600)
+    if (!(in >> magic >> version >> provider)) {
         return peelf::make_error("Invalid decompiler settings");
+    }
+    if (magic != "PEELF_DECOMPILER" || (version != 1 && version != 2) || provider < 0 || provider > 4) {
+        return peelf::make_error("Invalid decompiler settings");
+    }
+    if (version == 1) {
+        if (!(in >> std::quoted(home) >> std::quoted(java) >> std::quoted(python) >> settings.timeout_seconds) ||
+            java.empty() || python.empty() || settings.timeout_seconds < 10 || settings.timeout_seconds > 3600) {
+            return peelf::make_error("Invalid decompiler settings");
+        }
+        in >> std::ws;
+        if (!in.eof()) return peelf::make_error("Unexpected trailing decompiler settings");
+        settings.provider = static_cast<DecompilerProvider>(provider);
+        settings.ghidra_home = home;
+        settings.java = java;
+        settings.python = python;
+        return settings;
+    }
+
+    std::string retdec, cache_dir;
+    std::size_t max_cached_workspaces = 0;
+    int reuse_analysis = -1;
+    if (!(in >> std::quoted(home) >> std::quoted(java) >> std::quoted(python) >> std::quoted(retdec)
+             >> settings.timeout_seconds >> std::quoted(cache_dir) >> max_cached_workspaces >> reuse_analysis) ||
+        java.empty() || python.empty() || retdec.empty() ||
+        settings.timeout_seconds < 10 || settings.timeout_seconds > 3600 ||
+        max_cached_workspaces < 1u || max_cached_workspaces > 1024u ||
+        (reuse_analysis != 0 && reuse_analysis != 1)) {
+        return peelf::make_error("Invalid decompiler settings");
+    }
     in >> std::ws;
     if (!in.eof()) return peelf::make_error("Unexpected trailing decompiler settings");
+
     settings.provider = static_cast<DecompilerProvider>(provider);
-    settings.ghidra_home = home; settings.java = java; settings.python = python;
+    settings.ghidra_home = home;
+    settings.java = java;
+    settings.python = python;
+    settings.retdec = retdec;
+    settings.cache_directory = cache_dir;
+    settings.max_cached_workspaces = max_cached_workspaces;
+    settings.reuse_analysis = (reuse_analysis != 0);
     return settings;
 }
 peelf::Result<void> save_decompiler_settings(const std::filesystem::path& path, const DecompilerSettings& settings) {
     std::ostringstream out;
-    out << "PEELF_DECOMPILER 1\n" << static_cast<int>(settings.provider) << '\n'
-        << std::quoted(settings.ghidra_home.string()) << '\n' << std::quoted(settings.java.string()) << '\n'
-        << std::quoted(settings.python.string()) << '\n' << settings.timeout_seconds << '\n';
+    out << "PEELF_DECOMPILER 2\n"
+        << static_cast<int>(settings.provider) << '\n'
+        << std::quoted(settings.ghidra_home.string()) << '\n'
+        << std::quoted(settings.java.string()) << '\n'
+        << std::quoted(settings.python.string()) << '\n'
+        << std::quoted(settings.retdec.string()) << '\n'
+        << settings.timeout_seconds << '\n'
+        << std::quoted(settings.cache_directory.string()) << '\n'
+        << settings.max_cached_workspaces << '\n'
+        << (settings.reuse_analysis ? 1 : 0) << '\n';
     return write_analysis_file(path, out.str());
 }
 std::filesystem::path GhidraDecompiler::effective_cache_directory() const {

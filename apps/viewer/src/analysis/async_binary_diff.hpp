@@ -59,7 +59,7 @@ struct AsyncDiffOutcome {
 class AsyncBinaryDiffer {
 public:
     AsyncBinaryDiffer() = default;
-    ~AsyncBinaryDiffer();
+    ~AsyncBinaryDiffer() noexcept;
 
     AsyncBinaryDiffer(const AsyncBinaryDiffer&) = delete;
     AsyncBinaryDiffer& operator=(const AsyncBinaryDiffer&) = delete;
@@ -92,9 +92,17 @@ public:
     void wait_for_idle() noexcept;
 
 private:
-    void reset_for_launch(std::string_view initial_stage);
+    void reset_for_launch(AsyncDiffKind kind,
+                          std::uint64_t expected_revision,
+                          std::string_view initial_stage);
+    void rollback_failed_launch() noexcept;
     void update_progress(std::string_view stage, std::size_t completed, std::size_t total);
-    void publish_outcome(AsyncDiffOutcome outcome);
+    void publish_outcome(AsyncDiffOutcome outcome) noexcept;
+    void publish_preallocated_failure(bool is_oom, bool stop_requested) noexcept;
+    void publish_exception_failure(AsyncDiffKind kind,
+                                   std::uint64_t expected_revision,
+                                   const char* what_msg,
+                                   bool stop_requested) noexcept;
 
     mutable std::mutex mutex_{};
     std::atomic<bool> running_{false};
@@ -102,6 +110,8 @@ private:
     std::atomic<std::size_t> total_steps_{1};
     std::string stage_{};
     std::optional<AsyncDiffOutcome> pending_outcome_{};
+    AsyncDiffOutcome oom_outcome_{};
+    AsyncDiffOutcome unknown_exception_outcome_{};
     std::jthread worker_{};
 };
 

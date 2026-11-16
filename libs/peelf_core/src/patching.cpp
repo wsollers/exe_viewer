@@ -266,7 +266,7 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::load_page(std::uint64_t page
     // Bound retained pages to approximately 16 MiB (at least one page).
     const auto cache_limit = std::max<std::uint64_t>(1, (16u * 1024u * 1024u) / page_size_);
     if (page_cache_.size() >= cache_limit) page_cache_.erase(page_cache_.begin());
-    auto [it, inserted] = page_cache_.emplace(page_index, std::move(page));
+    auto [it, inserted] = page_cache_.try_emplace(page_index, std::move(page));
     (void)inserted;
     return it->second;
 }

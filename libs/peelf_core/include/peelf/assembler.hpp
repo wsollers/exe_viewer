@@ -149,7 +149,7 @@ public:
         Architecture architecture,
         Endianness endianness,
         bool is_64bit,
-        bool thumb_mode = false) const noexcept;
+        bool thumb_mode = false) const;
 
     [[nodiscard]] SubsystemStatus target_status(
         Architecture architecture,

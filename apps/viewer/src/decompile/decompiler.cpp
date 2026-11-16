@@ -246,12 +246,28 @@ void DecompileCache::put(const DecompileCacheKey& key, DecompiledUnit unit) {
         lru_.splice(lru_.begin(), lru_, it->second);
         return;
     }
-    while (lru_.size() >= max_entries_) {
+    if (max_entries_ == 0u) {
+        return;
+    }
+
+    lru_.push_front(Entry{.key = key, .unit = std::move(unit)});
+    struct LruInsertRollback {
+        std::list<Entry>& list;
+        bool committed{false};
+        ~LruInsertRollback() noexcept {
+            if (!committed) {
+                list.pop_front();
+            }
+        }
+    } rollback{lru_};
+
+    index_.try_emplace(lru_.front().key, lru_.begin());
+    rollback.committed = true;
+
+    while (lru_.size() > max_entries_) {
         index_.erase(lru_.back().key);
         lru_.pop_back();
     }
-    lru_.push_front(Entry{.key = key, .unit = std::move(unit)});
-    index_.emplace(lru_.front().key, lru_.begin());
 }
 
 void DecompileCache::invalidate_function(std::string_view binary_sha256,

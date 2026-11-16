@@ -360,7 +360,8 @@ using AbbrevTable = std::unordered_map<std::uint64_t, AbbrevDecl>;
             }
             decl.attrs.push_back(spec);
         }
-        table.emplace(decl.code, std::move(decl));
+        const std::uint64_t abbrev_code = decl.code;
+        table.try_emplace(abbrev_code, std::move(decl));
     }
     return table;
 }
@@ -1103,8 +1104,9 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
                 parent_stack.push_back(node.offset);
             }
 
-            die_order.push_back(node.offset);
-            all_dies.emplace(node.offset, std::move(node));
+            const std::uint64_t offset = node.offset;
+            die_order.push_back(offset);
+            all_dies.try_emplace(offset, std::move(node));
         }
 
         cursor = cu_end;
@@ -1612,7 +1614,7 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
     return out;
 }
 
-[[nodiscard]] bool file_exists_regular(const std::filesystem::path& p) noexcept {
+[[nodiscard]] bool file_exists_regular(const std::filesystem::path& p) {
     std::error_code ec;
     return !p.empty() && std::filesystem::is_regular_file(p, ec) && !ec;
 }

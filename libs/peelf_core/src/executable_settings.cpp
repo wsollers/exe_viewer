@@ -417,11 +417,19 @@ struct PeResourceWalkResult {
 }
 
 [[nodiscard]] std::optional<bool> parse_xml_bool(std::string_view val) noexcept {
-    const std::string low = ascii_lower(trim_ascii(val));
-    if (low == "true" || low == "1" || low == "yes") {
+    const std::string_view trimmed = trim_ascii(val);
+    const auto iequals = [](std::string_view a, std::string_view lower_b) noexcept -> bool {
+        if (a.size() != lower_b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            const char c = (a[i] >= 'A' && a[i] <= 'Z') ? static_cast<char>(a[i] - 'A' + 'a') : a[i];
+            if (c != lower_b[i]) return false;
+        }
+        return true;
+    };
+    if (iequals(trimmed, "true") || trimmed == "1" || iequals(trimmed, "yes")) {
         return true;
     }
-    if (low == "false" || low == "0" || low == "no") {
+    if (iequals(trimmed, "false") || trimmed == "0" || iequals(trimmed, "no")) {
         return false;
     }
     return std::nullopt;
@@ -1949,10 +1957,37 @@ void append_stamp_json(
 bool is_sensitive_environment_variable(
     std::string_view key,
     std::string_view raw_value) noexcept {
-    const std::string low_key = ascii_lower(trim_ascii(key));
-    if (low_key.empty()) {
+    const std::string_view trimmed_key = trim_ascii(key);
+    if (trimmed_key.empty()) {
         return false;
     }
+
+    const auto lower_ch = [](char c) noexcept -> char {
+        return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    };
+    const auto icontains = [&](std::string_view hay, std::string_view lower_needle) noexcept -> bool {
+        if (lower_needle.empty()) return true;
+        if (hay.size() < lower_needle.size()) return false;
+        const std::size_t limit = hay.size() - lower_needle.size();
+        for (std::size_t i = 0; i <= limit; ++i) {
+            bool ok = true;
+            for (std::size_t j = 0; j < lower_needle.size(); ++j) {
+                if (lower_ch(hay[i + j]) != lower_needle[j]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return true;
+        }
+        return false;
+    };
+    const auto istarts_with = [&](std::string_view hay, std::string_view lower_prefix) noexcept -> bool {
+        if (hay.size() < lower_prefix.size()) return false;
+        for (std::size_t i = 0; i < lower_prefix.size(); ++i) {
+            if (lower_ch(hay[i]) != lower_prefix[i]) return false;
+        }
+        return true;
+    };
 
     static constexpr std::array<std::string_view, 18> kSensitiveSubstrings = {
         "secret",
@@ -1976,7 +2011,7 @@ bool is_sensitive_environment_variable(
     };
 
     for (const std::string_view pat : kSensitiveSubstrings) {
-        if (low_key.find(pat) != std::string::npos) {
+        if (icontains(trimmed_key, pat)) {
             return true;
         }
     }
@@ -1989,29 +2024,26 @@ bool is_sensitive_environment_variable(
         "npm_token",
         "openai_",
     };
-    // Allow non-secret informational GitHub Actions / Azure public region vars only if clearly non-credential?
     // Conservative security posture: redact AWS_*, AZURE_*, GITHUB_*, GH_* by default per roadmap spec.
     for (const std::string_view pfx : kSensitivePrefixes) {
-        if (low_key.starts_with(pfx)) {
+        if (istarts_with(trimmed_key, pfx)) {
             return true;
         }
     }
 
     if (!raw_value.empty()) {
-        const std::string low_val = ascii_lower(raw_value);
         // Credential-bearing URL userinfo `scheme://user:pass@host` or PEM private key header
-        if (low_val.find("-----begin ") != std::string::npos &&
-            low_val.find("private key") != std::string::npos) {
+        if (icontains(raw_value, "-----begin ") &&
+            icontains(raw_value, "private key")) {
             return true;
         }
-        if (const std::size_t scheme = low_val.find("://"); scheme != std::string::npos) {
-            const std::string_view low_sv(low_val);
-            const std::size_t slash = low_sv.find('/', scheme + 3u);
+        if (const std::size_t scheme = raw_value.find("://"); scheme != std::string_view::npos) {
+            const std::size_t auth_start = scheme + 3u;
+            const std::size_t slash = raw_value.find('/', auth_start);
             const std::string_view authority =
-                low_sv.substr(scheme + 3u,
-                              slash == std::string_view::npos
-                                  ? std::string_view::npos
-                                  : (slash - (scheme + 3u)));
+                (slash == std::string_view::npos)
+                    ? raw_value.substr(auth_start)
+                    : raw_value.substr(auth_start, slash - auth_start);
             const std::size_t at = authority.find('@');
             const std::size_t colon = authority.find(':');
             if (at != std::string_view::npos && colon != std::string_view::npos && colon < at) {

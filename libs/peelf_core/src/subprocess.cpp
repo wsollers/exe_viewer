@@ -96,7 +96,7 @@ template <typename CharT>
 }
 
 #if !defined(_WIN32)
-[[nodiscard]] bool is_regular_executable(const std::filesystem::path& p) noexcept {
+[[nodiscard]] bool is_regular_executable(const std::filesystem::path& p) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(p, ec) || ec) {
         return false;

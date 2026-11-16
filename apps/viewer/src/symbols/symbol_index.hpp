@@ -70,10 +70,10 @@ public:
     [[nodiscard]] std::vector<std::string> libraries() const;
 
     [[nodiscard]] const SymbolRecord* find_by_name(std::string_view name) const noexcept;
-    [[nodiscard]] const SymbolRecord* find_containing_address(std::uint64_t virtual_address) const noexcept;
+    [[nodiscard]] const SymbolRecord* find_containing_address(std::uint64_t virtual_address) const;
     [[nodiscard]] const SymbolRecord* find_exact_address(std::uint64_t virtual_address) const noexcept;
     [[nodiscard]] const SymbolRecord* find_nearest_preceding_address(std::uint64_t virtual_address,
-                                                                     std::uint64_t max_distance) const noexcept;
+                                                                     std::uint64_t max_distance) const;
 
 private:
     struct AddressSpan {

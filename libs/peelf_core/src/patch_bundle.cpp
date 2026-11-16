@@ -38,14 +38,14 @@ namespace {
     return "Unknown";
 }
 
-[[nodiscard]] Format parse_format_token(std::string_view s) noexcept {
+[[nodiscard]] Format parse_format_token(std::string_view s) {
     const std::string low = to_lower_ascii(s);
     if (low == "pe") return Format::PE;
     if (low == "elf") return Format::ELF;
     return Format::Unknown;
 }
 
-[[nodiscard]] Architecture parse_arch_token(std::string_view s) noexcept {
+[[nodiscard]] Architecture parse_arch_token(std::string_view s) {
     const std::string low = to_lower_ascii(s);
     if (low == "x86") return Architecture::X86;
     if (low == "x86-64" || low == "x86_64" || low == "amd64") return Architecture::X86_64;

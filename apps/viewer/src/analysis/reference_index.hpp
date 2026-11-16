@@ -85,6 +85,7 @@ public:
     void reset_for_progressive_scan(std::size_t total_executable_bytes, bool scanning = true);
     void append_chunk(ReferenceScanChunk&& chunk);
     void set_scanning(bool scanning) noexcept;
+    void mark_failed_incomplete() noexcept;
 
     [[nodiscard]] std::span<const Reference> records() const noexcept { return records_; }
     [[nodiscard]] std::vector<const Reference*> incoming(std::uint64_t address, std::uint64_t size = 1) const;
@@ -155,7 +156,7 @@ private:
 class AsyncReferenceScanner {
 public:
     AsyncReferenceScanner() = default;
-    ~AsyncReferenceScanner();
+    ~AsyncReferenceScanner() noexcept;
 
     AsyncReferenceScanner(const AsyncReferenceScanner&) = delete;
     AsyncReferenceScanner& operator=(const AsyncReferenceScanner&) = delete;
@@ -171,7 +172,7 @@ public:
     void pause();
     void resume(ReferenceIndex& target);
     void scan_full(ReferenceIndex& target);
-    void cancel(ReferenceIndex* target = nullptr);
+    void cancel(ReferenceIndex* target = nullptr) noexcept;
 
     // Drains completed background chunks into `target` on the caller's thread.
     // Returns the number of chunks merged.
@@ -183,18 +184,24 @@ public:
     [[nodiscard]] bool is_scanning() const noexcept { return active_.load(std::memory_order_acquire) && !paused_.load(std::memory_order_acquire); }
     [[nodiscard]] bool is_paused() const noexcept { return paused_.load(std::memory_order_acquire); }
     [[nodiscard]] bool has_resumable_work() const noexcept;
+    [[nodiscard]] bool has_failed() const noexcept;
+    [[nodiscard]] std::string last_error() const;
 
 private:
     void worker_loop(std::stop_token stop, std::uint64_t generation);
+    void record_worker_failure(std::uint64_t generation, bool is_oom, const char* what_msg) noexcept;
 
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
     ReferenceScanJob job_;
     std::deque<ReferenceScanChunk> pending_chunks_;
+    std::string last_error_;
     std::size_t desired_budget_ = 0;
     std::size_t job_scanned_bytes_ = 0;
     std::size_t job_total_bytes_ = 0;
     bool job_finished_ = true;
+    bool worker_failed_ = false;
+    bool pending_failure_incomplete_ = false;
     std::uint64_t generation_ = 0;
     std::atomic<bool> active_{false};
     std::atomic<bool> paused_{false};
