@@ -1,0 +1,587 @@
+# PE / ELF Explorer — User Guide
+
+Welcome to the **PE / ELF Explorer** (`peelf_viewer`) user guide. PE / ELF Explorer is a cross-platform C++23 static binary analyzer, disassembler, decompiler, transactional binary patcher, read-only live process inspector, offline crash-dump analyzer, opt-in debugger, and CI/CD security auditor built on Dear ImGui (docking) + Vulkan 1.2+ with a zero-Vulkan `--headless` CLI.
+
+Related documentation:
+- **[System Architecture (`docs/ARCHITECTURE.md`)](ARCHITECTURE.md)** — Module boundaries, unified `IBinaryImage`, threading, and Vulkan 2-frames-in-flight design
+- **[Roadmap & C++23 Design (`docs/ROADMAP_DESIGN.md`)](ROADMAP_DESIGN.md)** — Validated `WU-19a..WU-19d` C++23 conformance & `WU-21..WU-28` next-gen specifications
+- **[Project Overview (`README.md`)](../README.md)** — Repository summary and quick build overview
+
+---
+
+## Table of Contents
+
+1. [Quick Start, Supported Platforms, Build Presets & External Tool Setup](#1-quick-start-supported-platforms-build-presets--external-tool-setup)
+2. [Workspace Navigation, Jump Bar, Synchronized Views, Bookmarks & `.peproj` v2 Sessions](#2-workspace-navigation-jump-bar-synchronized-views-bookmarks--peproj-v2-sessions)
+3. [Symbols, Demangling, Windows PDB/DIA & ELF DWARF v2–v5 Sidecars](#3-symbols-demangling-windows-pdbdia--elf-dwarf-v2v5-sidecars)
+4. [Background Cross-References (`ReferenceIndex`), Jump Tables & `Strings` Browser](#4-background-cross-references-referenceindex-jump-tables--strings-browser)
+5. [Interactive Call Graph, Function CFG Canvas & Decompilation](#5-interactive-call-graph-function-cfg-canvas--decompilation)
+6. [Static & Live `Structure View` (Built-In Schemas, C Structs, Arrays & Pointers)](#6-static--live-structure-view-built-in-schemas-c-structs-arrays--pointers)
+7. [Static & Live `Dependencies` Explorer](#7-static--live-dependencies-explorer)
+8. [Binary Patching, Interactive Assembly Preview & `.pepatch.json` Bundles](#8-binary-patching-interactive-assembly-preview--pepatchjson-bundles)
+9. [Binary Comparison (`Binary Diff`) & Disk-vs-Live-RAM Hook Detection](#9-binary-comparison-binary-diff--disk-vs-live-ram-hook-detection)
+10. [Read-Only Live Process Inspection, VMMap Visual RAM Explorer, Memory Search & Process Internals](#10-read-only-live-process-inspection-vmmap-visual-ram-explorer-memory-search--process-internals)
+11. [Offline Crash Dump Triage (Windows `.dmp` Minidumps & Linux ELF `ET_CORE`)](#11-offline-crash-dump-triage-windows-dmp-minidumps--linux-elf-et_core)
+12. [Opt-In `IDebugSession` Debugger (Stepping, Software/Hardware Breakpoints & Watchpoints)](#12-opt-in-idebugsession-debugger-stepping-softwarehardware-breakpoints--watchpoints)
+13. [Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`)](#13-formalized-binskim--checksec-security-audit-pe1001pe1008-elf2001elf2008-live3001live3003)
+14. [Headless CLI & CI/CD Automation (`--headless`, JSON, SARIF 2.1.0 & GitHub Actions)](#14-headless-cli--cicd-automation---headless-json-sarif-210--github-actions)
+15. [Troubleshooting & Best Practices](#15-troubleshooting--best-practices)
+
+---
+
+## 1. Quick Start, Supported Platforms, Build Presets & External Tool Setup
+
+### 1.1 Supported Formats, Hosts & Target Architectures
+
+| Dimension | Supported Coverage |
+|---|---|
+| **Host OS** | Windows 10/11 x64 (MSVC 2022) and Linux / WSL2 Ubuntu 22.04+ (Clang 18) |
+| **Static Binary Formats** | **PE32 / PE32+** (`.exe`, `.dll`, `.sys`, `.ocx`, delay-load/bound/forwarded/ordinal tables, `.pdata`, CLR, Authenticode) and **ELF32 / ELF64** little- & big-endian (`ET_EXEC`, `ET_DYN`, `ET_REL`, `SHN_XINDEX`/`PN_XNUM`, sectionless `PT_DYNAMIC`-only ELFs) |
+| **Offline Crash Dumps** | Windows Minidumps (`.dmp` `MDMP`) and Linux ELF Core Dumps (`ET_CORE`, 32/64-bit LE/BE) |
+| **Target Architectures** | `x86` (32-bit), `x86_64`, `ARM` (ARM32 + Thumb-2), `ARM64` (`AArch64`), `RISC-V` (`RV32`/`RV64`), `MIPS` (`MIPS32`/`MIPS64` LE/BE), `PowerPC` (`PPC32`/`PPC64` LE/BE) |
+
+> **WSL2 Filesystem Performance & Hygiene**: When working on WSL2, always keep your repository checkout, CMake `out/build/*` trees, `.peproj` journals, and Ghidra caches inside native Linux ext4 paths (for example `/home/<user>/projects/exe_viewer`), **never** on `/mnt/c`.
+
+### 1.2 CMake Presets & Build Commands
+
+Third-party libraries (Dear ImGui docking, GLFW, Capstone, AsmJit/AsmTK, nativefiledialog-extended, and GoogleTest) are fetched and pinned via CMake `FetchContent` (`third_party/dependencies.cmake`). Every preset enforces zero warnings (`-Werror` on Clang/GCC; `/W4 /WX /FS` on MSVC).
+
+#### Linux / WSL2 (Clang 18 + Ninja)
+```bash
+# 1. Debug build + full 326-test verification
+cmake --preset clang18-debug
+cmake --build --preset clang18-debug
+ctest --preset clang18-debug
+
+# 2. AddressSanitizer + UndefinedBehaviorSanitizer validation
+cmake --preset clang18-asan-ubsan
+cmake --build --preset clang18-asan-ubsan
+ctest --preset clang18-asan-ubsan
+
+# 3. Optimized Release build
+cmake --preset clang18-release
+cmake --build --preset clang18-release
+
+# 4. Headless CLI-only build (no Vulkan SDK, X11/Wayland, or GTK3 required)
+cmake -S . -B out/build/headless-cli -G Ninja \
+  -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+  -DCMAKE_BUILD_TYPE=Release -DPEELF_BUILD_GUI=OFF
+cmake --build out/build/headless-cli
+```
+
+#### Windows x64 (Visual Studio 2022 + LunarG Vulkan SDK)
+```powershell
+cmake --preset msvc-x64
+cmake --build --preset msvc-x64-release
+ctest --preset msvc-x64-release
+```
+
+#### Launch Interactive GUI or Headless CLI
+```bash
+# Interactive Vulkan GUI (loads libpeelf_gui.so / peelf_gui.dll dynamically)
+./out/build/clang18-debug/apps/viewer/peelf_viewer
+./out/build/clang18-debug/apps/viewer/peelf_viewer /bin/ls
+
+# Vulkan-free Headless CLI (never loads peelf_gui or touches GPU drivers)
+./out/build/clang18-debug/apps/viewer/peelf_viewer --headless /bin/ls
+./out/build/clang18-debug/apps/viewer/peelf_viewer --help
+```
+
+### 1.3 External Tool Setup (Optional Providers)
+
+PE / ELF Explorer works out of the box with zero external runtime tools (built-in `StructuredPseudoCDecompiler`, Capstone disassembler, `AsmTK` x86/x64 assembler, DWARF v2–v5 reader, and native layout engine). Configuring optional tools unlocks richer capabilities:
+
+1. **Headless Ghidra (`analyzeHeadless`) — High-Fidelity Decompilation**:
+   - Install **JDK 21 LTS** (`sudo apt install openjdk-21-jdk-headless` on Ubuntu/WSL2 or Eclipse Temurin 21 on Windows) and unpack an official [Ghidra release](https://github.com/NationalSecurityAgency/ghidra/releases).
+   - Export `GHIDRA_INSTALL_DIR` (or add `<ghidra>/support` to `PATH`), or set the path inside the **Decompile** panel settings:
+     ```bash
+     export GHIDRA_INSTALL_DIR="$HOME/tools/ghidra_11.3.1_PUBLIC"
+     ```
+   - `GhidraDecompiler` maintains **persistent LRU-reusable headless workspaces** (`ws-<sha256_prefix>` under `$XDG_CACHE_HOME/peelf_explorer/ghidra_workspaces` or `%LOCALAPPDATA%\peelf_explorer\ghidra_workspaces`, strictly avoiding `/mnt/c`) so subsequent function clicks reuse the analyzed Ghidra database in milliseconds and cache results in `DecompileCache`.
+2. **LLVM Machine Code Playground (`llvm-mc`) — Non-x86 Assembly Patching**:
+   - `AsmTK` assembles `x86` and `x86_64` in-process with zero external tools.
+   - Installing `llvm` (`sudo apt install llvm-18` or LLVM for Windows on `PATH` so `llvm-mc` / `llvm-mc-18` is discoverable) enables interactive assembly patching across `ARM`, `Thumb-2`, `ARM64`, `RISC-V 32/64`, `MIPS 32/64`, and `PowerPC 32/64`.
+3. **Graphviz (`dot`) — Static Graph Export**:
+   - Interactive `Flow Graph` cards render natively in ImGui. Installing `graphviz` (`dot` on `PATH`) additionally enables Graphviz coordinate layout and SVG/PNG/BMP export.
+4. **Symbol Discovery Paths, Symbol Servers & `debuginfod`**:
+   - **Windows PDB/DIA**: Visual Studio 2022 provides `msdia140.dll` (auto-discovered even without `regsvr32`). Pre-populated local symbol caches referenced in `_NT_SYMBOL_PATH` (for example `srv*C:\Symbols*https://msdl.microsoft.com/download/symbols`) or sibling `.pdb` paths can be selected directly via **File > Open Debug Symbols...**.
+   - **Linux Split Debug / `debuginfod`**: The DWARF loader automatically searches `.gnu_debuglink` (sibling directory, `.debug/`, and `/usr/lib/debug/...`) and `.note.gnu.build-id` (`/usr/lib/debug/.build-id/xx/yyyy....debug`, plus `$HOME/.cache/debuginfod_client/<buildid>/debuginfo` populated when `DEBUGINFOD_URLS` tools have cached symbols).
+
+---
+
+## 2. Workspace Navigation, Jump Bar, Synchronized Views, Bookmarks & `.peproj` v2 Sessions
+
+```mermaid
+flowchart LR
+    open["File > Open / Recent / CLI"] --> model["BinaryModel + IBinaryImage"]
+    proj["File > Open Analysis Project<br/>(.peproj v2 + SHA-256 check)"] --> model
+    model --> nav["ViewerSelection + Jump Bar"]
+    nav --> hex["Hex View<br/>(Synced Offsets & Patches)"]
+    nav --> dis["Disassembly & Flow Graph"]
+    nav --> str["Structure & Details"]
+    bmk["Bookmarks (Ctrl+B) &<br/>Comments / Renames"] --> save["Atomic .peproj v2 Save +<br/>Off-/mnt/c Recovery Journal"]
+```
+
+### 2.1 Opening Files & Navigating the Workspace
+- **Open a Binary**: Press **`Ctrl+O`** (**File > Open...**), pick an entry under **File > Recent Binaries**, or pass a file path on the command line.
+- **Structure Tree & Details**: The left **Structure** panel presents a unified hierarchy (`File/Image -> Headers -> Sections -> Segments -> Imports -> Exports -> Symbols -> Relocations / Notes / Dynamic / Debug`). Clicking any node populates **Details** and synchronizes **Hex View** and **Disassembly** when the item maps to bytes or code.
+- **Address / Offset Jump Bar**: At the top of the workspace, enter a hexadecimal virtual address (e.g. `0x401000` or `140001000`) in the **Jump** input box and click **Jump** (or press `Enter`). Use **Hex View**'s own address/offset box to jump directly by raw file offset or live virtual address.
+- **Synchronized Hex & Disassembly Views**:
+  - Selecting an instruction in **Disassembly** highlights its exact encoded byte span in **Hex View**.
+  - Clicking a byte in **Hex View** updates `ViewerSelection` and disassembles from that mapped address when inside an executable section/region.
+  - Toggle **View > Interface scale** (`100%`, `125%`, `150%`, `200%`) or **View > Reset Layout** at any time.
+
+### 2.2 Keyboard Shortcuts & Menu Reference
+
+| Shortcut | Menu Path / Context | Action |
+|---|---|---|
+| **`Ctrl+O`** | `File > Open...` | Open a static PE or ELF binary |
+| **`Ctrl+P`** | `File > Attach to Process...` | Open the read-only live process attach dialog |
+| **`Ctrl+Shift+S`** | `File > Save Patched As...` | Write staged patches to a new binary file (never overwrites original) |
+| **`Ctrl+F5`** | `File > Refresh Process Memory Map` | Re-enumerate live process regions and modules |
+| **`Alt+Left`** / **`Backspace`** | `Navigate > Back` | Navigate backward in address selection history |
+| **`Alt+Right`** / **`Shift+Backspace`** | `Navigate > Forward` | Navigate forward in address selection history |
+| **`Ctrl+B`** | `Navigate > Bookmark selection` | Toggle a named bookmark at the active VA / file offset |
+| **`X`** | `Navigate > References & Notes` | Focus incoming/outgoing cross-references and inline notes for current VA |
+| **`F5`** *(static / non-paused)* | `Navigate > Decompile selection` | Decompile the function containing the current selection |
+| **`F5`** *(debugger paused)* | `Inspect > Continue` | Resume execution in an active opt-in `IDebugSession` |
+| **`F9`** | `Inspect > Toggle Breakpoint at Selection` | Set or remove a software breakpoint at the selected VA |
+| **`F10`** | `Inspect > Step Over` | Step over the current instruction in an active `IDebugSession` |
+| **`F11`** | `Inspect > Step Into` | Step into a single instruction in an active `IDebugSession` |
+| **`Shift+F11`** | `Inspect > Step Out` | Execute until the current frame returns (`IDebugSession`) |
+| **`Space`** *(in Disasm / Graph)* | `Analyze > Call graph` / `Disassembly` | Toggle focus between linear **Disassembly** and **Flow Graph** |
+| **`Enter`** *(in Disasm / Graph)* | Canvas / Table | Follow the direct branch or call target of the selected instruction |
+| **`Alt+F4`** | `File > Exit` | Close PE / ELF Explorer (note: `Esc` closes popups only and never exits) |
+
+### 2.3 Bookmarks (`Ctrl+B`), Annotations & `.peproj` v2 Analysis Sessions
+1. **Bookmarks & Notes**:
+   - Press **`Ctrl+B`** (or click **Bookmark** next to the Jump bar) to bookmark any VA. View, rename, filter, or delete bookmarks in **References & Notes** (`X`).
+   - Rename functions/labels (`N` / **References & Notes** rename box) and attach inline comments; renamed symbols propagate immediately into **Disassembly**, **Flow Graph**, **Strings**, and **Decompile**.
+2. **Saving & Reopening `.peproj` v2 Projects**:
+   - Choose **File > Save Analysis Project...** to write a `.peproj` v2 JSON session containing:
+     - Cryptographic target identity: **`source_sha256`** (64-hex SHA-256) + **`source_size`**,
+     - Both `source_path` and **`relative_source`** (relative to the `.peproj` directory so projects can be moved across machines or git checkouts),
+     - User symbol renames, comments, bookmarks, pinned **Structure View** bindings, and staged patch intervals.
+   - Atomic persistence writes `<name>.peproj.tmp` and renames it atomically so power loss never truncates an existing `.peproj`.
+3. **Missing Binary Relocation & SHA-256 Mismatch Modals**:
+   - If you move a folder and open `.peproj` via **File > Open Analysis Project...**, `relative_source` resolves automatically. If the binary was moved elsewhere, the **Relocate Missing Binary** modal prompts you to browse to its new location.
+   - If the target binary on disk was rebuilt or modified (`SHA-256` or byte size differs), a **Binary Identity Mismatch Warning** modal displays both hashes and asks for confirmation before rebasing annotations.
+4. **Crash-Recovery Autosave Journals**:
+   - Unsaved annotations, bookmarks, structure bindings, and staged patches are periodically journaled to an off-`/mnt/c` recovery file (`$XDG_STATE_HOME/peelf_explorer/recovery` or `%LOCALAPPDATA%\peelf_explorer\recovery`). After an unexpected termination, reopening the project offers one-click journal recovery; clean saves remove the journal automatically.
+
+---
+
+## 3. Symbols, Demangling, Windows PDB/DIA & ELF DWARF v2–v5 Sidecars
+
+### 3.1 Multi-Language Symbol Demangling
+Toggle **View > Demangle symbols** (enabled by default) to decode mangled compiler symbols across **Symbols**, **Functions & Names**, **Imports**, **Exports**, **Disassembly**, **Flow Graph**, **Threads & Stack**, and **Decompile**:
+- **Itanium C++ ABI** (`_Z...`) — GCC / Clang Linux, MinGW, and embedded toolchains
+- **Rust v0 (`_R...`) & Legacy Rust (`_ZN...17h<hex>E`)** — Clean crate/module/trait paths without trailing hash noise
+- **MSVC C++ (`?...`)** — Visual C++ decorated functions, constructors/destructors, templates, and vtables
+
+### 3.2 Windows CodeView / PDB & RSDS GUID+Age Verification
+1. When opening a PE executable or DLL containing an `IMAGE_DEBUG_DIRECTORY` (`IMAGE_DEBUG_TYPE_CODEVIEW` `RSDS` record), PE / ELF Explorer extracts the embedded **PDB GUID**, **Age**, and `.pdb` path.
+2. Sibling and configured paths are checked automatically, or you can load an explicit `.pdb` via **File > Open Debug Symbols...**.
+3. **Cryptographic/Structural MSF 7.00 Verification**: Before merging symbols, `debug_symbols.cpp` parses the PDB's MSF 7.00 superblock, PDB Info Stream (Stream 1), and DBI Stream (Stream 3) to verify that the **GUID and Age match** the binary's `RSDS` record, rejecting mismatched or corrupt `.pdb` files with an explicit diagnostic in **Log**.
+4. On Windows hosts with the DIA SDK (`msdia140.dll`), public symbols, functions, parameters, and user-defined structs/unions (`UDT`s) populate `SymbolIndex` and `StructureCatalog`—and automatically rebase onto live ASLR module base addresses when attached to a running process.
+
+### 3.3 Cross-Platform ELF & MinGW DWARF v2–v5 + Separate Debug Sidecars
+On both Windows and Linux hosts without external libraries, the built-in DWARF v2–v5 reader (`peelf/dwarf.hpp`) parses:
+- `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line_str`, `.debug_str_offsets` (`DW_FORM_strx*`), `.debug_addr` (`DW_FORM_addrx*`), `.debug_line` (source file + line numbers), `.debug_ranges`, and DWARF v5 `.debug_rnglists` (`DW_RLE_*`).
+- Recovering function boundaries (`DW_TAG_subprogram`), variables, formal parameters, source file:line mappings, and composite `DW_TAG_structure_type` / `DW_TAG_union_type` layouts.
+- **Automatic Split-Debug Sidecar Discovery**:
+  - `.gnu_debuglink` — locates sibling `<file>.debug`, `<dir>/.debug/<file>.debug`, or `/usr/lib/debug/<dir>/<file>.debug` and verifies its IEEE **CRC32** checksum.
+  - `.note.gnu.build-id` — resolves `/usr/lib/debug/.build-id/<ab>/<cdef...>.debug` and cached `debuginfod` paths, or load any detached `.debug` file manually via **File > Open Debug Symbols...**.
+
+---
+
+## 4. Background Cross-References (`ReferenceIndex`), Jump Tables & `Strings` Browser
+
+### 4.1 Resumable Background Cross-Reference Scanner
+Large binaries (tens or hundreds of megabytes of `.text`) never freeze the UI or silently stop at an arbitrary byte limit:
+- `AsyncReferenceScanner` disassembles executable sections/regions on a cancellable background `std::jthread` in **256 KiB slices**, publishing sorted incoming (`to -> from`) and outgoing (`from -> to`) xref tables.
+- Open **References & Notes** (**Navigate > References & Notes** or press **`X`** on any instruction, symbol, or data item) to monitor scan progress (`Scanned X / Y MiB (Z%)`), **Pause**, **Resume**, or **Rescan**.
+- Each xref displays its source VA, target VA, resolved symbol/section + offset, reference kind (`Call`, `ConditionalJump`, `UnconditionalJump`, `DataRead`, `DataWrite`, `AddressLoad`), **Confidence** (`Exact`, `IndirectSlot`, `HeuristicTable`), and **Evidence** tag.
+
+### 4.2 Multi-Arch Indirect-Branch & Switch Jump-Table Recovery
+Beyond direct PC-relative calls and branches, `ReferenceIndex` recovers indirect control-flow targets and wires them directly into **References** and **Flow Graph**:
+- **x86 / x86_64**: RIP-relative and PIC base+i32 offset switch jump tables (`lea rdx, [rip+tbl]; movsxd rax, [rdx+rcx*4]; add rax, rdx; jmp rax`), absolute pointer jump tables, and IAT / GOT indirect `call [rip+disp]` / `jmp [rip+disp]` slots.
+- **ARM32 / Thumb-2**: `tbb [pc, rn]` and `tbh [pc, rn, lsl #1]` byte/halfword branch tables.
+- **ARM64 (`AArch64`)**: `adr`/`adrp` + `ldrb`/`ldrh`/`ldrsw` + `add` + `br` PC-relative switch tables and GOT page loads.
+
+### 4.3 Xref-Linked `Strings` Browser
+Open **Strings** (**Navigate > Strings** or **View > Strings**) to inspect literals extracted across `.rodata`, `.rdata`, `.data`, or live readable regions:
+- **Encodings**: Automatic classification of `ASCII`, `UTF-8` multi-byte sequences, `UTF-16LE` (Windows wide strings), and `UTF-16BE` (big-endian targets).
+- **Filtering & Sorting**: Filter by substring, VA, encoding dropdown (`All Encodings`, `ASCII`, `UTF-8`, `UTF-16LE`, `UTF-16BE`), or containing section/region; sort by `Address`, `Section`, `Encoding`, `Length`, **`XRefs` count**, or `String` text.
+- **One-Click Xref Triage**: Sort descending by **`XRefs`** to spot heavily referenced error messages, registry keys, URLs, or format strings; click a row to jump **Hex View** to the string and inspect every referencing function in **References & Notes**.
+
+---
+
+## 5. Interactive Call Graph, Function CFG Canvas & Decompilation
+
+```mermaid
+flowchart LR
+    sel["Select Function / Press F5"] --> cfg["FunctionIndex + Capstone CFG"]
+    cfg --> canvas["Interactive Flow Graph Canvas<br/>(Pan / Zoom / Drag / Follow Branch)"]
+    sel --> cache{"DecompileCache Hit?"}
+    cache -->|Yes| ui["Decompile Panel<br/>(Line <-> VA Sync)"]
+    cache -->|No| ghidra["Ghidra Persistent Workspace<br/>(analyzeHeadless + PeelfDecompile)"]
+    ghidra -->|Fallback if absent| pseudo["Built-in StructuredPseudoC<br/>(Zero External Deps)"]
+    ghidra --> ui
+    pseudo --> ui
+```
+
+### 5.1 Interactive `Flow Graph` (Call Fan-Out & Basic-Block CFG)
+Open **Flow Graph** (**Analyze > Call graph** or press **`Space`** inside **Disassembly**):
+- **Modes**: Inspect loaded entry/export **Call Fan-Out** (including resolved PE CRT->`main`/`WinMain`, PDB symbols, and ELF `_start -> __libc_start_main -> main` + GOT/PLT targets) or switch to **Function CFG** to view basic blocks, fallthroughs, true/false conditional edges, and recovered switch jump-table edges.
+- **Canvas Controls**:
+  - **Mouse Wheel**: Smooth zoom around cursor (`Fit`, `100%`, and **Reset Layout** buttons in toolbar).
+  - **Middle-Mouse Drag** (or background drag): Pan across the canvas.
+  - **Left-Click / Drag Node Card**: Select block (synchronizing **Hex View**, **Disassembly**, and **Details**) or reposition cards interactively with live edge rerouting.
+  - **`Up` / `Down` & `Enter`** (or double-click): Walk instructions/nodes and dive into direct branch/call targets; use **`Alt+Left`** (`Backspace`) to pop back.
+
+### 5.2 Decompilation (`F5`) — Built-In Pseudo-C vs. Persistent Headless Ghidra
+Select any function or instruction and press **`F5`** (**Navigate > Decompile selection**):
+1. **Backend Selection**:
+   - **Auto (Default)**: Uses **Headless Ghidra** (`GhidraDecompiler`) when `GHIDRA_INSTALL_DIR` / `analyzeHeadless` is configured, falling back automatically to the built-in **`StructuredPseudoCDecompiler`** (or optional `RetDec` / `Binary Ninja` bridges).
+   - Switch backends explicitly in the **Decompile** toolbar dropdown (`Auto`, `Ghidra`, `Structured Pseudo-C`, `Annotated Code`, `RetDec`, `Binary Ninja`).
+2. **Persistent Workspaces & `DecompileCache`**:
+   - First-time Ghidra decompilation of a binary creates a keyed headless project (`ws-<sha256_prefix>`) in your local cache directory; decompiling additional functions in the same binary reuses the analyzed project (`-noanalysis`) and stores `(binary_revision, backend, function_va)` results in `DecompileCache` for instant recall.
+   - Staging or undoing a binary patch bumps `edit_revision`, automatically invalidating stale cached pseudo-C so re-pressing `F5` reflects patched instructions.
+3. **Bidirectional Line <-> Disassembly Synchronization**:
+   - Clicking a C statement in **Decompile** highlights its originating instruction address in **Disassembly** and **Hex View**; clicking an instruction in **Disassembly** highlights the corresponding pseudo-C line(s).
+   - Recovered parameter/struct types (`DataTypeRecord`) appear in the **Data Structures** drawer (**View > Data Structures**) and feed **Structure View**.
+
+---
+
+## 6. Static & Live `Structure View` (Built-In Schemas, C Structs, Arrays & Pointers)
+
+Open **Structure View** (**Navigate > Structure** or **View > Structure View**) to overlay strongly typed layouts onto raw static file offsets or live process virtual addresses:
+
+1. **Built-In Format & OS Runtime Schemas (`StructureCatalog`)**:
+   - **PE Header**: `IMAGE_DOS_HEADER`, `IMAGE_NT_HEADERS32`, `IMAGE_NT_HEADERS64`, `IMAGE_SECTION_HEADER`
+   - **Win32 Runtime**: `PEB32`, `PEB64`, `RTL_USER_PROCESS_PARAMETERS64`, `TEB64`
+   - **ELF Header**: `Elf32_Ehdr`, `Elf64_Ehdr`, `Elf64_Phdr`, `Elf64_Shdr`
+   - **Linux Runtime**: `r_debug64`, `link_map64`
+2. **Custom C-Struct Definitions & Debug Types (`Debug / User` Category)**:
+   - Any C/C++ `struct` or `union` compiled with `-g` (ELF/MinGW DWARF v2–v5) or `/Zi` (Windows PDB/DIA), or recovered from C headers during Ghidra decompilation, is automatically imported into the **`Debug / User`** schema group with exact field offsets, primitive/array/bitfield sizes, and pointee type names.
+   - Browse all discovered composite layouts at any time via **View > Data Structures**.
+3. **Address Mode, Endianness, Array Stride & Pointer Dereferencing**:
+   - Choose **`Virtual Addr`** or **`File Offset`** on static files (live processes read **`Live VA`** directly through `read_memory_tolerant`, rendering unreadable guard pages cleanly without failing the rest of the struct).
+   - Click **`Use Selection`** (or enable **`Sync`** to follow `ViewerSelection` live as you click in Hex/Disassembly).
+   - Set **`Count`** (`1..64`) to decode contiguous arrays of structs (e.g., an array of `IMAGE_SECTION_HEADER` or `Elf64_Phdr` entries using each schema's exact byte stride), and override **`Endian`** (`Auto` / `Little` / `Big`) or **`Ptr`** (`Auto` / `32-bit` / `64-bit`) when inspecting cross-architecture blobs.
+   - **Pointer Following**: Fields typed as pointers display a clickable target VA badge (`-> 0x... [preview]`). Left-click to jump to that VA, or right-click a pointer field and choose **`Dereference as <PointeeStruct>`** to re-anchor **Structure View** at the pointee address with its target type!
+4. **Persisted Structure Bindings**:
+   - Give an overlay an optional label and click **`Pin Binding`**. Pinned bindings appear in the **Pinned Structure Bindings** strip for one-click recall and are saved inside `.peproj` v2 session files.
+
+---
+
+## 7. Static & Live `Dependencies` Explorer
+
+Open **Dependencies** (**View > Dependencies**) to audit transitive shared-library trees and symbol bindings across both static disk images and attached live processes:
+
+- **PE Dependency Resolution**:
+  - Parses standard `IMAGE_DIRECTORY_ENTRY_IMPORT`, **Delay-Load** imports (`ImgDelayDescr`), **Bound** imports, ordinal-only imports, and **Forwarded Exports** (`NTDLL.RtlAllocateHeap`).
+  - Recognizes Windows **`api-ms-win-*` and `ext-ms-win-*` virtual API-set contracts** (`VirtualApiSet` badge) so virtual OS redirection DLLs are never misreported as missing files on disk.
+- **ELF Dependency Resolution**:
+  - Parses `PT_INTERP` dynamic loader path, `DT_NEEDED` libraries, `DT_SONAME`, `DT_RPATH`, and `DT_RUNPATH` (recovering dynamic dependencies even on stripped sectionless `PT_DYNAMIC`-only ELFs).
+  - Expands `$ORIGIN` / `${ORIGIN}`, `$LIB`, and `$PLATFORM` tokens accurately relative to each importing binary's directory, plus custom `--search-root` sysroots and optional `LD_LIBRARY_PATH`.
+- **Triage Filters & Symbol Binding Status**:
+  - Adjust **Max Depth** (`1..16`), add semicolon/colon-separated **Extra Search Roots** (ideal for cross-compiled embedded rootfs directories or app bundles), and toggle **`Issues Only`** to immediately isolate:
+    - `Unresolved` (red — missing `.dll`/`.so`),
+    - `ArchitectureMismatch` (orange — e.g. 64-bit binary finding a 32-bit library first on search path),
+    - `UnboundMissingExport` (imported symbol or ordinal absent from target library's export table).
+  - Clicking an imported symbol selects its IAT/GOT call site and shows cross-references in **References & Notes**.
+
+---
+
+## 8. Binary Patching, Interactive Assembly Preview & `.pepatch.json` Bundles
+
+```mermaid
+flowchart LR
+    sel["Select Offset / VA in<br/>Disassembly or Hex View"] --> mode{"Patch Mode"}
+    mode -->|Hex Bytes| hexp["Hex Replacement Preview"]
+    mode -->|Assemble at VA| asmp["AsmTK (x86/x64) or<br/>llvm-mc (ARM/RISC-V/MIPS/PPC)"]
+    hexp --> cfg["Boundary & Before/After<br/>Basic-Block CFG Check"]
+    asmp --> cfg
+    cfg --> stage["Stage into PagedBinaryImage<br/>(Undo / Redo Stack)"]
+    stage --> out1["File > Save Patched As...<br/>(Ctrl+Shift+S)"]
+    stage --> out2["Export / Import<br/>.pepatch.json Bundle"]
+```
+
+> **Safety Invariant**: Original input files on disk are **never** modified in place, and patching controls are strictly disabled when attached to a read-only live process or crash dump.
+
+### 8.1 Staging Raw Hex or Multi-Arch Assembly Patches
+Open **Patch Set** (**Edit > Patch workspace** or **View > Patch Set**) and select a target instruction in **Disassembly** or byte offset in **Hex View**:
+1. **Mode 1 — `Hex Bytes`**:
+   - Enter hex bytes (e.g. `90 90` or `B8 01 00 00 00 C3`; **Edit > Byte input workspace** / `Shellcode` also converts C arrays, escaped `\x..` strings, and hex dumps) and click **`Preview Replacement`**.
+2. **Mode 2 — `Assemble at Selection / VA`**:
+   - Type multi-line assembly instructions directly (using `AsmTK` in-process for `x86`/`x86_64`, or `llvm-mc` for `ARM`, `Thumb`, `ARM64`, `RISC-V`, `MIPS`, and `PowerPC`).
+   - As you type, `Patch Set` encodes instructions against the exact target **Virtual Address** (so relative `call`/`jmp`/`b`/`jal` displacements compute accurately) and shows a **Live Capstone Round-Trip** disassembly + byte count.
+   - **NOP Padding**: Check **`Pad trailing overwritten instruction slack with NOPs`** to automatically emit architecture-appropriate NOPs (`0x90` on x86/x64, `0xD503201F` on ARM64, `0x00000013` on RISC-V, etc.) when your replacement is shorter than the overwritten instruction span, preventing misaligned mid-instruction fallthrough!
+   - Click **`Preview Assembly Patch`** to inspect boundary warnings and a side-by-side **Before vs. After Basic-Block CFG** table.
+3. **Commit to Staging, Undo/Redo & Save As**:
+   - Click **`Stage Patch`** to commit a `PatchTransaction` into `PagedBinaryImage`. Modified bytes highlight immediately in **Hex View** and **Disassembly**.
+   - Use **Edit > Undo patch** / **Edit > Redo patch** to step backward or forward across transactions.
+   - Press **`Ctrl+Shift+S`** (**File > Save Patched As...**) to export the patched executable to a new file path, or **File > Export Patch Report...** for an audit log.
+
+### 8.2 Reusable `.pepatch.json` Patch Bundles
+Share deterministic patches with teammates without redistributing proprietary binaries:
+- **Export**: In **Patch Set**, specify a bundle path (`<binary>.pepatch.json`), description, and click **Export Bundle**. Each hunk records `file_offset`, `virtual_address`, `original_bytes_hex`, `patched_bytes_hex`, optional `asm_source`, plus target `expected_sha256` and `expected_size`.
+- **Import & Pre-Apply Conflict Verification**: Load a `.pepatch.json` bundle to inspect a per-hunk conflict preview (`Ready`, `AlreadyApplied`, `OriginalBytesMismatch`, `OutOfBounds`, or whole-file `SHA-256` mismatch). Applying stages **all** hunks as a single atomic, undoable `PatchTransaction`—if any hunk conflicts, zero bytes are mutated.
+
+---
+
+## 9. Binary Comparison (`Binary Diff`) & Disk-vs-Live-RAM Hook Detection
+
+Open **Binary Diff** via **File > Compare With Binary...** (static A vs. static B) or **File > Compare Active Live Module vs. Disk** (live in-memory module vs. its backing `.exe`/`.dll`/`.so` on disk):
+
+1. **Cancellable Background Diffing**:
+   - Diff jobs run asynchronously on `AsyncBinaryDiffController` (`std::jthread` + `std::stop_token`) so comparing multi-megabyte builds keeps the UI responsive and supports instant **Cancel** or re-selection.
+2. **Structural & 3-Tier Relocation-Tolerant Function Diffing**:
+   - Compares **Headers** (entry point, image base, security flags, timestamps), **Sections** (size, entropy/byte delta, permission changes), **Imports**, and **Exports**.
+   - Matches functions across builds in 3 tiers: (1) Exact symbol/export name, (2) Entry VA/RVA, and (3) **Relocation-normalized byte signature**—classifying functions as `Identical`, **`IdenticalRelocated`** (code moved addresses between builds, only fixup slots changed), `Modified`, `Added`, or `Removed`.
+3. **Live-RAM vs. Disk Hook & Tampering Triage**:
+   - Normalizes expected loader relocations (`IMAGE_REL_BASED_*` / ELF `R_*_RELATIVE`) and normal IAT/GOT dynamic linker slots so legitimate ASLR rebasing does not flood you with false positives.
+   - Highlights anomalous modifications in bright coral as:
+     - **`InlineCodeHook`** — `.text` prologue detours (`jmp`/`call`/`push+ret` trampolines or patched instructions in RX pages),
+     - **`IatGotPointerHook`** — import/PLT pointers redirected outside expected loaded export modules,
+     - **`ReadOnlyDataModified`** — mutated `.rdata`/`.rodata` vtables or constants.
+4. **Synchronized Dual Hex & Disassembly View**:
+   - Click any modified function or byte hunk to inspect synchronized left-vs-right **Disassembly** and **Hex** panes side by side, or jump the main workspace directly to the hunk VA.
+
+---
+
+## 10. Read-Only Live Process Inspection, VMMap Visual RAM Explorer, Memory Search & Process Internals
+
+```mermaid
+flowchart TD
+    p1["File > Attach to Process (Ctrl+P)<br/>Strictly Read-Only Default"] --> ro["IProcessSession<br/>(is_read_only == true)"]
+    p2["File > Open Crash Dump...<br/>(.dmp Minidump / ELF ET_CORE)"] --> ro
+    p3["Inspect > Start / Attach Debugger<br/>(Explicit Opt-In Warning)"] --> dbg["IDebugSession<br/>(ptrace / Win32 Debug Loop)"]
+    ro --> panels["Memory Map (VMMap) · Internals · Search<br/>Threads & Stack · Live Binary Diff"]
+    dbg --> dbgui["Breakpoints (F9) · Watchpoints (DR0..7)<br/>Stepping (F10/F11) · Shadowed Memory"]
+```
+
+### 10.1 Attaching Read-Only (`Ctrl+P`)
+Press **`Ctrl+P`** (**File > Attach to Process...** or **Inspect > Attach to Process (Read-Only Default)...**):
+- Filter processes by name, PID, user, or command line; toggle **Accessible only**, enter a manual PID, or click **Attach Self** to inspect `peelf_viewer` itself.
+- **Strict Read-Only Guarantee**: Read-only sessions never open `PROCESS_VM_WRITE` / `PROCESS_VM_OPERATION` on Windows and never issue `PTRACE_POKETEXT`/`POKEDATA` on Linux. Unmapped or guard-paged ranges render safely as `??` in **Hex View** via `read_memory_tolerant`.
+- Switch between loaded `.exe`/`.dll`/`.so`/`[vdso]` modules in the **Memory Map** active-module selector or the **Structure** tree (`Modules (...)`)—all headers, symbols, imports, exports, disassembly, and decompilation rebase onto the live ASLR address automatically!
+- Press **`Ctrl+F5`** (**File > Refresh Process Memory Map**) to refresh mappings, or **File > Pause Process** / **Resume Process** when inspecting live thread stacks.
+
+### 10.2 Sysinternals VMMap-Style Visual RAM Explorer (`Memory Map`)
+Open **Memory Map** (**View > Memory Map**) for a complete virtual & physical footprint breakdown (`/proc/<pid>/smaps` on Linux; `VirtualQueryEx` + `QueryWorkingSetEx` on Windows):
+- **Stacked Proportional Bars**: Interactive horizontal bars break down total **Committed / Virtual**, **Resident (RSS)**, **Proportional Set Size (PSS)**, **Private Dirty/Clean**, **Shared Dirty/Clean**, and **Swap** across:
+  - **Categories**: `Image` (azure), `Heap` (amber), `Stack` (violet, attributed to owning `TID`), `MappedFile` (teal), `Anonymous` (green), `[vdso]` (gold), and `Reserved` (slate).
+  - **Protections**: `RX`, `R--`, `RW-`, **`RWX`** (high-attention coral), and `---`/Guard.
+- **Compressed Canonical VA Heat Strip**: Visualizes address-space layout and ASLR entropy across 32-bit or 48/57-bit canonical virtual memory; click any segment, category bar, or table row to filter or jump **Hex View** / **Disassembly** directly to that region.
+
+### 10.3 Bounded Endian-Aware `Memory Search`
+Open **Memory Search** (**Edit > Memory Search** or **Navigate > Memory Search**):
+- **Scopes** (on live processes): `Heap (default)`, `Selected Region`, `Active Module`, or `All Readable Memory` (automatically skipping multi-terabyte sparse/unresident sanitizer shadow reservations).
+- **13 Value Types**: `Hex Pattern` with `??` byte wildcards (e.g. `48 8B ?? 10`), signed/unsigned integers (`Int8`/`UInt8` .. `Int64`/`UInt64`), IEEE floats (`Float32`, `Float64`), `Text (UTF-8 / ASCII)`, and `Text (UTF-16)`.
+- Configure **Endianness** (`Target Auto`, `Little-Endian`, `Big-Endian`), **Alignment** (`1`, `2`, `4`, `8` bytes), `Case-sensitive`, and `Max hits`; click any match to inspect in **Hex View** or **Structure View**.
+
+### 10.4 `Process Internals`, `Threads & Stack`, `Thread Locals`, `PEB / TEB` & `Handlers`
+- **Process Internals** (**Navigate > Process Internals**):
+  - **Handles / FDs**: Open files, directories, pipes, `memfd`, `anon_inode` (`epoll`/`eventfd`), devices, registry keys, and sync objects with flags/offsets and filter combos.
+  - **Sockets**: Active `TCP`, `TCPv6`, `UDP`, `UDPv6`, and `UNIX` domain endpoints correlated directly to owning FD/inode and remote peer `IP:port` + connection state.
+  - **Security & Mitigations**: UID/GID, Linux capability bitmasks (`CapEff`/`CapPrm`/`CapBnd`), `Seccomp` mode, `NoNewPrivs`, LSM label, namespaces/cgroups, and Windows Token user/groups, Integrity Level, elevation, privileges, and `GetProcessMitigationPolicy` flags (DEP, ASLR, CFG,ACG, CET Shadow Stack). Every tab displays an explicit `[Available]`, `[Partial]`, or `[Unavailable]` status banner rather than silently omitting restricted kernel fields.
+- **Threads & Stack** (**Navigate > Threads & Stack**): Enumerates threads with state, wait reason, start address + symbol, user/kernel **CPU% delta**, general-purpose registers, and unwound stack frames distinguishing concrete frame-pointer chains from heuristic stack-scan candidates.
+- **Thread Locals**, **PEB / TEB & Flags**, and **Handlers**: Inspect TLS slots (`PT_TLS`/DTV & `.tls`/TEB), `PEB`/`TEB` or Linux `auxv`/`r_debug`, and registered VEH/SEH/signal/`atexit` handlers.
+
+---
+
+## 11. Offline Crash Dump Triage (Windows `.dmp` Minidumps & Linux ELF `ET_CORE`)
+
+Analyze post-mortem production crashes on **any** host OS (for example, open a Windows `.dmp` on Linux/WSL2 or a Linux ARM64/RISC-V `core` file on Windows) without executing the crashed binary:
+
+1. **Opening a Crash Dump**:
+   - Choose **File > Open Crash Dump...** (or pass a `.dmp` / `core` file to `peelf_viewer` on the command line).
+   - Both crash dump readers implement the read-only `IProcessSession` + `ICrashDumpSession` interface:
+     - **Windows Minidump (`MDMP`)**: Parses `ThreadListStream`, `ModuleListStream`, `MemoryListStream` & `Memory64ListStream` (full-memory dumps), `ExceptionStream` (faulting `TID`, exception code such as `0xC0000005` `EXCEPTION_ACCESS_VIOLATION`, read/write fault target VA), `SystemInfoStream`, `MiscInfoStream`, `HandleDataStream`, and `UnloadedModuleListStream`.
+     - **Linux ELF Core (`ET_CORE`)**: Parses 32/64-bit little- and big-endian `PT_LOAD` memory segments plus `PT_NOTE` records (`NT_PRSTATUS` per-thread signal & registers across x86, x86_64, ARM, ARM64, RISC-V 64, MIPS, PowerPC; `NT_PRPSINFO` command line/PID; `NT_SIGINFO` `si_signo`/`si_code`/`si_addr`; `NT_AUXV`; and **`NT_FILE` mapped module filenames & offsets**).
+2. **Triage Workflow**:
+   - Upon load, PE / ELF Explorer automatically selects the **faulting thread**, displays a crash summary banner (signal / exception code + fault address), and jumps **Disassembly**, **Hex View**, and **Threads & Stack** to the faulting instruction pointer!
+   - Load matching `.pdb` or `.debug` DWARF sidecars via **File > Open Debug Symbols...** to symbolize the crashed call stack, variables, and **Decompile (`F5`)** the faulting function directly from dump memory.
+   - Choose **File > Close Crash Dump** when finished.
+
+---
+
+## 12. Opt-In `IDebugSession` Debugger (Stepping, Software/Hardware Breakpoints & Watchpoints)
+
+Active debugging mutates target execution state and is therefore **strictly opt-in**, isolated from read-only live inspection:
+
+1. **Starting or Attaching an Opt-In Debug Session**:
+   - Open **Inspect > Start / Attach Debugger (Opt-in)...**.
+   - Review the explicit confirmation modal noting that active debugging attaches via OS debug APIs (Linux `ptrace` or Windows `DebugActiveProcess` / `DEBUG_ONLY_THIS_PROCESS` on a dedicated Win32 debug-loop thread) and can pause/modify the target.
+   - Choose **Launch Executable Under Debugger** (specify executable path + arguments) or **Attach Debugger to Running PID**.
+2. **Execution Control & Stepping**:
+   - **`F5`** (**Inspect > Continue**) — Resume execution until the next breakpoint, watchpoint, signal, or exception.
+   - **Inspect > Pause** — Interrupt running target cleanly.
+   - **`F10`** (**Inspect > Step Over**) — Step over `call` instructions (automatically placing a temporary return-address breakpoint when needed).
+   - **`F11`** (**Inspect > Step Into**) — Single-step one machine instruction (`PTRACE_SINGLESTEP` / trap flag `TF`, transparently stepping past software breakpoints by restoring the original byte, single-stepping, and re-arming the trap).
+   - **`Shift+F11`** (**Inspect > Step Out**) — Run until the current function returns to its caller frame.
+3. **Software Breakpoints (`F9`) & Breakpoint-Shadowed Memory Reads**:
+   - Select any instruction in **Disassembly** and press **`F9`** (or add an address in the **Debugger** panel's **Breakpoints** tab).
+   - **Shadowed Reads**: `IDebugSession::read_memory` automatically masks injected trap opcodes (`0xCC` on x86/x64, `BRK` `0xD4200000` on ARM64, `EBREAK` on RISC-V) with the saved original instruction bytes—so **Disassembly**, **Hex View**, **Flow Graph**, and **Decompile** never show corrupted instructions where breakpoints are armed!
+4. **Hardware Breakpoints & Data Watchpoints (`DR0..DR7` / Arch Debug Regs)**:
+   - In the **Debugger** panel (**View > Debugger**), add up to 4 hardware slots (`Execute`, `Write`, or `Read/Write` watchpoints of width `1`, `2`, `4`, or `8` bytes) to catch global/heap memory corruption at the exact instruction that writes to an address.
+5. **Step-Diff Highlighted Registers & Clean Detach**:
+   - The **Registers** tab compares register values before and after each step/stop, highlighting changed registers in gold/amber and allowing inline hex edits when paused.
+   - The **Debug Events** log records thread creations, DLL/`.so` loads, signals/exceptions, and breakpoint hits.
+   - Click **Detach Cleanly** (**Inspect > Detach Debugger Cleanly**) to strip all software trap bytes from target RAM, clear `DR7` hardware debug registers, and release the process safely without terminating it.
+
+---
+
+## 13. Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`)
+
+Every loaded binary or attached process is evaluated against 19 deterministic security hardening rules (`peelf/security_audit.hpp`), viewable in the **File** security summary and exported via `--headless`:
+
+### 13.1 Windows PE Rules (`PE1001 .. PE1008`)
+
+| Rule ID | Rule Name | Default Fail Level | What It Verifies & Compiler/Linker Remediation |
+|---|---|---|---|
+| **`PE1001`** | `EnableAddressSpaceLayoutRandomization` | `Error` | `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE` (`/DYNAMICBASE`) plus `HIGH_ENTROPY_VA` (`/HIGHENTROPYVA`) on 64-bit PE32+ images |
+| **`PE1002`** | `EnableDataExecutionPrevention` | `Error` | `IMAGE_DLLCHARACTERISTICS_NX_COMPAT` (`/NXCOMPAT`) hardware DEP/NX |
+| **`PE1003`** | `EnableControlFlowGuard` | `Warning` | `IMAGE_DLLCHARACTERISTICS_GUARD_CF` + `LoadConfig` Guard CF function table (`/guard:cf`) |
+| **`PE1004`** | `EnableSafeSEH` | `Error` *(32-bit x86)* | Valid `SEHandlerTable` in `LoadConfig` or `IMAGE_DLLCHARACTERISTICS_NO_SEH` (`/SAFESEH`; N/A `Pass` on 64-bit `.pdata` targets) |
+| **`PE1005`** | `SignBinaryWithAuthenticode` | `Note` / `Error` | Inspects Data Directory 4 (`WIN_CERTIFICATE`). **Strictly separates structural presence from cryptographic trust**: on Windows, invokes `WinVerifyTrust` (`WINTRUST_ACTION_GENERIC_VERIFY_V2`) to verify signature digest & certificate chain; on non-Windows hosts (where OS trust roots aren't evaluated), reports structural presence as `Note` (`Unverified`) rather than claiming cryptographic `Pass`. Malformed/out-of-bounds certificate entries report `Error`/`Warning`. |
+| **`PE1006`** | `EnableCetShadowStack` | `Note` | Extended DLL characteristic `IMAGE_DLLCHARACTERISTICS_EX_CET_COMPAT` (`/CETCOMPAT`) |
+| **`PE1007`** | `DoNotMarkSectionsWritableAndExecutable` | `Error` | Flags any section with both `IMAGE_SCN_MEM_WRITE` and `IMAGE_SCN_MEM_EXECUTE` (W^X violation) |
+| **`PE1008`** | `DoNotUseWritableSharedSections` | `Error` | Flags any section with both `IMAGE_SCN_MEM_WRITE` and `IMAGE_SCN_MEM_SHARED` (cross-process tampering risk) |
+
+### 13.2 Linux / Embedded ELF Rules (`ELF2001 .. ELF2008`)
+
+| Rule ID | Rule Name | Default Fail Level | What It Verifies & Compiler/Linker Remediation |
+|---|---|---|---|
+| **`ELF2001`** | `EnablePositionIndependentExecutable` | `Error` | Executables built as PIE (`ET_DYN` rather than fixed-base `ET_EXEC`; `-fPIE -pie`) |
+| **`ELF2002`** | `MarkStackNonExecutable` | `Error` | Presence of `PT_GNU_STACK` without `PF_X` (`-Wl,-z,noexecstack`) |
+| **`ELF2003`** | `EnableRelocationReadOnly` | `Warning` / `Error` | `PT_GNU_RELRO` + `BIND_NOW` (`DT_BIND_NOW` / `DF_1_NOW`) for **Full RELRO** (`-Wl,-z,relro,-z,now`); Partial RELRO emits `Warning`, missing RELRO emits `Error` |
+| **`ELF2004`** | `EnableStackProtector` | `Warning` | Stack canary symbols (`__stack_chk_fail` / `__stack_chk_guard`; `-fstack-protector-strong`) |
+| **`ELF2005`** | `FortifySourceFunctions` | `Warning` | Fortified `*_chk` libc bounds-checked imports vs. unfortified libc calls (`-O2 -D_FORTIFY_SOURCE=3`) |
+| **`ELF2006`** | `DoNotUseWritableExecutableSegments` | `Error` | Flags RWX `PT_LOAD` segments (`PF_W | PF_X`), `SHF_WRITE | SHF_EXECINSTR` sections, and `DT_TEXTREL` text relocations |
+| **`ELF2007`** | `DoNotUseInsecureRunpath` | `Error` / `Warning` | Audits `DT_RPATH` / `DT_RUNPATH` for empty segments (`::`), `.`, relative paths, `/tmp`, or world-writable directories |
+| **`ELF2008`** | `EnableControlFlowEnforcement` | `Note` | `.note.gnu.property` hardware CFI: x86_64 Intel CET (`IBT` + `SHSTK`, `-fcf-protection=full`) or AArch64 `BTI` + `PAC` (`-mbranch-protection=standard`) |
+
+### 13.3 Live Process Rules (`LIVE3001 .. LIVE3003`)
+
+| Rule ID | Rule Name | Level | What It Verifies |
+|---|---|---|---|
+| **`LIVE3001`** | `AvoidLiveReadWriteExecuteRegions` | `Warning` | Enumerates live virtual memory regions currently mapped `rwx` |
+| **`LIVE3002`** | `InspectUnbackedExecutableMemory` | `Warning` | Flags anonymous/private executable pages not backed by an on-disk image (JIT / shellcode / unpacker stubs) |
+| **`LIVE3003`** | `VerifyProcessRuntimeMitigations` | `Warning` | Checks OS-level runtime ASLR, DEP, Seccomp, `NoNewPrivs`, and process mitigation policy state |
+
+---
+
+## 14. Headless CLI & CI/CD Automation (`--headless`, JSON, SARIF 2.1.0 & GitHub Actions)
+
+```mermaid
+flowchart LR
+    cli["peelf_viewer --headless <binary><br/>(Zero Vulkan / Zero GUI Deps)"] --> parse["IBinaryImage + DependencyGraph<br/>+ SecurityAudit (+ BinaryDiff)"]
+    parse --> fmt{"--format"}
+    fmt -->|json| json["Deterministic JSON Report<br/>(Summary · Deps · Security · Diff)"]
+    fmt -->|sarif| sarif["OASIS SARIF 2.1.0<br/>(GitHub Code Scanning Upload)"]
+    parse --> gate{"--fail-on<br/>none | error | warning"}
+    gate -->|Pass| e0["Exit Code 0"]
+    gate -->|Policy Violation| e2["Exit Code 2"]
+```
+
+`peelf_viewer --headless` runs completely inside `peelf_viewer` + `peelf_core` without loading `peelf_gui`, initializing GLFW, or requiring a GPU/display server.
+
+### 14.1 CLI Synopsis, Options & Exit Codes
+
+```text
+peelf_viewer --headless [<binary_or_dump>] [options]
+```
+
+| Option | Description |
+|---|---|
+| `--headless` | Run in Vulkan-free CLI mode (passing `--headless` alone with no path performs a fast readiness check and exits `0`) |
+| `<binary_or_dump>` | Path to a PE, ELF, Windows `.dmp` Minidump, or Linux ELF `ET_CORE` file |
+| `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only) |
+| `--format <json\|sarif>` | Output format: structured `json` (default) or **OASIS SARIF 2.1.0** (`sarif`) |
+| `--output <path>` | Write report to `<path>` instead of `stdout` |
+| `--search-root <dir>` | Repeatable sysroot / staging directory prefix for resolving `DT_NEEDED` / DLL dependencies |
+| `--include-strings` | Extract and embed printable ASCII/UTF-8/UTF-16 strings in the JSON report |
+| `--min-string-len <N>` | Minimum character length for `--include-strings` (default `4`) |
+| `--fail-on <none\|error\|warning>` | CI policy gate (`none` default):<br/>• `error`: exits `2` on any security `Error` finding, missing library, arch mismatch, or unresolved symbol<br/>• `warning`: exits `2` on any `Error` **or** `Warning` finding |
+| `-h`, `--help` | Print CLI usage and exit `0` |
+
+**Exit Codes**:
+- **`0`** — Analysis succeeded and `--fail-on` policy passed.
+- **`1`** — Invalid CLI arguments, unreadable file, or malformed/unrecognized input.
+- **`2`** — Analysis succeeded, but one or more findings violated `--fail-on error` or `--fail-on warning`.
+
+### 14.2 Common Headless Recipes
+
+```bash
+# 1. Full JSON audit of a release binary with custom sysroot dependency resolution
+peelf_viewer --headless ./build/my_service \
+  --search-root /opt/my_service/lib \
+  --format json --output audit.json --fail-on error
+
+# 2. Generate OASIS SARIF 2.1.0 for GitHub Code Scanning security tab
+peelf_viewer --headless ./build/my_service \
+  --format sarif --output results.sarif --fail-on error
+
+# 3. Automated release-vs-previous binary comparison in CI
+peelf_viewer --headless ./release/v1.1/app.exe \
+  --compare ./release/v1.0/app.exe \
+  --format json --output diff_v1.0_v1.1.json
+
+# 4. Headless post-mortem crash-dump summary (JSON threads, faulting IP, modules)
+peelf_viewer --headless ./crashes/service.core --format json
+```
+
+### 14.3 GitHub Actions Workflow Example (Upload SARIF to GitHub Security)
+
+```yaml
+name: Binary Hardening Audit
+on: [push, pull_request]
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Headless Auditor
+        run: |
+          cmake -S . -B build-cli -G Ninja -DCMAKE_BUILD_TYPE=Release -DPEELF_BUILD_GUI=OFF -DPEELF_BUILD_TESTS=OFF
+          cmake --build build-cli --target peelf_viewer
+
+      - name: Audit Release Artifacts & Emit SARIF 2.1.0
+        continue-on-error: true
+        id: audit
+        run: |
+          ./build-cli/apps/viewer/peelf_viewer --headless ./path/to/target_binary \
+            --format sarif --output binary-audit.sarif --fail-on error
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: binary-audit.sarif
+
+      - name: Enforce Hardening Gate
+        if: steps.audit.outcome != 'success'
+        run: exit 2
+```
+
+---
+
+## 15. Troubleshooting & Best Practices
+
+| Symptom / Question | Cause & Resolution |
+|---|---|
+| **Linux live attach (`Ctrl+P`) or opt-in `ptrace` says `Permission denied (EPERM)`** | Linux Yama LSM restricts non-child `ptrace` / `/proc/<pid>/mem` reads by default (`kernel.yama.ptrace_scope = 1`). Attach to processes you launched, run with `CAP_SYS_PTRACE`, or temporarily allow same-UID attach during local debugging via `sudo sysctl -w kernel.yama.ptrace_scope=0`. |
+| **Ghidra decompilation falls back to `StructuredPseudoC` or is slow on WSL2** | Verify `GHIDRA_INSTALL_DIR` points to the root folder containing `support/analyzeHeadless` and `java --version` reports **JDK 21+**. On WSL2, ensure neither `XDG_CACHE_HOME` nor the target binary resides on `/mnt/c` (9P cross-OS I/O slows JVM startup by 10x+). |
+| **`Patch Set` says `Assembler Unavailable` on ARM64 / RISC-V / MIPS / PowerPC** | `x86` and `x86_64` assemble in-process via `AsmTK`, whereas non-x86 targets invoke `llvm-mc`. Install LLVM (`sudo apt install llvm-18` or add `llvm-mc` to `PATH`) and re-select the instruction. |
+| **`PE1005` (`SignBinaryWithAuthenticode`) shows `[NOTE]` instead of `[PASS]` on Linux** | Expected design: on Linux/WSL2, PE / ELF Explorer validates the structural `WIN_CERTIFICATE` table (`Note: Authenticode certificate present, cryptographic chain unverified on non-Windows host`) rather than falsely claiming cryptographic `WinVerifyTrust` verification. Run on Windows to evaluate OS root-store trust. |
+| **PDB file is rejected when using `File > Open Debug Symbols...`** | Check the **Log** panel: `debug_symbols.cpp` verifies the MSF 7.00 `RSDS` **GUID and Age** against the binary's `IMAGE_DEBUG_DIRECTORY`. Ensure the `.pdb` came from the exact same link invocation as the `.exe`/`.dll`. |
+| **Headless CLI fails to start on a minimal Docker container** | Make sure you pass `--headless` (or build with `-DPEELF_BUILD_GUI=OFF`). `peelf_viewer` links only `peelf_core` and `libdl`, so `--headless` never loads `libpeelf_gui.so`, `libvulkan.so.1`, or X11/Wayland libraries. |
+| **Panels look crowded or moved off-screen after resizing monitors** | Click **View > Reset Layout** to rebuild the default dockspace and adjust **View > Interface scale** (`100%`–`200%`) for HiDPI displays. |

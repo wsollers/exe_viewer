@@ -1,13 +1,18 @@
 # PE / ELF Explorer (C++23)
 
 A cross-platform executable, shared-library, crash-dump, and live-process analysis suite:
-- **Core parsing & runtime library**: `peelf_core` (PE32/PE32+ & ELF32/ELF64 LE/BE parsers, DWARF v4/v5 types & lines, multi-ABI demangling, dependency DAG resolution, binary & disk-vs-live-RAM diffing, BinSkim/checksec security rules, offline Windows `.dmp` Minidump & Linux `ET_CORE` crash dump sessions, strictly read-only `IProcessSession`, and opt-in BSD-2-Clause `IDebugSession` debugger)
-- **GUI app & headless CLI**: `peelf_viewer` + `peelf_gui` (Vulkan + GLFW + Dear ImGui), with structure navigation, Details/Hex/Disassembly, VMMap `Memory Map`, `Threads & Stack`, `Thread Locals`, `Structure View`, `Strings`, `References`, `Dependencies`, `Binary Diff`, `Process Internals`, opt-in `Debugger` workspace, interactive `Flow Graph`, multi-backend `Decompiler`, and JSON/SARIF 2.1.0 `--headless` CLI export
-- **Analysis integrations**: Capstone disassembly, Graphviz CFG layout, PDB/DIA & DWARF debug symbol hydration, AsmTK + `llvm-mc` assembly-to-bytes providers, `.pepatch.json` patch bundles, and Ghidra / Binary Ninja / RetDec / Structured Pseudo-C decompilation
+- **Core parsing & runtime library (`peelf_core`)**: Unified `IBinaryImage` spine (`viewer::PeParser` retired in `473ee3f`) covering PE32/PE32+ (ordinals, forwarders, delay-load/bound imports, `.pdata`/`.xdata` unwind, MSF 7.00 RSDS GUID+Age PDB verification, Authenticode `WinVerifyTrust` & structural checks, LoadConfig/GuardCF, TLS, resources, CLR) and ELF32/ELF64 LE/BE across 10 CPU variants (including `SHN_XINDEX`/`PN_XNUM` extended numbering and static sectionless `PT_DYNAMIC` recovery), DWARF v2–v5 + `.gnu_debuglink`/`.note.gnu.build-id` sidecars, Itanium/Rust/MSVC demangling, dependency DAG resolution, relocation-tolerant binary & disk-vs-live-RAM diffing, formalized BinSkim/checksec security rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`), offline Windows `.dmp` Minidump & Linux `ET_CORE` crash dumps, strictly read-only `IProcessSession` (`/proc/<pid>/smaps` & `QueryWorkingSetEx`), and opt-in BSD-2-Clause `IDebugSession` (`ptrace` & Win32 Debug API)
+- **Vulkan-free CLI launcher & dynamically loaded GUI (`peelf_viewer` + `peelf_gui`)**: `peelf_viewer` links only `peelf_core` for zero-GUI `--headless` JSON/SARIF 2.1.0 CI automation and dynamically loads `peelf_gui` (Vulkan 2-frames-in-flight `VulkanManager` + GLFW + Dear ImGui docking) for interactive reverse engineering across `Structure`, `Details`, `Hex View`, `Disassembly`, `Flow Graph`, `Decompile`, `References & Notes`, `Strings`, `Structure View`, `Dependencies`, `Binary Diff`, VMMap `Memory Map`, `Process Internals`, `Threads & Stack`, `Thread Locals`, `Memory Search`, `PEB / TEB & Flags`, `Handlers`, and opt-in `Debugger`
+- **Analysis & patching integrations**: Capstone multi-arch disassembly, resumable background `ReferenceIndex` & jump-table/indirect-branch recovery, Graphviz CFG/call-graph layout, `AsmTK` (in-process x86/x86_64) + `llvm-mc` (multi-arch) assembly-to-bytes providers, transactional `PagedBinaryImage` & `.pepatch.json` patch bundles, `.peproj` v2 `SHA-256` sessions with crash-recovery journals, and `DecompileCache` + persistent LRU-reusable headless Ghidra / Structured Pseudo-C / RetDec / Binary Ninja decompilation
 
-> Status: Phase 0 (`P0-1..P0-10`) and the Next-Gen Execution Queue (`WU-01..WU-15`) are complete and covered by GoogleTest/CTest suites (`ToDo.md`).
+> **Status**: Phase 0 (`P0-1..P0-10`) and Work Units `WU-01..WU-18` are complete with **326/326 CTests passing** under `-Werror` (Clang 18 Debug/Release + `clang18-asan-ubsan` AddressSanitizer/UBSan + `malformed_inputs_matrix_test`) and `/W4 /WX /FS` (MSVC 2022 Debug/Release), gated continuously by [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-For architecture diagrams and data-flow notes, see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+## Documentation
+
+- **[User Guide (`docs/USER_GUIDE.md`)](docs/USER_GUIDE.md)** — End-to-end walkthrough of every UI panel, keyboard shortcut, workflow, security rule, and `--headless` CI/CD recipe
+- **[Architecture (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md)** — Target boundaries (`peelf_core` / `peelf_gui` / `peelf_viewer`), subsystem data-flow diagrams, and threading/caching invariants
+- **[Roadmap & C++23 Conformance Design (`docs/ROADMAP_DESIGN.md`)](docs/ROADMAP_DESIGN.md)** — Validated specification for the C++23 / CppCoreGuidelines upgrade (`WU-19a..WU-19d`) and Next-Gen Roadmap (`WU-21..WU-28`)
+- **[Development Tracker (`ToDo.md`)](ToDo.md)** — Historical phase checklist and active execution queue
 
 ## Screenshots
 
@@ -53,9 +58,7 @@ Theme parsing, fonts, menus, and rendering belong exclusively to the UI layer.
 Binary models, parsers, navigation, symbols, disassembly, and patch operations
 have no ImGui/GLFW/Vulkan dependency and are exercised by the non-GUI test binary.
 
-Menus provide File, Edit, Navigate, Analyze, View, and Help commands. Ctrl+O opens
-a binary; Ctrl+Shift+S exports a patched copy. Code views retain monospace fonts;
-Windows interface controls use Segoe UI when available.
+Menus provide **File**, **Edit**, **Navigate**, **Analyze**, **Inspect**, **View**, and **Help** commands. `Ctrl+O` opens a binary; `Ctrl+P` attaches read-only to a live process; `Ctrl+Shift+S` exports a patched copy; `Alt+F4` (**File > Exit**) closes the application. Code views retain monospace fonts; Windows interface controls use Segoe UI when available.
 
 Windows builds embed `resources/viewer.ico` in the launcher and use it for the
 window/taskbar icon. On GUI startup, a responsive splash displays the original
@@ -63,8 +66,8 @@ window/taskbar icon. On GUI startup, a responsive splash displays the original
 MIPS, and PowerPC), then closes after initialization (minimum 1.2 seconds).
 `--headless` and `--help` do not display the splash.
 
-- **Visual Studio 2022** (MSVC v143, **17.6 or newer** — required for `std::expected`, `std::format`, and `std::byteswap`)
-- **Clang 18** with **Ninja** (recommended on Linux)
+- **Visual Studio 2022** (MSVC v143, **17.6 or newer** — required for `std::expected`, `std::format`, and `std::byteswap`; compiled with `/W4 /WX /FS`)
+- **Clang 18** with **Ninja** and `libc++` (recommended on Linux/WSL; compiled with `-Wall -Wextra -Wpedantic -Werror`, including the `clang18-asan-ubsan` sanitizer preset)
 
 ## Prerequisites
 
@@ -146,10 +149,10 @@ To run the viewer directly:
 .\out\build\msvc-debug\apps\viewer\Debug\peelf_viewer.exe
 ```
 
-### Linux: Clang 18 + Ninja
+### Linux: Clang 18 + Ninja (Debug, Release, & ASan+UBSan)
 
 ```bash
-# Debug
+# Debug (326/326 CTests)
 cmake --preset clang18-debug
 cmake --build --preset clang18-debug
 ctest --test-dir out/build/clang18-debug --output-on-failure
@@ -157,9 +160,18 @@ ctest --test-dir out/build/clang18-debug --output-on-failure
 # Release
 cmake --preset clang18-release
 cmake --build --preset clang18-release
+ctest --test-dir out/build/clang18-release --output-on-failure
+
+# AddressSanitizer + UndefinedBehaviorSanitizer (includes malformed input matrix)
+cmake --preset clang18-asan-ubsan
+cmake --build --preset clang18-asan-ubsan
+ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+  ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure
 ```
 
 Output binary: `out/build/<preset>/apps/viewer/peelf_viewer`
+
+Continuous integration in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `clang18-debug`, `clang18-release`, `clang18-asan-ubsan`, and Windows MSVC 2022 `Debug` + `Release` (with `-Werror` / `/WX /FS` and `--headless` JSON/SARIF smoke checks) on every push and pull request.
 
 ### Configure with options
 
@@ -226,115 +238,125 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `PEELF_BUILD_VIEWER` | `ON` | Build the GUI viewer app (`peelf_viewer`) |
-| `PEELF_BUILD_SHARED` | `ON` | Build `peelf_core` as a shared library |
-| `PEELF_BUILD_TESTS` | `ON` | Build the GoogleTest unit suite |
-| `PEELF_ENABLE_ASMTK` | `ON` | Fetch and build pinned AsmJit + AsmTK sources for optional assembly-to-bytes providers |
+| `PEELF_BUILD_VIEWER` | `ON` | Build the `peelf_viewer` CLI/GUI launcher executable |
+| `PEELF_BUILD_GUI` | `ON` | Build the `peelf_gui` Vulkan/GLFW/ImGui shared module (`OFF` builds a Vulkan-free CLI launcher) |
+| `PEELF_BUILD_SHARED` | `OFF` (Win32) / `ON` (POSIX) | Build `peelf_core` as a shared library |
+| `PEELF_BUILD_TESTS` | `ON` | Build the GoogleTest unit & integration suite (`326` CTests) |
+| `PEELF_WARNINGS_AS_ERRORS` | `ON` | Enforce `-Werror` (Clang/GCC) and `/W4 /WX /FS` (MSVC) on project targets while isolating `FetchContent` headers as `SYSTEM` |
+| `PEELF_ENABLE_SANITIZERS` | `OFF` (`ON` in `clang18-asan-ubsan`) | Enable AddressSanitizer and UndefinedBehaviorSanitizer across project and test targets |
+| `PEELF_ENABLE_ASMTK` | `ON` | Fetch and build pinned AsmJit + AsmTK sources for in-process x86/x86_64 assembly |
 | `PEELF_ENABLE_GRAPHVIZ` | `OFF` | Fetch optional Graphviz source and expose Graphviz feature macros through `peelf::graphviz` |
-| `PEELF_ENABLE_CLANG_TIDY` | `OFF` | Run clang-tidy on project targets for supported generators |
+| `PEELF_ENABLE_CLANG_TIDY` | `OFF` | Run `clang-tidy` on `peelf_core`, `peelf_gui`, `peelf_viewer`, and `peelf_tests` (Ninja/Makefile generators) |
 | `PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST` | `OFF` | Register an opt-in CTest test that refreshes `bin-matrix/` with Docker and runs the focused matrix test |
 
 ## Running
 
-Launch `peelf_viewer`, then **File → Open** and pick an executable
-(`.exe`, `.dll`, `.so`, `.elf`). Use **File → Open Debug Symbols...** to load a
-matching PDB when available. Use **View** to show or reset panels, including
-Flow Graph, Disassembly, Symbols, Imports/Exports, PE tables, Log, and
-Shellcode. Press `Esc` to quit.
+For complete panel-by-panel instructions, keyboard shortcuts, and CI recipes, see **[`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)**.
+
+Launch `peelf_viewer`, then use **File > Open...** (`Ctrl+O`) to inspect an executable or shared library (`.exe`, `.dll`, `.sys`, `.so`, `.elf`, including stripped/sectionless `PT_DYNAMIC` ELFs and `SHN_XINDEX`/`PN_XNUM` extended-header binaries), **File > Open Crash Dump...** for offline Windows `.dmp` Minidumps or Linux ELF `ET_CORE` dumps, or **File > Attach to Process...** (`Ctrl+P`) for strictly read-only live process inspection. Use **File > Open Debug Symbols...** to load an explicit PDB (verified against MSF 7.00 RSDS GUID + Age via DIA on Windows); ELF DWARF v2–v5 sections and `.gnu_debuglink` / `.note.gnu.build-id` debug sidecars hydrate automatically. Use **View** to toggle any workspace panel or **View > Reset Layout** to restore default docking; **View > Demangle symbols** toggles Itanium C++, Rust (`v0` + legacy), and MSVC demangling globally. Rendering runs on a Vulkan 2-frames-in-flight (`kMaxFramesInFlight = 2`) swapchain loop with automatic resize/minimize recovery.
 
 The analysis workspace opens a control-flow preview at the entry point. Select a
-function to view instruction-bearing basic blocks and directed branch edges.
-Use the mouse wheel to zoom, middle-drag to pan, **Fit** for an overview, and
-**100%** for readable code. Clicking a block synchronizes the byte selection and
-disassembly. **Calls** switches to function relationships. Graph layout requires
-Graphviz. Function bounds use symbol sizes or x64 PE runtime metadata, then the
-next known function or executable region, capped at 16 KiB. The graph reports
-which boundary source was used. Unknown indirect branches remain explicitly
-unresolved. Guarded absolute x86 jump tables are recovered only when all entries
-are available and point to decoded instructions; other table forms remain
-unresolved. Applied byte edits refresh the active graph.
+function to view instruction-bearing basic blocks and directed branch edges as
+interactive draggable cards in **Flow Graph**. Use the mouse wheel to zoom,
+middle-drag to pan, **Fit** for an overview, and **100%** for readable code.
+Clicking a block synchronizes `ViewerSelection`, **Hex View**, and **Disassembly**.
+**Calls** switches to inter-procedural fan-out relationships (Graphviz `dot`
+provides initial layout when installed). Function bounds use symbol sizes, PE
+`.pdata` runtime-function metadata, or ELF `.eh_frame` FDEs before falling back to
+adjacent functions or executable region bounds. Indirect control-flow recovery
+handles guarded x86 absolute tables, x86/x64 PIC/RIP-relative `i32` offset tables,
+ARM Thumb-2 `tbb`/`tbh`, ARM64 PC-relative jump tables, and IAT/GOT pointer slots,
+labeling every edge with explicit `ReferenceConfidence` and `evidence`. Applied
+byte edits automatically refresh the active graph.
 
 Double-click a graph instruction or listing address to follow a direct target.
-Use **Back/Forward**, `Backspace` / `Shift+Backspace`, or `Alt+Left` / `Alt+Right`
-to retrace navigation, `Space` to
-switch between graph and listing, arrow keys to select code, and `Enter` to
-follow a selected direct target. These shortcuts do not interfere with text
-entry. Graph instructions and the listing show resolved symbol names.
+Use **Navigate > Back / Forward**, `Backspace` / `Shift+Backspace`, or
+`Alt+Left` / `Alt+Right` to retrace navigation, `Space` to switch between
+**Flow Graph** and **Disassembly**, arrow keys to step selection, `Enter` to
+follow a selected branch target, and `Ctrl+B` (**Navigate > Bookmark selection**)
+to toggle categorized bookmarks.
 
-Open **References** from the toolbar or press `X` for **References & Notes**.
-Filter incoming/outgoing references for the selection, or search addresses,
-symbols, referenced ASCII strings, user names, and comments. Source and target
-addresses navigate independently. Reference analysis scans up to 4 MiB of
-executable section bytes, reports partial coverage, and refreshes on patch or
-Thumb-mode changes while the panel is open. This is a conservative static scan:
-address constants are distinguished from memory references, and
-register-dependent targets are not guessed.
+Open **References & Notes** (`X`) to inspect incoming and outgoing cross-references,
+filter by confidence (`Direct`, `IndirectTable`, `IndirectPointerSlot`,
+`HeuristicConstant`), or search addresses, symbols, strings, user names, and
+comments. Instead of a fixed byte cap, `AsyncReferenceScanner` indexes executable
+sections/regions asynchronously on a background `std::jthread` in resumable 256 KiB
+slices (into sorted $O(\log N + K)$ `ReferenceIndex` tables), reporting live
+coverage percentage with **Pause**, **Resume**, and **Scan Full Binary** controls.
+The **Strings** browser (**Navigate > Strings**) links extracted ASCII/UTF-8 and
+UTF-16LE/BE strings directly to `ReferenceIndex` xrefs and containing functions.
 
-Names and comments appear in the function list, graph, and listing; original
-symbols remain searchable. Use **File > Save Analysis Project** to preserve
-annotations, imported symbol records, staged patches, navigation history, Thumb
-mode, and dock layout in a `.peproj` file. Open it with **Open Analysis Project**.
-The original binary must remain available. Restore checks its size and an FNV-1a
-change-detection fingerprint plus original patch bytes before applying the patch
-set as one undoable transaction. The fingerprint is not a cryptographic identity.
+Names, comments, bookmarks (`Ctrl+B`), pinned **Structure View** bindings, imported
+debug symbols, staged patches, navigation history, ARM/Thumb mode, and docking
+layout persist in **`.peproj` v2** (`PEELF_PROJECT 2`, with automatic in-memory
+migration from v1) via **File > Save Analysis Project...** and **File > Open Analysis Project...**.
+Each `.peproj` v2 file records original `source_sha256` (`peelf::sha256_hex`) and
+`source_size` alongside both canonical `source` and portable workspace-relative
+`relative_source` paths. If the binary has moved or changed on disk, an interactive
+relocation/mismatch modal guides resolution before replaying patches as an atomic
+undoable transaction. Project saves write to a sibling `.tmp` file before atomic
+rename, while dirty sessions periodically write off-`/mnt/c` crash-recovery
+journals (`$PEELF_CACHE_DIR/recovery` or `/tmp/peelf_viewer-recovery-<uid>`).
 
-The patch panel previews replacement bytes as before/after instructions and
-control-flow edges before applying them. Editing invalidates older previews.
-**File > Export Patch Report** writes offsets, mapped addresses, and original and
-replacement bytes. Exporting a patched binary remains a separate action.
+For static files, **Patch Set** and **Hex View** stage edits inside transactional
+`PagedBinaryImage` overlays without mutating the input file on disk (**File > Save Patched As...** / `Ctrl+Shift+S` writes a new binary; live-process sessions enforce
+strict read-only protection). **Patch Set** supports both raw hex replacement and
+**Assemble at Selection / VA** (`AsmTK` in-process for x86/x86_64 and `llvm-mc`
+for ARM, Thumb, AArch64, RISC-V, MIPS, and PowerPC), previewing Capstone round-trip
+disassembly, overwritten-instruction slack warnings, optional NOP padding, and
+before/after basic-block CFG diffs. Staged edits can also be exported and shared
+as portable **`.pepatch.json`** patch bundles with `SHA-256` and original-byte
+conflict previews, or summarized via **File > Export Patch Report...**.
 
-Press **F5** on a selected function to open the Decompiler panel. **Ghidra is the
-default provider**, producing actual C output with clickable mapped lines.
-Unmapped declarations and braces remain unlinked; decompiler line mappings are
-approximate. Byte edits and ARM/Thumb changes mark existing output stale.
+Additional workspaces cover:
+- **Structure View** & **Data Structures**: Overlay built-in PE, ELF, Win32 (`PEB`/`TEB`), and Linux (`r_debug`/`link_map`) schemas or loaded PDB/DWARF/Ghidra `DataTypeRecord` structs onto any static offset or live VA with array counts, endian/pointer overrides, click-to-follow pointers, and `.peproj` v2 pinned bindings.
+- **Dependencies** (**View > Dependencies**): Inspect static PE imports/delay-load/bound imports/forwarders/`api-ms-win-*` contracts and ELF `DT_NEEDED`/`PT_INTERP`/`DT_RPATH`/`DT_RUNPATH` (`$ORIGIN` expansion) or live loaded module DAGs, highlighting missing libraries, architecture mismatches, and unresolved symbols.
+- **Binary Diff** (**File > Compare With Binary...** & **File > Compare Active Live Module vs. Disk**): Cancellable background `AsyncBinaryDiffController` diffing headers, sections, imports, exports, byte hunks, and 3-tier relocation-tolerant function matches (`ExactName`, `NormalizedFingerprint`, n-gram `Similarity`), plus live RAM vs. on-disk module integrity checks separating `.text` inline detours from IAT/GOT pointer hooks alongside synced Hex/Disassembly panes.
+- **Security Audit** (**PEB / TEB & Flags > Security Audit (BinSkim)** & `--headless`): Evaluates 19 formalized rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`). `PE1005` explicitly distinguishes structural `WIN_CERTIFICATE` Authenticode presence (`Note` when unverified off-Windows) from cryptographic `WinVerifyTrust` signature and publisher trust verification on Windows.
+- **Live Process, Crash Dumps & Opt-In Debugger**: VMMap-style `Memory Map` (`/proc/<pid>/smaps` PSS/RSS/Swap & `QueryWorkingSetEx` proportional bars), `Process Internals` (handles/FDs, sockets, tokens/capabilities/Seccomp, thread CPU%), offline `.dmp` & `ET_CORE` crash triage, and explicit opt-in `IDebugSession` debugging (**Inspect > Start / Attach Debugger (Opt-in)...** with `F5`/`F9`/`F10`/`F11`/`Shift+F11`, software + `DR0..DR7` hardware breakpoints/watchpoints, shadow-filtered memory reads, and clean detach).
+
+Press **`F5`** outside an active paused debugger session (**Navigate > Decompile selection**) to open the **Decompile** panel. **Ghidra** is the primary external provider when configured, falling back automatically to the built-in zero-dependency **Structured Pseudo-C** decompiler (`RetDec`, `Binary Ninja`, and `Annotated assembly` are also selectable).
 
 ### Installing and configuring Ghidra
 
-The decompiler uses loaded image/PDB symbols and user-renamed symbols for function
-and data names. F5 resolves an interior selection to its containing function using
-symbol lengths or PE runtime function metadata when available. Ghidra analysis
-supplies function discovery when authoritative bounds are absent.
+The decompiler uses loaded image/PDB/DWARF symbols and user-renamed annotations for
+function and data names. `F5` resolves an interior selection to its containing
+function using symbol lengths, PE `.pdata` unwind entries, or ELF `.eh_frame`
+ranges when available, and Ghidra analysis supplies function discovery when
+authoritative bounds are absent.
 
-The listing has Address and Code columns. Clicking a mapped code row selects its
-instruction ranges in Hex View and highlights the corresponding flow graph blocks.
+The listing has **Address** and **Code** columns. Clicking a mapped code row selects its
+instruction ranges in **Hex View** and highlights the corresponding **Flow Graph** blocks.
 Mappings are approximate: optimized C can represent several disjoint instructions;
 declarations and braces without addresses remain unlinked. Select a contiguous hex
-range before editing a multi-range selection. Byte or symbol changes mark the
-decompiler snapshot stale until reanalysis.
+range before editing a multi-range selection.
 
 The **Data Structures** tab beside **Functions & Names** searches structure names,
-member names and member types by substring. It displays PDB and Ghidra structure/
-union layouts, plus a separate searchable data-symbol list linked to Hex View.
-Structure layouts require debug type information; symbol names alone cannot recover
-them. Importing names and layouts does not recover every original local variable or
-function prototype.
+member names, and member types by substring across PDB, DWARF, and Ghidra layouts,
+with one-click **Apply** into **Structure View**, plus a searchable **Data symbols**
+list linked to **Hex View**.
 
 Use a local, extracted [official Ghidra release](https://github.com/NationalSecurityAgency/ghidra/releases)
-and the JDK required by that release. This integration is tested with **Ghidra 12.2
-and JDK 25**. Ghidra is a runtime dependency, not linked into the C++ application
-or downloaded automatically at startup. No Docker daemon or Ghidra GUI is needed.
+and the JDK required by that release (tested with **Ghidra 12.2 and JDK 25**).
+Ghidra is an optional external tool, not linked into the C++ application or
+downloaded automatically at startup. No Docker daemon or Ghidra GUI is needed.
 
-In **Decompiler > Backend settings**, set the Ghidra root folder and Java
+In **Decompile > Backend settings**, set the Ghidra root folder and Java
 executable, then **Save settings**. Settings persist in `decompiler.ini` next to
-the viewer executable; save failures are shown in the panel. On first startup,
-`GHIDRA_INSTALL_DIR` and `JAVA_HOME` supply defaults. Discovery also checks `tools`
-and `out/tools` folders along the executable's parent directories, so a development
-installation can live in the ignored `out/tools/ghidra_12.2_PUBLIC` folder.
+the viewer executable. On first startup, `GHIDRA_INSTALL_DIR` and `JAVA_HOME`
+supply defaults, and auto-discovery checks `tools` and `out/tools` along parent
+directories (such as `out/tools/ghidra_12.2_PUBLIC`).
 
-The viewer launches Java directly, imports an effective-byte snapshot into a
-temporary Ghidra project, and exports the selected function through the bundled
-`resources/PeelfDecompile.java` script. It never executes the analyzed binary.
-Cancellation and deadlines terminate the analyzer process tree; temporary projects
-and snapshots are removed afterward. The default overall deadline is 180 seconds
-(configurable from 10 to 3600); per-function decompilation has a 60-second limit.
-Each request currently reanalyzes a fresh snapshot. Ghidra's normal user cache and
-script compilation cache may persist outside that temporary project.
+Decompilation uses two caching tiers so switching functions is fast and never touches `/mnt/c` on WSL:
+1. **In-memory `DecompileCache`**: Keyed by `(binary_sha256, patch_revision, symbol_revision, provider, settings_fingerprint, arch, endian, thumb, function_va)`. Repeat visits return instantaneously and automatically invalidate when bytes or symbol names change.
+2. **Persistent LRU Headless Ghidra Workspaces**: Keyed by `(binary_sha256, patch_revision, arch, endian, ghidra_home)` under `$PEELF_CACHE_DIR/ghidra_workspaces` (or an off-`/mnt/c` OS cache/temp directory). The first function in a binary runs `analyzeHeadless -import` without `-deleteProject`; subsequent functions reuse the analyzed project via `-process -noanalysis` with incremental symbol sync through `resources/PeelfDecompile.java` (automatically falling back to a clean cold re-import if a stale lock or corrupt workspace is encountered). Use **Re-analyze** or **Clear Cache** in the **Decompile** toolbar to force a fresh run. Cancellation and configurable deadlines (default 180s overall, 60s per function) terminate the headless Java process tree cleanly; the target binary itself is never executed.
 
-**Binary Ninja HLIL** remains optional in the provider selector. It requires a
-Python interpreter with the Binary Ninja API and a **Commercial-or-higher** license
-for headless operation; Personal cannot use this adapter. See the
-[Binary Ninja API cookbook](https://docs.binary.ninja/dev/cookbook.html).
-The third provider, **Annotated assembly**, is explicitly not decompiled C.
+**Structured Pseudo-C** works out of the box with zero external dependencies.
+**RetDec** uses a local `retdec-decompiler` CLI installation when configured.
+**Binary Ninja HLIL** remains optional via `resources/bn_decompile.py` (requires a
+Python interpreter with the Binary Ninja API and a **Commercial-or-higher** headless
+license; see the [Binary Ninja API cookbook](https://docs.binary.ninja/dev/cookbook.html)).
+**Annotated assembly** renders symbol-annotated disassembly rather than C.
 
 Ghidra integration tests are opt-in: set `GHIDRA_INSTALL_DIR` and `JAVA_HOME`, then
 run `ctest --test-dir out/build/msvc-debug -C Debug -R GhidraIntegration --output-on-failure`.

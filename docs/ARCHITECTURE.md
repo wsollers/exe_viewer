@@ -1,272 +1,217 @@
 # PE / ELF Explorer Architecture
 
-This document describes the current shape of the project. It is intentionally
-practical: the diagrams show how code and data move today, plus the provider
-boundaries we are adding for assembler/decompiler/live-process work.
+This document describes the post-`89cf67f` runtime and build architecture of PE / ELF Explorer across its three primary CMake targets (`peelf_core`, `peelf_gui`, and `peelf_viewer`). Related documents:
+- **[User Guide (`docs/USER_GUIDE.md`)](USER_GUIDE.md)** — End-to-end feature walkthrough, UI panels, shortcuts, and CLI automation
+- **[Roadmap & C++23 Design (`docs/ROADMAP_DESIGN.md`)](ROADMAP_DESIGN.md)** — Validated specification for `WU-19a..WU-19d` and `WU-21..WU-28`
 
-## Runtime Shape
+---
+
+## 1. System & Target Split Overview
+
+`peelf_viewer` (`apps/viewer/src/launcher.cpp`) is a lightweight Vulkan-free executable that links **only** `peelf_core` and `${CMAKE_DL_LIBS}`. When invoked with `--headless` or `--help`, it executes completely inside `peelf_core` without loading graphics libraries, making it suitable for minimal CI containers (`-DPEELF_BUILD_GUI=OFF` omits GUI compilation altogether). In interactive desktop sessions, `peelf_viewer` dynamically loads `peelf_gui` (`peelf_gui.dll` / `libpeelf_gui.so`) and invokes `peelf_run_gui()`.
 
 ```mermaid
 flowchart LR
-    user["User"]
-    app["peelf_viewer<br/>Application"]
-    ui["UiApp<br/>Dear ImGui panels + VMMap + Structure View + Dependencies + Binary Diff + Debugger + Process Internals + Threads/Stack/TLS + Search + Runtime/Flags + Handlers"]
-    model["BinaryModel<br/>static file (editable), read-only live process / crash dump, OR opt-in IDebugSession"]
-    core["peelf_core<br/>C++23 EndianReader + PE/ELF/DWARF + diff + security rules + crash dumps + smaps/internals"]
-    proc["IProcessBackend / IProcessSession + opt-in IDebugSession<br/>read-only attach by default; Minidump/ET_CORE offline dumps; opt-in ptrace/Win32 debugger"]
-    patches["PagedBinaryImage<br/>staged edits + Save Patched As (static files only)"]
-    disasm["Capstone wrapper<br/>Disassembler + FunctionIndex"]
-    decomp["IDecompiler<br/>StructuredPseudoC + RetDec + Ghidra"]
-    symbols["SymbolIndex<br/>PE/ELF symbols + GOT/PLT + rebased PDB"]
-    graph["CallGraph model<br/>entry / fan-out / CFG work"]
-    graphviz["Graphviz dot<br/>external renderer"]
-    vulkan["VulkanManager<br/>textures + ImGui backend"]
+    user["Analyst / CI Job"]
+    launcher["peelf_viewer<br/>Vulkan-free launcher"]
+    cli["Headless CLI<br/>JSON + SARIF 2.1.0"]
+    gui["peelf_gui<br/>Dynamic GUI module"]
+    vk["VulkanManager<br/>2 frames-in-flight"]
+    ui["UiApp + Panels<br/>Dear ImGui docking"]
+    model["BinaryModel<br/>Static / Live / Dump / Debug"]
+    core["peelf_core<br/>IBinaryImage + Runtime"]
+    ext["External Tools<br/>Ghidra / llvm-mc / dot"]
 
-    user --> app
-    app --> ui
-    app --> model
-    model --> core
-    model --> proc
-    model --> patches
+    user --> launcher
+    launcher -->|"--headless / --help"| cli
+    cli --> core
+    launcher -->|"dlopen / LoadLibraryExW"| gui
+    gui --> vk
+    gui --> ui
     ui --> model
-    ui --> disasm
-    ui --> decomp
-    ui --> symbols
-    ui --> graph
-    graph --> graphviz
-    graphviz --> graph
-    graph --> vulkan
-    ui --> vulkan
+    model --> core
+    ui --> ext
+    core --> ext
 ```
 
-## Static File Load Flow
+### Target Boundary Invariants
+- **`peelf_core` (`libs/peelf_core`)**: Zero ImGui, GLFW, or Vulkan dependencies. Uses `peelf::Result<T> = std::expected<T, peelf::Error>` across API boundaries (`peelf/error.hpp`) and forgiving `ForgivingValue<T>` / `SubsystemStatus` (`peelf/forgiving.hpp`) when partial OS telemetry is expected.
+- **`peelf_gui` (`apps/viewer`)**: Owns `VulkanManager`, `Application`, `BinaryModel`, `UiApp`, background UI controllers (`AsyncReferenceScanner`, `AsyncBinaryDiffController`, `DecompileCache`), Capstone `Disassembler`, DIA/PDB symbol bridge, and `.peproj` v2 session management.
+- **Compiler & Sanitizer Gate**: Project targets compile with `-Wall -Wextra -Wpedantic -Werror` on Clang/GCC and `/W4 /WX /FS` on MSVC (`PEELF_WARNINGS_AS_ERRORS=ON`), while `FetchContent` headers are isolated as `SYSTEM`. All `326/326` CTests pass under `clang18-asan-ubsan` (`AddressSanitizer` + `UndefinedBehaviorSanitizer`).
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant App as Application
-    participant Model as BinaryModel
-    participant Core as peelf_core
-    participant Ui as UiApp
-    participant Symbols as SymbolIndex
-    participant Disasm as Capstone Disassembler
+---
 
-    User->>App: File > Open
-    App->>Model: load_file(path)
-    Model->>Core: detect + parse PE/ELF bytes
-    Core-->>Model: IBinaryImage + parsed structures
-    App->>Ui: on_file_loaded()
-    Ui->>Symbols: build(image)
-    Ui->>Disasm: init(architecture, endianness)
-    Ui->>Ui: build Structure tree
-    Ui->>Ui: navigate Hex/Disassembly to entry point
-```
+## 2. Unified `IBinaryImage` & Session Spine
 
-## Strictly Read-Only Live Process Attach, Static Hydration & Multi-Arch Runtime Inspection
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant Ui as UiApp / Panels
-    participant Model as BinaryModel
-    participant Proc as IProcessBackend / Read-Only Session
-    participant Core as peelf_core (Forgiving Multi-Arch Subsystems)
-    participant Decomp as FunctionIndex + IDecompiler
-
-    User->>Ui: File > Attach to Process...
-    Ui->>Model: list_processes() / attach_process(pid)
-    Model->>Proc: open_process(pid) [strictly read-only]
-    Model->>Core: resolve_executable_from_command_line(cmdline, cwd, PATH)
-    Model->>Core: load_live_module_image(main_module + resolved backing PE/ELF)
-    Note over Core: Combines live RAM at runtime ASLR base<br/>with resolved on-disk PE/ELF (.symtab, .pdata, .eh_frame, TLS)<br/>rebased by (live_base - static_base)
-    Core-->>Model: Rebased IBinaryImage + SymbolIndex + FunctionIndex
-    Model->>Core: harvest_header_flags + inspect_process_environment + inspect_handlers
-    Note over Core: Forgiving Availability (Available / Partial / Unavailable):<br/>PEB32/64 + TEB32/64 OR Linux auxv + status + r_debug/link_map + TCB;<br/>SEH/VEH/.pdata/.eh_frame/Linux signals/atexit across 32/64-bit LE/BE
-    User->>Ui: Click executable MemoryRegion or Function
-    Ui->>Decomp: Disassemble window + CFG + StructuredPseudoC / RetDec / Ghidra
-    User->>Ui: Pause Process -> Select Thread
-    Ui->>Proc: suspend() + threads() + thread_context(tid)
-    Model->>Core: unwind_and_inspect_stack + inspect_thread_locals
-    Note over Ui: Stack View highlights Return Addresses (Gold/Amber)<br/>vs. Base/Frame Pointers (Cyan/Teal); TLS decodes PE & ELF Variant I/II
-    User->>Ui: Search Heap (Hex / Endian Numbers / UTF-8 & UTF-16 Text)
-    Ui->>Core: search_process_memory (target endianness & alignment)
-```
-
-## Panel Navigation Model
+The duplicate legacy `viewer::PeParser` / `PeModel` path was retired in `473ee3f` (`WU-18`). Every static view, live attached module view, offline crash dump module hydration, dependency resolver, binary differ, and security rule operates on `peelf::IBinaryImage` (`libs/peelf_core/include/peelf/binary_image.hpp`).
 
 ```mermaid
 flowchart TD
-    structure["Structure tree<br/>File OR Process / Modules / Memory Map"]
-    memmap["Memory Map panel<br/>VMMap regions + module selector"]
-    sections["Sections panel"]
-    imports["Imports panel"]
-    exports["Exports panel"]
-    symbolsPanel["Symbols panel<br/>source + VA + offset"]
-    patchPanel["Patch Set panel<br/>staged static edits"]
-    graphPanel["Flow Graph panel<br/>draggable cards + live edges"]
+    bytes["FileMapping / Byte Span"]
+    parse["parse_image() / parse_mapped_image()"]
+    pe["PeImage : IBinaryImage<br/>PE32/PE32+ + 16 Data Dirs"]
+    elf["ElfImage : IBinaryImage<br/>ELF32/64 LE/BE + PT_DYNAMIC"]
+    paged["PagedBinaryImage<br/>Sparse patch transactions"]
+    ro["IProcessSession (Read-Only)<br/>Win32 VM_READ / Linux /proc"]
+    dump["ICrashDumpSession : IProcessSession<br/>Win32 .dmp + ELF ET_CORE"]
+    dbg["IDebugSession (Opt-in)<br/>Linux ptrace + Win32 Debug API"]
+    hybrid["load_live_module_image()<br/>Live RAM + Rebased Disk Metadata"]
+    model["BinaryModel"]
 
-    selection["ViewerSelection<br/>kind, label, window offset, VA, size, preferred view"]
-
-    details["Details panel"]
-    hex["Hex View<br/>VA/offset + static inline edit + ?? unmapped"]
-    disasmPanel["Disassembly panel<br/>symbol labels + staged static patch tint"]
-
-    structure --> selection
-    memmap --> selection
-    sections --> selection
-    imports --> selection
-    exports --> selection
-    symbolsPanel --> selection
-    patchPanel --> selection
-    graphPanel --> selection
-
-    selection --> details
-    selection --> hex
-    selection --> disasmPanel
+    bytes --> parse
+    parse --> pe
+    parse --> elf
+    bytes --> paged
+    paged --> model
+    pe --> model
+    elf --> model
+    ro --> hybrid
+    dump --> hybrid
+    dbg --> hybrid
+    hybrid --> model
 ```
 
-Selections are the core UI contract. A panel should update `ViewerSelection`
-instead of directly rewriting unrelated panels. `UiApp` then maps the selection
-to Details/Hex/Disassembly when readable bytes exist. Selections without readable
-bytes should remain valid and display a clear "hex not available" style message
-as that path is hardened.
+### Format & Session Capabilities
+- **PE32 / PE32+ (`PeImage`)**: Typed `PeFileHeaderInfo`, `PeOptionalHeaderInfo`, and `PeDataDirectoryEntry` accessors; standard, ordinal, bound, and delay-load imports; named, ordinal, and forwarded exports; base relocations; `.pdata`/`.xdata` unwind metadata; CodeView RSDS + MSF 7.00 Stream 1/3 GUID+Age verification; TLS callbacks; `WIN_CERTIFICATE` table; LoadConfig (SafeSEH, GuardCF, security cookie); resource directory trees; and CLR header.
+- **ELF32 / ELF64 LE/BE (`ElfImage`)**: Supports x86, x86-64, ARM32, ARM64, RISC-V 32/64, MIPS 32/64, and PowerPC 32/64; extended header numbering (`e_shnum == 0`, `SHN_XINDEX`, `PN_XNUM`); static sectionless `PT_DYNAMIC` symbol/relocation/import recovery (`DT_HASH` / `DT_GNU_HASH` / `DT_SYMTAB` / `DT_STRTAB` via `PT_LOAD` VA translation); notes (`.note.gnu.build-id`, `.note.gnu.property`); and DWARF v2–v5 + `.gnu_debuglink` sidecar hydration.
+- **Strictly Read-Only Live Inspection vs. Opt-In Debugging**:
+  - Default `IProcessSession` (`Ctrl+P`) guarantees `is_read_only() == true` (Linux `O_RDONLY` `/proc/<pid>/mem` + `process_vm_readv`; Windows `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`) and never injects traps or writes memory.
+  - Offline crash dumps (`Minidump` `"MDMP"` and ELF `ET_CORE` with multi-arch `NT_PRSTATUS` decoding) implement `ICrashDumpSession : IProcessSession`, reusing every live inspection panel without executing target code.
+  - Active debugging (`peelf::debugger::IDebugSession`) requires explicit opt-in via **Inspect > Start / Attach Debugger (Opt-in)...**, backed by BSD-2-Clause native Linux `ptrace` and Win32 Debug API implementations with software breakpoint byte-shadowing in memory reads and clean restoration on detach.
 
-## `.peproj` v2 Analysis Sessions & Crash Recovery
+---
 
-Static analysis state persists in versioned `.peproj` (`PEELF_PROJECT 2`) files with
-automatic in-memory migration from `PEELF_PROJECT 1`:
-- **Target Identity & Portable Relocation**: Records both `relative_source` (proximate to the `.peproj` parent directory) and canonical `source`, verified against original `source_sha256` (`peelf::sha256_hex`) and `source_size` with structured `ExactMatch`, `ModifiedMismatch`, and `RelocationNeeded` handling.
-- **Session State**: Persists staged static patches, user symbol/comment annotations, imported debug symbols, bookmarks (`Bookmark`), pinned `AppliedStructureBinding`s, navigation history, and docking layout.
-- **Atomic Saves & Autosave Journals**: Project writes stage to a sibling `.tmp` file before atomic rename, while dirty session edits periodically write crash-recovery journals under `$PEELF_CACHE_DIR/recovery` or `/tmp/peelf_viewer-recovery-<uid>`.
+## 3. Background Analysis, Decompilation & Session Persistence
 
-## Call Graph Flow
+Expensive static and cross-binary analyses run off the UI render thread with explicit progress, cancellation, or caching so 60+ FPS interactivity is preserved.
 
 ```mermaid
 flowchart LR
-    image["IBinaryImage<br/>sections, imports, symbols"]
-    bytes["file bytes"]
-    symidx["SymbolIndex<br/>parser + PDB/DWARF future"]
-    capstone["Capstone detail disassembly"]
-    builder["Call graph builders<br/>entry sketch, symbol fan-out, CFG"]
-    dot["DOT text"]
-    plain["Graphviz plain layout"]
-    bmp["BMP/SVG output"]
-    panel["Call Graph panel<br/>draw + hit-test"]
-    selection["ViewerSelection"]
+    model["BinaryModel<br/>SHA-256 + edit_revision"]
+    refscan["AsyncReferenceScanner<br/>std::jthread 256 KiB slices"]
+    refidx["ReferenceIndex<br/>Direct + JumpTable + IAT/GOT"]
+    stridx["StringsIndex<br/>ASCII / UTF-8 / UTF-16 xrefs"]
+    diffctl["AsyncBinaryDiffController<br/>Revision-gated stop_token"]
+    dcache["DecompileCache<br/>SHA-256 + patch/sym rev key"]
+    ghidra["Persistent Ghidra LRU<br/>Off-/mnt/c ws-* projects"]
+    peproj[".peproj v2 + Recovery<br/>Atomic .tmp + off-/mnt/c journal"]
 
-    image --> builder
-    bytes --> builder
-    symidx --> builder
-    capstone --> builder
-    builder --> dot
-    dot --> plain
-    dot --> bmp
-    plain --> panel
-    bmp --> panel
-    panel --> selection
+    model --> refscan
+    refscan --> refidx
+    refidx --> stridx
+    model --> diffctl
+    model --> dcache
+    dcache -->|"cache miss"| ghidra
+    model --> peproj
+    refidx --> peproj
 ```
 
-The current UI renders a graph and uses Graphviz `plain` metadata for node
-hit-testing. Clicking a function-like node updates the shared selection and can
-queue a new fan-out graph rooted at that symbol. The next major step is richer
-basic-block CFG construction and more precise indirect-call handling.
+- **Resumable `ReferenceIndex` (`WU-03`)**: `AsyncReferenceScanner` scans executable sections/regions in 256 KiB slices on a `std::jthread`, populating sorted `incoming`/`outgoing` xref vectors ($O(\log N + K)$ queries). Recovers direct branches/calls, guarded x86 absolute jump tables, x86/x64 PIC/RIP-relative `i32` tables, ARM Thumb-2 `tbb`/`tbh`, ARM64 PC-relative jump tables, and IAT/GOT indirect slots with `ReferenceConfidence` and `evidence` strings.
+- **Two-Tier Persistent Decompilation (`WU-02`)**: `DecompileCache` caches `DecompiledUnit` results in memory by `(binary_sha256, patch_revision, symbol_revision, provider, settings_fingerprint, arch, endian, thumb, function_va)`. On cache miss, `GhidraDecompiler` reuses an LRU-bounded headless workspace (`ws-*` under `$PEELF_CACHE_DIR/ghidra_workspaces` or safe OS temp dir, never `/mnt/c` on WSL): cold imports run `analyzeHeadless -import` without `-deleteProject`, while subsequent functions run `-process -noanalysis` with incremental symbol sync and automatic cold-retry on stale project locks. In-tree `StructuredPseudoCDecompiler` provides an instant zero-dependency fallback.
+- **Cancellable Binary Diff (`WU-12`, `WU-17`)**: `AsyncBinaryDiffController` executes `peelf::compare_binaries` (header, section, import, export, byte-hunk, and 3-tier `ExactName` / `NormalizedFingerprint` / `Similarity` function matching) on a background `std::jthread` with monotonic request IDs and `std::stop_token` cooperative cancellation. `peelf::compare_module_disk_to_live` normalizes relocations, LoadConfig cookies, and resolved IAT/GOT entries to isolate `.text` `InlineCodeHook` detours from `IatGotPointerHook` hijacks.
+- **`.peproj` v2 Sessions & Crash Recovery (`WU-09`)**: Stores `source_sha256`, `source_size`, canonical `source`, and portable `relative_source` alongside staged patches, annotations, debug symbols, bookmarks, pinned `AppliedStructureBinding`s, history, and layout. Writes atomically via `.tmp` rename and maintains periodic off-`/mnt/c` recovery journals.
 
-## Assembly Providers & Reusable Patch Bundles (`.pepatch.json`)
+---
+
+## 4. Panel Selection Hub & Synchronized Views
+
+Panels communicate through `ViewerSelection` (`apps/viewer/src/navigation/viewer_navigation.hpp`) rather than mutating peer panels directly.
 
 ```mermaid
 flowchart TD
-    shellcode["Shellcode panel<br/>hex or live assembly scratchpad"]
-    patch["Patch Set panel<br/>Hex OR Assemble at Selection / VA + .pepatch.json"]
-    request["AssembleRequest<br/>arch, mode, endian, syntax, base_address, asm_text"]
-    manager["AssemblerRegistry / assemble_instructions"]
-    asmtk["AsmTkAssemblerProvider<br/>in-process x86/x86_64 @ base_address"]
-    llvm["LlvmMcAssemblerProvider<br/>safe argv llvm-mc --show-encoding multi-arch"]
-    unavailable["SubsystemStatus::Unavailable<br/>explicit diagnostic"]
-    result["AssembleOutput<br/>encoded bytes + per-instruction spans"]
-    preview["PatchPreview + PatchBundlePreview<br/>Capstone round-trip + slack warning + SHA-256/byte conflict check"]
-    tx["PagedBinaryImage::begin_transaction<br/>atomic static-file staging (read-only live sessions rejected)"]
+    nav["Navigation Sources<br/>Structure / Sections / Symbols / Strings"]
+    xref["Analysis Sources<br/>Flow Graph / Decompile / References"]
+    live["Runtime Sources<br/>Memory Map / Dependencies / Diff / Debugger"]
+    sel["ViewerSelection<br/>kind, label, offset, VA, size, preferred_view"]
+    details["Details Panel"]
+    hex["Hex View<br/>Effective bytes + ?? unmapped"]
+    disasm["Disassembly Panel<br/>Demangled labels + patch tint"]
+    structv["Structure View<br/>Synced schema overlay"]
 
-    shellcode --> request
-    patch --> request
-    request --> manager
-    manager --> asmtk
-    manager --> llvm
-    manager --> unavailable
-    asmtk --> result
-    llvm --> result
-    result --> preview
-    preview --> tx
+    nav --> sel
+    xref --> sel
+    live --> sel
+    sel --> details
+    sel --> hex
+    sel --> disasm
+    sel --> structv
 ```
 
-`IAssemblerProvider` (`peelf/assembler.hpp`) selects `AsmTkAssemblerProvider` first for little-endian x86/x86_64 targets when `PEELF_ASMTK_AVAILABLE` is enabled and falls back to `LlvmMcAssemblerProvider` across ARM, Thumb, AArch64, RISC-V 32/64, PowerPC 32/64, and MIPS 32/64 when `llvm-mc` is installed. Portable `.pepatch.json` patch bundles (`peelf/patch_bundle.hpp`) verify target `expected_sha256`, `expected_size`, and per-entry `original_bytes_hex` before staging all entries inside a single `PagedBinaryImage` transaction, and strictly reject read-only live process sessions.
+---
 
-## Dependency Shape
+## 5. Assembly Providers & Transactional Patching (`.pepatch.json`)
+
+```mermaid
+flowchart TD
+    ui["Hex View / Shellcode / Patch Set"]
+    req["AssembleRequest<br/>arch, mode, endian, base_va, asm"]
+    reg["AssemblerRegistry"]
+    asmtk["AsmTkAssemblerProvider<br/>In-process x86 / x86_64"]
+    llvm["LlvmMcAssemblerProvider<br/>Safe argv llvm-mc multi-arch"]
+    prev["PatchPreview + BundlePreview<br/>Round-trip disasm + slack + SHA-256 check"]
+    tx["PagedBinaryImage::begin_transaction()<br/>Undo/Redo + Save Patched As (static only)"]
+
+    ui --> req
+    req --> reg
+    reg --> asmtk
+    reg --> llvm
+    asmtk --> prev
+    llvm --> prev
+    prev --> tx
+```
+
+`IAssemblerProvider` (`peelf/assembler.hpp`) dispatches little-endian x86/x86_64 assembly to `AsmTkAssemblerProvider` in-process and routes ARM, Thumb, AArch64, RISC-V 32/64, PowerPC 32/64, and MIPS 32/64 to `LlvmMcAssemblerProvider` via shell-free `argv` execution (`fork`/`execv` on POSIX, `CreateProcessW` on Windows). `.pepatch.json` bundles (`peelf/patch_bundle.hpp`) validate `expected_sha256`, `expected_size`, and per-entry `original_bytes_hex` before staging all spans inside one atomic `PatchTransaction`, rejecting live process sessions unconditionally.
+
+---
+
+## 6. Vulkan 2-Frames-in-Flight Rendering Loop (`WU-18`)
+
+`VulkanManager` (`apps/viewer/src/vulkan/vulkan_manager.*`) decouples CPU ImGui frame preparation from GPU presentation using `kMaxFramesInFlight = 2`:
 
 ```mermaid
 flowchart LR
-    cmake["CMake configure"]
-    fetch["FetchContent"]
-    system["System packages"]
-    viewer["peelf_viewer"]
-    tests["peelf_tests"]
+    glfw["GLFW Window Events<br/>Resize + Minimize Guard"]
+    fence["Wait Frame Fence<br/>frame_index in 0..1"]
+    acq["vkAcquireNextImageKHR<br/>image_available_sem[frame]"]
+    cmd["Reset Pool + Record ImGui<br/>command_buffer[frame]"]
+    sub["vkQueueSubmit<br/>render_finished_sem[image_idx]"]
+    pres["vkQueuePresentKHR<br/>Swapchain Recreate on OutOfDate"]
 
-    fetch --> glfw["GLFW"]
-    fetch --> imgui["Dear ImGui docking pin"]
-    fetch --> nfd["nativefiledialog-extended"]
-    fetch --> capstone["Capstone"]
-    fetch --> asmjit["AsmJit"]
-    fetch --> asmtk["AsmTK local wrapper"]
-    fetch --> graphvizsrc["Graphviz source<br/>optional"]
-
-    system --> vulkan["Vulkan SDK / libvulkan-dev"]
-    system --> dot["Graphviz dot executable<br/>optional but recommended"]
-
-    glfw --> viewer
-    imgui --> viewer
-    nfd --> viewer
-    capstone --> viewer
-    asmjit --> asmtk
-    asmtk --> viewer
-    capstone --> tests
-    asmtk --> tests
-    vulkan --> viewer
-    dot --> viewer
-    graphvizsrc --> viewer
+    glfw --> fence
+    fence --> acq
+    acq --> cmd
+    cmd --> sub
+    sub --> pres
+    pres -->|"next frame (frame + 1) % 2"| fence
 ```
 
-`peelf::asmtk` and `peelf::graphviz` are stable project-facing targets. Their
-feature macros report whether the backing implementation/tool is available.
+- Each in-flight frame (`0` and `1`) owns an isolated `VkCommandPool`, `VkCommandBuffer`, `image_available` `VkSemaphore`, and `in_flight` `VkFence`.
+- `render_finished` semaphores are indexed by acquired **swapchain `image_index`** rather than `frame_index` so semaphore reuse stays hazard-free under Vulkan validation layers across triple-buffered swapchains.
+- Minimized zero-extent windows (`width == 0 || height == 0`) pause acquisition cleanly, and `VK_ERROR_OUT_OF_DATE_KHR` / `VK_SUBOPTIMAL_KHR` trigger `recreate_swapchain()` + `ImGui_ImplVulkan_SetMinImageCount()`.
 
-## Test Fixture Matrix
+---
+
+## 7. Security Rule Engine, CI & Verification Matrix
 
 ```mermaid
-flowchart TD
-    docker["Docker cross toolchain image"]
-    generator["tests/fixtures/build_cross_callgraph_fixtures.sh"]
-    matrix["bin-matrix/"]
-    tests["GoogleTest matrix tests"]
+flowchart LR
+    matrix["bin-matrix/ + Malformed Matrix<br/>PE32/64 + 10-Arch ELF + Dumps"]
+    presets["CMake Presets<br/>Clang 18 + ASan/UBSan + MSVC 2022"]
+    gates["Compile Gates<br/>-Werror + /W4 /WX /FS"]
+    ctest["CTest Suite<br/>326 / 326 Unit & Integration Tests"]
+    headless["peelf_viewer --headless<br/>JSON + OASIS SARIF 2.1.0"]
+    gha[".github/workflows/ci.yml<br/>Ubuntu 24.04 + Windows 2022"]
 
-    docker --> generator
-    generator --> elf["ELF executables + .so<br/>x86, x86-64, ARM, ARM64, RISC-V64, MIPS, PowerPC"]
-    generator --> pe["PE DLL fixtures<br/>x86, x86-64"]
-    elf --> matrix
-    pe --> matrix
-    matrix --> tests
+    matrix --> ctest
+    presets --> gates
+    gates --> ctest
+    gates --> headless
+    ctest --> gha
+    headless --> gha
 ```
 
-The checked-in `bin-matrix/` files let normal builds run parser, symbol,
-disassembly, and call-graph tests without regenerating fixtures. The Docker
-targets refresh the matrix when cross-toolchain coverage changes.
+- **Security Rules (`peelf/security_audit.hpp`)**: Evaluates `PE1001..PE1008`, `ELF2001..ELF2008`, and `LIVE3001..LIVE3003` with `Pass` / `Note` / `Warning` / `Error` severities, header/segment/region evidence, VA/offset locations, and compiler/linker remediation flags. `PE1005` (`SignBinaryWithAuthenticode`) explicitly separates structural `WIN_CERTIFICATE` presence (`Note` when cryptographic verification is unavailable off-Windows) from Windows `WinVerifyTrust` cryptographic signature and publisher trust verification.
+- **Hostile-Input & Sanitizer Verification (`WU-16`, `WU-17`)**: `tests/malformed_inputs_matrix_test.cpp` tests wrap-around offsets, cyclic PE forwarders and ELF `sh_link` chains, `SHN_XINDEX`/`PN_XNUM` boundary conditions, cyclic DWARF `DW_AT_type` graphs, truncated LEB128 streams, and `0xFFFFFFFF` `ET_CORE` note alignments under `clang18-asan-ubsan`.
 
-## Binary Comparison & Disk-vs-Live-RAM Integrity Diff (`WU-12`)
-
-- `peelf::compare_binaries` (`libs/peelf_core/include/peelf/binary_diff.hpp`) diffs PE/ELF headers, sections (with SHA-256 and byte-change deltas), imports, exports, bounded coalesced byte hunks, and functions using a three-tier relocation- and address-shift-tolerant matcher (`ExactName`, `NormalizedFingerprint` masking PC/RIP-relative displacements and `.reloc`/ELF fixups, and n-gram `Similarity`).
-- `peelf::compare_module_disk_to_live` rebases an on-disk PE/ELF module to its live runtime `ModuleInfo::base_address`, normalizes `.reloc` / ELF `RELATIVE` entries, LoadConfig security cookies, and legitimate IAT/GOT loader resolutions, and surfaces unexpected `.text` `InlineCodeHook` detours and `IatGotPointerHook` hijacks.
-- `viewer::BinaryDiffPanel` (`View > Binary Diff`, `File > Compare With Binary...`) provides tabbed inspection plus synchronized side-by-side Hex and Disassembly views.
-
-## Security & Hardening Rule Engine & Headless CLI (`WU-13`)
-
-- `peelf::audit_security` and `peelf::audit_live_process_security` (`libs/peelf_core/include/peelf/security_audit.hpp`) evaluate 19 formalized BinSkim/checksec-style rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`) with `Pass`/`Note`/`Warning`/`Error` severities, header/directory/segment/live-region evidence, navigable virtual-address/file-offset anchors, and remediation guidance, surfaced in the GUI inside `PEB / TEB & Flags` (`Security Audit (BinSkim)` tab).
-- `peelf_viewer` links `peelf::core` directly (with zero Vulkan/GLFW/ImGui shared-library dependencies) so `peelf_viewer --headless [<binary> [options]]` works in GUI-less CI containers: bare `--headless` exits `0` for smoke compatibility, while `--headless <binary>` supports `--compare`, `--format json|sarif` (valid SARIF 2.1.0), `--output` (atomic write), `--search-root`, `--include-strings` / `--min-string-len`, and `--fail-on none|error|warning` (`0` clean, `1` CLI/file/parse error, `2` policy gate failure).
 
 
