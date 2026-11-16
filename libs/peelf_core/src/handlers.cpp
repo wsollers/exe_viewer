@@ -1851,6 +1851,8 @@ struct EhDecodeBases {
 
     const auto format = static_cast<std::uint8_t>(encoding & 0x0Fu);
     std::uint64_t raw = 0;
+    std::int64_t signed_disp = 0;
+    bool is_signed_format = false;
     switch (format) {
         case 0x00u: {  // DW_EH_PE_absptr
             const auto v = reader.read_pointer(cursor);
@@ -1901,7 +1903,9 @@ struct EhDecodeBases {
             if (!v) {
                 return std::nullopt;
             }
+            signed_disp = *v;
             raw = static_cast<std::uint64_t>(*v);
+            is_signed_format = true;
             break;
         }
         case 0x0Au: {  // DW_EH_PE_sdata2
@@ -1909,7 +1913,9 @@ struct EhDecodeBases {
             if (!v) {
                 return std::nullopt;
             }
-            raw = static_cast<std::uint64_t>(static_cast<std::int64_t>(*v));
+            signed_disp = static_cast<std::int64_t>(*v);
+            raw = static_cast<std::uint64_t>(signed_disp);
+            is_signed_format = true;
             cursor += 2u;
             break;
         }
@@ -1918,7 +1924,9 @@ struct EhDecodeBases {
             if (!v) {
                 return std::nullopt;
             }
-            raw = static_cast<std::uint64_t>(static_cast<std::int64_t>(*v));
+            signed_disp = static_cast<std::int64_t>(*v);
+            raw = static_cast<std::uint64_t>(signed_disp);
+            is_signed_format = true;
             cursor += 4u;
             break;
         }
@@ -1927,7 +1935,9 @@ struct EhDecodeBases {
             if (!v) {
                 return std::nullopt;
             }
+            signed_disp = *v;
             raw = static_cast<std::uint64_t>(*v);
+            is_signed_format = true;
             cursor += 8u;
             break;
         }
@@ -1935,35 +1945,61 @@ struct EhDecodeBases {
             return std::nullopt;
     }
 
-    if (size_only || raw == 0) {
+    if (size_only) {
+        if (is_signed_format && signed_disp < 0) {
+            return std::nullopt;
+        }
         return DecodedEhPointer{raw, {}};
     }
+    if (raw == 0) {
+        return DecodedEhPointer{0, {}};
+    }
+
+    const auto apply_rel_base = [&](std::uint64_t rel_base) -> std::optional<std::uint64_t> {
+        if (is_signed_format) {
+            return checked_apply_signed_displacement(rel_base, signed_disp, layout.is_64bit());
+        }
+        if (raw > std::numeric_limits<std::uint64_t>::max() - rel_base) {
+            return std::nullopt;
+        }
+        const std::uint64_t sum = rel_base + raw;
+        if (!layout.is_64bit() && sum > 0xFFFF'FFFFull) {
+            return std::nullopt;
+        }
+        return sum;
+    };
 
     const auto application = static_cast<std::uint8_t>(encoding & 0x70u);
-    std::uint64_t addr = raw;
+    std::optional<std::uint64_t> resolved_addr;
     switch (application) {
         case 0x00u:  // DW_EH_PE_absptr
-            addr = raw;
+            if (is_signed_format && signed_disp < 0) {
+                return std::nullopt;
+            }
+            if (!layout.is_64bit() && raw > 0xFFFF'FFFFull) {
+                return std::nullopt;
+            }
+            resolved_addr = raw;
             break;
         case 0x10u:  // DW_EH_PE_pcrel
-            addr = field_va + raw;
+            resolved_addr = apply_rel_base(field_va);
             break;
         case 0x20u:  // DW_EH_PE_textrel
-            addr = bases.text_base + raw;
+            resolved_addr = apply_rel_base(bases.text_base);
             break;
         case 0x30u:  // DW_EH_PE_datarel
-            addr = bases.datarel_base + raw;
+            resolved_addr = apply_rel_base(bases.datarel_base);
             break;
         case 0x40u:  // DW_EH_PE_funcrel
-            addr = bases.func_base + raw;
+            resolved_addr = apply_rel_base(bases.func_base);
             break;
         default:
             return std::nullopt;
     }
-
-    if (!layout.is_64bit()) {
-        addr &= 0xFFFF'FFFFull;
+    if (!resolved_addr) {
+        return std::nullopt;
     }
+    const std::uint64_t addr = *resolved_addr;
 
     DecodedEhPointer out{addr, {}};
     if ((encoding & 0x80u) != 0) {  // DW_EH_PE_indirect
@@ -1994,13 +2030,20 @@ struct EhDecodeBases {
                         out.symbol_hint = es.name;
                     }
                     if (es.value != 0) {
-                        out.address = static_cast<std::uint64_t>(
-                            static_cast<std::int64_t>(es.value) + rel.addend);
-                        return out;
+                        if (const auto relocated = checked_apply_signed_displacement(
+                                es.value, rel.addend, img->is_64bit())) {
+                            out.address = *relocated;
+                            return out;
+                        }
+                        return std::nullopt;
                     }
                 } else if (rel.has_addend && rel.addend > 0) {
-                    out.address = img->image_base() + static_cast<std::uint64_t>(rel.addend);
-                    return out;
+                    if (const auto relocated = checked_apply_signed_displacement(
+                            img->image_base(), rel.addend, img->is_64bit())) {
+                        out.address = *relocated;
+                        return out;
+                    }
+                    return std::nullopt;
                 }
             }
             for (const Symbol& sym : img->symbols()) {
@@ -2030,11 +2073,17 @@ struct EhDecodeBases {
         if (rel.symbol_index > 0 && rel.symbol_index < img.elf_symbols().size()) {
             const ElfSymbol& es = img.elf_symbols()[static_cast<std::size_t>(rel.symbol_index)];
             if (es.value != 0) {
-                return static_cast<std::uint64_t>(static_cast<std::int64_t>(es.value) + rel.addend);
+                return checked_apply_signed_displacement(es.value, rel.addend, img.is_64bit());
             }
         } else if (rel.has_addend && rel.addend > 0) {
             const auto add = static_cast<std::uint64_t>(rel.addend);
-            return add < img.image_base() ? (img.image_base() + add) : add;
+            if (add < img.image_base()) {
+                return checked_apply_signed_displacement(img.image_base(), rel.addend, img.is_64bit());
+            }
+            if (!img.is_64bit() && add > 0xFFFF'FFFFull) {
+                return std::nullopt;
+            }
+            return add;
         }
     }
     return std::nullopt;
@@ -2655,15 +2704,22 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
                         }
 
                         if ((lsda_va != 0 || cie.has_personality) &&
-                            emitted_eh < kMaxEmittedEhEntries) {
+                            emitted_eh < kMaxEmittedEhEntries &&
+                            static_cast<std::uint64_t>(record_start) <=
+                                std::numeric_limits<std::uint64_t>::max() - *eh_frame_va) {
                             const std::uint64_t fde_va =
                                 *eh_frame_va + static_cast<std::uint64_t>(record_start);
+                            const std::uint64_t scope_end =
+                                (pc_range->address <=
+                                 std::numeric_limits<std::uint64_t>::max() - pc_begin->address)
+                                    ? (pc_begin->address + pc_range->address)
+                                    : std::numeric_limits<std::uint64_t>::max();
                             const std::string func_sym = ctx.resolve_symbol(pc_begin->address);
                             std::string fde_name =
                                 !func_sym.empty() ? ("FDE " + func_sym)
                                                   : ("FDE@" + hex_u64(fde_va));
                             std::string det = "scope=[" + hex_u64(pc_begin->address) + ", " +
-                                              hex_u64(pc_begin->address + pc_range->address) + ")";
+                                              hex_u64(scope_end) + ")";
                             if (lsda_va != 0) {
                                 det += ", LSDA=" + hex_u64(lsda_va);
                             }
@@ -2679,7 +2735,7 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
                                 std::move(det));
                             e.record_address = fde_va;
                             e.scope_start = pc_begin->address;
-                            e.scope_end = pc_begin->address + pc_range->address;
+                            e.scope_end = scope_end;
                             if (lsda_va != 0) {
                                 e.lsda_or_data_address = lsda_va;
                             }

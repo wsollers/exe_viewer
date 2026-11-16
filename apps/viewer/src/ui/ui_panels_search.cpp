@@ -95,34 +95,66 @@ void MemorySearchPanel::draw_contents() {
 
     const bool is_live = model_.is_live_process();
     if (is_live) {
+        static constexpr std::array<const char*, 4> kScopeItems = {
+            "Heap (default)",
+            "Selected Region",
+            "Active Module",
+            "All Readable Memory",
+        };
         ImGui::SetNextItemWidth(175.0f);
         ImGui::Combo("Scope",
                      &scope_idx_,
-                     "Heap (default)\0Selected Region\0Active Module\0All Readable Memory\0");
+                     kScopeItems.data(),
+                     static_cast<int>(kScopeItems.size()));
     } else {
         ImGui::TextDisabled("Scope: Static Binary Image");
     }
 
+    static constexpr std::array<const char*, 13> kKindItems = {
+        "Hex Pattern (e.g. 48 8B ?? 10)",
+        "Int8 (signed)",
+        "UInt8 (unsigned)",
+        "Int16",
+        "UInt16",
+        "Int32",
+        "UInt32",
+        "Int64",
+        "UInt64",
+        "Float32",
+        "Float64",
+        "Text (UTF-8 / ASCII)",
+        "Text (UTF-16)",
+    };
     ImGui::SetNextItemWidth(175.0f);
     ImGui::Combo("Value Type",
                  &kind_idx_,
-                 "Hex Pattern (e.g. 48 8B ?? 10)\0"
-                 "Int8 (signed)\0UInt8 (unsigned)\0"
-                 "Int16\0UInt16\0"
-                 "Int32\0UInt32\0"
-                 "Int64\0UInt64\0"
-                 "Float32\0Float64\0"
-                 "Text (UTF-8 / ASCII)\0"
-                 "Text (UTF-16)\0");
+                 kKindItems.data(),
+                 static_cast<int>(kKindItems.size()));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(155.0f);
     const std::string auto_endian_label = std::string("Target Auto (") +
                                           std::string(peelf::to_string(model_.endianness())) + ")";
-    const std::string endian_items = auto_endian_label + "\0Little-Endian\0Big-Endian\0";
-    ImGui::Combo("Endianness", &endian_mode_, endian_items.c_str());
+    const std::array<const char*, 3> endian_items = {
+        auto_endian_label.c_str(),
+        "Little-Endian",
+        "Big-Endian",
+    };
+    ImGui::Combo("Endianness",
+                 &endian_mode_,
+                 endian_items.data(),
+                 static_cast<int>(endian_items.size()));
 
+    static constexpr std::array<const char*, 4> kAlignItems = {
+        "1 byte",
+        "2 bytes",
+        "4 bytes",
+        "8 bytes",
+    };
     ImGui::SetNextItemWidth(90.0f);
-    ImGui::Combo("Align", &align_idx_, "1 byte\02 bytes\04 bytes\08 bytes\0");
+    ImGui::Combo("Align",
+                 &align_idx_,
+                 kAlignItems.data(),
+                 static_cast<int>(kAlignItems.size()));
     ImGui::SameLine();
     ImGui::Checkbox("Case-sensitive", &case_sensitive_);
     ImGui::SameLine();

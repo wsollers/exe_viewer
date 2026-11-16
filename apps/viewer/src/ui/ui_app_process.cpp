@@ -280,6 +280,7 @@ void UiApp::render_attach_process_modal() {
         if (!model_.is_live_process() || model_.process_session() == nullptr) {
             return;
         }
+        pending_navigations_.clear();
         binary_diff_panel_.invalidate();
         sync_live_process_view(true);
         struct_view_panel_.reset_for_new_binary();

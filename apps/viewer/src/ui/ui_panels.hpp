@@ -11,8 +11,8 @@
 #include "model/binary_model.hpp"
 #include "navigation/viewer_navigation.hpp"
 #include "symbols/symbol_index.hpp"
+#include "tools/shellcode_converter.hpp"
 #include "ui_panel.hpp"
-#include "symbols/symbol_index.hpp"
 #include "analysis/patch_preview.hpp"
 #include "navigation/byte_range.hpp"
 
@@ -115,33 +115,37 @@ namespace viewer {
     class HexViewPanel : public UiPanel {
     public:
         explicit HexViewPanel(BinaryModel& model);
-        // Invoked with the file offset of the byte the user clicks.
-        void set_byte_activated_callback(std::function<void(std::size_t, std::size_t)> cb) { on_byte_activated_ = std::move(cb); }
-        void set_bytes_patched_callback(std::function<void(std::size_t)> cb) { on_bytes_patched_ = std::move(cb); }
+        // Invoked with the file/window offset of the byte the user clicks.
+        void set_byte_activated_callback(std::function<void(std::uint64_t, std::uint64_t)> cb) {
+            on_byte_activated_ = std::move(cb);
+        }
+        void set_bytes_patched_callback(std::function<void(std::uint64_t)> cb) {
+            on_bytes_patched_ = std::move(cb);
+        }
         void set_apply_structure_callback(std::function<void(std::uint64_t address, bool is_file_offset)> cb) {
             on_apply_structure_ = std::move(cb);
         }
-        void navigate_to_range(std::size_t file_offset, std::size_t size);
+        void navigate_to_range(std::uint64_t file_offset, std::uint64_t size);
         void navigate_to_ranges(std::span<const ByteRange> ranges);
         void clear_selection() noexcept;
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
-        std::size_t selected_offset_ = 0;
-        std::size_t highlighted_offset_ = 0;
-        std::size_t highlighted_size_ = 0;
+        std::uint64_t selected_offset_ = 0;
+        std::uint64_t highlighted_offset_ = 0;
+        std::uint64_t highlighted_size_ = 0;
         std::vector<ByteRange> mapped_ranges_;
-        std::optional<std::size_t> pending_scroll_offset_;
+        std::optional<std::uint64_t> pending_scroll_offset_;
         std::size_t bytes_per_row_ = 16;
         std::uint64_t goto_offset_ = 0;
         char edit_bytes_[4096] = {};
         std::string edit_status_;
-        std::function<void(std::size_t, std::size_t)> on_byte_activated_;
+        std::function<void(std::uint64_t, std::uint64_t)> on_byte_activated_;
         char quick_patch_buf_[256] = {};
         std::string quick_patch_status_;
-        std::size_t quick_patch_offset_ = 0;
-        std::function<void(std::size_t)> on_bytes_patched_;
+        std::uint64_t quick_patch_offset_ = 0;
+        std::function<void(std::uint64_t)> on_bytes_patched_;
         std::function<void(std::uint64_t, bool)> on_apply_structure_;
     };
 
@@ -156,14 +160,10 @@ namespace viewer {
         const ViewerSelection& selection_;
         bool assembly_mode_ = false;
         char input_buf_[32768] = {};
-        std::vector<std::uint8_t> output_bytes_;
-        std::string hex_view_;
-        std::string roundtrip_disasm_view_;
-        std::string diagnostic_;
-        bool last_assembly_mode_ = false;
-        std::uint64_t last_base_address_ = 0;
+        ShellcodeScratchCache scratch_cache_;
         std::function<void()> on_patch_changed_;
 
+        [[nodiscard]] ShellcodeTargetConfig current_target_config() const;
         void rebuild_output();
         void draw_hex_output() const;
         void apply_to_selection();
@@ -177,6 +177,7 @@ namespace viewer {
         void set_analysis_context(const SymbolIndex* symbols, const bool* thumb) { symbols_ = symbols; thumb_ = thumb; }
         void reset_preview() {
             preview_.reset();
+            last_asm_target_.reset();
             live_asm_bytes_.clear();
             live_asm_disasm_.clear();
             live_asm_diag_.clear();
@@ -207,7 +208,7 @@ namespace viewer {
         bool pad_nops_to_boundary_ = false;
         char replacement_[4096]{};
         char asm_input_[8192]{};
-        std::uint64_t last_asm_base_va_ = 0;
+        std::optional<ShellcodeTargetConfig> last_asm_target_;
         std::vector<std::uint8_t> live_asm_bytes_;
         std::vector<Instruction> live_asm_disasm_;
         std::string live_asm_diag_;

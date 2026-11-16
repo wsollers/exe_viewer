@@ -18,11 +18,14 @@
 #include <windows.h>
 #include <dbghelp.h>
 #else
+#include <cerrno>
+#include <cstdint>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <ucontext.h>
 #include <unistd.h>
 #endif
 
@@ -333,27 +336,141 @@ void write_backtrace() noexcept {
     void* frames[64]{};
     const int frame_count = backtrace(frames, 64);
     crash_printf(kCrashLogPath, "Backtrace (%d frames):\n", frame_count);
-    const int fd = open(kCrashLogPath, O_CREAT | O_WRONLY | O_APPEND, 0644);
+    const int fd = open(kCrashLogPath, O_CREAT | O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
     if (fd >= 0) {
         backtrace_symbols_fd(frames, frame_count, fd);
         close(fd);
     }
 }
 
-void signal_handler(int signal, siginfo_t* info, void* /*context*/) noexcept {
-    ensure_crash_directory();
-    crash_printf(kCrashLogPath,
-                 "\n==== PE/ELF Viewer fatal diagnostic ====\nFatal POSIX signal: %d (%s)\nAddress: %p\n",
-                 signal,
-                 signal_name(signal),
-                 info != nullptr ? info->si_addr : nullptr);
-    write_backtrace();
+// Async-signal-safe write helper: uses only ::write() on stack buffers.
+void write_all_async_safe(int fd, const char* data, std::size_t len) noexcept {
+    std::size_t offset = 0;
+    while (offset < len) {
+        const ssize_t n = ::write(fd, data + offset, len - offset);
+        if (n > 0) {
+            offset += static_cast<std::size_t>(n);
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+}
+
+void buf_append_char(char* buf, std::size_t cap, std::size_t& pos, char ch) noexcept {
+    if (pos < cap) {
+        buf[pos++] = ch;
+    }
+}
+
+void buf_append_str(char* buf, std::size_t cap, std::size_t& pos, const char* str) noexcept {
+    if (str == nullptr) {
+        return;
+    }
+    while (*str != '\0' && pos < cap) {
+        buf[pos++] = *str++;
+    }
+}
+
+void buf_append_u64_dec(char* buf, std::size_t cap, std::size_t& pos, std::uint64_t val) noexcept {
+    char tmp[24]{};
+    std::size_t count = 0;
+    do {
+        tmp[count++] = static_cast<char>('0' + (val % 10u));
+        val /= 10u;
+    } while (val != 0u && count < sizeof(tmp));
+    while (count > 0u) {
+        buf_append_char(buf, cap, pos, tmp[--count]);
+    }
+}
+
+void buf_append_i32(char* buf, std::size_t cap, std::size_t& pos, int val) noexcept {
+    if (val < 0) {
+        buf_append_char(buf, cap, pos, '-');
+        const std::uint64_t mag = static_cast<std::uint64_t>(-(static_cast<std::int64_t>(val)));
+        buf_append_u64_dec(buf, cap, pos, mag);
+    } else {
+        buf_append_u64_dec(buf, cap, pos, static_cast<std::uint64_t>(val));
+    }
+}
+
+void buf_append_hex_u64(char* buf, std::size_t cap, std::size_t& pos, std::uint64_t val) noexcept {
+    static constexpr char kHexDigits[] = "0123456789ABCDEF";
+    buf_append_str(buf, cap, pos, "0x");
+    char tmp[16]{};
+    std::size_t count = 0;
+    do {
+        tmp[count++] = kHexDigits[val & 0xFu];
+        val >>= 4u;
+    } while (val != 0u && count < sizeof(tmp));
+    while (count > 0u) {
+        buf_append_char(buf, cap, pos, tmp[--count]);
+    }
+}
+
+void signal_handler(int signal, siginfo_t* info, void* context) noexcept {
+    const int saved_errno = errno;
+
+    char buf[512]{};
+    std::size_t pos = 0;
+    buf_append_str(buf, sizeof(buf), pos,
+                   "\n==== PE/ELF Viewer fatal diagnostic ====\nFatal POSIX signal: ");
+    buf_append_i32(buf, sizeof(buf), pos, signal);
+    buf_append_str(buf, sizeof(buf), pos, " (");
+    buf_append_str(buf, sizeof(buf), pos, signal_name(signal));
+    buf_append_str(buf, sizeof(buf), pos, ")");
+    if (info != nullptr) {
+        buf_append_str(buf, sizeof(buf), pos, ", code=");
+        buf_append_i32(buf, sizeof(buf), pos, info->si_code);
+    }
+    buf_append_char(buf, sizeof(buf), pos, '\n');
+
+    buf_append_str(buf, sizeof(buf), pos, "Address: ");
+    const std::uint64_t fault_addr = (info != nullptr)
+        ? reinterpret_cast<std::uintptr_t>(info->si_addr)
+        : 0u;
+    buf_append_hex_u64(buf, sizeof(buf), pos, fault_addr);
+    buf_append_char(buf, sizeof(buf), pos, '\n');
+
+#if defined(__linux__) && defined(__x86_64__) && defined(REG_RIP) && defined(REG_RSP)
+    if (context != nullptr) {
+        const auto* uctx = static_cast<const ucontext_t*>(context);
+        buf_append_str(buf, sizeof(buf), pos, "PC: ");
+        buf_append_hex_u64(buf, sizeof(buf), pos,
+                           static_cast<std::uint64_t>(uctx->uc_mcontext.gregs[REG_RIP]));
+        buf_append_str(buf, sizeof(buf), pos, "  SP: ");
+        buf_append_hex_u64(buf, sizeof(buf), pos,
+                           static_cast<std::uint64_t>(uctx->uc_mcontext.gregs[REG_RSP]));
+        buf_append_char(buf, sizeof(buf), pos, '\n');
+    }
+#elif defined(__linux__) && defined(__aarch64__)
+    if (context != nullptr) {
+        const auto* uctx = static_cast<const ucontext_t*>(context);
+        buf_append_str(buf, sizeof(buf), pos, "PC: ");
+        buf_append_hex_u64(buf, sizeof(buf), pos, static_cast<std::uint64_t>(uctx->uc_mcontext.pc));
+        buf_append_str(buf, sizeof(buf), pos, "  SP: ");
+        buf_append_hex_u64(buf, sizeof(buf), pos, static_cast<std::uint64_t>(uctx->uc_mcontext.sp));
+        buf_append_char(buf, sizeof(buf), pos, '\n');
+    }
+#else
+    (void)context;
+#endif
+
+    write_all_async_safe(STDERR_FILENO, buf, pos);
+    const int log_fd = ::open(kCrashLogPath, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (log_fd >= 0) {
+        write_all_async_safe(log_fd, buf, pos);
+        ::close(log_fd);
+    }
 
     struct sigaction action {};
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
-    sigaction(signal, &action, nullptr);
-    raise(signal);
+    ::sigaction(signal, &action, nullptr);
+    errno = saved_errno;
+    ::raise(signal);
+    ::_exit(128 + (signal & 0x7F));
 }
 
 void install_signal_handler(int signal) noexcept {

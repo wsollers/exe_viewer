@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -11,8 +12,11 @@
 #include <gtest/gtest.h>
 
 #include "graph/call_graph.hpp"
+#include "navigation/byte_range.hpp"
 #include "navigation/viewer_navigation.hpp"
 #include <peelf/binary_image.hpp>
+#include <peelf/handlers.hpp>
+#include <peelf/stack_tls.hpp>
 
 TEST(NavigationHistory, BackForwardAndBranchingPreserveSelections) {
     viewer::NavigationHistory history;
@@ -332,4 +336,201 @@ TEST(ViewerNavigation, DoesNotMapUnresolvedCallGraphSelectionToFirstSymbol) {
     };
 
     EXPECT_EQ(viewer::selected_symbol_index(graph_selection, *image), std::nullopt);
+}
+
+TEST(DeferredNavigationQueue, DrainsFifoOutsideRowIterationAndHandlesReentrantEnqueue) {
+    viewer::NavigationRequestQueue queue;
+    std::vector<std::uint64_t> active_module_rows{0x401000u, 0x402000u, 0x7FF01000u};
+    std::vector<std::string> execution_log;
+
+    // Simulate clicking a cross-module row during an ImGui table loop:
+    // backing vector must remain untouched until EndTable() + queue.drain().
+    const std::uint64_t* initial_data_ptr = active_module_rows.data();
+    for (std::uint64_t va : active_module_rows) {
+        if (va == 0x402000u) {
+            queue.enqueue_address(va, viewer::PreferredView::Disassembly);
+        }
+        EXPECT_EQ(active_module_rows.data(), initial_data_ptr);
+    }
+    EXPECT_FALSE(queue.empty());
+    EXPECT_EQ(queue.size(), 1u);
+
+    queue.enqueue_module(2u);
+
+    const std::size_t processed = queue.drain([&](viewer::DeferredNavigationRequest& req) {
+        using Kind = viewer::DeferredNavigationRequest::Kind;
+        if (req.kind == Kind::Address) {
+            execution_log.push_back("addr:" + std::to_string(req.target));
+            // Simulate select_live_module() replacing model vectors safely during drain:
+            active_module_rows = {0x900000u, 0x900010u, 0x900020u, 0x900030u};
+            // Re-entrant enqueue during drain must execute in the subsequent pass:
+            queue.enqueue_custom([&]() { execution_log.push_back("followup_custom"); });
+        } else if (req.kind == Kind::ModuleIndex) {
+            execution_log.push_back("mod:" + std::to_string(req.target));
+        } else if (req.kind == Kind::Custom && req.custom_action) {
+            req.custom_action();
+        }
+    });
+
+    EXPECT_EQ(processed, 3u);
+    EXPECT_TRUE(queue.empty());
+    ASSERT_EQ(execution_log.size(), 3u);
+    EXPECT_EQ(execution_log[0], "addr:4202496");
+    EXPECT_EQ(execution_log[1], "mod:2");
+    EXPECT_EQ(execution_log[2], "followup_custom");
+}
+
+TEST(DeferredNavigationQueue, GuardsAgainstRunawayReentrantCycles) {
+    viewer::NavigationRequestQueue queue;
+    queue.enqueue_offset(0x1000u);
+    std::size_t invocations = 0;
+    const std::size_t processed = queue.drain([&](viewer::DeferredNavigationRequest& req) {
+        ++invocations;
+        // Attempt infinite re-enqueue: drain() caps passes to 8 and clears remaining.
+        queue.enqueue_offset(req.target + 1u);
+    });
+    EXPECT_EQ(processed, 8u);
+    EXPECT_EQ(invocations, 8u);
+    EXPECT_TRUE(queue.empty());
+    EXPECT_FALSE(queue.is_draining());
+}
+
+TEST(ByteRange64BitSafety, PreservesOffsetsAbove4GiBAndRejectsOutOfBounds) {
+    constexpr std::uint64_t kLargeFileSize = 0x2'8000'0000ULL; // 10 GiB
+    const auto range = viewer::selected_byte_range(
+        0x2'0000'1000ULL, 0x2'0000'103FULL, kLargeFileSize);
+    ASSERT_TRUE(range.has_value());
+    EXPECT_EQ(range->offset, 0x2'0000'1000ULL);
+    EXPECT_EQ(range->size, 0x40ULL);
+
+    EXPECT_FALSE(viewer::selected_byte_range(
+                     kLargeFileSize, 0x2'0000'1000ULL, kLargeFileSize)
+                     .has_value());
+}
+
+TEST(CheckedHandlerRelocationMath, HandlesSignedBoundsAndRejectsWraparound) {
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x402000ULL, -0x1000LL, true),
+              std::optional<std::uint64_t>(0x401000ULL));
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x402000ULL, 0x280LL, true),
+              std::optional<std::uint64_t>(0x402280ULL));
+
+    // Negative displacement larger than base must fail instead of wrapping around 2^64.
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x1000ULL, -0x1001LL, true),
+              std::nullopt);
+
+    // Positive displacement overflowing UINT64_MAX must fail.
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(
+                  std::numeric_limits<std::uint64_t>::max() - 3ULL, 4LL, true),
+              std::nullopt);
+
+    // INT64_MIN must not trigger signed negation UB:
+    constexpr std::int64_t kMinI64 = std::numeric_limits<std::int64_t>::min();
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x7FFF'FFFF'FFFF'FFFFULL, kMinI64, true),
+              std::nullopt);
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x8000'0000'0000'0000ULL, kMinI64, true),
+              std::optional<std::uint64_t>(0ULL));
+
+    // 32-bit target mode masks/rejects out-of-32-bit range cleanly:
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0x08049000ULL, -0x1000LL, false),
+              std::optional<std::uint64_t>(0x08048000ULL));
+    EXPECT_EQ(peelf::checked_apply_signed_displacement(0xFFFF'FFF0ULL, 0x20LL, false),
+              std::nullopt);
+}
+
+namespace {
+
+class PartialStackSession final : public peelf::IProcessSession {
+public:
+    PartialStackSession() {
+        info_.pid = 4242u;
+        info_.name = "partial_stack_fixture";
+        info_.architecture = peelf::Architecture::X86_64;
+        info_.is_64bit = true;
+        info_.endianness = peelf::Endianness::Little;
+    }
+
+    [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override { return info_; }
+    [[nodiscard]] bool is_alive() const noexcept override { return true; }
+    [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
+        return std::vector<peelf::MemoryRegion>{};
+    }
+    [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
+        return std::vector<peelf::ModuleInfo>{};
+    }
+    [[nodiscard]] peelf::Result<std::size_t> read_memory(
+        std::uint64_t address, std::span<std::uint8_t> buffer) override {
+        // Simulate page-granular stack validity across 3 pages starting at SP = 0x7FFF00001FF8:
+        // - [0x7FFF00001FF8 .. 0x7FFF00001FFB]: 4 readable bytes (EF BE AD DE), short-read at 0x1FFC
+        // - [0x7FFF00002000 .. 0x7FFF00002FFF]: completely unreadable guard/hole page
+        // - [0x7FFF00003000 .. 0x7FFF00003007]: 8 readable bytes (11 22 33 44 55 66 77 88)
+        constexpr std::uint64_t kChunk0Start = 0x7FFF'0000'1FF8ULL;
+        constexpr std::array<std::uint8_t, 4> kChunk0 = {0xEFu, 0xBEu, 0xADu, 0xDEu};
+        constexpr std::uint64_t kChunk1Start = 0x7FFF'0000'3000ULL;
+        constexpr std::array<std::uint8_t, 8> kChunk1 = {
+            0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u};
+
+        std::size_t copied = 0;
+        for (std::size_t i = 0; i < buffer.size(); ++i) {
+            const std::uint64_t cur = address + i;
+            if (cur >= kChunk0Start && cur < kChunk0Start + kChunk0.size()) {
+                buffer[copied++] = kChunk0[static_cast<std::size_t>(cur - kChunk0Start)];
+            } else if (cur >= kChunk1Start && cur < kChunk1Start + kChunk1.size()) {
+                buffer[copied++] = kChunk1[static_cast<std::size_t>(cur - kChunk1Start)];
+            } else {
+                break;
+            }
+        }
+        if (copied == 0u) {
+            return peelf::make_error("unmapped stack range");
+        }
+        return copied;
+    }
+
+private:
+    peelf::ProcessInfo info_{};
+};
+
+} // namespace
+
+TEST(StackByteValidity, PreservesPartialAndUnreadableBytesInsteadOfZeroFlattening) {
+    PartialStackSession session;
+    const peelf::TargetLayout layout = session.target_layout();
+
+    peelf::ThreadContext ctx{};
+    ctx.tid = 1001u;
+    ctx.layout = layout;
+    ctx.stack_pointer = 0x7FFF'0000'1FF8ULL;
+    ctx.instruction_pointer = 0x401000ULL;
+    ctx.status = peelf::SubsystemStatus::available("test");
+
+    peelf::MemoryRegion stack_region{};
+    stack_region.start_address = 0x7FFF'0000'1000ULL;
+    stack_region.end_address = 0x7FFF'0000'4000ULL;
+    stack_region.kind = peelf::MemoryRegionKind::Stack;
+    stack_region.protection.readable = true;
+    stack_region.protection.writable = true;
+
+    const std::array<peelf::MemoryRegion, 1> regions = {stack_region};
+    const peelf::ThreadStackSnapshot snap = peelf::unwind_and_inspect_stack(
+        session, ctx, regions, {}, nullptr, {}, 4u, 516u);
+
+    ASSERT_EQ(snap.slots.size(), 514u);
+    // Slot 0 (0x7FFF00001FF8) has low 4 bytes readable (mask 0x0F) and upper 4 bytes unreadable.
+    EXPECT_EQ(snap.slots[0].valid_byte_mask, 0x0Fu);
+    EXPECT_FALSE(snap.slots[0].all_bytes_valid());
+    EXPECT_TRUE(snap.slots[0].any_bytes_valid());
+    EXPECT_EQ(peelf::format_stack_slot_value(snap.slots[0], layout), "0x????????DEADBEEF");
+
+    // Slot 1 (0x7FFF00002000) is on the unmapped hole page (mask 0x00):
+    // must NOT look like valid 0x0000000000000000!
+    EXPECT_EQ(snap.slots[1].valid_byte_mask, 0x00u);
+    EXPECT_FALSE(snap.slots[1].any_bytes_valid());
+    EXPECT_FALSE(snap.slots[1].points_to_executable);
+    EXPECT_FALSE(snap.slots[1].points_to_stack);
+    EXPECT_EQ(peelf::format_stack_slot_value(snap.slots[1], layout), "0x????????????????");
+
+    // Slot 513 (0x7FFF00003000) on the next readable page has all 8 bytes valid (mask 0xFF).
+    EXPECT_EQ(snap.slots[513].valid_byte_mask, 0xFFu);
+    EXPECT_TRUE(snap.slots[513].all_bytes_valid());
+    EXPECT_EQ(peelf::format_stack_slot_value(snap.slots[513], layout), "0x8877665544332211");
 }

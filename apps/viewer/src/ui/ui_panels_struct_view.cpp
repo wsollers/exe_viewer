@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstdio>
 #include <format>
@@ -304,8 +305,15 @@ void StructureViewPanel::draw_contents() {
     // ---- Row 2: Address / Mode / Count / Layout ----
     if (!model_.is_live_process()) {
         int addr_mode = use_file_offset_ ? 1 : 0;
+        static constexpr std::array<const char*, 2> kAddrModeItems = {
+            "Virtual Addr",
+            "File Offset",
+        };
         ImGui::SetNextItemWidth(110.0f);
-        if (ImGui::Combo("##AddrMode", &addr_mode, "Virtual Addr\0File Offset\0")) {
+        if (ImGui::Combo("##AddrMode",
+                         &addr_mode,
+                         kAddrModeItems.data(),
+                         static_cast<int>(kAddrModeItems.size()))) {
             const bool want_off = (addr_mode == 1);
             if (want_off != use_file_offset_) {
                 if (want_off) {
@@ -365,13 +373,29 @@ void StructureViewPanel::draw_contents() {
                         base_layout.is_64bit() ? "64-bit" : "32-bit",
                         base_layout.endianness == peelf::Endianness::Big ? "Big-Endian" : "Little-Endian");
     ImGui::SameLine();
+    static constexpr std::array<const char*, 3> kEndianOverrideItems = {
+        "Endian: Auto",
+        "Little",
+        "Big",
+    };
     ImGui::SetNextItemWidth(95.0f);
-    if (ImGui::Combo("##EndianOvr", &endian_override_, "Endian: Auto\0Little\0Big\0")) {
+    if (ImGui::Combo("##EndianOvr",
+                     &endian_override_,
+                     kEndianOverrideItems.data(),
+                     static_cast<int>(kEndianOverrideItems.size()))) {
         dirty_ = true;
     }
     ImGui::SameLine();
+    static constexpr std::array<const char*, 3> kWidthOverrideItems = {
+        "Ptr: Auto",
+        "32-bit",
+        "64-bit",
+    };
     ImGui::SetNextItemWidth(95.0f);
-    if (ImGui::Combo("##WidthOvr", &width_override_, "Ptr: Auto\032-bit\064-bit\0")) {
+    if (ImGui::Combo("##WidthOvr",
+                     &width_override_,
+                     kWidthOverrideItems.data(),
+                     static_cast<int>(kWidthOverrideItems.size()))) {
         dirty_ = true;
     }
     ImGui::SameLine();

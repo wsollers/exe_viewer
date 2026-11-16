@@ -389,6 +389,58 @@ std::optional<ViewerSelection> NavigationHistory::forward() {
     return entries_[++cursor_];
 }
 
+void NavigationRequestQueue::enqueue(DeferredNavigationRequest request) {
+    pending_.push_back(std::move(request));
+}
+
+void NavigationRequestQueue::enqueue_address(std::uint64_t address,
+                                             PreferredView view,
+                                             std::size_t highlight_size,
+                                             bool request_decompile) {
+    pending_.push_back(DeferredNavigationRequest{
+        .kind = DeferredNavigationRequest::Kind::Address,
+        .target = address,
+        .preferred_view = view,
+        .highlight_size = highlight_size,
+        .request_decompile = request_decompile,
+    });
+}
+
+void NavigationRequestQueue::enqueue_offset(std::uint64_t offset, std::size_t highlight_size) {
+    pending_.push_back(DeferredNavigationRequest{
+        .kind = DeferredNavigationRequest::Kind::Offset,
+        .target = offset,
+        .preferred_view = PreferredView::Hex,
+        .highlight_size = highlight_size,
+    });
+}
+
+void NavigationRequestQueue::enqueue_module(std::size_t module_index) {
+    pending_.push_back(DeferredNavigationRequest{
+        .kind = DeferredNavigationRequest::Kind::ModuleIndex,
+        .target = static_cast<std::uint64_t>(module_index),
+    });
+}
+
+void NavigationRequestQueue::enqueue_memory_region(std::size_t region_index,
+                                                   bool prefer_module_context) {
+    pending_.push_back(DeferredNavigationRequest{
+        .kind = DeferredNavigationRequest::Kind::MemoryRegionIndex,
+        .target = static_cast<std::uint64_t>(region_index),
+        .prefer_module_context = prefer_module_context,
+    });
+}
+
+void NavigationRequestQueue::enqueue_custom(std::function<void()> action) {
+    if (!action) {
+        return;
+    }
+    pending_.push_back(DeferredNavigationRequest{
+        .kind = DeferredNavigationRequest::Kind::Custom,
+        .custom_action = std::move(action),
+    });
+}
+
 StructureNode build_structure_tree(const peelf::IBinaryImage& image) {
     StructureNode root{
         .selection = ViewerSelection{

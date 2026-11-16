@@ -79,6 +79,10 @@ namespace viewer {
         void on_process_attached();
         void load_debug_symbols(const std::filesystem::path& path);
         void navigate_to_address(std::uint64_t address, PreferredView view = PreferredView::Disassembly);
+        void enqueue_navigation(std::uint64_t address,
+                                PreferredView view = PreferredView::Disassembly,
+                                std::size_t highlight_size = 0,
+                                bool request_decompile = false);
 
         ImVec4 get_mnemonic_color(const std::string &mnemonic) const;
 
@@ -148,6 +152,7 @@ namespace viewer {
         ViewerSelection current_selection_;
         std::optional<ViewerSelection> last_navigation_selection_;
         NavigationHistory navigation_history_;
+        NavigationRequestQueue pending_navigations_;
         void navigate_history(bool forward);
         void switch_analysis_view(bool graph);
         [[nodiscard]] std::optional<SymbolRecord> navigation_graph_root(std::uint64_t address) const;
@@ -249,7 +254,7 @@ namespace viewer {
         std::filesystem::path loaded_call_graph_bmp_;
         std::vector<Instruction> current_instructions_;
         struct DisassemblyLocation {
-            std::size_t file_offset;
+            std::uint64_t file_offset;
             std::uint64_t address;
         };
         // Keep the requested location even when edited bytes cannot be decoded.
@@ -257,6 +262,7 @@ namespace viewer {
         std::uint64_t rendered_edit_revision_ = 0;
 
 
+        void drain_pending_navigations();
         void render_main_menu();
         [[nodiscard]] DecompileValidationStamp current_decompile_stamp() const;
         void request_decompile(bool force_reanalyze = false);

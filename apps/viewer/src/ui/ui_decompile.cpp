@@ -1,6 +1,7 @@
 #include "ui_app.hpp"
 #include "decompile/structured_decompiler.hpp"
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cstring>
 #include <format>
@@ -304,10 +305,18 @@ void UiApp::render_decompiler() {
     if (!ImGui::Begin("Decompiler",&show_decompiler_)) { ImGui::End(); return; }
     const bool job_busy = decompile_controller_.is_busy();
     ImGui::BeginDisabled(job_busy);
+    static constexpr std::array<const char*, 5> kDecompilerProviderItems = {
+        "Ghidra",
+        "Binary Ninja HLIL",
+        "Annotated assembly",
+        "Structured Pseudo-C (built-in)",
+        "RetDec CLI",
+    };
     ImGui::SetNextItemWidth(-1);
     ImGui::Combo("##provider",
                  &decompiler_provider_,
-                 "Ghidra\0Binary Ninja HLIL\0Annotated assembly\0Structured Pseudo-C (built-in)\0RetDec CLI\0");
+                 kDecompilerProviderItems.data(),
+                 static_cast<int>(kDecompilerProviderItems.size()));
     if (ImGui::CollapsingHeader("Backend settings")) {
         if (decompiler_provider_ == 0) {
             ImGui::TextUnformatted("Ghidra installation folder"); ImGui::SetNextItemWidth(-1);
@@ -424,7 +433,7 @@ void UiApp::select_decompiled_line(std::size_t index) {
         if (!offset || !range.size || *offset >= total_view || range.size > total_view - *offset) continue;
         const auto last = model_.virtual_address_to_offset(range.address + range.size - 1);
         if (!last || *last != *offset + range.size - 1) continue;
-        bytes.push_back({static_cast<std::size_t>(*offset), static_cast<std::size_t>(range.size)});
+        bytes.push_back(ByteRange{*offset, range.size});
     }
     if (!bytes.empty()) {
         hex_panel_.navigate_to_ranges(bytes); hex_panel_.set_visible(true);
@@ -490,14 +499,19 @@ void UiApp::render_data_types() {
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Data symbols")) {
+            struct PendingDataSymNav {
+                std::uint64_t va = 0;
+                std::optional<std::uint64_t> file_offset;
+                std::uint64_t size = 0;
+            };
+            std::optional<PendingDataSymNav> pending_sym_nav;
             if (model_.image() && ImGui::BeginTable("data_symbols",3,ImGuiTableFlags_RowBg|ImGuiTableFlags_Resizable|ImGuiTableFlags_ScrollY)) {
                 ImGui::TableSetupColumn("Name"); ImGui::TableSetupColumn("Address"); ImGui::TableSetupColumn("Size"); ImGui::TableHeadersRow();
                 for (const auto& symbol : symbol_index_.records()) {
                     if (!symbol.virtual_address || symbol_has_code(*model_.image(),symbol) || !symbol_name_matches(symbol.name,data_type_filter_)) continue;
                     ImGui::PushID(&symbol); ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
                     if (ImGui::Selectable(symbol.name.c_str(),current_selection_.virtual_address==symbol.virtual_address,ImGuiSelectableFlags_SpanAllColumns)) {
-                        navigate_to_address(*symbol.virtual_address,PreferredView::Hex);
-                        if (symbol.file_offset && symbol.size) hex_panel_.navigate_to_range(*symbol.file_offset,symbol.size);
+                        pending_sym_nav = PendingDataSymNav{*symbol.virtual_address, symbol.file_offset, symbol.size};
                     }
                     ImGui::TableSetColumnIndex(1);
                     ImGui::Text("%016" PRIX64, *symbol.virtual_address);
@@ -506,6 +520,15 @@ void UiApp::render_data_types() {
                     ImGui::PopID();
                 }
                 ImGui::EndTable();
+            }
+            if (pending_sym_nav.has_value()) {
+                const PendingDataSymNav nav = *pending_sym_nav;
+                pending_navigations_.enqueue_custom([this, nav]() {
+                    navigate_to_address(nav.va, PreferredView::Hex);
+                    if (nav.file_offset && nav.size) {
+                        hex_panel_.navigate_to_range(*nav.file_offset, nav.size);
+                    }
+                });
             }
             ImGui::EndTabItem();
         }

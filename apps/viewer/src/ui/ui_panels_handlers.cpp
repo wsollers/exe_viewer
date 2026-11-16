@@ -7,8 +7,11 @@
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
+#include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace viewer {
 namespace {
@@ -78,10 +81,21 @@ void HandlersPanel::draw_contents() {
                        primary_status.detail.c_str(),
                        rep.entries.size());
 
+    static constexpr std::array<const char*, 8> kHandlerCategoryItems = {
+        "All Categories",
+        "SEH / SafeSEH / GuardEH",
+        "VEH / VCH / Unhandled",
+        "Unwind (.pdata / .eh_frame)",
+        "Linux Signals",
+        "TLS Callbacks",
+        "Init / Fini / CRT",
+        "atexit / __exit_funcs",
+    };
     ImGui::SetNextItemWidth(190.0f);
     ImGui::Combo("##HandlerCat",
                  &category_filter_,
-                 "All Categories\0SEH / SafeSEH / GuardEH\0VEH / VCH / Unhandled\0Unwind (.pdata / .eh_frame)\0Linux Signals\0TLS Callbacks\0Init / Fini / CRT\0atexit / __exit_funcs\0");
+                 kHandlerCategoryItems.data(),
+                 static_cast<int>(kHandlerCategoryItems.size()));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##HandlerFilter", "Filter symbol, handler name, address, or detail...", filter_buf_, sizeof(filter_buf_));
@@ -106,6 +120,7 @@ void HandlersPanel::draw_contents() {
         visible.push_back(i);
     }
 
+    std::optional<std::pair<std::uint64_t, PreferredView>> pending_nav;
     if (ImGui::BeginTable("HandlersTable",
                           5,
                           ImGuiTableFlags_Borders |
@@ -121,8 +136,11 @@ void HandlersPanel::draw_contents() {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
+        const int clipped_count = visible.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())
+                                      ? std::numeric_limits<int>::max()
+                                      : static_cast<int>(visible.size());
         ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(visible.size()));
+        clipper.Begin(clipped_count);
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                 const peelf::HandlerEntry& h = rep.entries[visible[static_cast<std::size_t>(row)]];
@@ -141,10 +159,10 @@ void HandlersPanel::draw_contents() {
                     std::array<char, 32> hbuf{};
                     std::snprintf(hbuf.data(), hbuf.size(), "0x%016" PRIX64, h.handler_address);
                     if (ImGui::Selectable(hbuf.data()) && on_address_activated_) {
-                        on_address_activated_(
+                        pending_nav = std::pair{
                             h.handler_address,
                             (h.pointer_encoded && !h.pointer_decoded) ? PreferredView::Hex
-                                                                      : PreferredView::Disassembly);
+                                                                      : PreferredView::Disassembly};
                     }
                 } else {
                     ImGui::TextDisabled("-");
@@ -159,6 +177,9 @@ void HandlersPanel::draw_contents() {
             }
         }
         ImGui::EndTable();
+    }
+    if (pending_nav.has_value() && on_address_activated_) {
+        on_address_activated_(pending_nav->first, pending_nav->second);
     }
 
     if (!rep.signals.empty() && ImGui::CollapsingHeader("Linux Process Signal Dispositions (SigCgt / SigIgn / SigBlk)", ImGuiTreeNodeFlags_DefaultOpen)) {

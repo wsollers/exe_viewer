@@ -39,6 +39,7 @@ void draw_decoded_fields_table(const char* table_id,
         ImGui::TextDisabled("No structured fields available.");
         return;
     }
+    std::optional<std::uint64_t> pending_nav_addr;
     if (ImGui::BeginTable(table_id,
                           4,
                           ImGuiTableFlags_Borders |
@@ -69,7 +70,7 @@ void draw_decoded_fields_table(const char* table_id,
             ImGui::PushID(static_cast<int>(i));
             if (f.raw_value.has_value() && *f.raw_value >= 0x1000u) {
                 if (ImGui::Selectable(f.formatted_value.c_str()) && on_addr) {
-                    on_addr(*f.raw_value, PreferredView::Hex);
+                    pending_nav_addr = *f.raw_value;
                 }
             } else {
                 ImGui::TextUnformatted(f.formatted_value.c_str());
@@ -80,6 +81,9 @@ void draw_decoded_fields_table(const char* table_id,
             ImGui::TextDisabled("%s", f.description.c_str());
         }
         ImGui::EndTable();
+    }
+    if (pending_nav_addr.has_value() && on_addr) {
+        on_addr(*pending_nav_addr, PreferredView::Hex);
     }
 }
 
@@ -119,10 +123,16 @@ void RuntimeAndFlagsPanel::draw_contents() {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.42f, 0.92f, 0.58f, 1.0f), "  Passed: %zu", audit.pass_count);
 
+            static constexpr std::array<const char*, 3> kAuditSeverityItems = {
+                "All Rules",
+                "Warnings & Errors",
+                "Errors Only",
+            };
             ImGui::SetNextItemWidth(190.0f);
             ImGui::Combo("Severity##AuditSev",
                          &audit_severity_filter_,
-                         "All Rules\0Warnings & Errors\0Errors Only\0");
+                         kAuditSeverityItems.data(),
+                         static_cast<int>(kAuditSeverityItems.size()));
             ImGui::SameLine();
             ImGui::SetNextItemWidth(-1.0f);
             ImGui::InputTextWithHint("##AuditFilter",
@@ -131,6 +141,7 @@ void RuntimeAndFlagsPanel::draw_contents() {
                                      sizeof(audit_filter_buf_));
             const std::string_view afilter(audit_filter_buf_);
 
+            std::optional<std::uint64_t> pending_audit_nav_va;
             if (ImGui::BeginTable("SecurityAuditTable",
                                   5,
                                   ImGuiTableFlags_Borders |
@@ -182,7 +193,7 @@ void RuntimeAndFlagsPanel::draw_contents() {
                     }
                     if (nav_va.has_value() && on_address_activated_) {
                         if (ImGui::Selectable(f.rule_id.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
-                            on_address_activated_(*nav_va, PreferredView::Hex);
+                            pending_audit_nav_va = *nav_va;
                         }
                     } else {
                         ImGui::TextUnformatted(f.rule_id.c_str());
@@ -212,6 +223,9 @@ void RuntimeAndFlagsPanel::draw_contents() {
                     ImGui::TextDisabled("%s", f.remediation.c_str());
                 }
                 ImGui::EndTable();
+            }
+            if (pending_audit_nav_va.has_value() && on_address_activated_) {
+                on_address_activated_(*pending_audit_nav_va, PreferredView::Hex);
             }
             ImGui::EndTabItem();
         }
@@ -311,6 +325,7 @@ void RuntimeAndFlagsPanel::draw_contents() {
 
             if (!peb.loader_modules.empty() &&
                 ImGui::CollapsingHeader("Loader Module Chain (PEB_LDR_DATA / r_debug link_map)", ImGuiTreeNodeFlags_DefaultOpen)) {
+                std::optional<std::uint64_t> pending_ldr_base_va;
                 if (ImGui::BeginTable("LdrModulesTable",
                                       4,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
@@ -328,7 +343,7 @@ void RuntimeAndFlagsPanel::draw_contents() {
                         std::array<char, 32> bbuf{};
                         std::snprintf(bbuf.data(), bbuf.size(), "0x%016" PRIX64, m.base_address);
                         if (ImGui::Selectable(bbuf.data()) && m.base_address != 0 && on_address_activated_) {
-                            on_address_activated_(m.base_address, PreferredView::Hex);
+                            pending_ldr_base_va = m.base_address;
                         }
                         ImGui::PopID();
                         ImGui::TableNextColumn();
@@ -339,6 +354,9 @@ void RuntimeAndFlagsPanel::draw_contents() {
                         ImGui::TextUnformatted(!m.full_path.empty() ? m.full_path.c_str() : m.name.c_str());
                     }
                     ImGui::EndTable();
+                }
+                if (pending_ldr_base_va.has_value() && on_address_activated_) {
+                    on_address_activated_(*pending_ldr_base_va, PreferredView::Hex);
                 }
             }
 

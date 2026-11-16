@@ -12,8 +12,10 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace viewer {
 namespace {
@@ -257,6 +259,7 @@ void DebuggerPanel::render_opt_in_modal() {
             }
 
             const std::string_view filter = trim_ws(attach_filter_buf_.data());
+            std::optional<peelf::ProcessId> pending_attach_pid;
             if (ImGui::BeginTable("##DbgProcTable", 5,
                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable,
@@ -292,14 +295,7 @@ void DebuggerPanel::render_opt_in_modal() {
                                           ImGuiSelectableFlags_AllowDoubleClick)) {
                         selected_pid_ = proc.pid;
                         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                            if (auto res = model_.attach_debug_process(proc.pid); res.has_value()) {
-                                set_visible(true);
-                                status_msg_ = std::format("Attached opt-in debugger to PID {}.", proc.pid);
-                                if (on_session_changed_) on_session_changed_();
-                                ImGui::CloseCurrentPopup();
-                            } else {
-                                modal_error_ = res.error().message;
-                            }
+                            pending_attach_pid = proc.pid;
                         }
                     }
                     ImGui::PopID();
@@ -316,6 +312,17 @@ void DebuggerPanel::render_opt_in_modal() {
                     ImGui::TextUnformatted(detail.empty() ? "-" : detail.c_str());
                 }
                 ImGui::EndTable();
+            }
+
+            if (pending_attach_pid.has_value()) {
+                if (auto res = model_.attach_debug_process(*pending_attach_pid); res.has_value()) {
+                    set_visible(true);
+                    status_msg_ = std::format("Attached opt-in debugger to PID {}.", *pending_attach_pid);
+                    if (on_session_changed_) on_session_changed_();
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    modal_error_ = res.error().message;
+                }
             }
 
             ImGui::BeginDisabled(!selected_pid_.has_value());
@@ -487,20 +494,27 @@ void DebuggerPanel::draw_breakpoints_tab() {
     ImGui::InputTextWithHint("##BpAddrSym", "0xVA or symbol name...",
                              bp_expr_buf_.data(), bp_expr_buf_.size());
     ImGui::SameLine();
-    const char* kinds[] = {
+    static constexpr std::array<const char*, 4> kBreakpointKinds{
         "Software (Trap)",
         "Hardware Execute (DR)",
         "Hardware Write (DR)",
         "Hardware Read/Write (DR)"
     };
     ImGui::SetNextItemWidth(185.0f);
-    ImGui::Combo("##BpKind", &bp_kind_idx_, kinds, IM_ARRAYSIZE(kinds));
+    ImGui::Combo("##BpKind", &bp_kind_idx_, kBreakpointKinds.data(),
+                 static_cast<int>(kBreakpointKinds.size()));
 
     if (bp_kind_idx_ > 0) {
         ImGui::SameLine();
-        const char* sizes[] = {"1 Byte", "2 Bytes", "4 Bytes", "8 Bytes"};
+        static constexpr std::array<const char*, 4> kBreakpointSizes{
+            "1 Byte",
+            "2 Bytes",
+            "4 Bytes",
+            "8 Bytes"
+        };
         ImGui::SetNextItemWidth(95.0f);
-        ImGui::Combo("##BpSize", &bp_hw_size_idx_, sizes, IM_ARRAYSIZE(sizes));
+        ImGui::Combo("##BpSize", &bp_hw_size_idx_, kBreakpointSizes.data(),
+                     static_cast<int>(kBreakpointSizes.size()));
     }
 
     ImGui::SameLine();
@@ -547,6 +561,9 @@ void DebuggerPanel::draw_breakpoints_tab() {
 
     model_.refresh_debug_breakpoints();
     const auto bps = model_.debug_breakpoints();
+    std::optional<std::pair<peelf::debugger::BreakpointId, bool>> pending_toggle;
+    std::optional<peelf::debugger::BreakpointId> pending_delete;
+    std::optional<std::pair<std::uint64_t, PreferredView>> pending_nav;
     if (ImGui::BeginTable("##BreakpointsTable", 8,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
@@ -561,7 +578,6 @@ void DebuggerPanel::draw_breakpoints_tab() {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
-        std::optional<peelf::debugger::BreakpointId> pending_delete;
         for (const peelf::debugger::BreakpointDescriptor& bp : bps) {
             ImGui::TableNextRow();
             ImGui::PushID(static_cast<int>(bp.id));
@@ -570,10 +586,7 @@ void DebuggerPanel::draw_breakpoints_tab() {
             bool en = bp.enabled;
             ImGui::BeginDisabled(!paused);
             if (ImGui::Checkbox("##En", &en)) {
-                if (auto r = dbg->set_breakpoint_enabled(bp.id, en); !r.has_value()) {
-                    status_msg_ = r.error().message;
-                }
-                model_.refresh_debug_breakpoints();
+                pending_toggle = std::pair{bp.id, en};
             }
             ImGui::EndDisabled();
 
@@ -593,7 +606,7 @@ void DebuggerPanel::draw_breakpoints_tab() {
             ImGui::TableNextColumn();
             const std::string addr_s = std::format("0x{:016X}", bp.address);
             if (ImGui::Selectable(addr_s.c_str()) && on_navigate_) {
-                on_navigate_(bp.address, PreferredView::Disassembly);
+                pending_nav = std::pair{bp.address, PreferredView::Disassembly};
             }
 
             ImGui::TableNextColumn();
@@ -616,13 +629,23 @@ void DebuggerPanel::draw_breakpoints_tab() {
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
 
-        if (pending_delete.has_value()) {
-            if (auto r = dbg->remove_breakpoint(*pending_delete); !r.has_value()) {
-                status_msg_ = r.error().message;
-            }
-            model_.refresh_debug_breakpoints();
+    if (pending_toggle.has_value()) {
+        if (auto r = dbg->set_breakpoint_enabled(pending_toggle->first, pending_toggle->second);
+            !r.has_value()) {
+            status_msg_ = r.error().message;
         }
+        model_.refresh_debug_breakpoints();
+    }
+    if (pending_delete.has_value()) {
+        if (auto r = dbg->remove_breakpoint(*pending_delete); !r.has_value()) {
+            status_msg_ = r.error().message;
+        }
+        model_.refresh_debug_breakpoints();
+    }
+    if (pending_nav.has_value() && on_navigate_) {
+        on_navigate_(pending_nav->first, pending_nav->second);
     }
 }
 
@@ -676,6 +699,7 @@ void DebuggerPanel::draw_registers_tab() {
         ImGui::TextDisabled("Click any register row to pre-fill editor; changed registers highlighted in gold.");
     }
 
+    std::optional<std::pair<std::uint64_t, PreferredView>> pending_nav;
     if (ImGui::BeginTable("##DbgRegistersTable", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
@@ -713,7 +737,7 @@ void DebuggerPanel::draw_registers_tab() {
                 std::copy_n(reg_hex.data(), val_len, edit_reg_val_buf_.data());
                 edit_reg_val_buf_[val_len] = '\0';
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && on_navigate_ && rv.value_u64 != 0u) {
-                    on_navigate_(rv.value_u64, PreferredView::Disassembly);
+                    pending_nav = std::pair{rv.value_u64, PreferredView::Disassembly};
                 }
             }
             ImGui::PopStyleColor();
@@ -764,6 +788,108 @@ void DebuggerPanel::draw_registers_tab() {
         }
         ImGui::EndTable();
     }
+    if (pending_nav.has_value() && on_navigate_) {
+        on_navigate_(pending_nav->first, pending_nav->second);
+    }
+}
+
+void DebuggerPanel::draw_stack_tab() {
+    if (!model_.is_live_process()) {
+        ImGui::TextDisabled("No live process or debugger session active.");
+        return;
+    }
+
+    const peelf::ThreadStackSnapshot& stack_snap = model_.selected_thread_stack();
+    if (!stack_snap.status.detail.empty()) {
+        ImGui::TextDisabled("Stack status: %s", stack_snap.status.detail.c_str());
+    }
+    if (stack_snap.slots.empty()) {
+        ImGui::TextDisabled("No readable stack slots available at current SP.");
+        return;
+    }
+
+    std::optional<std::pair<std::uint64_t, PreferredView>> pending_nav;
+    if (ImGui::BeginTable("##DbgStackSlotsTable", 5,
+                          ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Stack Address", ImGuiTableColumnFlags_WidthFixed, 145.0f);
+        ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 175.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 155.0f);
+        ImGui::TableSetupColumn("Role", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Symbol / Annotation", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        const int row_count = stack_snap.slots.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())
+            ? std::numeric_limits<int>::max()
+            : static_cast<int>(stack_snap.slots.size());
+        clipper.Begin(row_count);
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                const peelf::StackSlotEntry& slot = stack_snap.slots[static_cast<std::size_t>(row)];
+                const bool fully_valid = slot.all_bytes_valid();
+                const bool is_ret = fully_valid && slot.role == peelf::StackSlotRole::ReturnAddress;
+
+                ImGui::TableNextRow();
+                ImGui::PushID(row);
+
+                ImGui::TableNextColumn();
+                const std::string addr_s = stack_snap.layout.address_width == peelf::AddressWidth::Bits32
+                    ? std::format("0x{:08X}", static_cast<std::uint32_t>(slot.slot_address))
+                    : std::format("0x{:016X}", slot.slot_address);
+                ImGui::TextUnformatted(addr_s.c_str());
+
+                ImGui::TableNextColumn();
+                std::string raw_hex;
+                raw_hex.reserve(static_cast<std::size_t>(slot.byte_size) * 3u);
+                for (std::size_t b = 0; b < slot.byte_size; ++b) {
+                    if (b > 0) raw_hex.push_back(' ');
+                    if (slot.is_byte_valid(b)) {
+                        raw_hex += std::format("{:02X}", slot.raw_bytes[b]);
+                    } else {
+                        raw_hex += "??";
+                    }
+                }
+                if (fully_valid) {
+                    ImGui::TextDisabled("%s", raw_hex.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.92f, 0.55f, 0.35f, 1.0f), "%s", raw_hex.c_str());
+                }
+
+                ImGui::TableNextColumn();
+                const std::string val_s = peelf::format_stack_slot_value(slot, stack_snap.layout);
+                if (fully_valid) {
+                    if (ImGui::Selectable(val_s.c_str()) && on_navigate_ && slot.value != 0u) {
+                        pending_nav = std::pair{
+                            slot.value,
+                            is_ret ? PreferredView::Disassembly : PreferredView::Hex
+                        };
+                    }
+                } else {
+                    ImGui::TextColored(ImVec4(0.92f, 0.55f, 0.35f, 1.0f), "%s", val_s.c_str());
+                }
+
+                ImGui::TableNextColumn();
+                const std::string_view role_sv = peelf::to_string(slot.role);
+                ImGui::TextDisabled("%.*s", static_cast<int>(role_sv.size()), role_sv.data());
+
+                ImGui::TableNextColumn();
+                std::string note = slot.resolved_symbol;
+                if (!slot.annotation.empty()) {
+                    if (!note.empty()) note += " | ";
+                    note += slot.annotation;
+                }
+                ImGui::TextUnformatted(note.empty() ? "-" : note.c_str());
+
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+    if (pending_nav.has_value() && on_navigate_) {
+        on_navigate_(pending_nav->first, pending_nav->second);
+    }
 }
 
 void DebuggerPanel::draw_events_tab() {
@@ -778,6 +904,7 @@ void DebuggerPanel::draw_events_tab() {
     }
 
     const std::vector<peelf::debugger::DebugEvent> evs = dbg->events();
+    std::optional<std::pair<std::uint64_t, PreferredView>> pending_nav;
     if (ImGui::BeginTable("##DbgEventsTable", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
@@ -808,7 +935,7 @@ void DebuggerPanel::draw_events_tab() {
             if (ev.address.has_value() && *ev.address != 0u) {
                 const std::string as = std::format("0x{:016X}", *ev.address);
                 if (ImGui::Selectable(as.c_str()) && on_navigate_) {
-                    on_navigate_(*ev.address, PreferredView::Disassembly);
+                    pending_nav = std::pair{*ev.address, PreferredView::Disassembly};
                 }
             } else {
                 ImGui::TextDisabled("-");
@@ -820,6 +947,9 @@ void DebuggerPanel::draw_events_tab() {
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+    if (pending_nav.has_value() && on_navigate_) {
+        on_navigate_(pending_nav->first, pending_nav->second);
     }
 }
 
@@ -834,6 +964,10 @@ void DebuggerPanel::draw_contents() {
         }
         if (ImGui::BeginTabItem("Registers (Step-Diff Highlighted)")) {
             draw_registers_tab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Stack")) {
+            draw_stack_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Debug Events")) {

@@ -58,10 +58,19 @@ void FunctionsPanel::draw_contents() {
     ImGui::SetNextItemWidth(220.0f);
     ImGui::InputTextWithHint("##FnFilter", "Filter function name or VA...", filter_buf_, sizeof(filter_buf_));
     ImGui::SameLine();
+    static constexpr std::array<const char*, 6> kOriginItems = {
+        "All Origins",
+        "Symbols / Debug",
+        "Unwind (.pdata/.eh_frame)",
+        "Exports / Entry",
+        "Callbacks (TLS/Init)",
+        "Call Targets",
+    };
     ImGui::SetNextItemWidth(155.0f);
     ImGui::Combo("##FnOrigin",
                  &origin_filter_,
-                 "All Origins\0Symbols / Debug\0Unwind (.pdata/.eh_frame)\0Exports / Entry\0Callbacks (TLS/Init)\0Call Targets\0");
+                 kOriginItems.data(),
+                 static_cast<int>(kOriginItems.size()));
     ImGui::SameLine();
     bool demangle = model_.demangle_symbols();
     if (ImGui::Checkbox("Demangle", &demangle)) {

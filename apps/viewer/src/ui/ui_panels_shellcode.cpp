@@ -16,10 +16,7 @@
 namespace viewer {
 
 ShellcodeScratchPanel::ShellcodeScratchPanel(BinaryModel& model, const ViewerSelection& selection)
-    : UiPanel("Shellcode"), model_(model), selection_(selection)
-{
-    diagnostic_ = "Paste hex bytes, shellcode escapes, or toggle Assembly input.";
-}
+    : UiPanel("Shellcode"), model_(model), selection_(selection) {}
 
 std::uint64_t ShellcodeScratchPanel::effective_base_address() const {
     if (selection_.virtual_address.has_value()) {
@@ -34,92 +31,45 @@ std::uint64_t ShellcodeScratchPanel::effective_base_address() const {
     return 0;
 }
 
-void ShellcodeScratchPanel::rebuild_output() {
-    output_bytes_.clear();
-    hex_view_.clear();
-    roundtrip_disasm_view_.clear();
-
-    peelf::Architecture arch = peelf::Architecture::X86_64;
-    peelf::Endianness endian = peelf::Endianness::Little;
-    bool is_64bit = true;
-    const bool thumb = model_.analysis_thumb_mode();
+ShellcodeTargetConfig ShellcodeScratchPanel::current_target_config() const {
+    ShellcodeTargetConfig cfg{};
+    cfg.thumb = model_.analysis_thumb_mode();
+    cfg.base_va = effective_base_address();
+    cfg.assembly_mode = assembly_mode_;
     if (model_.image() != nullptr) {
-        arch = model_.image()->architecture();
-        endian = model_.image()->endianness();
-        is_64bit = model_.image()->is_64bit();
+        cfg.architecture = model_.image()->architecture();
+        cfg.endianness = model_.image()->endianness();
+        cfg.is_64bit = model_.image()->is_64bit();
     } else if (model_.architecture() != peelf::Architecture::Unknown) {
-        arch = model_.architecture();
-        endian = model_.endianness();
-        is_64bit = (arch == peelf::Architecture::X86_64 ||
-                    arch == peelf::Architecture::ARM64 ||
-                    arch == peelf::Architecture::MIPS64 ||
-                    arch == peelf::Architecture::PowerPC64 ||
-                    arch == peelf::Architecture::RISCV64);
+        cfg.architecture = model_.architecture();
+        cfg.endianness = model_.endianness();
+        cfg.is_64bit = (cfg.architecture == peelf::Architecture::X86_64 ||
+                        cfg.architecture == peelf::Architecture::ARM64 ||
+                        cfg.architecture == peelf::Architecture::MIPS64 ||
+                        cfg.architecture == peelf::Architecture::PowerPC64 ||
+                        cfg.architecture == peelf::Architecture::RISCV64);
     }
+    return cfg;
+}
 
-    const std::uint64_t base_va = effective_base_address();
-    last_base_address_ = base_va;
-
-    if (assembly_mode_) {
-        if (input_buf_[0] == '\0') {
-            diagnostic_ = std::format(
-                "Enter {} assembly instructions (base VA 0x{:X}).",
-                peelf::to_string(arch),
-                base_va);
-            return;
-        }
-        auto res = peelf::assemble_instructions(arch, endian, is_64bit, thumb, base_va, input_buf_);
-        if (!res.has_value()) {
-            diagnostic_ = res.error().message;
-            return;
-        }
-        output_bytes_ = std::move(res->bytes);
-        diagnostic_ = std::format(
-            "Assembled {} instruction(s) -> {} byte(s) via {} @ 0x{:X}",
-            res->instruction_spans.size(),
-            output_bytes_.size(),
-            res->provider_name,
-            base_va);
-    } else {
-        const ShellcodeParseResult parsed = parse_hex_shellcode(input_buf_);
-        output_bytes_ = parsed.bytes;
-        diagnostic_ = parsed.diagnostic;
-        if (!parsed.success) {
-            return;
-        }
-    }
-
-    if (!output_bytes_.empty()) {
-        hex_view_ = format_shellcode_hex_view(
-            std::span<const std::uint8_t>(output_bytes_.data(), output_bytes_.size()));
-        const auto insns = disassemble_patch_bytes(output_bytes_, base_va, arch, endian, thumb);
-        if (!insns.empty()) {
-            std::ostringstream oss;
-            for (const Instruction& inst : insns) {
-                oss << std::format("0x{:08X}  {} {}\n",
-                                   inst.address,
-                                   inst.mnemonic,
-                                   inst.operands);
-            }
-            roundtrip_disasm_view_ = oss.str();
-        }
-    }
+void ShellcodeScratchPanel::rebuild_output() {
+    scratch_cache_.rebuild(current_target_config(), input_buf_);
 }
 
 void ShellcodeScratchPanel::draw_hex_output() const {
-    if (hex_view_.empty()) {
-        ImGui::TextDisabled("%s", diagnostic_.c_str());
+    if (scratch_cache_.hex_view().empty()) {
+        ImGui::TextDisabled("%s", scratch_cache_.diagnostic().c_str());
         return;
     }
 
-    ImGui::TextDisabled("%s", diagnostic_.c_str());
+    ImGui::TextDisabled("%s", scratch_cache_.diagnostic().c_str());
     ImGui::Separator();
-    ImGui::TextUnformatted(hex_view_.c_str());
-    if (!roundtrip_disasm_view_.empty()) {
+    ImGui::TextUnformatted(scratch_cache_.hex_view().c_str());
+    if (!scratch_cache_.roundtrip_disasm_view().empty()) {
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::TextDisabled("Capstone Round-Trip Disassembly:");
-        ImGui::TextUnformatted(roundtrip_disasm_view_.c_str());
+        ImGui::TextUnformatted(scratch_cache_.roundtrip_disasm_view().c_str());
     }
 }
 
@@ -135,13 +85,15 @@ std::optional<std::uint64_t> ShellcodeScratchPanel::selected_file_offset() const
 
 void ShellcodeScratchPanel::apply_to_selection() {
     if (model_.is_live_process()) {
-        diagnostic_ =
-            "Attached live processes are strictly read-only; target process memory is never modified.";
+        scratch_cache_.set_diagnostic(
+            "Attached live processes are strictly read-only; target process memory is never modified.");
         return;
     }
 
-    if (output_bytes_.empty()) {
-        diagnostic_ = "No bytes to apply.";
+    scratch_cache_.sync_target(current_target_config(), input_buf_);
+    const std::span<const std::uint8_t> bytes = scratch_cache_.output_bytes();
+    if (bytes.empty()) {
+        scratch_cache_.set_diagnostic("No bytes to apply.");
         return;
     }
 
@@ -153,13 +105,13 @@ void ShellcodeScratchPanel::apply_to_selection() {
 
     const std::optional<std::uint64_t> offset = selected_file_offset();
     if (!offset) {
-        diagnostic_ = "Select file-backed bytes before applying shellcode.";
+        scratch_cache_.set_diagnostic("Select file-backed bytes before applying shellcode.");
         return;
     }
 
-    auto applied = model_.apply_patch_bytes(*offset, output_bytes_, label);
+    auto applied = model_.apply_patch_bytes(*offset, bytes, label);
     if (!applied) {
-        diagnostic_ = std::format("Patch failed: {}", applied.error().message);
+        scratch_cache_.set_diagnostic(std::format("Patch failed: {}", applied.error().message));
         return;
     }
 
@@ -167,18 +119,15 @@ void ShellcodeScratchPanel::apply_to_selection() {
         *offset,
         label,
         assembly_mode_ ? std::optional<std::string>(input_buf_) : std::nullopt);
-    diagnostic_ = std::format("Staged {} bytes at file offset 0x{:X}.", output_bytes_.size(), *offset);
+    scratch_cache_.set_diagnostic(
+        std::format("Staged {} bytes at file offset 0x{:X}.", bytes.size(), *offset));
     if (on_patch_changed_) {
         on_patch_changed_();
     }
 }
 
 void ShellcodeScratchPanel::draw_contents() {
-    if (assembly_mode_ != last_assembly_mode_ ||
-        (assembly_mode_ && effective_base_address() != last_base_address_)) {
-        last_assembly_mode_ = assembly_mode_;
-        rebuild_output();
-    }
+    scratch_cache_.sync_target(current_target_config(), input_buf_);
 
     if (model_.is_live_process()) {
         ImGui::TextColored(
@@ -201,7 +150,7 @@ void ShellcodeScratchPanel::draw_contents() {
             rebuild_output();
         }
         ImGui::SameLine();
-        ImGui::BeginDisabled(model_.is_live_process() || output_bytes_.empty());
+        ImGui::BeginDisabled(model_.is_live_process() || scratch_cache_.output_bytes().empty());
         if (ImGui::Button("Stage Patch")) {
             apply_to_selection();
         }
@@ -210,7 +159,9 @@ void ShellcodeScratchPanel::draw_contents() {
         ImGui::BeginDisabled(model_.is_live_process());
         if (ImGui::Button("Undo")) {
             auto undone = model_.undo_patch();
-            diagnostic_ = undone ? "Undid last patch." : std::format("Undo failed: {}", undone.error().message);
+            scratch_cache_.set_diagnostic(
+                undone ? "Undid last patch."
+                       : std::format("Undo failed: {}", undone.error().message));
             if (undone && on_patch_changed_) {
                 on_patch_changed_();
             }
@@ -218,7 +169,9 @@ void ShellcodeScratchPanel::draw_contents() {
         ImGui::SameLine();
         if (ImGui::Button("Redo")) {
             auto redone = model_.redo_patch();
-            diagnostic_ = redone ? "Redid last patch." : std::format("Redo failed: {}", redone.error().message);
+            scratch_cache_.set_diagnostic(
+                redone ? "Redid last patch."
+                       : std::format("Redo failed: {}", redone.error().message));
             if (redone && on_patch_changed_) {
                 on_patch_changed_();
             }

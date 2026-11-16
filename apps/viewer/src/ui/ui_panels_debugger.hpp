@@ -37,6 +37,7 @@ private:
     void draw_transport_bar();
     void draw_breakpoints_tab();
     void draw_registers_tab();
+    void draw_stack_tab();
     void draw_events_tab();
 
     [[nodiscard]] std::optional<std::uint64_t> parse_address_or_symbol(std::string_view expr) const;

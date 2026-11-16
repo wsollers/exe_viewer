@@ -1,5 +1,6 @@
 #include "ui_panels_references.hpp"
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <format>
 
@@ -48,14 +49,17 @@ void ReferencesPanel::draw_contents() {
     ImGui::RadioButton("To selection", &direction_, 1); ImGui::SameLine();
     ImGui::RadioButton("From selection", &direction_, 2); ImGui::SameLine();
     ImGui::SetNextItemWidth(190.0f);
-    static constexpr const char* kConfidenceItems[] = {
+    static constexpr std::array<const char*, 5> kConfidenceItems = {
         "All confidences",
         "Direct",
         "IndirectTable",
         "IndirectPointerSlot",
         "HeuristicConstant",
     };
-    ImGui::Combo("##confidence_filter", &confidence_filter_, kConfidenceItems, IM_ARRAYSIZE(kConfidenceItems));
+    ImGui::Combo("##confidence_filter",
+                 &confidence_filter_,
+                 kConfidenceItems.data(),
+                 static_cast<int>(kConfidenceItems.size()));
 
     const auto describe = [&](std::uint64_t address) {
         auto text = std::format("{:X}", address);

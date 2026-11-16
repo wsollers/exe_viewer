@@ -1,12 +1,18 @@
 #include "tools/shellcode_converter.hpp"
 
+#include "analysis/patch_preview.hpp"
+
+#include <peelf/assembler.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdio>
+#include <format>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <system_error>
 
@@ -187,6 +193,96 @@ std::string format_shellcode_hex_view(std::span<const std::uint8_t> bytes, std::
     }
 
     return out;
+}
+
+void ShellcodeScratchCache::invalidate() noexcept {
+    active_target_.reset();
+    output_bytes_.clear();
+    hex_view_.clear();
+    roundtrip_disasm_view_.clear();
+    diagnostic_.clear();
+}
+
+void ShellcodeScratchCache::rebuild(const ShellcodeTargetConfig& target, std::string_view input) {
+    active_target_ = target;
+    output_bytes_.clear();
+    hex_view_.clear();
+    roundtrip_disasm_view_.clear();
+
+    if (target.assembly_mode) {
+        if (input.empty()) {
+            diagnostic_ = std::format(
+                "Enter {} assembly instructions (base VA 0x{:X}).",
+                peelf::to_string(target.architecture),
+                target.base_va);
+            return;
+        }
+        auto res = peelf::assemble_instructions(target.architecture,
+                                                target.endianness,
+                                                target.is_64bit,
+                                                target.thumb,
+                                                target.base_va,
+                                                input);
+        if (!res.has_value()) {
+            diagnostic_ = res.error().message;
+            return;
+        }
+        output_bytes_ = std::move(res->bytes);
+        diagnostic_ = std::format(
+            "Assembled {} instruction(s) -> {} byte(s) via {} @ 0x{:X}",
+            res->instruction_spans.size(),
+            output_bytes_.size(),
+            res->provider_name,
+            target.base_va);
+    } else {
+        if (input.empty()) {
+            diagnostic_ = "Paste hex bytes, shellcode escapes, or toggle Assembly input.";
+            return;
+        }
+        const ShellcodeParseResult parsed = parse_hex_shellcode(input);
+        if (!parsed.success) {
+            diagnostic_ = parsed.diagnostic;
+            return;
+        }
+        output_bytes_ = parsed.bytes;
+        diagnostic_ = parsed.diagnostic;
+    }
+
+    if (!output_bytes_.empty()) {
+        hex_view_ = format_shellcode_hex_view(
+            std::span<const std::uint8_t>(output_bytes_.data(), output_bytes_.size()));
+        const auto insns = disassemble_patch_bytes(output_bytes_,
+                                                   target.base_va,
+                                                   target.architecture,
+                                                   target.endianness,
+                                                   target.thumb);
+        if (!insns.empty()) {
+            std::ostringstream oss;
+            for (const Instruction& inst : insns) {
+                if (target.is_64bit || inst.address > 0xFFFFFFFFull) {
+                    oss << std::format("0x{:016X}  {} {}\n",
+                                       inst.address,
+                                       inst.mnemonic,
+                                       inst.operands);
+                } else {
+                    oss << std::format("0x{:08X}  {} {}\n",
+                                       inst.address,
+                                       inst.mnemonic,
+                                       inst.operands);
+                }
+            }
+            roundtrip_disasm_view_ = oss.str();
+        }
+    }
+}
+
+bool ShellcodeScratchCache::sync_target(const ShellcodeTargetConfig& target, std::string_view input) {
+    if (active_target_.has_value() && *active_target_ == target) {
+        return false;
+    }
+    invalidate();
+    rebuild(target, input);
+    return true;
 }
 
 } // namespace viewer

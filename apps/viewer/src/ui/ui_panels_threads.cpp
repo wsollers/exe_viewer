@@ -9,8 +9,11 @@
 #include <cinttypes>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <utility>
 
 namespace viewer {
 namespace {
@@ -153,6 +156,9 @@ void ThreadsAndStackPanel::draw_contents() {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
+        std::optional<peelf::ThreadId> pending_select_tid;
+        std::optional<std::pair<peelf::ThreadId, bool>> pending_thread_ctl;
+        std::optional<std::tuple<std::uint64_t, PreferredView, bool>> pending_thread_nav;
         for (std::size_t i = 0; i < threads.size(); ++i) {
             const peelf::ThreadInfo& th = threads[i];
             const bool is_sel = selected_tid && *selected_tid == th.tid;
@@ -163,7 +169,7 @@ void ThreadsAndStackPanel::draw_contents() {
             std::array<char, 32> tid_buf{};
             std::snprintf(tid_buf.data(), tid_buf.size(), "%" PRIu32, th.tid);
             if (ImGui::Selectable(tid_buf.data(), is_sel)) {
-                model_.select_thread(th.tid);
+                pending_select_tid = th.tid;
             }
 
             ImGui::TableNextColumn();
@@ -191,9 +197,7 @@ void ThreadsAndStackPanel::draw_contents() {
                 const std::string sym = model_.resolve_address_symbol(*th.start_address);
                 const std::string label = sym.empty() ? start_hex : (sym + " (" + start_hex + ")");
                 if (ImGui::SmallButton(label.c_str())) {
-                    if (on_address_activated_) {
-                        on_address_activated_(*th.start_address, PreferredView::Disassembly, false);
-                    }
+                    pending_thread_nav = std::tuple{*th.start_address, PreferredView::Disassembly, false};
                 }
             } else {
                 ImGui::TextDisabled("-");
@@ -221,13 +225,26 @@ void ThreadsAndStackPanel::draw_contents() {
             ImGui::TableNextColumn();
             const bool th_stopped = th.state == peelf::ThreadRunState::Stopped;
             if (ImGui::SmallButton(th_stopped ? "Resume" : "Pause")) {
-                const peelf::SubsystemStatus tst =
-                    th_stopped ? model_.resume_thread(th.tid) : model_.suspend_thread(th.tid);
-                status_note_ = tst.detail;
+                pending_thread_ctl = std::pair{th.tid, th_stopped};
             }
             ImGui::PopID();
         }
         ImGui::EndTable();
+
+        if (pending_select_tid.has_value()) {
+            model_.select_thread(*pending_select_tid);
+        }
+        if (pending_thread_ctl.has_value()) {
+            const peelf::SubsystemStatus tst = pending_thread_ctl->second
+                ? model_.resume_thread(pending_thread_ctl->first)
+                : model_.suspend_thread(pending_thread_ctl->first);
+            status_note_ = tst.detail;
+        }
+        if (pending_thread_nav.has_value() && on_address_activated_) {
+            on_address_activated_(std::get<0>(*pending_thread_nav),
+                                  std::get<1>(*pending_thread_nav),
+                                  std::get<2>(*pending_thread_nav));
+        }
     }
 
     ImGui::Separator();
@@ -250,6 +267,7 @@ void ThreadsAndStackPanel::draw_contents() {
                                 std::string(peelf::to_string(stack_snap.layout.endianness)).c_str(),
                                 static_cast<unsigned>(stack_snap.layout.pointer_size() * 8u));
 
+            std::optional<std::tuple<std::uint64_t, PreferredView, bool>> pending_slot_nav;
             if (ImGui::BeginTable("StackSlotsTable",
                                   4,
                                   ImGuiTableFlags_Borders |
@@ -264,13 +282,17 @@ void ThreadsAndStackPanel::draw_contents() {
                 ImGui::TableHeadersRow();
 
                 ImGuiListClipper clipper;
-                clipper.Begin(static_cast<int>(stack_snap.slots.size()));
+                const int slot_rows = stack_snap.slots.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())
+                    ? std::numeric_limits<int>::max()
+                    : static_cast<int>(stack_snap.slots.size());
+                clipper.Begin(slot_rows);
                 while (clipper.Step()) {
                     for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                         const peelf::StackSlotEntry& slot = stack_snap.slots[static_cast<std::size_t>(row)];
                         ImGui::TableNextRow();
 
-                        const bool is_ret = slot.role == peelf::StackSlotRole::ReturnAddress;
+                        const bool fully_valid = slot.all_bytes_valid();
+                        const bool is_ret = fully_valid && slot.role == peelf::StackSlotRole::ReturnAddress;
                         const bool is_fp = slot.role == peelf::StackSlotRole::ActiveFramePointer ||
                                            slot.role == peelf::StackSlotRole::SavedFramePointer;
                         const bool is_sp = slot.role == peelf::StackSlotRole::StackPointerTop;
@@ -291,26 +313,28 @@ void ThreadsAndStackPanel::draw_contents() {
                         }
 
                         ImGui::TableNextColumn();
-                        const std::string val_str = format_ptr_width(slot.value, stack_snap.layout.address_width);
-                        int pushed = 0;
-                        if (is_ret) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, kReturnAddrTextColor);
-                            ++pushed;
-                        } else if (is_fp) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, kFramePtrTextColor);
-                            ++pushed;
-                        }
-                        if (ImGui::Selectable(val_str.c_str(),
-                                              false,
-                                              ImGuiSelectableFlags_AllowDoubleClick)) {
-                            if (on_address_activated_) {
+                        const std::string val_str = peelf::format_stack_slot_value(slot, stack_snap.layout);
+                        if (fully_valid) {
+                            int pushed = 0;
+                            if (is_ret) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, kReturnAddrTextColor);
+                                ++pushed;
+                            } else if (is_fp) {
+                                ImGui::PushStyleColor(ImGuiCol_Text, kFramePtrTextColor);
+                                ++pushed;
+                            }
+                            if (ImGui::Selectable(val_str.c_str(),
+                                                  false,
+                                                  ImGuiSelectableFlags_AllowDoubleClick)) {
                                 const PreferredView pv = is_ret ? PreferredView::Disassembly : PreferredView::Hex;
                                 const bool want_dec = is_ret && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
-                                on_address_activated_(slot.value, pv, want_dec);
+                                pending_slot_nav = std::tuple{slot.value, pv, want_dec};
                             }
-                        }
-                        if (pushed > 0) {
-                            ImGui::PopStyleColor(pushed);
+                            if (pushed > 0) {
+                                ImGui::PopStyleColor(pushed);
+                            }
+                        } else {
+                            ImGui::TextColored(ImVec4(0.92f, 0.55f, 0.35f, 1.0f), "%s", val_str.c_str());
                         }
 
                         ImGui::TableNextColumn();
@@ -351,11 +375,17 @@ void ThreadsAndStackPanel::draw_contents() {
                 }
                 ImGui::EndTable();
             }
+            if (pending_slot_nav.has_value() && on_address_activated_) {
+                on_address_activated_(std::get<0>(*pending_slot_nav),
+                                      std::get<1>(*pending_slot_nav),
+                                      std::get<2>(*pending_slot_nav));
+            }
             ImGui::EndTabItem();
         }
 
         if (ImGui::BeginTabItem("Call Frames")) {
             draw_status_banner("Unwind", stack_snap.status);
+            std::optional<std::tuple<std::uint64_t, PreferredView, bool>> pending_frame_nav;
             if (ImGui::BeginTable("CallFramesTable",
                                   6,
                                   ImGuiTableFlags_Borders |
@@ -382,11 +412,11 @@ void ThreadsAndStackPanel::draw_contents() {
                     if (ImGui::Selectable(pc_str.c_str(),
                                           false,
                                           ImGuiSelectableFlags_AllowDoubleClick)) {
-                        if (on_address_activated_) {
-                            on_address_activated_(fr.instruction_pointer,
-                                                  PreferredView::Disassembly,
-                                                  ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left));
-                        }
+                        pending_frame_nav = std::tuple{
+                            fr.instruction_pointer,
+                            PreferredView::Disassembly,
+                            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
+                        };
                     }
                     ImGui::PopStyleColor();
                     ImGui::PopID();
@@ -419,6 +449,11 @@ void ThreadsAndStackPanel::draw_contents() {
                 }
                 ImGui::EndTable();
             }
+            if (pending_frame_nav.has_value() && on_address_activated_) {
+                on_address_activated_(std::get<0>(*pending_frame_nav),
+                                      std::get<1>(*pending_frame_nav),
+                                      std::get<2>(*pending_frame_nav));
+            }
             ImGui::EndTabItem();
         }
 
@@ -446,6 +481,7 @@ void ThreadsAndStackPanel::draw_contents() {
                 }
             }
 
+            std::optional<std::pair<std::uint64_t, PreferredView>> pending_reg_nav;
             if (ImGui::BeginTable("RegistersTable",
                                   4,
                                   ImGuiTableFlags_Borders |
@@ -473,12 +509,12 @@ void ThreadsAndStackPanel::draw_contents() {
                     std::string vstr = !rv.formatted.empty()
                         ? rv.formatted
                         : format_ptr_width(rv.value_u64, rv.bit_width <= 32 ? peelf::AddressWidth::Bits32 : peelf::AddressWidth::Bits64);
-                    if (ImGui::Selectable(vstr.c_str()) && rv.value_u64 != 0 && on_address_activated_) {
+                    if (ImGui::Selectable(vstr.c_str()) && rv.value_u64 != 0) {
                         const PreferredView pv =
                             rv.category == peelf::RegisterCategory::InstructionPointer
                                 ? PreferredView::Disassembly
                                 : PreferredView::Hex;
-                        on_address_activated_(rv.value_u64, pv, false);
+                        pending_reg_nav = std::pair{rv.value_u64, pv};
                     }
                     ImGui::PopID();
 
@@ -491,6 +527,9 @@ void ThreadsAndStackPanel::draw_contents() {
                     }
                 }
                 ImGui::EndTable();
+            }
+            if (pending_reg_nav.has_value() && on_address_activated_) {
+                on_address_activated_(pending_reg_nav->first, pending_reg_nav->second, false);
             }
             ImGui::EndTabItem();
         }
@@ -589,6 +628,7 @@ void ThreadLocalsPanel::draw_contents() {
     ImGui::InputTextWithHint("##TlsFilter", "Filter thread-local variable...", filter_buf_, sizeof(filter_buf_));
     const std::string_view filter(filter_buf_);
 
+    std::optional<std::uint64_t> pending_tls_nav;
     if (!tls.variables.empty() &&
         ImGui::BeginTable("LiveTlsVarsTable",
                           5,
@@ -620,8 +660,8 @@ void ThreadLocalsPanel::draw_contents() {
             ImGui::PushID(static_cast<int>(i));
             if (v.live_address.has_value()) {
                 const std::string lva = format_ptr_width(*v.live_address, layout.address_width);
-                if (ImGui::Selectable(lva.c_str()) && on_address_activated_) {
-                    on_address_activated_(*v.live_address, PreferredView::Hex);
+                if (ImGui::Selectable(lva.c_str())) {
+                    pending_tls_nav = *v.live_address;
                 }
             } else {
                 ImGui::TextDisabled("<static only>");
@@ -637,6 +677,9 @@ void ThreadLocalsPanel::draw_contents() {
         ImGui::EndTable();
     } else if (tls.variables.empty()) {
         ImGui::TextDisabled("No thread-local variables discovered for the active module.");
+    }
+    if (pending_tls_nav.has_value() && on_address_activated_) {
+        on_address_activated_(*pending_tls_nav, PreferredView::Hex);
     }
 
     if (!tls.pe_slots.empty() && ImGui::CollapsingHeader("Win32 TEB TlsSlots / TlsExpansionSlots", ImGuiTreeNodeFlags_DefaultOpen)) {

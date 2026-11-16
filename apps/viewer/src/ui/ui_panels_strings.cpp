@@ -103,10 +103,18 @@ void StringsPanel::draw_contents() {
     ImGui::SetNextItemWidth(210.0f);
     ImGui::InputTextWithHint("##StrFilter", "Filter text, VA, or section...", filter_, sizeof(filter_));
     ImGui::SameLine();
+    static constexpr std::array<const char*, 5> kEncodingItems = {
+        "All Encodings",
+        "ASCII",
+        "UTF-8",
+        "UTF-16LE",
+        "UTF-16BE",
+    };
     ImGui::SetNextItemWidth(115.0f);
     ImGui::Combo("##StrEncoding",
                  &encoding_filter_,
-                 "All Encodings\0ASCII\0UTF-8\0UTF-16LE\0UTF-16BE\0");
+                 kEncodingItems.data(),
+                 static_cast<int>(kEncodingItems.size()));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(145.0f);
     const char* current_sec_label =

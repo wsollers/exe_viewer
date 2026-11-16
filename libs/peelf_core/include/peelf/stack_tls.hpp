@@ -5,6 +5,7 @@
 #include <peelf/forgiving.hpp>
 #include <peelf/process.hpp>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -57,7 +58,28 @@ struct StackSlotEntry {
     std::string resolved_symbol;
     bool points_to_executable{false};
     bool points_to_stack{false};
+    std::uint8_t byte_size{8};
+    std::uint8_t valid_byte_mask{0xFFu};
+    std::array<std::uint8_t, 8> raw_bytes{};
+
+    [[nodiscard]] constexpr std::uint8_t full_valid_mask() const noexcept {
+        return byte_size >= 8u ? 0xFFu
+                               : static_cast<std::uint8_t>((1u << byte_size) - 1u);
+    }
+    [[nodiscard]] constexpr bool all_bytes_valid() const noexcept {
+        return byte_size != 0u && (valid_byte_mask & full_valid_mask()) == full_valid_mask();
+    }
+    [[nodiscard]] constexpr bool any_bytes_valid() const noexcept {
+        return (valid_byte_mask & full_valid_mask()) != 0u;
+    }
+    [[nodiscard]] constexpr bool is_byte_valid(std::size_t idx) const noexcept {
+        return idx < byte_size && idx < raw_bytes.size() &&
+               ((valid_byte_mask >> idx) & 1u) != 0u;
+    }
 };
+
+[[nodiscard]] std::string format_stack_slot_value(const StackSlotEntry& slot,
+                                                  TargetLayout layout);
 
 struct ThreadStackSnapshot {
     ThreadId tid{0};

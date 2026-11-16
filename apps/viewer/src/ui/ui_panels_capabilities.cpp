@@ -3,6 +3,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cinttypes>
 #include <format>
@@ -262,10 +263,17 @@ void CapabilityMatrixPanel::draw_contents() {
     }
 
     ImGui::Separator();
+    static constexpr std::array<const char*, 4> kCapStateItems = {
+        "All Operations",
+        "Validated Only",
+        "Experimental / Partial",
+        "Unsupported Only",
+    };
     ImGui::SetNextItemWidth(185.0f);
     ImGui::Combo("State##CapStateFilter",
                  &state_filter_,
-                 "All Operations\0Validated Only\0Experimental / Partial\0Unsupported Only\0");
+                 kCapStateItems.data(),
+                 static_cast<int>(kCapStateItems.size()));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-1.0f);
     ImGui::InputTextWithHint("##CapSearchFilter",

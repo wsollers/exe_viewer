@@ -139,14 +139,18 @@ public:
             std::min<std::uint64_t>(avail, std::min<std::uint64_t>(want_bytes, 131072ull)));
         if (read_len > 0) {
             MemorySample sample = read_memory_tolerant(session_, regions, sp, read_len);
-            if (sample.readable_count > 0) {
-                std::size_t usable_len = sample.bytes.size();
-                while (usable_len > 0 && sample.valid[usable_len - 1] == 0u) {
-                    --usable_len;
+            if (sample.readable_count > 0 && sample.valid.size() == sample.bytes.size()) {
+                std::size_t last_valid_end = sample.valid.size();
+                while (last_valid_end > 0 && sample.valid[last_valid_end - 1] == 0u) {
+                    --last_valid_end;
                 }
-                usable_len = (usable_len / ptr_size) * ptr_size;
-                sample.bytes.resize(usable_len);
+                const std::size_t aligned_len = std::min(
+                    sample.bytes.size(),
+                    ((last_valid_end + ptr_size - 1u) / ptr_size) * ptr_size);
+                sample.bytes.resize(aligned_len);
+                sample.valid.resize(aligned_len);
                 window_bytes_ = std::move(sample.bytes);
+                window_valid_ = std::move(sample.valid);
                 readable_count_ = sample.readable_count;
             }
         }
@@ -154,6 +158,10 @@ public:
 
     [[nodiscard]] std::span<const std::uint8_t> window_bytes() const noexcept {
         return window_bytes_;
+    }
+
+    [[nodiscard]] std::span<const std::uint8_t> window_valid() const noexcept {
+        return window_valid_;
     }
 
     [[nodiscard]] std::size_t readable_count() const noexcept { return readable_count_; }
@@ -165,8 +173,17 @@ public:
         }
         if (addr >= window_base_ &&
             (addr - window_base_) + ptr_size <= window_bytes_.size()) {
+            const auto rel = static_cast<std::size_t>(addr - window_base_);
+            if (rel + ptr_size > window_valid_.size()) {
+                return std::nullopt;
+            }
+            for (std::size_t i = 0; i < ptr_size; ++i) {
+                if (window_valid_[rel + i] == 0u) {
+                    return std::nullopt;
+                }
+            }
             const EndianReader reader(window_bytes_, layout_);
-            const auto res = reader.read_pointer(static_cast<std::size_t>(addr - window_base_));
+            const auto res = reader.read_pointer(rel);
             return res ? std::optional<std::uint64_t>{*res} : std::nullopt;
         }
         std::array<std::uint8_t, 8> buf{};
@@ -186,6 +203,7 @@ private:
     StackBounds bounds_;
     std::uint64_t window_base_{0};
     std::vector<std::uint8_t> window_bytes_;
+    std::vector<std::uint8_t> window_valid_;
     std::size_t readable_count_{0};
 };
 
@@ -1255,36 +1273,55 @@ ThreadStackSnapshot unwind_and_inspect_stack(
         }
     }
 
-    // Build color-role classified stack slots starting at SP.
+    // Build color-role classified stack slots starting at SP while preserving
+    // per-byte read validity across partial or unreadable stack pages.
     const std::span<const std::uint8_t> win = stack_mem.window_bytes();
+    const std::span<const std::uint8_t> win_valid = stack_mem.window_valid();
     const EndianReader win_reader(win, snap.layout);
     const std::size_t avail_slots = win.size() / ptr_size;
     const std::size_t slot_count = std::min(max_slots, avail_slots);
     snap.slots.reserve(slot_count);
 
     for (std::size_t i = 0; i < slot_count; ++i) {
+        const std::size_t byte_off = i * ptr_size;
         const std::uint64_t slot_addr = initial_sp + static_cast<std::uint64_t>(i) * ptr_size;
-        const std::uint64_t val = win_reader.read_pointer(i * ptr_size).value_or(0);
 
         StackSlotEntry entry;
         entry.slot_address = slot_addr;
+        entry.byte_size = static_cast<std::uint8_t>(std::min<std::size_t>(ptr_size, 8u));
+        entry.valid_byte_mask = 0u;
+        for (std::size_t b = 0; b < entry.byte_size; ++b) {
+            entry.raw_bytes[b] = win[byte_off + b];
+            if (byte_off + b < win_valid.size() && win_valid[byte_off + b] != 0u) {
+                entry.valid_byte_mask =
+                    static_cast<std::uint8_t>(entry.valid_byte_mask | (1u << b));
+            }
+        }
+
+        const bool fully_valid = entry.all_bytes_valid();
+        const std::uint64_t val =
+            fully_valid ? win_reader.read_pointer(byte_off).value_or(0) : 0ull;
         entry.value = val;
-        entry.points_to_executable =
-            is_executable_address(val, bounds, regions, modules, active_image);
-        entry.points_to_stack = (val >= bounds.start && val < bounds.end);
-        entry.resolved_symbol =
-            resolve_address_label(val, modules, active_image, symbol_resolver);
+        if (fully_valid) {
+            entry.points_to_executable =
+                is_executable_address(val, bounds, regions, modules, active_image);
+            entry.points_to_stack = (val >= bounds.start && val < bounds.end);
+            entry.resolved_symbol =
+                resolve_address_label(val, modules, active_image, symbol_resolver);
+        }
 
         bool matched_role = false;
 
-        for (const StackFrame& fr : snap.frames) {
-            if (fr.return_address_slot.has_value() && *fr.return_address_slot == slot_addr) {
-                entry.role = StackSlotRole::ReturnAddress;
-                entry.frame_index = fr.index;
-                entry.annotation =
-                    std::format("Frame #{} return address ({})", fr.index, fr.unwind_method);
-                matched_role = true;
-                break;
+        if (fully_valid) {
+            for (const StackFrame& fr : snap.frames) {
+                if (fr.return_address_slot.has_value() && *fr.return_address_slot == slot_addr) {
+                    entry.role = StackSlotRole::ReturnAddress;
+                    entry.frame_index = fr.index;
+                    entry.annotation =
+                        std::format("Frame #{} return address ({})", fr.index, fr.unwind_method);
+                    matched_role = true;
+                    break;
+                }
             }
         }
 
@@ -1301,7 +1338,7 @@ ThreadStackSnapshot unwind_and_inspect_stack(
             matched_role = true;
         }
 
-        if (!matched_role) {
+        if (!matched_role && fully_valid) {
             for (const StackFrame& fr : snap.frames) {
                 if (fr.saved_fp_slot.has_value() && *fr.saved_fp_slot == slot_addr) {
                     entry.role = StackSlotRole::SavedFramePointer;
@@ -1313,7 +1350,7 @@ ThreadStackSnapshot unwind_and_inspect_stack(
             }
         }
 
-        if (!matched_role && i == 0 && context.frame_pointer != 0 &&
+        if (!matched_role && fully_valid && i == 0 && context.frame_pointer != 0 &&
             val == context.frame_pointer) {
             entry.role = StackSlotRole::ActiveFramePointer;
             entry.frame_index = 0;
@@ -1321,7 +1358,7 @@ ThreadStackSnapshot unwind_and_inspect_stack(
             matched_role = true;
         }
 
-        if (!matched_role && entry.points_to_executable &&
+        if (!matched_role && fully_valid && entry.points_to_executable &&
             check_post_call_address(session, snap.layout, val)) {
             entry.role = StackSlotRole::ReturnAddress;
             entry.annotation = "Candidate return address";
@@ -1335,7 +1372,17 @@ ThreadStackSnapshot unwind_and_inspect_stack(
             matched_role = true;
         }
 
-        if (entry.annotation.empty()) {
+        if (!fully_valid) {
+            const char* read_note = entry.any_bytes_valid()
+                                        ? "<partial read: ?? marks unreadable bytes>"
+                                        : "<unreadable stack memory>";
+            if (!entry.annotation.empty()) {
+                entry.annotation += " | ";
+                entry.annotation += read_note;
+            } else {
+                entry.annotation = read_note;
+            }
+        } else if (entry.annotation.empty()) {
             if (entry.points_to_stack) {
                 if (val >= initial_sp) {
                     entry.annotation = std::format("Stack ptr (SP+0x{:x})", val - initial_sp);
@@ -1932,6 +1979,31 @@ ThreadLocalSnapshot inspect_thread_locals(
 
     snap.status = SubsystemStatus::unavailable("TLS Inspector", "unsupported binary format");
     return snap;
+}
+
+std::string format_stack_slot_value(const StackSlotEntry& slot, TargetLayout layout) {
+    const std::size_t width = slot.byte_size != 0u
+        ? static_cast<std::size_t>(std::min<std::uint8_t>(slot.byte_size, 8u))
+        : layout.pointer_size();
+    if (slot.all_bytes_valid()) {
+        if (width <= 4u) {
+            return std::format("0x{:08X}", static_cast<std::uint32_t>(slot.value));
+        }
+        return std::format("0x{:016X}", slot.value);
+    }
+
+    std::string out = "0x";
+    out.reserve(2u + width * 2u);
+    for (std::size_t idx = 0; idx < width; ++idx) {
+        const std::size_t byte_index =
+            (layout.endianness == Endianness::Big) ? idx : (width - 1u - idx);
+        if (slot.is_byte_valid(byte_index)) {
+            out += std::format("{:02X}", slot.raw_bytes[byte_index]);
+        } else {
+            out += "??";
+        }
+    }
+    return out;
 }
 
 }  // namespace peelf

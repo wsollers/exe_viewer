@@ -55,19 +55,19 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , binary_diff_panel_(
           model,
           current_selection_,
-          [this](std::uint64_t address, PreferredView view) { navigate_to_address(address, view); },
+          [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); },
           [this]() {
               if (on_analysis_file_) on_analysis_file_(3);
           })
     , debugger_panel_(
           model,
-          [this](std::uint64_t address, PreferredView view) { navigate_to_address(address, view); },
+          [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); },
           [this]() { on_process_attached(); },
           [this]() { open_attach_process_modal(); })
     , capabilities_panel_(model)
     , executable_settings_panel_(
           model,
-          [this](std::uint64_t address, PreferredView view) { navigate_to_address(address, view); })
+          [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); })
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -93,35 +93,38 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     patch_set_panel_.set_analysis_context(&symbol_index_, &thumb_mode_);
     references_panel_.set_scanner(&reference_scanner_);
     references_panel_.set_navigate_callback([this](std::uint64_t address) {
-        navigate_to_address(address, PreferredView::Disassembly);
+        enqueue_navigation(address, PreferredView::Disassembly);
     });
     references_panel_.set_rebuild_callback([this] { references_dirty_ = true; });
     strings_panel_.set_rebuild_callback([this](std::size_t, bool) { strings_dirty_ = true; });
     strings_panel_.set_string_selected_callback([this](const ExtractedString& s) {
-        std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(s.virtual_address);
-        if (!nav_offset && !model_.is_live_process()) {
-            nav_offset = s.file_offset;
-        }
-        if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(s.virtual_address)) {
-            sync_live_process_view(false);
-            nav_offset = model_.virtual_address_to_offset(s.virtual_address);
-        }
-        navigation_history_.visit(current_selection_);
-        const std::size_t byte_len = std::max<std::size_t>(s.byte_length, 1u);
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::ByteRange,
-            .label = "String: " + format_single_line_string_preview(s.preview, 96),
-            .file_offset = nav_offset,
-            .virtual_address = s.virtual_address,
-            .size = byte_len,
-            .preferred_view = PreferredView::Hex,
-        };
-        if (nav_offset) {
-            hex_panel_.set_visible(true);
-            hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(byte_len));
-        }
-        last_navigation_selection_ = current_selection_;
-        navigation_history_.visit(current_selection_);
+        const ExtractedString s_copy = s;
+        pending_navigations_.enqueue_custom([this, s_copy]() {
+            std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(s_copy.virtual_address);
+            if (!nav_offset && !model_.is_live_process()) {
+                nav_offset = s_copy.file_offset;
+            }
+            if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(s_copy.virtual_address)) {
+                sync_live_process_view(false);
+                nav_offset = model_.virtual_address_to_offset(s_copy.virtual_address);
+            }
+            navigation_history_.visit(current_selection_);
+            const std::uint64_t byte_len = std::max<std::uint64_t>(s_copy.byte_length, 1u);
+            current_selection_ = ViewerSelection{
+                .kind = SelectionKind::ByteRange,
+                .label = "String: " + format_single_line_string_preview(s_copy.preview, 96),
+                .file_offset = nav_offset,
+                .virtual_address = s_copy.virtual_address,
+                .size = byte_len,
+                .preferred_view = PreferredView::Hex,
+            };
+            if (nav_offset) {
+                hex_panel_.set_visible(true);
+                hex_panel_.navigate_to_range(*nav_offset, byte_len);
+            }
+            last_navigation_selection_ = current_selection_;
+            navigation_history_.visit(current_selection_);
+        });
     });
     struct_view_panel_.set_extra_types_provider([this]() -> std::span<const DataTypeRecord> {
         return decompiled_.types;
@@ -131,81 +134,74 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
                std::optional<std::uint64_t> virtual_address,
                std::uint64_t size,
                std::string label) {
-            const std::uint64_t byte_len = std::max<std::uint64_t>(1u, size);
-            current_selection_ = ViewerSelection{
-                .kind = SelectionKind::ByteRange,
-                .label = std::move(label),
-                .file_offset = model_.is_live_process() ? std::nullopt : window_offset,
-                .virtual_address = virtual_address,
-                .size = byte_len,
-                .object_index = 0,
-                .preferred_view = PreferredView::Hex,
-                .graph_root = std::nullopt,
-            };
-            if (window_offset) {
-                hex_panel_.set_visible(true);
-                hex_panel_.navigate_to_range(clamp_to_size_t(*window_offset), clamp_to_size_t(byte_len));
-            } else if (virtual_address && model_.is_live_process() &&
-                       model_.navigate_to_virtual_address(*virtual_address)) {
-                sync_live_process_view(false);
-                if (const auto off = model_.virtual_address_to_offset(*virtual_address)) {
-                    hex_panel_.set_visible(true);
-                    hex_panel_.navigate_to_range(clamp_to_size_t(*off), clamp_to_size_t(byte_len));
-                }
-            }
+            pending_navigations_.enqueue_custom(
+                [this, window_offset, virtual_address, size, label = std::move(label)]() mutable {
+                    const std::uint64_t byte_len = std::max<std::uint64_t>(1u, size);
+                    current_selection_ = ViewerSelection{
+                        .kind = SelectionKind::ByteRange,
+                        .label = std::move(label),
+                        .file_offset = model_.is_live_process() ? std::nullopt : window_offset,
+                        .virtual_address = virtual_address,
+                        .size = byte_len,
+                        .object_index = 0,
+                        .preferred_view = PreferredView::Hex,
+                        .graph_root = std::nullopt,
+                    };
+                    if (window_offset) {
+                        hex_panel_.set_visible(true);
+                        hex_panel_.navigate_to_range(*window_offset, byte_len);
+                    } else if (virtual_address && model_.is_live_process() &&
+                               model_.navigate_to_virtual_address(*virtual_address)) {
+                        sync_live_process_view(false);
+                        if (const auto off = model_.virtual_address_to_offset(*virtual_address)) {
+                            hex_panel_.set_visible(true);
+                            hex_panel_.navigate_to_range(*off, byte_len);
+                        }
+                    }
+                });
         });
     struct_view_panel_.set_pointer_activated_callback([this](std::uint64_t target_va) {
-        navigate_to_address(target_va, PreferredView::Hex);
+        enqueue_navigation(target_va, PreferredView::Hex);
     });
     hex_panel_.set_apply_structure_callback([this](std::uint64_t address, bool is_file_offset) {
         open_structure_view({}, address, is_file_offset);
     });
     strings_panel_.set_referrer_activated_callback(
         [this](const StringReferrer& ref, StringReferrerTargetView target) {
-            if (target == StringReferrerTargetView::FlowGraph) {
-                navigate_to_address(ref.instruction_address, PreferredView::Graph);
-                return;
-            }
-            if (target == StringReferrerTargetView::Decompile) {
-                navigate_to_address(ref.function_address.value_or(ref.instruction_address),
-                                    PreferredView::Disassembly);
-                selected_code_address_ = ref.instruction_address;
-                request_decompile();
-                return;
-            }
-            navigate_to_address(ref.instruction_address, PreferredView::Disassembly);
-            if (target == StringReferrerTargetView::SyncAllOpen) {
-                if (show_call_graph_panel_ && model_.image() != nullptr) {
-                    if (const auto root = navigation_graph_root(ref.instruction_address)) {
-                        if (!active_graph_root_ || active_graph_root_->virtual_address != root->virtual_address) {
-                            pending_call_graph_root_ = *root;
-                            pending_call_graph_delay_frames_ = 0;
+            const StringReferrer ref_copy = ref;
+            pending_navigations_.enqueue_custom([this, ref_copy, target]() {
+                if (target == StringReferrerTargetView::FlowGraph) {
+                    navigate_to_address(ref_copy.instruction_address, PreferredView::Graph);
+                    return;
+                }
+                if (target == StringReferrerTargetView::Decompile) {
+                    navigate_to_address(ref_copy.function_address.value_or(ref_copy.instruction_address),
+                                        PreferredView::Disassembly);
+                    selected_code_address_ = ref_copy.instruction_address;
+                    request_decompile();
+                    return;
+                }
+                navigate_to_address(ref_copy.instruction_address, PreferredView::Disassembly);
+                if (target == StringReferrerTargetView::SyncAllOpen) {
+                    if (show_call_graph_panel_ && model_.image() != nullptr) {
+                        if (const auto root = navigation_graph_root(ref_copy.instruction_address)) {
+                            if (!active_graph_root_ || active_graph_root_->virtual_address != root->virtual_address) {
+                                pending_call_graph_root_ = *root;
+                                pending_call_graph_delay_frames_ = 0;
+                            }
+                            center_graph_selection_ = true;
                         }
-                        center_graph_selection_ = true;
+                    }
+                    if (show_decompiler_) {
+                        selected_code_address_ = ref_copy.instruction_address;
+                        request_decompile();
                     }
                 }
-                if (show_decompiler_) {
-                    selected_code_address_ = ref.instruction_address;
-                    request_decompile();
-                }
-            }
+            });
         });
     references_panel_.set_model(&model_);
     references_panel_.set_navigate_offset_callback([this](std::uint64_t off) {
-        if (off >= model_.view_size()) return;
-        const auto va = model_.offset_to_virtual_address(off);
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::ByteRange,
-            .label = std::format("off+0x{:X}", off),
-            .file_offset = off,
-            .virtual_address = va,
-            .size = 1,
-            .preferred_view = PreferredView::Hex,
-        };
-        hex_panel_.set_visible(true);
-        hex_panel_.navigate_to_range(clamp_to_size_t(off), 1);
-        if (va) disassemble_at_offset(off, *va);
-        last_navigation_selection_ = current_selection_;
+        pending_navigations_.enqueue_offset(off, 1);
     });
     references_panel_.set_pause_callback([this] { reference_scanner_.pause(); });
     references_panel_.set_resume_callback([this] { reference_scanner_.resume(reference_index_); });
@@ -240,7 +236,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     });
     symbols_panel_.set_demangle_changed_callback([this](bool) { ++symbol_revision_; });
     functions_panel_.set_demangle_changed_callback([this](bool) { ++symbol_revision_; });
-    hex_panel_.set_byte_activated_callback([this](std::size_t off, std::size_t size) {
+    hex_panel_.set_byte_activated_callback([this](std::uint64_t off, std::uint64_t size) {
         current_selection_ = ViewerSelection{
             .kind = SelectionKind::ByteRange,
             .label = "Hex selection",
@@ -252,7 +248,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         last_navigation_selection_ = current_selection_;
         disassemble_at_offset(off);
     });
-    hex_panel_.set_bytes_patched_callback([this](std::size_t) {
+    hex_panel_.set_bytes_patched_callback([this](std::uint64_t) {
         refresh_disassembly();
     });
 
@@ -299,82 +295,50 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     memory_map_panel_.set_detach_requested_callback(on_detach_proc);
     memory_map_panel_.set_pause_toggle_callback(on_toggle_pause);
     memory_map_panel_.set_module_selected_callback([this](std::size_t module_index) {
-        auto res = model_.select_process_module(module_index);
-        if (!res) {
-            Log().error("Failed to select module: {}", res.error().message);
-            return;
-        }
-        sync_live_process_view(true);
+        pending_navigations_.enqueue_module(module_index);
     });
     memory_map_panel_.set_region_activated_callback([this](std::size_t region_index, bool prefer_module_context) {
-        if (region_index >= model_.memory_regions().size()) {
-            return;
-        }
-        const peelf::MemoryRegion reg_copy = model_.memory_regions()[region_index];
-        auto res = model_.select_memory_region(region_index, prefer_module_context);
-        if (!res) {
-            Log().error("Failed to select memory region: {}", res.error().message);
-            return;
-        }
-        sync_live_process_view(false);
-        const std::uint64_t offset = model_.virtual_address_to_offset(reg_copy.start_address).value_or(0u);
-        current_selection_ = selection_from_memory_region(reg_copy, static_cast<std::uint64_t>(region_index), offset);
-        hex_panel_.navigate_to_range(clamp_to_size_t(offset),
-                                     clamp_to_size_t(std::min<std::uint64_t>(reg_copy.size(), 16u)));
-        if (reg_copy.protection.executable) {
-            const auto disasm_win = static_cast<std::size_t>(
-                std::clamp<std::uint64_t>(reg_copy.size(), 4096u, 65536u));
-            disassemble_at_offset(offset, reg_copy.start_address, disasm_win);
-            show_disassembly_panel_ = true;
-            focus_listing_ = true;
-        }
-        last_navigation_selection_ = current_selection_;
+        pending_navigations_.enqueue_memory_region(region_index, prefer_module_context);
     });
 
     functions_panel_.set_function_activated_callback([this](std::uint64_t va, bool want_decompile) {
-        navigate_to_address(va, PreferredView::Disassembly);
-        if (want_decompile) {
-            request_decompile();
-        }
+        enqueue_navigation(va, PreferredView::Disassembly, 0, want_decompile);
     });
     threads_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv, bool want_decompile) {
-        navigate_to_address(va, pv);
-        if (want_decompile) {
-            request_decompile();
-        }
+        enqueue_navigation(va, pv, 0, want_decompile);
     });
     thread_locals_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
-        navigate_to_address(va, pv);
+        enqueue_navigation(va, pv);
     });
     memory_search_panel_.set_address_activated_callback([this](std::uint64_t va, std::size_t match_size) {
-        navigate_to_address(va, PreferredView::Hex);
-        if (const auto off = model_.virtual_address_to_offset(va)) {
-            hex_panel_.navigate_to_range(clamp_to_size_t(*off), std::max<std::size_t>(1u, match_size));
-        }
+        enqueue_navigation(va, PreferredView::Hex, std::max<std::size_t>(1u, match_size));
     });
     runtime_flags_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
-        navigate_to_address(va, pv);
+        enqueue_navigation(va, pv);
     });
     handlers_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
-        navigate_to_address(va, pv);
+        enqueue_navigation(va, pv);
     });
 
     patch_set_panel_.set_patch_activated_callback([this](const ViewerSelection& sel) {
-        std::optional<std::uint64_t> off = sel.file_offset;
-        if (!off && sel.virtual_address) {
-            if (model_.is_live_process() && !model_.virtual_address_to_offset(*sel.virtual_address)) {
-                if (model_.navigate_to_virtual_address(*sel.virtual_address)) {
-                    sync_live_process_view(false);
+        const ViewerSelection sel_copy = sel;
+        pending_navigations_.enqueue_custom([this, sel_copy]() {
+            std::optional<std::uint64_t> off = sel_copy.file_offset;
+            if (!off && sel_copy.virtual_address) {
+                if (model_.is_live_process() && !model_.virtual_address_to_offset(*sel_copy.virtual_address)) {
+                    if (model_.navigate_to_virtual_address(*sel_copy.virtual_address)) {
+                        sync_live_process_view(false);
+                    }
                 }
+                off = model_.virtual_address_to_offset(*sel_copy.virtual_address);
             }
-            off = model_.virtual_address_to_offset(*sel.virtual_address);
-        }
-        if (off) {
-            const std::uint64_t sz = sel.size != 0 ? sel.size : 1u;
-            hex_panel_.navigate_to_range(clamp_to_size_t(*off), clamp_to_size_t(sz));
-            disassemble_at_offset(*off, sel.virtual_address.value_or(*off));
-        }
-        last_navigation_selection_ = sel;
+            if (off) {
+                const std::uint64_t sz = sel_copy.size != 0 ? sel_copy.size : 1u;
+                hex_panel_.navigate_to_range(*off, sz);
+                disassemble_at_offset(*off, sel_copy.virtual_address.value_or(*off));
+            }
+            last_navigation_selection_ = sel_copy;
+        });
     });
     patch_set_panel_.set_patch_mutated_callback([this]() {
         refresh_disassembly();
@@ -385,163 +349,171 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 
     sections_panel_.set_section_activated_callback(
         [this](const peelf::Section& section, std::uint64_t object_index) {
-            const std::optional<std::uint64_t> nav_offset =
-                model_.is_live_process()
-                    ? model_.virtual_address_to_offset(section.virtual_address)
-                    : std::optional<std::uint64_t>(section.file_offset);
-            if (!nav_offset) {
-                Log().warn("Section '{}' at 0x{:X} is outside the active window",
-                           section.name,
-                           section.virtual_address);
+            const peelf::Section section_copy = section;
+            pending_navigations_.enqueue_custom([this, section_copy, object_index]() {
+                const std::optional<std::uint64_t> nav_offset =
+                    model_.is_live_process()
+                        ? model_.virtual_address_to_offset(section_copy.virtual_address)
+                        : std::optional<std::uint64_t>(section_copy.file_offset);
+                if (!nav_offset) {
+                    Log().warn("Section '{}' at 0x{:X} is outside the active window",
+                               section_copy.name,
+                               section_copy.virtual_address);
+                    return;
+                }
+                const std::uint64_t range_size =
+                    section_copy.file_size != 0 ? section_copy.file_size : section_copy.virtual_size;
+                current_selection_ = ViewerSelection{
+                    .kind = SelectionKind::Section,
+                    .label = section_copy.name,
+                    .file_offset = *nav_offset,
+                    .virtual_address = section_copy.virtual_address,
+                    .size = std::max(section_copy.file_size, section_copy.virtual_size),
+                    .object_index = object_index,
+                    .preferred_view = section_copy.executable ? PreferredView::Disassembly : PreferredView::Hex
+                };
+                hex_panel_.navigate_to_range(*nav_offset, std::max<std::uint64_t>(range_size, 1u));
+                if (section_copy.executable) {
+                    const auto disasm_win = static_cast<std::size_t>(
+                        std::clamp<std::uint64_t>(range_size, 4096u, 65536u));
+                    disassemble_at_offset(*nav_offset, section_copy.virtual_address, disasm_win);
+                }
+                last_navigation_selection_ = current_selection_;
+            });
+        });
+    symbols_panel_.set_symbol_activated_callback([this](const SymbolRecord& symbol, std::uint64_t object_index) {
+        const SymbolRecord symbol_copy = symbol;
+        pending_navigations_.enqueue_custom([this, symbol_copy, object_index]() {
+            focus_graph_ = true;
+            activate_panel(details_panel_.name().c_str());
+            activate_panel("Disassembly");
+            if (model_.image() == nullptr) {
                 return;
             }
-            const std::uint64_t range_size = section.file_size != 0 ? section.file_size : section.virtual_size;
+
             current_selection_ = ViewerSelection{
-                .kind = SelectionKind::Section,
-                .label = section.name,
-                .file_offset = *nav_offset,
-                .virtual_address = section.virtual_address,
-                .size = std::max(section.file_size, section.virtual_size),
-                .object_index = object_index,
-                .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex
+                .kind = SelectionKind::Symbol, .label = symbol_copy.name,
+                .file_offset = symbol_copy.file_offset, .virtual_address = symbol_copy.virtual_address,
+                .size = symbol_copy.size, .object_index = object_index,
+                .preferred_view = PreferredView::Details
             };
-            hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset),
-                                         clamp_to_size_t(std::max<std::uint64_t>(range_size, 1u)));
-            if (section.executable) {
-                const auto disasm_win = static_cast<std::size_t>(
-                    std::clamp<std::uint64_t>(range_size, 4096u, 65536u));
-                disassemble_at_offset(*nav_offset, section.virtual_address, disasm_win);
+            auto file_offset = symbol_copy.virtual_address
+                ? model_.virtual_address_to_offset(*symbol_copy.virtual_address)
+                : symbol_copy.file_offset;
+            if (!file_offset && model_.is_live_process() && symbol_copy.virtual_address &&
+                model_.navigate_to_virtual_address(*symbol_copy.virtual_address)) {
+                sync_live_process_view(false);
+                file_offset = model_.virtual_address_to_offset(*symbol_copy.virtual_address);
+            }
+            const peelf::IBinaryImage* img = model_.image();
+            pending_call_graph_root_.reset();
+            current_instructions_.clear();
+            disassembly_location_.reset();
+            hex_panel_.clear_selection();
+            if (!file_offset || img == nullptr) {
+                Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
+                           symbol_copy.name.empty() ? "<unnamed>" : symbol_copy.name,
+                           symbol_copy.virtual_address.value_or(0));
+                current_instructions_.clear();
+                return;
+            }
+
+            const std::uint64_t highlight_size = symbol_copy.size != 0 ? symbol_copy.size : 1u;
+            const bool has_code = symbol_has_code(*img, symbol_copy);
+            current_selection_ = ViewerSelection{
+                .kind = SelectionKind::Symbol,
+                .label = symbol_copy.name.empty() ? "<unnamed>" : symbol_copy.name,
+                .file_offset = *file_offset,
+                .virtual_address = symbol_copy.virtual_address,
+                .size = symbol_copy.size,
+                .object_index = object_index,
+                .preferred_view = has_code ? PreferredView::Graph : PreferredView::Hex
+            };
+            hex_panel_.navigate_to_range(*file_offset, highlight_size);
+            if (has_code) {
+                current_selection_.graph_root = symbol_copy;
+                disassemble_at_offset(*file_offset, *symbol_copy.virtual_address);
+                pending_call_graph_root_ = symbol_copy;
+                pending_call_graph_delay_frames_ = 1;
+                show_call_graph_panel_ = true;
+                call_graph_status_ = "Analyzing " + symbol_copy.name;
             }
             last_navigation_selection_ = current_selection_;
         });
-    symbols_panel_.set_symbol_activated_callback([this](const SymbolRecord& symbol, std::uint64_t object_index) {
-        focus_graph_ = true;
-        activate_panel(details_panel_.name().c_str());
-        activate_panel("Disassembly");
-        const peelf::IBinaryImage* img = model_.image();
-        if (img == nullptr) {
-            return;
-        }
-
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::Symbol, .label = symbol.name,
-            .file_offset = symbol.file_offset, .virtual_address = symbol.virtual_address,
-            .size = symbol.size, .object_index = object_index,
-            .preferred_view = PreferredView::Details
-        };
-        auto file_offset = symbol.virtual_address ? model_.virtual_address_to_offset(*symbol.virtual_address) : symbol.file_offset;
-        if (!file_offset && model_.is_live_process() && symbol.virtual_address && model_.navigate_to_virtual_address(*symbol.virtual_address)) {
-            sync_live_process_view(false);
-            file_offset = model_.virtual_address_to_offset(*symbol.virtual_address);
-        }
-        pending_call_graph_root_.reset();
-        current_instructions_.clear();
-        disassembly_location_.reset();
-        hex_panel_.clear_selection();
-        if (!file_offset) {
-            Log().warn("Symbol '{}' at 0x{:X} does not map to file bytes",
-                       symbol.name.empty() ? "<unnamed>" : symbol.name,
-                       symbol.virtual_address.value_or(0));
-            current_instructions_.clear();
-            return;
-        }
-        if (*file_offset > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) ||
-            symbol.size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-            Log().warn("Symbol '{}' range is too large for this platform",
-                       symbol.name.empty() ? "<unnamed>" : symbol.name);
-            return;
-        }
-
-        const std::size_t highlight_size = symbol.size != 0
-            ? static_cast<std::size_t>(symbol.size)
-            : std::size_t{1};
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::Symbol,
-            .label = symbol.name.empty() ? "<unnamed>" : symbol.name,
-            .file_offset = *file_offset,
-            .virtual_address = symbol.virtual_address,
-            .size = symbol.size,
-            .object_index = object_index,
-            .preferred_view = symbol_has_code(*img, symbol) ? PreferredView::Graph : PreferredView::Hex
-        };
-        hex_panel_.navigate_to_range(static_cast<std::size_t>(*file_offset), highlight_size);
-        if (symbol_has_code(*img, symbol)) {
-            current_selection_.graph_root = symbol;
-            disassemble_at_offset(static_cast<std::size_t>(*file_offset), *symbol.virtual_address);
-            pending_call_graph_root_ = symbol;
-            pending_call_graph_delay_frames_ = 1;
-            show_call_graph_panel_ = true;
-            call_graph_status_ = "Analyzing " + symbol.name;
-        }
-        last_navigation_selection_ = current_selection_;
     });
     imports_panel_.set_import_activated_callback([this](const peelf::ImportEntry& entry, std::uint64_t object_index) {
-        const peelf::IBinaryImage* img = model_.image();
-        if (img == nullptr || entry.address == 0) {
-            return;
-        }
+        const peelf::ImportEntry entry_copy = entry;
+        pending_navigations_.enqueue_custom([this, entry_copy, object_index]() {
+            if (model_.image() == nullptr || entry_copy.address == 0) {
+                return;
+            }
 
-        std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(entry.address);
-        if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(entry.address)) {
-            sync_live_process_view(false);
-            nav_offset = model_.virtual_address_to_offset(entry.address);
-        }
-        if (!nav_offset) {
-            Log().warn("Import '{}!{}' at 0x{:X} does not map to bytes",
-                       entry.library,
-                       entry.name.empty() ? "<ordinal-or-library>" : entry.name,
-                       entry.address);
-            return;
-        }
+            std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(entry_copy.address);
+            if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(entry_copy.address)) {
+                sync_live_process_view(false);
+                nav_offset = model_.virtual_address_to_offset(entry_copy.address);
+            }
+            const peelf::IBinaryImage* img = model_.image();
+            if (!nav_offset || img == nullptr) {
+                Log().warn("Import '{}!{}' at 0x{:X} does not map to bytes",
+                           entry_copy.library,
+                           entry_copy.name.empty() ? "<ordinal-or-library>" : entry_copy.name,
+                           entry_copy.address);
+                return;
+            }
 
-        const std::uint64_t pointer_size = img->is_64bit() ? 8u : 4u;
-        std::string label = entry.library;
-        if (!entry.name.empty()) {
-            label += "!";
-            label += entry.name;
-        }
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::Import,
-            .label = std::move(label),
-            .file_offset = *nav_offset,
-            .virtual_address = entry.address,
-            .size = pointer_size,
-            .object_index = object_index,
-            .preferred_view = PreferredView::Hex
-        };
-        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(pointer_size));
-        last_navigation_selection_ = current_selection_;
+            const std::uint64_t pointer_size = img->is_64bit() ? 8u : 4u;
+            std::string label = entry_copy.library;
+            if (!entry_copy.name.empty()) {
+                label += "!";
+                label += entry_copy.name;
+            }
+            current_selection_ = ViewerSelection{
+                .kind = SelectionKind::Import,
+                .label = std::move(label),
+                .file_offset = *nav_offset,
+                .virtual_address = entry_copy.address,
+                .size = pointer_size,
+                .object_index = object_index,
+                .preferred_view = PreferredView::Hex
+            };
+            hex_panel_.navigate_to_range(*nav_offset, pointer_size);
+            last_navigation_selection_ = current_selection_;
+        });
     });
     exports_panel_.set_export_activated_callback([this](const peelf::ExportEntry& entry, std::uint64_t object_index) {
-        const peelf::IBinaryImage* img = model_.image();
-        if (img == nullptr || entry.virtual_address == 0) {
-            return;
-        }
+        const peelf::ExportEntry entry_copy = entry;
+        pending_navigations_.enqueue_custom([this, entry_copy, object_index]() {
+            if (model_.image() == nullptr || entry_copy.virtual_address == 0) {
+                return;
+            }
 
-        std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(entry.virtual_address);
-        if (!nav_offset && model_.is_live_process() && model_.navigate_to_virtual_address(entry.virtual_address)) {
-            sync_live_process_view(false);
-            nav_offset = model_.virtual_address_to_offset(entry.virtual_address);
-        }
-        if (!nav_offset) {
-            Log().warn("Export '{}' at 0x{:X} does not map to bytes",
-                       entry.name.empty() ? "<unnamed>" : entry.name,
-                       entry.virtual_address);
-            return;
-        }
+            std::optional<std::uint64_t> nav_offset = model_.virtual_address_to_offset(entry_copy.virtual_address);
+            if (!nav_offset && model_.is_live_process() &&
+                model_.navigate_to_virtual_address(entry_copy.virtual_address)) {
+                sync_live_process_view(false);
+                nav_offset = model_.virtual_address_to_offset(entry_copy.virtual_address);
+            }
+            if (!nav_offset) {
+                Log().warn("Export '{}' at 0x{:X} does not map to bytes",
+                           entry_copy.name.empty() ? "<unnamed>" : entry_copy.name,
+                           entry_copy.virtual_address);
+                return;
+            }
 
-        current_selection_ = ViewerSelection{
-            .kind = SelectionKind::Export,
-            .label = entry.name.empty() ? "<unnamed>" : entry.name,
-            .file_offset = *nav_offset,
-            .virtual_address = entry.virtual_address,
-            .size = 1,
-            .object_index = object_index,
-            .preferred_view = PreferredView::Disassembly
-        };
-        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), 1);
-        disassemble_at_offset(*nav_offset, entry.virtual_address);
-        last_navigation_selection_ = current_selection_;
+            current_selection_ = ViewerSelection{
+                .kind = SelectionKind::Export,
+                .label = entry_copy.name.empty() ? "<unnamed>" : entry_copy.name,
+                .file_offset = *nav_offset,
+                .virtual_address = entry_copy.virtual_address,
+                .size = 1,
+                .object_index = object_index,
+                .preferred_view = PreferredView::Disassembly
+            };
+            hex_panel_.navigate_to_range(*nav_offset, 1);
+            disassemble_at_offset(*nav_offset, entry_copy.virtual_address);
+            last_navigation_selection_ = current_selection_;
+        });
     });
 }
 
@@ -701,7 +673,6 @@ void UiApp::render() {
     file_panel_.draw();
     memory_map_panel_.draw();
     structure_panel_.draw();
-    apply_structure_selection_navigation();
     details_panel_.draw();
     sections_panel_.draw();
     ImGui::PushFont(code_font_, 0.0f);
@@ -757,6 +728,8 @@ void UiApp::render() {
     }
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
+    apply_structure_selection_navigation();
+    drain_pending_navigations();
     if (focus_listing_) { activate_panel("Disassembly"); focus_listing_ = false; }
     navigation_history_.visit(current_selection_);
     if (focus_workspace_) {
@@ -997,6 +970,7 @@ void UiApp::process_deferred_gpu_work() {
 
     // Called after a file (PE or ELF) is loaded into the model, or after detaching.
     void UiApp::on_file_loaded() {
+        pending_navigations_.clear();
         patch_set_panel_.reset_preview();
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();

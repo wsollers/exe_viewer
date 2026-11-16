@@ -321,7 +321,7 @@ void UiApp::render_call_graph_panel() {
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Enter) && selected != nodes.end()) {
                 const auto target = std::ranges::find_if((*selected)->instructions, [](const auto& i) { return i.branch_target.has_value(); });
-                if (target != (*selected)->instructions.end()) navigate_to_address(*target->branch_target, PreferredView::Graph);
+                if (target != (*selected)->instructions.end()) enqueue_navigation(*target->branch_target, PreferredView::Graph);
             }
         }
     }
@@ -385,7 +385,7 @@ void UiApp::render_call_graph_panel() {
                     "0x{:X} [{}] {}",
                     rec.source_address, rec.confidence, rec.evidence);
                 if (ImGui::Selectable(line.c_str())) {
-                    navigate_to_address(rec.source_address, PreferredView::Disassembly);
+                    enqueue_navigation(rec.source_address, PreferredView::Disassembly);
                 }
                 ImGui::PopID();
             }
@@ -582,7 +582,7 @@ void UiApp::render_call_graph_panel() {
                         const auto row = static_cast<int>((ImGui::GetIO().MousePos.y - top) / std::max(3.0f, scale / 7.2f)) - 1;
                         if (row >= 0 && static_cast<std::size_t>(row) < node->instructions.size()) {
                             const auto target = node->instructions[static_cast<std::size_t>(row)].branch_target;
-                            if (target) navigate_to_address(*target, PreferredView::Graph);
+                            if (target) enqueue_navigation(*target, PreferredView::Graph);
                         }
                     }
                 } else {

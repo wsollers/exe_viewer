@@ -13,6 +13,15 @@
 #include "navigation/byte_range.hpp"
 
 namespace viewer {
+namespace {
+
+[[nodiscard]] constexpr std::uint64_t saturating_add_u64(std::uint64_t a, std::uint64_t b) noexcept {
+    return b > std::numeric_limits<std::uint64_t>::max() - a
+               ? std::numeric_limits<std::uint64_t>::max()
+               : (a + b);
+}
+
+} // namespace
 
 HexViewPanel::HexViewPanel(BinaryModel& model)
     : UiPanel("Hex View"), model_(model)
@@ -27,7 +36,7 @@ void HexViewPanel::clear_selection() noexcept {
     edit_status_.clear();
 }
 
-void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) {
+void HexViewPanel::navigate_to_range(std::uint64_t file_offset, std::uint64_t size) {
     mapped_ranges_.clear();
     const std::uint64_t total64 = model_.view_size();
     if (total64 == 0 || file_offset >= total64) {
@@ -35,23 +44,23 @@ void HexViewPanel::navigate_to_range(std::size_t file_offset, std::size_t size) 
         return;
     }
 
-    const std::uint64_t avail64 = total64 - static_cast<std::uint64_t>(file_offset);
-    const std::size_t avail = avail64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())
-                                  ? std::numeric_limits<std::size_t>::max()
-                                  : static_cast<std::size_t>(avail64);
+    const std::uint64_t avail64 = total64 - file_offset;
     selected_offset_ = file_offset;
     highlighted_offset_ = file_offset;
-    highlighted_size_ = std::min(size, avail);
+    highlighted_size_ = std::min(size, avail64);
     pending_scroll_offset_ = file_offset;
     goto_offset_ = file_offset;
 }
 
 void HexViewPanel::navigate_to_ranges(std::span<const ByteRange> ranges) {
     if (ranges.empty()) { clear_selection(); return; }
-    navigate_to_range(ranges.front().offset,ranges.front().size);
-    for (const auto& range : ranges)
-        if (range.offset<model_.view_size() && range.size && range.size<=model_.view_size()-range.offset)
+    navigate_to_range(ranges.front().offset, ranges.front().size);
+    const std::uint64_t total64 = model_.view_size();
+    for (const auto& range : ranges) {
+        if (range.offset < total64 && range.size != 0 && range.size <= total64 - range.offset) {
             mapped_ranges_.push_back(range);
+        }
+    }
 }
 
 void HexViewPanel::draw_contents() {
@@ -62,12 +71,11 @@ void HexViewPanel::draw_contents() {
     }
 
     // Clamp displayed clipper rows to ImGui int range while keeping 64-bit offsets safe.
-    const std::uint64_t row_bytes64 = static_cast<std::uint64_t>(bytes_per_row_);
+    const std::uint64_t row_bytes64 = std::max<std::uint64_t>(1u, static_cast<std::uint64_t>(bytes_per_row_));
+    const std::size_t row_bytes = static_cast<std::size_t>(row_bytes64);
     const std::uint64_t max_rows64 = static_cast<std::uint64_t>(std::numeric_limits<int>::max() - 1);
     const std::uint64_t capped_total64 = std::min(total64, max_rows64 * row_bytes64);
-    const std::size_t total = static_cast<std::size_t>(capped_total64);
-    const std::size_t row_bytes = bytes_per_row_;
-    const int rows = static_cast<int>((capped_total64 + row_bytes64 - 1u) / row_bytes64);
+    const int rows = static_cast<int>((capped_total64 + (row_bytes64 - 1u)) / row_bytes64);
     const bool is_live = model_.is_live_process();
     const std::uint64_t base_va = model_.view_base_address();
     ImGui::SetNextItemWidth(160.0f);
@@ -75,7 +83,7 @@ void HexViewPanel::draw_contents() {
     ImGui::SameLine();
     if (ImGui::Button("Go")) {
         if (goto_offset_ < total64) {
-            navigate_to_range(static_cast<std::size_t>(goto_offset_), 1);
+            navigate_to_range(goto_offset_, 1);
             if (on_byte_activated_) on_byte_activated_(highlighted_offset_, highlighted_size_);
             edit_status_.clear();
         } else edit_status_ = "Offset is outside the file.";
@@ -89,7 +97,7 @@ void HexViewPanel::draw_contents() {
             const auto parsed = parse_hex_shellcode(edit_bytes_);
             if (!parsed.success || parsed.bytes.empty()) edit_status_ = "Enter valid hex bytes.";
             else {
-                if (highlighted_size_ > 1 && parsed.bytes.size() != highlighted_size_) {
+                if (highlighted_size_ > 1 && static_cast<std::uint64_t>(parsed.bytes.size()) != highlighted_size_) {
                     edit_status_ = "Replacement length must match the selected range.";
                 } else {
                     const auto applied = model_.apply_patch_bytes(highlighted_offset_, parsed.bytes, "Hex editor replacement");
@@ -106,8 +114,13 @@ void HexViewPanel::draw_contents() {
             ImGui::TextDisabled("%zu mapped instruction ranges. Select a contiguous range to edit.", mapped_ranges_.size());
         }
     }
-    if (ImGui::Button(mapped_ranges_.size()>1 ? "Copy primary range" : "Copy hex")) {
-        const auto selected = model_.read_effective_bytes(highlighted_offset_, highlighted_size_);
+    if (ImGui::Button(mapped_ranges_.size() > 1 ? "Copy primary range" : "Copy hex")) {
+        constexpr std::uint64_t kMaxCopyBytes = 16u * 1024u * 1024u;
+        const auto copy_len = static_cast<std::size_t>(
+            std::min<std::uint64_t>(highlighted_size_,
+                                    std::min<std::uint64_t>(kMaxCopyBytes,
+                                                            std::numeric_limits<std::size_t>::max())));
+        const auto selected = model_.read_effective_bytes(highlighted_offset_, copy_len);
         if (selected) {
             std::string text;
             for (const auto byte : *selected) text += std::format("{:02X} ", byte);
@@ -118,13 +131,13 @@ void HexViewPanel::draw_contents() {
         ImGui::SameLine();
         if (ImGui::Button("Apply Structure...")) {
             const std::uint64_t addr = is_live
-                ? (base_va + static_cast<std::uint64_t>(selected_offset_))
-                : static_cast<std::uint64_t>(selected_offset_);
+                ? saturating_add_u64(base_va, selected_offset_)
+                : selected_offset_;
             on_apply_structure_(addr, !is_live);
         }
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("0x%" PRIX64 " | %zu bytes", static_cast<std::uint64_t>(selected_offset_), highlighted_size_);
+    ImGui::TextDisabled("0x%" PRIX64 " | %" PRIu64 " bytes", selected_offset_, highlighted_size_);
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Shift-click a byte to extend the selection.");
     if (!edit_status_.empty()) ImGui::TextUnformatted(edit_status_.c_str());
     ImGui::Separator();
@@ -132,7 +145,7 @@ void HexViewPanel::draw_contents() {
     if (is_live) {
         ImGui::TextDisabled("Live Window (Read-Only): 0x%016" PRIX64 " .. 0x%016" PRIX64,
                             base_va,
-                            base_va + total64);
+                            saturating_add_u64(base_va, total64));
     } else {
         ImGui::TextDisabled("Static File: %" PRIu64 " bytes  (right-click byte to stage patch)",
                             total64);
@@ -141,14 +154,20 @@ void HexViewPanel::draw_contents() {
     ImGui::BeginChild("HexScroll", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(rows), ImGui::GetTextLineHeightWithSpacing());
-    if (pending_scroll_offset_)
-        clipper.IncludeItemByIndex(static_cast<int>(*pending_scroll_offset_ / row_bytes));
+    clipper.Begin(rows, ImGui::GetTextLineHeightWithSpacing());
+    if (pending_scroll_offset_) {
+        const std::uint64_t target_row64 = *pending_scroll_offset_ / row_bytes64;
+        if (target_row64 < static_cast<std::uint64_t>(rows)) {
+            clipper.IncludeItemByIndex(static_cast<int>(target_row64));
+        } else {
+            pending_scroll_offset_.reset();
+        }
+    }
     while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
-            const std::size_t start = static_cast<std::size_t>(row) * row_bytes;
-            const std::size_t end = std::min(start + row_bytes, total);
-            const std::size_t len = end - start;
+            const std::uint64_t start = static_cast<std::uint64_t>(row) * row_bytes64;
+            const std::uint64_t end = std::min(start + row_bytes64, capped_total64);
+            const auto len = static_cast<std::size_t>(end - start);
 
             std::vector<std::uint8_t> row_data(len, 0u);
             std::vector<std::uint8_t> row_valid(len, 0u);
@@ -159,31 +178,36 @@ void HexViewPanel::draw_contents() {
 
             char addr[40];
             if (is_live) {
-                std::snprintf(addr, sizeof(addr), "%016" PRIX64 ": ", base_va + start);
+                std::snprintf(addr, sizeof(addr), "%016" PRIX64 ": ", saturating_add_u64(base_va, start));
+            } else if (start > 0xFFFF'FFFFull) {
+                std::snprintf(addr, sizeof(addr), "%016" PRIX64 ": ", start);
             } else {
-                std::snprintf(addr, sizeof(addr), "%08zx: ", start);
+                std::snprintf(addr, sizeof(addr), "%08" PRIx64 ": ", start);
             }
             ImGui::TextUnformatted(addr);
             ImGui::SameLine();
 
             const float hex_start = ImGui::GetCursorPosX();
 
-            for (std::size_t i = start; i < end; ++i) {
-                const std::size_t k = i - start;
+            for (std::uint64_t i = start; i < end; ++i) {
+                const auto k = static_cast<std::size_t>(i - start);
                 const bool valid = k < row_valid.size() && row_valid[k] != 0;
                 const BytePatchState patch_state = model_.byte_patch_state_at_offset(i);
 
                 char buf[32];
                 if (valid) {
-                    std::snprintf(buf, sizeof(buf), "%02X##%zu", row_data[k], i);
+                    std::snprintf(buf, sizeof(buf), "%02X##%" PRIx64, row_data[k], i);
                 } else {
-                    std::snprintf(buf, sizeof(buf), "??##%zu", i);
+                    std::snprintf(buf, sizeof(buf), "??##%" PRIx64, i);
                 }
 
-                const bool in_highlight = std::ranges::any_of(mapped_ranges_,[i](const ByteRange& range){ return i>=range.offset && i-range.offset<range.size; }) || (
-                    highlighted_size_ != 0 &&
-                    i >= highlighted_offset_ &&
-                    i - highlighted_offset_ < highlighted_size_);
+                const bool in_highlight =
+                    std::ranges::any_of(mapped_ranges_, [i](const ByteRange& range) {
+                        return i >= range.offset && i - range.offset < range.size;
+                    }) ||
+                    (highlighted_size_ != 0 &&
+                     i >= highlighted_offset_ &&
+                     i - highlighted_offset_ < highlighted_size_);
                 bool selected = (i == selected_offset_) || in_highlight;
                 int pushed_colors = 0;
                 if (!valid) {
@@ -200,7 +224,7 @@ void HexViewPanel::draw_contents() {
                 if (ImGui::Selectable(buf, selected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(ImGui::CalcTextSize("FF").x, 0))) {
                     mapped_ranges_.clear();
                     if (ImGui::GetIO().KeyShift) {
-                        if (const auto range = selected_byte_range(selected_offset_, i, total)) {
+                        if (const auto range = selected_byte_range(selected_offset_, i, capped_total64)) {
                             highlighted_offset_ = range->offset;
                             highlighted_size_ = range->size;
                         }
@@ -246,8 +270,8 @@ void HexViewPanel::draw_contents() {
                 hex_start + ImGui::CalcTextSize("00 ").x * static_cast<float>(row_bytes) + 20.0f;
             ImGui::SameLine(ascii_start);
 
-            for (std::size_t i = start; i < end; ++i) {
-                const std::size_t k = i - start;
+            for (std::uint64_t i = start; i < end; ++i) {
+                const auto k = static_cast<std::size_t>(i - start);
                 const bool valid = k < row_valid.size() && row_valid[k] != 0;
                 char ch = '?';
                 if (valid) {
@@ -263,7 +287,8 @@ void HexViewPanel::draw_contents() {
                     ImGui::SameLine(0.0f, 0.0f);
                 }
             }
-            if (pending_scroll_offset_ && *pending_scroll_offset_ / row_bytes == static_cast<std::size_t>(row)) {
+            if (pending_scroll_offset_ &&
+                (*pending_scroll_offset_ / row_bytes64) == static_cast<std::uint64_t>(row)) {
                 ImGui::SetScrollHereY(0.5f);
                 pending_scroll_offset_.reset();
             }
@@ -272,7 +297,8 @@ void HexViewPanel::draw_contents() {
     clipper.End();
 
     if (ImGui::BeginPopup("HexQuickPatchPopup")) {
-        const std::uint64_t display_addr = is_live ? (base_va + quick_patch_offset_) : quick_patch_offset_;
+        const std::uint64_t display_addr =
+            is_live ? saturating_add_u64(base_va, quick_patch_offset_) : quick_patch_offset_;
         if (on_apply_structure_) {
             const std::string apply_lbl = std::format(
                 "Apply Structure at {} 0x{:X}...", is_live ? "VA" : "offset", display_addr);

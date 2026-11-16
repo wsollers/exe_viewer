@@ -47,6 +47,7 @@ void PatchSetPanel::refresh_live_assembly_preview() {
     live_asm_diag_.clear();
 
     if (!model_.image()) {
+        last_asm_target_.reset();
         live_asm_diag_ = "Open a static PE/ELF binary to assemble instructions.";
         return;
     }
@@ -57,7 +58,15 @@ void PatchSetPanel::refresh_live_assembly_preview() {
         base_va = image.file_offset_to_virtual_address(*selection_.file_offset)
                       .value_or(*selection_.file_offset);
     }
-    last_asm_base_va_ = base_va;
+    const bool thumb = (thumb_ != nullptr && *thumb_);
+    last_asm_target_ = ShellcodeTargetConfig{
+        .architecture = image.architecture(),
+        .endianness = image.endianness(),
+        .is_64bit = image.is_64bit(),
+        .thumb = thumb,
+        .base_va = base_va,
+        .assembly_mode = true,
+    };
 
     if (asm_input_[0] == '\0') {
         live_asm_diag_ = std::format("Type {} assembly instructions for VA 0x{:X}.",
@@ -66,7 +75,6 @@ void PatchSetPanel::refresh_live_assembly_preview() {
         return;
     }
 
-    const bool thumb = (thumb_ != nullptr && *thumb_);
     auto res = peelf::assemble_instructions(
         image.architecture(),
         image.endianness(),
@@ -205,8 +213,16 @@ void PatchSetPanel::draw_contents() {
                                    st.detail.c_str());
             }
 
-            const std::uint64_t cur_va = target_va.value_or(target_offset.value_or(0));
-            if (cur_va != last_asm_base_va_) {
+            const ShellcodeTargetConfig cur_target{
+                .architecture = img.architecture(),
+                .endianness = img.endianness(),
+                .is_64bit = img.is_64bit(),
+                .thumb = thumb,
+                .base_va = target_va.value_or(target_offset.value_or(0)),
+                .assembly_mode = true,
+            };
+            if (!last_asm_target_.has_value() || *last_asm_target_ != cur_target) {
+                preview_.reset();
                 refresh_live_assembly_preview();
             }
         }

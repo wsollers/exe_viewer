@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <format>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -105,9 +106,11 @@ void UiApp::open_structure_view(std::string_view type_name,
                 current_selection_ = {.kind = SelectionKind::ByteRange, .label = instruction.to_string(),
                     .file_offset = *offset, .virtual_address = instruction.address, .size = instruction.bytes.size(),
                     .preferred_view = PreferredView::Disassembly, .graph_root = root};
-                scroll_to_row = static_cast<int>(index);
+                scroll_to_row = index > static_cast<std::ptrdiff_t>(std::numeric_limits<int>::max())
+                                    ? std::optional<int>{}
+                                    : std::optional<int>(static_cast<int>(index));
                 last_navigation_selection_ = current_selection_;
-                hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), instruction.bytes.size());
+                hex_panel_.navigate_to_range(*offset, instruction.bytes.size());
             }
         }
     }
@@ -137,6 +140,7 @@ void UiApp::open_structure_view(std::string_view type_name,
             : std::nullopt;
 
     // Simple table view with debugger breakpoint + current IP/PC gutter
+    std::optional<std::uint64_t> pending_bp_toggle_va;
     if (ImGui::BeginTable("DisasmTableReadable", 6,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX | ImGuiTableFlags_Resizable)) {
@@ -149,9 +153,15 @@ void UiApp::open_structure_view(std::string_view type_name,
         ImGui::TableSetupScrollFreeze(2, 1);
         ImGui::TableHeadersRow();
 
+        const int clipped_inst_count =
+            current_instructions_.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())
+                ? std::numeric_limits<int>::max()
+                : static_cast<int>(current_instructions_.size());
         ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(current_instructions_.size()));
-        if (scroll_to_row) clipper.IncludeItemByIndex(*scroll_to_row);
+        clipper.Begin(clipped_inst_count);
+        if (scroll_to_row && *scroll_to_row >= 0 && *scroll_to_row < clipped_inst_count) {
+            clipper.IncludeItemByIndex(*scroll_to_row);
+        }
         while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             const auto& inst = current_instructions_[static_cast<std::size_t>(row)];
@@ -173,11 +183,11 @@ void UiApp::open_structure_view(std::string_view type_name,
                     : ImVec4(0.55f, 0.55f, 0.60f, 1.0f);
                 ImGui::TextColored(bp_col, row_bp->enabled ? "●" : "○");
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && model_.is_debug_session()) {
-                    (void)model_.toggle_software_breakpoint(inst.address);
+                    pending_bp_toggle_va = inst.address;
                 }
             } else if (model_.is_debug_session() && !is_ip) {
                 if (ImGui::Selectable("##BpGutter", false, 0, ImVec2(14.0f, 0.0f))) {
-                    (void)model_.toggle_software_breakpoint(inst.address);
+                    pending_bp_toggle_va = inst.address;
                 }
             }
             if (is_ip) {
@@ -197,7 +207,7 @@ void UiApp::open_structure_view(std::string_view type_name,
                 if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) follow_target = inst.branch_target;
                 if (const auto offset = model_.virtual_address_to_offset(inst.address)) {
                     const auto root = navigation_graph_root(inst.address);
-                    hex_panel_.navigate_to_range(static_cast<std::size_t>(*offset), inst.bytes.size());
+                    hex_panel_.navigate_to_range(*offset, inst.bytes.size());
                     current_selection_ = ViewerSelection{
                         .kind = SelectionKind::ByteRange,
                         .label = "Instruction: " + inst.to_string(),
@@ -304,9 +314,12 @@ void UiApp::open_structure_view(std::string_view type_name,
 
         ImGui::EndTable();
                           }
+    if (pending_bp_toggle_va.has_value() && model_.is_debug_session()) {
+        (void)model_.toggle_software_breakpoint(*pending_bp_toggle_va);
+    }
 
     ImGui::End();
-    if (follow_target) navigate_to_address(*follow_target);
+    if (follow_target) enqueue_navigation(*follow_target);
 }
 
 std::optional<SymbolRecord> UiApp::navigation_graph_root(std::uint64_t address) const {
@@ -364,7 +377,7 @@ void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
         .preferred_view = view,
         .graph_root = root,
     };
-    hex_panel_.navigate_to_range(clamp_to_size_t(*offset), 1);
+    hex_panel_.navigate_to_range(*offset, 1);
     disassemble_at_offset(*offset, address);
     last_navigation_selection_ = current_selection_;
     if (view == PreferredView::Graph && model_.image() != nullptr) {
@@ -385,6 +398,97 @@ void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
     navigation_history_.visit(current_selection_);
 }
 
+void UiApp::enqueue_navigation(std::uint64_t address,
+                               PreferredView view,
+                               std::size_t highlight_size,
+                               bool request_decompile) {
+    pending_navigations_.enqueue_address(address, view, highlight_size, request_decompile);
+}
+
+void UiApp::drain_pending_navigations() {
+    pending_navigations_.drain([this](DeferredNavigationRequest& req) {
+        switch (req.kind) {
+            case DeferredNavigationRequest::Kind::Address: {
+                navigate_to_address(req.target, req.preferred_view);
+                if (req.highlight_size > 1) {
+                    if (const auto off = model_.virtual_address_to_offset(req.target)) {
+                        hex_panel_.navigate_to_range(*off, req.highlight_size);
+                    }
+                }
+                if (req.request_decompile) {
+                    request_decompile();
+                }
+                break;
+            }
+            case DeferredNavigationRequest::Kind::Offset: {
+                if (req.target >= model_.view_size()) {
+                    break;
+                }
+                const auto va = model_.offset_to_virtual_address(req.target);
+                const std::uint64_t sz = std::max<std::uint64_t>(1u, req.highlight_size);
+                current_selection_ = ViewerSelection{
+                    .kind = SelectionKind::ByteRange,
+                    .label = std::format("off+0x{:X}", req.target),
+                    .file_offset = req.target,
+                    .virtual_address = va,
+                    .size = sz,
+                    .preferred_view = PreferredView::Hex,
+                };
+                hex_panel_.set_visible(true);
+                hex_panel_.navigate_to_range(req.target, sz);
+                if (va) {
+                    disassemble_at_offset(req.target, *va);
+                }
+                last_navigation_selection_ = current_selection_;
+                break;
+            }
+            case DeferredNavigationRequest::Kind::ModuleIndex: {
+                const auto module_index = clamp_to_size_t(req.target);
+                auto res = model_.select_process_module(module_index);
+                if (!res) {
+                    Log().error("Failed to select module: {}", res.error().message);
+                    break;
+                }
+                sync_live_process_view(true);
+                break;
+            }
+            case DeferredNavigationRequest::Kind::MemoryRegionIndex: {
+                const auto region_index = clamp_to_size_t(req.target);
+                if (region_index >= model_.memory_regions().size()) {
+                    break;
+                }
+                const peelf::MemoryRegion reg_copy = model_.memory_regions()[region_index];
+                auto res = model_.select_memory_region(region_index, req.prefer_module_context);
+                if (!res) {
+                    Log().error("Failed to select memory region: {}", res.error().message);
+                    break;
+                }
+                sync_live_process_view(false);
+                const std::uint64_t offset =
+                    model_.virtual_address_to_offset(reg_copy.start_address).value_or(0u);
+                current_selection_ = selection_from_memory_region(
+                    reg_copy, static_cast<std::uint64_t>(region_index), offset);
+                hex_panel_.navigate_to_range(offset, std::min<std::uint64_t>(reg_copy.size(), 16u));
+                if (reg_copy.protection.executable) {
+                    const auto disasm_win = static_cast<std::size_t>(
+                        std::clamp<std::uint64_t>(reg_copy.size(), 4096u, 65536u));
+                    disassemble_at_offset(offset, reg_copy.start_address, disasm_win);
+                    show_disassembly_panel_ = true;
+                    focus_listing_ = true;
+                }
+                last_navigation_selection_ = current_selection_;
+                break;
+            }
+            case DeferredNavigationRequest::Kind::Custom: {
+                if (req.custom_action) {
+                    req.custom_action();
+                }
+                break;
+            }
+        }
+    });
+}
+
 void UiApp::navigate_history(bool forward) {
     navigation_history_.visit(current_selection_);
     const auto destination = forward ? navigation_history_.forward() : navigation_history_.back();
@@ -395,8 +499,10 @@ void UiApp::navigate_history(bool forward) {
         navigate_to_address(*destination->virtual_address, destination->preferred_view);
         current_selection_ = *destination;
         last_navigation_selection_ = current_selection_;
-        if (destination->file_offset) hex_panel_.navigate_to_range(static_cast<std::size_t>(*destination->file_offset),
-            static_cast<std::size_t>(std::max<std::uint64_t>(1, destination->size)));
+        if (destination->file_offset) {
+            hex_panel_.navigate_to_range(*destination->file_offset,
+                                         std::max<std::uint64_t>(1u, destination->size));
+        }
     }
     else { last_navigation_selection_.reset(); apply_structure_selection_navigation(); }
 }
@@ -409,8 +515,10 @@ void UiApp::switch_analysis_view(bool graph) {
         selection.preferred_view = graph ? PreferredView::Graph : PreferredView::Disassembly;
         current_selection_ = std::move(selection);
         last_navigation_selection_ = current_selection_;
-        if (current_selection_.file_offset) hex_panel_.navigate_to_range(static_cast<std::size_t>(*current_selection_.file_offset),
-            static_cast<std::size_t>(std::max<std::uint64_t>(1, current_selection_.size)));
+        if (current_selection_.file_offset) {
+            hex_panel_.navigate_to_range(*current_selection_.file_offset,
+                                         std::max<std::uint64_t>(1u, current_selection_.size));
+        }
     }
 }
 
@@ -448,8 +556,7 @@ void UiApp::switch_analysis_view(bool graph) {
                     current_selection_ = saved_sel;
                     const std::uint64_t off = model_.virtual_address_to_offset(reg_copy.start_address).value_or(0u);
                     current_selection_.file_offset = off;
-                    hex_panel_.navigate_to_range(clamp_to_size_t(off),
-                                                 clamp_to_size_t(std::min<std::uint64_t>(reg_copy.size(), 16u)));
+                    hex_panel_.navigate_to_range(off, std::min<std::uint64_t>(reg_copy.size(), 16u));
                     if (reg_copy.protection.executable) {
                         const auto disasm_win = static_cast<std::size_t>(
                             std::clamp<std::uint64_t>(reg_copy.size(), 4096u, 65536u));
@@ -476,7 +583,7 @@ void UiApp::switch_analysis_view(bool graph) {
         }
 
         const std::uint64_t size = current_selection_.size != 0 ? current_selection_.size : 1u;
-        hex_panel_.navigate_to_range(clamp_to_size_t(*nav_offset), clamp_to_size_t(size));
+        hex_panel_.navigate_to_range(*nav_offset, size);
 
         if (current_selection_.preferred_view == PreferredView::Disassembly) {
             const std::uint64_t display_address = current_selection_.virtual_address
@@ -517,7 +624,7 @@ void UiApp::switch_analysis_view(bool graph) {
             : section->file_offset;
         const std::size_t size = std::min<std::size_t>(
             max_size,
-            static_cast<std::size_t>(section->file_size != 0u ? section->file_size : section->virtual_size));
+            clamp_to_size_t(section->file_size != 0u ? section->file_size : section->virtual_size));
         const auto sample = model_.read_effective_bytes(window_off, size);
         if (!sample.has_value() || sample->empty()) {
             fprintf(stderr, "Failed to read section data\n");
@@ -527,10 +634,14 @@ void UiApp::switch_analysis_view(bool graph) {
         const std::uint64_t va = section->virtual_address;
         const auto instructions = disasm_.disassemble(sample->data(), sample->size(), va);
 
+        const std::uint64_t end_va =
+            section->virtual_size > std::numeric_limits<std::uint64_t>::max() - va
+                ? std::numeric_limits<std::uint64_t>::max()
+                : (va + section->virtual_size);
         Log().info("Section: {} (0x{:X} - 0x{:X})",
                    section_name,
                    va,
-                   va + section->virtual_size);
+                   end_va);
 
         for (const auto& inst : instructions) {
             std::string bytes_str;
@@ -549,6 +660,10 @@ void UiApp::switch_analysis_view(bool graph) {
         const peelf::IBinaryImage* img = model_.image();
         if (img == nullptr) {
             Log().error("No binary image loaded");
+            return;
+        }
+        if (rva > std::numeric_limits<std::uint64_t>::max() - img->image_base()) {
+            Log().error("RVA 0x{:X} overflows image base 0x{:X}", rva, img->image_base());
             return;
         }
         const std::uint64_t va = img->image_base() + rva;
@@ -592,7 +707,7 @@ void UiApp::switch_analysis_view(bool graph) {
     void UiApp::disassemble_at_offset(std::uint64_t file_offset,
                                       std::uint64_t display_address,
                                       std::size_t max_window_bytes) {
-        disassembly_location_ = DisassemblyLocation{clamp_to_size_t(file_offset), display_address};
+        disassembly_location_ = DisassemblyLocation{file_offset, display_address};
         if (!file_loaded_ || !disasm_.is_initialized()) {
             return;
         }
@@ -646,7 +761,7 @@ void UiApp::switch_analysis_view(bool graph) {
         for (const auto& s : img->sections()) {
             const std::uint64_t sec_span = s.file_size != 0u ? s.file_size : s.virtual_size;
             if (va >= s.virtual_address && (va - s.virtual_address) < sec_span) {
-                const auto remaining = static_cast<std::size_t>(sec_span - (va - s.virtual_address));
+                const auto remaining = clamp_to_size_t(sec_span - (va - s.virtual_address));
                 max_size = std::min(max_size, remaining);
                 break;
             }

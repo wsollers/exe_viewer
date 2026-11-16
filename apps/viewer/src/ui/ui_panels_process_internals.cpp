@@ -109,12 +109,15 @@ void ProcessInternalsPanel::draw_handles_tab(const peelf::ProcessInternalsSnapsh
     ImGui::InputTextWithHint("##HandleFilter", "Filter target / type / flags...",
                              handle_filter_.data(), handle_filter_.size());
     ImGui::SameLine();
-    static constexpr const char* kKindItems[] = {
+    static constexpr std::array<const char*, 11> kKindItems = {
         "All Kinds", "File", "Directory", "Socket", "Pipe",
         "AnonInode", "Device", "Memfd", "Registry", "SyncObject", "Proc/Thread",
     };
     ImGui::SetNextItemWidth(140.0f);
-    ImGui::Combo("##HandleKindFilter", &handle_kind_filter_, kKindItems, IM_ARRAYSIZE(kKindItems));
+    ImGui::Combo("##HandleKindFilter",
+                 &handle_kind_filter_,
+                 kKindItems.data(),
+                 static_cast<int>(kKindItems.size()));
 
     if (!snap.handles.has_value()) {
         ImGui::TextDisabled("No handle / FD entries available.");

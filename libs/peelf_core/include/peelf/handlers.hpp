@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -86,6 +87,31 @@ struct HandlersReport {
     SubsystemStatus live_atexit_status{};
     SubsystemStatus signal_status{};
 };
+
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_apply_signed_displacement(
+    std::uint64_t base,
+    std::int64_t displacement,
+    bool is_64bit = true) noexcept {
+    std::uint64_t result = 0;
+    if (displacement >= 0) {
+        const auto mag = static_cast<std::uint64_t>(displacement);
+        if (mag > std::numeric_limits<std::uint64_t>::max() - base) {
+            return std::nullopt;
+        }
+        result = base + mag;
+    } else {
+        // Unsigned two's-complement negation avoids UB when displacement == INT64_MIN.
+        const std::uint64_t mag = 0ull - static_cast<std::uint64_t>(displacement);
+        if (mag > base) {
+            return std::nullopt;
+        }
+        result = base - mag;
+    }
+    if (!is_64bit && result > 0xFFFF'FFFFull) {
+        return std::nullopt;
+    }
+    return result;
+}
 
 [[nodiscard]] HandlersReport inspect_handlers(
     const IBinaryImage* image,

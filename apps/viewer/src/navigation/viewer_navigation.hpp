@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <peelf/binary_image.hpp>
@@ -85,6 +88,73 @@ public:
 private:
     std::vector<ViewerSelection> entries_;
     std::size_t cursor_ = 0;
+};
+
+struct DeferredNavigationRequest {
+    enum class Kind : std::uint8_t {
+        Address,
+        Offset,
+        ModuleIndex,
+        MemoryRegionIndex,
+        Custom
+    };
+
+    Kind kind = Kind::Address;
+    std::uint64_t target = 0;
+    PreferredView preferred_view = PreferredView::Disassembly;
+    std::size_t highlight_size = 0;
+    bool request_decompile = false;
+    bool prefer_module_context = true;
+    std::function<void()> custom_action{};
+};
+
+// Defers panel-initiated navigation until the end of UiApp's panel-render phase so
+// live-module switches cannot replace BinaryModel vectors/spans mid-table-render.
+class NavigationRequestQueue {
+public:
+    void enqueue(DeferredNavigationRequest request);
+    void enqueue_address(std::uint64_t address,
+                         PreferredView view = PreferredView::Disassembly,
+                         std::size_t highlight_size = 0,
+                         bool request_decompile = false);
+    void enqueue_offset(std::uint64_t offset, std::size_t highlight_size = 1);
+    void enqueue_module(std::size_t module_index);
+    void enqueue_memory_region(std::size_t region_index, bool prefer_module_context = true);
+    void enqueue_custom(std::function<void()> action);
+
+    [[nodiscard]] bool empty() const noexcept { return pending_.empty(); }
+    [[nodiscard]] std::size_t size() const noexcept { return pending_.size(); }
+    [[nodiscard]] bool is_draining() const noexcept { return draining_; }
+    void clear() noexcept { pending_.clear(); }
+
+    template <typename Executor>
+    std::size_t drain(Executor&& executor) {
+        if (draining_ || pending_.empty()) {
+            return 0;
+        }
+        struct DrainScope {
+            bool& active;
+            ~DrainScope() noexcept { active = false; }
+        } scope{draining_};
+        draining_ = true;
+
+        std::size_t processed = 0;
+        constexpr std::size_t kMaxDrainPasses = 8;
+        for (std::size_t pass = 0; pass < kMaxDrainPasses && !pending_.empty(); ++pass) {
+            std::vector<DeferredNavigationRequest> batch;
+            batch.swap(pending_);
+            for (DeferredNavigationRequest& req : batch) {
+                executor(req);
+                ++processed;
+            }
+        }
+        pending_.clear();
+        return processed;
+    }
+
+private:
+    std::vector<DeferredNavigationRequest> pending_;
+    bool draining_ = false;
 };
 
 struct StructureNode {
