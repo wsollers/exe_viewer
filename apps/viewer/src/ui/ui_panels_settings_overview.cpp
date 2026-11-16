@@ -77,6 +77,21 @@ void ExecutableSettingsPanel::draw_contents() {
         return;
     }
 
+    DeferredNav pending_nav{};
+    std::optional<peelf::EnvironmentRedactionPolicy> pending_policy{};
+
+    // Snapshot & diff controls (and lazy process-internals load) run before binding `report`
+    // so mutations to `model_` never invalidate references into `executable_settings()`.
+    if (model_.is_live_process()) {
+        if (!model_.has_process_internals() &&
+            model_.process_session() != nullptr &&
+            model_.process_session()->is_alive()) {
+            model_.refresh_process_internals();
+        }
+        draw_snapshot_controls_bar(pending_nav);
+        ImGui::Separator();
+    }
+
     const peelf::ExecutableSettingsReport& report = model_.executable_settings();
 
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 18.0f);
@@ -93,14 +108,277 @@ void ExecutableSettingsPanel::draw_contents() {
         peelf::to_string(report.target_profile.backend));
     ImGui::TextDisabled("Target: %s", prof_summary.c_str());
 
+    if (model_.latest_snapshot_diff().has_value()) {
+        ImGui::Separator();
+        draw_snapshot_diff_section(*model_.latest_snapshot_diff(), pending_nav);
+    }
+
     ImGui::Separator();
     draw_declared_section(report);
     ImGui::Spacing();
     ImGui::Separator();
-    draw_launch_environment_section(report);
+    draw_launch_environment_section(report, pending_policy);
     ImGui::Spacing();
     ImGui::Separator();
-    draw_observed_runtime_section(report);
+    draw_observed_runtime_section(report, pending_nav);
+
+    if (pending_policy.has_value()) {
+        model_.set_environment_redaction_policy(*pending_policy);
+    }
+    if (pending_nav.has_value() && on_navigate_) {
+        on_navigate_(pending_nav->first, pending_nav->second);
+    }
+}
+
+void ExecutableSettingsPanel::draw_snapshot_controls_bar(DeferredNav& /*pending_nav*/) {
+    if (ImGui::Button("Capture Snapshot")) {
+        if (auto res = model_.capture_snapshot(pause_during_snapshot_); res.has_value()) {
+            const std::size_t idx = *res;
+            if (idx >= 1u) {
+                diff_before_index_ = idx - 1u;
+                diff_after_index_ = idx;
+            } else {
+                diff_before_index_ = 0u;
+                diff_after_index_ = 0u;
+            }
+            snapshot_status_msg_ = std::format("Captured snapshot #{} (rev {}).",
+                                               idx,
+                                               model_.captured_snapshots()[idx].snapshot_revision);
+        } else {
+            snapshot_status_msg_ = std::format("Snapshot failed: {}", res.error().message);
+        }
+    }
+
+    if (!model_.is_crash_dump()) {
+        ImGui::SameLine();
+        ImGui::Checkbox("Pause during capture", &pause_during_snapshot_);
+    }
+
+    const auto snapshots = model_.captured_snapshots();
+    ImGui::SameLine();
+    ImGui::TextDisabled("Snapshots: %zu", snapshots.size());
+
+    if (snapshots.size() >= 2u) {
+        if (diff_before_index_ >= snapshots.size()) {
+            diff_before_index_ = snapshots.size() - 2u;
+        }
+        if (diff_after_index_ >= snapshots.size()) {
+            diff_after_index_ = snapshots.size() - 1u;
+        }
+
+        const auto format_snap_label = [&](std::size_t idx) {
+            const peelf::ProcessStateSnapshot& s = snapshots[idx];
+            return std::format("#{} (rev {}, {})",
+                               idx,
+                               s.snapshot_revision,
+                               s.snapshot_stamp.captured_at_utc.empty()
+                                   ? "uninitialized"
+                                   : s.snapshot_stamp.captured_at_utc);
+        };
+
+        ImGui::Spacing();
+        const std::string before_preview = format_snap_label(diff_before_index_);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+        if (ImGui::BeginCombo("Baseline##snap_before", before_preview.c_str())) {
+            for (std::size_t i = 0u; i < snapshots.size(); ++i) {
+                const std::string lbl = format_snap_label(i);
+                const bool selected = (i == diff_before_index_);
+                if (ImGui::Selectable(lbl.c_str(), selected)) {
+                    diff_before_index_ = i;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::SameLine();
+        const std::string after_preview = format_snap_label(diff_after_index_);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 14.0f);
+        if (ImGui::BeginCombo("Target##snap_after", after_preview.c_str())) {
+            for (std::size_t i = 0u; i < snapshots.size(); ++i) {
+                const std::string lbl = format_snap_label(i);
+                const bool selected = (i == diff_after_index_);
+                if (ImGui::Selectable(lbl.c_str(), selected)) {
+                    diff_after_index_ = i;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Diff Snapshots")) {
+            if (auto diff_res = model_.diff_snapshots(diff_before_index_, diff_after_index_);
+                diff_res.has_value()) {
+                snapshot_status_msg_ =
+                    std::format("Computed diff #{} -> #{}.", diff_before_index_, diff_after_index_);
+            } else {
+                snapshot_status_msg_ = std::format("Diff failed: {}", diff_res.error().message);
+            }
+        }
+    } else {
+        ImGui::SameLine();
+        ImGui::BeginDisabled(true);
+        (void)ImGui::Button("Diff Snapshots");
+        ImGui::EndDisabled();
+    }
+
+    if (!snapshots.empty()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Snapshots")) {
+            model_.clear_snapshots();
+            diff_before_index_ = 0u;
+            diff_after_index_ = 0u;
+            snapshot_status_msg_ = "Cleared captured snapshots.";
+        }
+    }
+
+    if (!snapshot_status_msg_.empty()) {
+        ImGui::TextDisabled("%s", snapshot_status_msg_.c_str());
+    }
+}
+
+void ExecutableSettingsPanel::draw_snapshot_diff_section(
+    const peelf::SnapshotDiff& diff,
+    DeferredNav& pending_nav) {
+    if (!ImGui::CollapsingHeader("Snapshot Timeline Diff", ImGuiTreeNodeFlags_DefaultOpen)) {
+        return;
+    }
+
+    if (diff.rejected_target_mismatch) {
+        ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "%s", diff.summary.c_str());
+    } else {
+        ImGui::TextUnformatted(diff.summary.c_str());
+    }
+
+    for (const peelf::SnapshotUncertainty& unc : diff.uncertainties) {
+        ImGui::TextColored(
+            ImVec4(1.00f, 0.72f, 0.28f, 1.0f),
+            "[Uncertainty: %s / %s] %s",
+            std::string(peelf::to_string(unc.domain)).c_str(),
+            std::string(peelf::to_string(unc.kind)).c_str(),
+            unc.message.c_str());
+    }
+
+    if (!diff.modules.empty() && ImGui::TreeNode("Module Deltas")) {
+        if (ImGui::BeginTable("##snap_mod_deltas", 5, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Change", ImGuiTableColumnFlags_WidthStretch, 0.16f);
+            ImGui::TableSetupColumn("Base VA", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+            ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+            ImGui::TableSetupColumn("Flags", ImGuiTableColumnFlags_WidthStretch, 0.16f);
+            ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.22f);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0u; i < diff.modules.size(); ++i) {
+                const peelf::ModuleDelta& md = diff.modules[i];
+                const std::uint64_t target_va =
+                    md.after.has_value()
+                        ? md.after->base_address
+                        : (md.before.has_value() ? md.before->base_address : 0u);
+                const std::string mod_name =
+                    md.after.has_value()
+                        ? md.after->name
+                        : (md.before.has_value() ? md.before->name : "<unknown>");
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(std::string(peelf::to_string(md.kind)).c_str());
+                ImGui::TableSetColumnIndex(1);
+                const std::string va_btn = std::format("0x{:X}##md_va_{}", target_va, i);
+                if (target_va != 0u && ImGui::SmallButton(va_btn.c_str())) {
+                    pending_nav = std::pair{target_va, PreferredView::Disassembly};
+                } else if (target_va == 0u) {
+                    ImGui::TextDisabled("0x0");
+                }
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(mod_name.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextDisabled(
+                    "%s%s",
+                    md.base_address_reused ? "VA-Reused " : "",
+                    md.backing_identity_changed ? "Build-ID-Changed" : "");
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(md.detail.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (!diff.regions.empty() && ImGui::TreeNode("Memory Region Interval Deltas")) {
+        if (ImGui::BeginTable("##snap_reg_deltas", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Change", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+            ImGui::TableSetupColumn("Sub-Interval", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+            ImGui::TableSetupColumn("Flags", ImGuiTableColumnFlags_WidthStretch, 0.20f);
+            ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0u; i < diff.regions.size(); ++i) {
+                const peelf::RegionDelta& rd = diff.regions[i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(std::string(peelf::to_string(rd.kind)).c_str());
+                ImGui::TableSetColumnIndex(1);
+                const std::string range_lbl =
+                    std::format("[0x{:X}, 0x{:X})##rd_{}", rd.start_address, rd.end_address, i);
+                if (rd.start_address != 0u && ImGui::SmallButton(range_lbl.c_str())) {
+                    pending_nav = std::pair{
+                        rd.start_address,
+                        rd.became_executable ? PreferredView::Disassembly : PreferredView::Hex};
+                } else {
+                    ImGui::Text("[0x%" PRIX64 ", 0x%" PRIX64 ")", rd.start_address, rd.end_address);
+                }
+                ImGui::TableSetColumnIndex(2);
+                if (rd.became_rwx) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.42f, 0.42f, 1.0f), "RWX! ");
+                    ImGui::SameLine();
+                }
+                ImGui::TextDisabled(
+                    "%s%s%s%s",
+                    rd.was_split ? "Split " : "",
+                    rd.was_merged ? "Merged " : "",
+                    rd.va_reused ? "VA-Reused " : "",
+                    rd.jit_rw_to_rx ? "RW->RX" : "");
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(rd.detail.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (!diff.threads.empty() && ImGui::TreeNode("Thread Deltas")) {
+        for (std::size_t i = 0u; i < diff.threads.size(); ++i) {
+            const peelf::ThreadDelta& td = diff.threads[i];
+            ImGui::BulletText("[%s] %s",
+                              std::string(peelf::to_string(td.kind)).c_str(),
+                              td.detail.c_str());
+            if (td.after.has_value() && td.after->info.instruction_pointer.has_value() &&
+                *td.after->info.instruction_pointer != 0u) {
+                ImGui::SameLine();
+                const std::string ip_btn =
+                    std::format("Go IP 0x{:X}##td_ip_{}", *td.after->info.instruction_pointer, i);
+                if (ImGui::SmallButton(ip_btn.c_str())) {
+                    pending_nav =
+                        std::pair{*td.after->info.instruction_pointer, PreferredView::Disassembly};
+                }
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    if (!diff.handles.empty() && ImGui::TreeNode("Handle / FD Deltas")) {
+        for (const peelf::HandleDelta& hd : diff.handles) {
+            ImGui::BulletText("[%s] %s",
+                              std::string(peelf::to_string(hd.kind)).c_str(),
+                              hd.detail.c_str());
+        }
+        ImGui::TreePop();
+    }
+
+    if (!diff.sockets.empty() && ImGui::TreeNode("Socket Deltas")) {
+        for (const peelf::SocketDelta& sd : diff.sockets) {
+            ImGui::BulletText("[%s] %s",
+                              std::string(peelf::to_string(sd.kind)).c_str(),
+                              sd.detail.c_str());
+        }
+        ImGui::TreePop();
+    }
 }
 
 void ExecutableSettingsPanel::draw_declared_section(const peelf::ExecutableSettingsReport& report) {
@@ -424,7 +702,8 @@ void ExecutableSettingsPanel::draw_elf_settings_block(const peelf::DeclaredSetti
 }
 
 void ExecutableSettingsPanel::draw_launch_environment_section(
-    const peelf::ExecutableSettingsReport& report) {
+    const peelf::ExecutableSettingsReport& report,
+    std::optional<peelf::EnvironmentRedactionPolicy>& pending_policy) {
     if (!ImGui::CollapsingHeader("2. Launch / Current Environment", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
@@ -442,11 +721,26 @@ void ExecutableSettingsPanel::draw_launch_environment_section(
     }
 
     const peelf::LaunchEnvironmentSettings& le = *report.launch_environment.value;
+    ImGui::Text("Capture Origin: %s",
+                std::string(peelf::to_string(le.capture_origin)).c_str());
+    if (!report.launch_environment.note.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%s)", report.launch_environment.note.c_str());
+    }
     ImGui::Text("Executable Path: %s",
                 le.executable_path.empty() ? "<unknown>" : le.executable_path.generic_string().c_str());
     ImGui::Text("Current Working Directory: %s",
                 le.cwd.has_value() ? le.cwd.value->generic_string().c_str() : le.cwd.note.c_str());
     ImGui::Text("Environment Policy: %s", std::string(peelf::to_string(le.redaction_policy)).c_str());
+    ImGui::SameLine();
+    bool reveal_unredacted =
+        (model_.environment_redaction_policy() ==
+         peelf::EnvironmentRedactionPolicy::RevealUnredactedOptIn);
+    if (ImGui::Checkbox("Reveal Unredacted Values (Session Opt-In)", &reveal_unredacted)) {
+        pending_policy = reveal_unredacted
+                             ? peelf::EnvironmentRedactionPolicy::RevealUnredactedOptIn
+                             : peelf::EnvironmentRedactionPolicy::RedactSensitiveDefault;
+    }
 
     if (le.argv.has_value() && ImGui::TreeNode("Command-Line Arguments (argv)")) {
         for (std::size_t i = 0u; i < le.argv.value->size(); ++i) {
@@ -483,10 +777,45 @@ void ExecutableSettingsPanel::draw_launch_environment_section(
         }
         ImGui::TreePop();
     }
+
+    if (le.security_profile.has_value() && ImGui::TreeNode("Process Security Profile")) {
+        const peelf::ProcessSecurityProfile& sec = *le.security_profile.value;
+        if (!sec.user_summary.empty()) {
+            ImGui::BulletText("User: %s", sec.user_summary.c_str());
+        }
+        if (!sec.group_summary.empty()) {
+            ImGui::BulletText("Groups: %s", sec.group_summary.c_str());
+        }
+        if (!sec.integrity_or_lsm_label.empty()) {
+            ImGui::BulletText("Integrity / LSM: %s", sec.integrity_or_lsm_label.c_str());
+        }
+        if (sec.is_elevated.has_value()) {
+            ImGui::BulletText("Elevated: %s", *sec.is_elevated ? "Yes" : "No");
+        }
+        if (sec.no_new_privs.has_value()) {
+            ImGui::BulletText("NoNewPrivs: %s", *sec.no_new_privs ? "Enabled" : "Disabled");
+        }
+        if (!sec.seccomp_mode.empty()) {
+            ImGui::BulletText("Seccomp: %s", sec.seccomp_mode.c_str());
+        }
+        if (!sec.cgroup_summary.empty()) {
+            ImGui::BulletText("Cgroup: %s", sec.cgroup_summary.c_str());
+        }
+        if (sec.cap_eff != 0u || !sec.capabilities.empty()) {
+            ImGui::BulletText("Effective Capabilities Mask: 0x%016" PRIX64 " (%zu entries)",
+                              sec.cap_eff,
+                              sec.capabilities.size());
+        }
+        if (!sec.mitigations.empty()) {
+            ImGui::BulletText("Active Mitigations: %zu policies", sec.mitigations.size());
+        }
+        ImGui::TreePop();
+    }
 }
 
 void ExecutableSettingsPanel::draw_observed_runtime_section(
-    const peelf::ExecutableSettingsReport& report) {
+    const peelf::ExecutableSettingsReport& report,
+    DeferredNav& pending_nav) {
     if (!ImGui::CollapsingHeader("3. Observed Runtime Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
         return;
     }
@@ -504,34 +833,161 @@ void ExecutableSettingsPanel::draw_observed_runtime_section(
     }
 
     const peelf::ObservedRuntimeConfiguration& rt = *report.observed_runtime.value;
+    const std::string mod_cnt =
+        rt.loaded_modules.has_value()
+            ? std::to_string(rt.loaded_modules.value->size())
+            : std::string(peelf::to_string(rt.loaded_modules.availability));
+    const std::string hnd_cnt =
+        rt.open_handles.has_value()
+            ? std::to_string(rt.open_handles.value->size())
+            : std::string(peelf::to_string(rt.open_handles.availability));
+    const std::string sck_cnt =
+        rt.sockets.has_value()
+            ? std::to_string(rt.sockets.value->size())
+            : std::string(peelf::to_string(rt.sockets.availability));
     ImGui::Text("Loaded Modules: %s  |  Open Handles: %s  |  Active Sockets: %s",
-                rt.loaded_modules.has_value()
-                    ? std::to_string(rt.loaded_modules.value->size()).c_str()
-                    : std::string(peelf::to_string(rt.loaded_modules.availability)).c_str(),
-                rt.open_handles.has_value()
-                    ? std::to_string(rt.open_handles.value->size()).c_str()
-                    : std::string(peelf::to_string(rt.open_handles.availability)).c_str(),
-                rt.sockets.has_value()
-                    ? std::to_string(rt.sockets.value->size()).c_str()
-                    : std::string(peelf::to_string(rt.sockets.availability)).c_str());
+                mod_cnt.c_str(),
+                hnd_cnt.c_str(),
+                sck_cnt.c_str());
 
+    const std::string_view filter(filter_buf_);
     if (rt.declared_vs_loaded.has_value()) {
         const peelf::DeclaredVsLoadedModuleComparison& cmp = *rt.declared_vs_loaded.value;
         ImGui::BulletText("%s", cmp.summary.c_str());
+        if (!cmp.missing_declared.empty() && ImGui::TreeNode("Declared Root Imports Not Observed Loaded")) {
+            for (const std::string& miss : cmp.missing_declared) {
+                if (matches_case_insensitive(miss, filter)) {
+                    ImGui::BulletText("%s", miss.c_str());
+                }
+            }
+            ImGui::TreePop();
+        }
         if (!cmp.unmatched_loaded.empty() && ImGui::TreeNode("Loaded Modules Not Declared in Root Imports")) {
             ImGui::TextDisabled(
                 "%s",
                 cmp.runtime_load_proven_by_timeline
-                    ? "Observed via execution timeline dynamic module load events:"
-                    : "Note: Presence in memory may reflect transitive dependencies, OS shims, or dynamic loading (timeline proof not active):");
-            for (const peelf::UnmatchedLoadedModule& um : cmp.unmatched_loaded) {
-                ImGui::BulletText("%s @ 0x%" PRIX64 " (%s)",
-                                  um.module_name.c_str(),
-                                  um.base_address,
-                                  um.provenance_note.c_str());
+                    ? "Includes module(s) proven newly loaded across session snapshots:"
+                    : "Note: Presence in memory may reflect transitive dependencies, OS shims, or prior dynamic loads (not asserted as LoadLibrary/dlopen without timeline delta):");
+            if (ImGui::BeginTable("##unmatched_mods", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+                ImGui::TableSetupColumn("Base VA", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+                ImGui::TableSetupColumn("Provenance Note", ImGuiTableColumnFlags_WidthStretch, 0.57f);
+                ImGui::TableHeadersRow();
+                for (std::size_t i = 0u; i < cmp.unmatched_loaded.size(); ++i) {
+                    const peelf::UnmatchedLoadedModule& um = cmp.unmatched_loaded[i];
+                    if (!matches_case_insensitive(um.module_name, filter) &&
+                        !matches_case_insensitive(um.path.generic_string(), filter)) {
+                        continue;
+                    }
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::TextUnformatted(um.module_name.c_str());
+                    ImGui::TableSetColumnIndex(1);
+                    const std::string btn = std::format("0x{:X}##um_va_{}", um.base_address, i);
+                    if (um.base_address != 0u && ImGui::SmallButton(btn.c_str())) {
+                        pending_nav = std::pair{um.base_address, PreferredView::Disassembly};
+                    } else {
+                        ImGui::Text("0x%" PRIX64, um.base_address);
+                    }
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::TextWrapped("%s", um.provenance_note.c_str());
+                }
+                ImGui::EndTable();
             }
             ImGui::TreePop();
         }
+    }
+
+    if (rt.loaded_modules.has_value() && ImGui::TreeNode("Loaded Modules")) {
+        if (ImGui::BeginTable("##rt_loaded_mods", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.24f);
+            ImGui::TableSetupColumn("Base VA", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+            ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+            ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch, 0.44f);
+            ImGui::TableHeadersRow();
+            for (std::size_t i = 0u; i < rt.loaded_modules.value->size(); ++i) {
+                const peelf::ModuleInfo& m = (*rt.loaded_modules.value)[i];
+                const std::string path_str = m.path.generic_string();
+                if (!matches_case_insensitive(m.name, filter) &&
+                    !matches_case_insensitive(path_str, filter)) {
+                    continue;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(m.name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                const std::string btn = std::format("0x{:X}##lm_va_{}", m.base_address, i);
+                if (m.base_address != 0u && ImGui::SmallButton(btn.c_str())) {
+                    pending_nav = std::pair{m.base_address, PreferredView::Disassembly};
+                } else {
+                    ImGui::Text("0x%" PRIX64, m.base_address);
+                }
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("0x%" PRIX64, m.size);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(path_str.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (rt.open_handles.has_value() && ImGui::TreeNode("Open Handles / File Descriptors")) {
+        if (ImGui::BeginTable("##rt_handles", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("FD / Handle", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 0.18f);
+            ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 0.48f);
+            ImGui::TableSetupColumn("Flags / Access", ImGuiTableColumnFlags_WidthStretch, 0.20f);
+            ImGui::TableHeadersRow();
+            for (const peelf::ProcessHandleEntry& h : *rt.open_handles.value) {
+                if (!matches_case_insensitive(h.target, filter) &&
+                    !matches_case_insensitive(h.type_name, filter)) {
+                    continue;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("0x%" PRIX64, h.handle_or_fd);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(
+                    h.type_name.empty()
+                        ? std::string(peelf::to_string(h.kind)).c_str()
+                        : h.type_name.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(h.target.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextDisabled("%s", h.access_or_flags.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (rt.sockets.has_value() && ImGui::TreeNode("Open Sockets")) {
+        if (ImGui::BeginTable("##rt_sockets", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Protocol", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+            ImGui::TableSetupColumn("Local Endpoint", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+            ImGui::TableSetupColumn("Remote Endpoint", ImGuiTableColumnFlags_WidthStretch, 0.32f);
+            ImGui::TableSetupColumn("State", ImGuiTableColumnFlags_WidthStretch, 0.22f);
+            ImGui::TableHeadersRow();
+            for (const peelf::ProcessSocketEntry& s : *rt.sockets.value) {
+                if (!matches_case_insensitive(s.local_endpoint, filter) &&
+                    !matches_case_insensitive(s.remote_endpoint, filter) &&
+                    !matches_case_insensitive(s.state, filter)) {
+                    continue;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(std::string(peelf::to_string(s.protocol)).c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(s.local_endpoint.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(s.remote_endpoint.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(s.state.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
     }
 }
 

@@ -380,7 +380,7 @@ struct Observed {
         std::vector<Evidence> ev;
         ev.push_back(Evidence{
             .tag = tag,
-            .source = fv.status.subsystem.empty() ? std::string(to_string(tag)) : fv.status.subsystem,
+            .source = fv.status.source.empty() ? std::string(to_string(tag)) : fv.status.source,
             .detail = fv.status.detail,
         });
         return Observed<T>{

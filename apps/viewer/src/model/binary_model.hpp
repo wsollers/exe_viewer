@@ -29,6 +29,7 @@
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
+#include <peelf/process_snapshot.hpp>
 #include <peelf/provenance.hpp>
 #include <peelf/runtime_structures.hpp>
 #include <peelf/security_audit.hpp>
@@ -111,7 +112,8 @@ namespace viewer {
             const std::filesystem::path& working_dir = {});
         [[nodiscard]] peelf::Result<void> attach_debug_process(peelf::ProcessId pid);
         [[nodiscard]] peelf::Result<void> attach_debug_session(
-            std::unique_ptr<peelf::debugger::IDebugSession> debug_session);
+            std::unique_ptr<peelf::debugger::IDebugSession> debug_session,
+            bool launched_by_session = false);
         [[nodiscard]] bool is_debug_session() const noexcept { return debug_session_ != nullptr; }
         [[nodiscard]] peelf::debugger::IDebugSession* debug_session() noexcept { return debug_session_.get(); }
         [[nodiscard]] const peelf::debugger::IDebugSession* debug_session() const noexcept {
@@ -388,7 +390,24 @@ namespace viewer {
             return executable_settings_;
         }
 
+        // Timestamped ProcessStateSnapshot capture, interval/identity SnapshotDiff,
+        // and session-scoped environment redaction opt-in (WU-23).
+        [[nodiscard]] peelf::EnvironmentRedactionPolicy environment_redaction_policy() const noexcept {
+            return environment_redaction_policy_;
+        }
+        void set_environment_redaction_policy(peelf::EnvironmentRedactionPolicy policy);
+        [[nodiscard]] peelf::Result<std::size_t> capture_snapshot(bool pause_during_capture = false);
+        [[nodiscard]] peelf::Result<void> diff_snapshots(std::size_t before_index, std::size_t after_index);
+        void clear_snapshots() noexcept;
+        [[nodiscard]] std::span<const peelf::ProcessStateSnapshot> captured_snapshots() const noexcept {
+            return captured_snapshots_;
+        }
+        [[nodiscard]] const std::optional<peelf::SnapshotDiff>& latest_snapshot_diff() const noexcept {
+            return latest_snapshot_diff_;
+        }
+
     private:
+        void sync_live_executable_settings();
         BinarySourceKind source_kind_ = BinarySourceKind::None;
         LiveViewTargetKind live_target_kind_ = LiveViewTargetKind::None;
         BinaryFormat format_ = BinaryFormat::None;
@@ -458,6 +477,12 @@ namespace viewer {
         peelf::HandlersReport handlers_report_;
         peelf::SecurityAuditReport security_audit_;
         peelf::ExecutableSettingsReport executable_settings_{};
+        peelf::EnvironmentRedactionPolicy environment_redaction_policy_{
+            peelf::EnvironmentRedactionPolicy::RedactSensitiveDefault};
+        bool launched_debug_session_{false};
+        std::vector<peelf::ProcessStateSnapshot> captured_snapshots_{};
+        std::optional<peelf::SnapshotDiff> latest_snapshot_diff_{};
+        std::vector<std::uint64_t> timeline_proven_dynamic_bases_{};
         peelf::ProcessInternalsSnapshot process_internals_{};
         bool process_internals_loaded_{false};
         peelf::ThreadCpuTracker thread_cpu_tracker_{};

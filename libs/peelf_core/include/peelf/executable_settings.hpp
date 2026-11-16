@@ -256,6 +256,25 @@ enum class EnvironmentRedactionPolicy : std::uint8_t {
     return "RedactSensitiveDefault";
 }
 
+/// Origin of observed process launch/environment telemetry (`WU-23`), explicitly
+/// distinguishing launch-time capture from current state sampled after attach.
+enum class EnvironmentCaptureOrigin : std::uint8_t {
+    Unavailable = 0,
+    LaunchCaptured,
+    AttachedCurrentState,
+    CrashDumpState,
+};
+
+[[nodiscard]] constexpr std::string_view to_string(EnvironmentCaptureOrigin origin) noexcept {
+    switch (origin) {
+        case EnvironmentCaptureOrigin::Unavailable:          return "Unavailable";
+        case EnvironmentCaptureOrigin::LaunchCaptured:       return "LaunchCaptured";
+        case EnvironmentCaptureOrigin::AttachedCurrentState: return "AttachedCurrentState";
+        case EnvironmentCaptureOrigin::CrashDumpState:       return "CrashDumpState";
+    }
+    return "Unavailable";
+}
+
 struct EnvironmentVariableEntry {
     std::string key;
     std::string display_value;
@@ -267,6 +286,7 @@ struct EnvironmentVariableEntry {
 };
 
 struct LaunchEnvironmentSettings {
+    EnvironmentCaptureOrigin capture_origin{EnvironmentCaptureOrigin::Unavailable};
     std::filesystem::path executable_path;
     Observed<std::vector<std::string>> argv;
     Observed<std::filesystem::path> cwd;
@@ -327,6 +347,65 @@ struct ExecutableSettingsReport {
 [[nodiscard]] ExecutableSettingsReport extract_executable_settings(
     const IBinaryImage& image,
     std::span<const std::uint8_t> raw_bytes,
+    const CaptureStamp& static_stamp = {});
+
+/// Options controlling live/crash-dump population of `ExecutableSettingsReport`
+/// runtime sections (`launch_environment` and `observed_runtime`).
+struct RuntimeSettingsOptions {
+    EnvironmentRedactionPolicy redaction_policy{
+        EnvironmentRedactionPolicy::RedactSensitiveDefault};
+    bool launched_by_session{false};
+    bool query_process_internals{true};
+    std::filesystem::path resolved_executable_path{};
+    std::span<const std::uint64_t> timeline_proven_dynamic_bases{};
+};
+
+/// Parse a `"KEY=VALUE"` environment entry and format it according to `policy`.
+[[nodiscard]] EnvironmentVariableEntry parse_and_format_environment_entry(
+    std::string_view raw_key_value,
+    EnvironmentRedactionPolicy policy = EnvironmentRedactionPolicy::RedactSensitiveDefault);
+
+/// Reconciles statically declared root library dependencies against observed loaded modules.
+/// Unmatched loaded modules are reported honestly as unmatched against root imports unless
+/// `timeline_proven_dynamic_bases` supplies explicit snapshot/timeline load delta evidence.
+[[nodiscard]] Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
+    const Observed<DeclaredSettings>& declared_in_file,
+    const Observed<std::vector<ModuleInfo>>& loaded_modules,
+    const std::filesystem::path& main_executable_path = {},
+    std::span<const std::uint64_t> timeline_proven_dynamic_bases = {});
+
+/// Builds `LaunchEnvironmentSettings` for `session` (`argv`, `cwd`, redacted-by-default
+/// `environment`, and `ProcessSecurityProfile`), distinguishing `LaunchCaptured`,
+/// `AttachedCurrentState`, and `CrashDumpState`.
+[[nodiscard]] Observed<LaunchEnvironmentSettings> extract_launch_environment_settings(
+    IProcessSession& session,
+    const TargetInstanceId& target_id,
+    std::uint64_t snapshot_revision,
+    const RuntimeSettingsOptions& options = {},
+    const Observed<ProcessSecurityProfile>* pre_captured_security = nullptr,
+    const std::string* fallback_cwd = nullptr);
+
+/// Populates `report.launch_environment` and `report.observed_runtime` from `session`
+/// (reusing optional pre-captured internals/modules when provided).
+void populate_runtime_executable_settings(
+    ExecutableSettingsReport& report,
+    IProcessSession& session,
+    const TargetInstanceId& target_id,
+    std::uint64_t snapshot_revision,
+    const RuntimeSettingsOptions& options = {},
+    const ProcessInternalsSnapshot* cached_internals = nullptr,
+    const CaptureStamp* cached_internals_stamp = nullptr,
+    std::span<const ModuleInfo> cached_modules = {},
+    const CaptureStamp* cached_modules_stamp = nullptr,
+    const std::string* fallback_cwd = nullptr);
+
+/// Convenience entry point extracting both static `declared_in_file` (when `image != nullptr`)
+/// and live/dump `launch_environment` + `observed_runtime` sections for `session`.
+[[nodiscard]] ExecutableSettingsReport extract_executable_settings_for_session(
+    const IBinaryImage* image,
+    std::span<const std::uint8_t> raw_bytes,
+    IProcessSession& session,
+    const RuntimeSettingsOptions& options = {},
     const CaptureStamp& static_stamp = {});
 
 /// Serializes `ExecutableSettingsReport` as deterministic versioned JSON (`schema_version: 1`).

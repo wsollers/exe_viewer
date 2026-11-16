@@ -233,6 +233,11 @@ private:
             .image_sha256 = {},
             .build_id_or_pdb_guid = {},
         };
+        if (!target_instance_id_.creation_identity.has_value()) {
+            const auto ptr_val = reinterpret_cast<std::uintptr_t>(session_.get());
+            target_instance_id_.session_nonce =
+                ptr_val != 0u ? static_cast<std::uint64_t>(ptr_val) : 1u;
+        }
         static_image_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
         process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
 
@@ -290,7 +295,7 @@ private:
             last_diagnostic_ = launched.error().message;
             return std::unexpected(launched.error());
         }
-        return attach_debug_session(std::move(*launched));
+        return attach_debug_session(std::move(*launched), true);
     }
 
     peelf::Result<void> BinaryModel::attach_debug_process(peelf::ProcessId pid) {
@@ -299,17 +304,19 @@ private:
             last_diagnostic_ = attached.error().message;
             return std::unexpected(attached.error());
         }
-        return attach_debug_session(std::move(*attached));
+        return attach_debug_session(std::move(*attached), false);
     }
 
     peelf::Result<void> BinaryModel::attach_debug_session(
-        std::unique_ptr<peelf::debugger::IDebugSession> debug_session) {
+        std::unique_ptr<peelf::debugger::IDebugSession> debug_session,
+        bool launched_by_session) {
         if (!debug_session) {
             last_diagnostic_ = "Debug session is null";
             return peelf::make_error(last_diagnostic_);
         }
 
         reset_all();
+        launched_debug_session_ = launched_by_session;
         debug_session_ = std::shared_ptr<peelf::debugger::IDebugSession>(std::move(debug_session));
         session_ = std::make_shared<DebugSessionProcessProxy>(debug_session_);
         source_kind_ = BinarySourceKind::LiveProcess;
@@ -335,6 +342,11 @@ private:
             .image_sha256 = {},
             .build_id_or_pdb_guid = {},
         };
+        if (!target_instance_id_.creation_identity.has_value()) {
+            const auto ptr_val = reinterpret_cast<std::uintptr_t>(session_.get());
+            target_instance_id_.session_nonce =
+                ptr_val != 0u ? static_cast<std::uint64_t>(ptr_val) : 1u;
+        }
         static_image_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
         process_internals_stamp_ = peelf::CaptureStamp::unavailable_for(target_instance_id_);
 
@@ -1330,7 +1342,122 @@ private:
                         unavail_stamp);
             }
             executable_settings_.target_profile = target_profile_;
+            sync_live_executable_settings();
         }
+    }
+
+    void BinaryModel::sync_live_executable_settings() {
+        if (!is_live_process() || session_ == nullptr) {
+            return;
+        }
+        peelf::RuntimeSettingsOptions rt_opts{};
+        rt_opts.redaction_policy = environment_redaction_policy_;
+        rt_opts.launched_by_session = launched_debug_session_;
+        rt_opts.query_process_internals = false;
+        rt_opts.resolved_executable_path =
+            resolved_exe_path_.value_or(session_->info().executable_path);
+        rt_opts.timeline_proven_dynamic_bases = timeline_proven_dynamic_bases_;
+
+        const std::string* peb_cwd =
+            !process_env_.current_directory.empty() ? &process_env_.current_directory : nullptr;
+        const std::uint64_t rev =
+            runtime_stamp_.snapshot_revision != 0u
+                ? runtime_stamp_.snapshot_revision
+                : (next_capture_revision_ != 0u ? next_capture_revision_ : 1u);
+
+        peelf::populate_runtime_executable_settings(
+            executable_settings_,
+            *session_,
+            target_instance_id_,
+            rev,
+            rt_opts,
+            process_internals_loaded_ ? &process_internals_ : nullptr,
+            process_internals_loaded_ ? &process_internals_stamp_ : nullptr,
+            modules_,
+            &memory_map_stamp_,
+            peb_cwd);
+    }
+
+    void BinaryModel::set_environment_redaction_policy(
+        peelf::EnvironmentRedactionPolicy policy) {
+        if (environment_redaction_policy_ == policy) {
+            return;
+        }
+        environment_redaction_policy_ = policy;
+        if (is_live_process() && session_ != nullptr) {
+            sync_live_executable_settings();
+        }
+    }
+
+    peelf::Result<std::size_t> BinaryModel::capture_snapshot(bool pause_during_capture) {
+        if (!is_live_process() || session_ == nullptr) {
+            last_diagnostic_ = "Cannot capture process snapshot: no live process or crash dump attached.";
+            return peelf::make_error(last_diagnostic_);
+        }
+
+        peelf::CaptureOptions opts{};
+        opts.target_id = target_instance_id_;
+        opts.snapshot_revision = ++next_capture_revision_;
+        opts.pause_target_during_capture = pause_during_capture;
+        opts.environment_redaction_policy = environment_redaction_policy_;
+        opts.launched_by_session = launched_debug_session_;
+        opts.probe_module_identities = true;
+
+        peelf::ProcessStateSnapshot snap = peelf::capture_process_snapshot(*session_, opts);
+        captured_snapshots_.push_back(std::move(snap));
+        const std::size_t new_index = captured_snapshots_.size() - 1u;
+
+        if (captured_snapshots_.size() >= 2u) {
+            latest_snapshot_diff_ = peelf::diff_process_snapshots(
+                captured_snapshots_[captured_snapshots_.size() - 2u],
+                captured_snapshots_.back());
+            for (const std::uint64_t base :
+                 peelf::collect_loaded_module_bases_from_diff(*latest_snapshot_diff_)) {
+                if (std::ranges::find(timeline_proven_dynamic_bases_, base) ==
+                    timeline_proven_dynamic_bases_.end()) {
+                    timeline_proven_dynamic_bases_.push_back(base);
+                }
+            }
+        }
+
+        peelf::populate_runtime_settings_from_snapshot(
+            executable_settings_,
+            captured_snapshots_.back(),
+            timeline_proven_dynamic_bases_);
+        return new_index;
+    }
+
+    peelf::Result<void> BinaryModel::diff_snapshots(
+        std::size_t before_index,
+        std::size_t after_index) {
+        if (before_index >= captured_snapshots_.size() ||
+            after_index >= captured_snapshots_.size()) {
+            last_diagnostic_ = "Snapshot index out of range for diff.";
+            return peelf::make_error(last_diagnostic_);
+        }
+        latest_snapshot_diff_ = peelf::diff_process_snapshots(
+            captured_snapshots_[before_index],
+            captured_snapshots_[after_index]);
+        if (before_index < after_index) {
+            for (const std::uint64_t base :
+                 peelf::collect_loaded_module_bases_from_diff(*latest_snapshot_diff_)) {
+                if (std::ranges::find(timeline_proven_dynamic_bases_, base) ==
+                    timeline_proven_dynamic_bases_.end()) {
+                    timeline_proven_dynamic_bases_.push_back(base);
+                }
+            }
+            peelf::populate_runtime_settings_from_snapshot(
+                executable_settings_,
+                captured_snapshots_[after_index],
+                timeline_proven_dynamic_bases_);
+        }
+        return {};
+    }
+
+    void BinaryModel::clear_snapshots() noexcept {
+        captured_snapshots_.clear();
+        latest_snapshot_diff_.reset();
+        timeline_proven_dynamic_bases_.clear();
     }
 
     void BinaryModel::refresh_process_internals() {
@@ -1367,6 +1494,7 @@ private:
         } else {
             security_audit_ = peelf::audit_live_process_security(*session_, cached_sec);
         }
+        sync_live_executable_settings();
     }
 
 } // namespace viewer

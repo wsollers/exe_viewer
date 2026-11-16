@@ -78,6 +78,7 @@ add_executable(peelf_tests
   malformed_inputs_matrix_test.cpp
   capability_provenance_test.cpp
   executable_settings_test.cpp
+  process_snapshot_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_dot.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_build.cpp

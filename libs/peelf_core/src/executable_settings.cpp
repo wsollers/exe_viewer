@@ -2187,6 +2187,660 @@ ExecutableSettingsReport extract_executable_settings(
     return report;
 }
 
+namespace {
+
+[[nodiscard]] constexpr std::string_view strip_deleted_view(std::string_view sv) noexcept {
+    constexpr std::string_view kDeletedSuffix = " (deleted)";
+    if (sv.ends_with(kDeletedSuffix)) {
+        sv.remove_suffix(kDeletedSuffix.size());
+    }
+    return sv;
+}
+
+[[nodiscard]] std::string extract_filename_component(std::string_view raw_path_or_name) {
+    const std::string_view cleaned = strip_deleted_view(raw_path_or_name);
+    const std::size_t slash = cleaned.find_last_of("/\\");
+    const std::string_view base =
+        (slash == std::string_view::npos) ? cleaned : cleaned.substr(slash + 1u);
+    return std::string(base);
+}
+
+[[nodiscard]] std::string normalize_pe_dll_stem(std::string_view name) {
+    std::string lower = ascii_lower(extract_filename_component(name));
+    if (lower.ends_with(".dll")) {
+        lower.resize(lower.size() - 4u);
+    }
+    return lower;
+}
+
+[[nodiscard]] bool pe_declared_matches_loaded(
+    std::string_view declared_dll,
+    std::string_view loaded_basename) {
+    const std::string d_lower = ascii_lower(extract_filename_component(declared_dll));
+    const std::string l_lower = ascii_lower(loaded_basename);
+    if (d_lower.empty() || l_lower.empty()) {
+        return false;
+    }
+    if (d_lower == l_lower) {
+        return true;
+    }
+    return normalize_pe_dll_stem(d_lower) == normalize_pe_dll_stem(l_lower);
+}
+
+[[nodiscard]] bool elf_declared_matches_loaded(
+    std::string_view declared_soname,
+    std::string_view loaded_basename) noexcept {
+    if (declared_soname.empty() || loaded_basename.empty()) {
+        return false;
+    }
+    const std::size_t d_slash = declared_soname.find_last_of("/\\");
+    const std::string_view d_base =
+        (d_slash == std::string_view::npos) ? declared_soname : declared_soname.substr(d_slash + 1u);
+    if (loaded_basename == d_base) {
+        return true;
+    }
+    // Handle symlink-resolved kernel dentry names such as libstdc++.so.6 -> libstdc++.so.6.0.30.
+    if (loaded_basename.size() > d_base.size() &&
+        loaded_basename.starts_with(d_base) &&
+        loaded_basename[d_base.size()] == '.') {
+        return true;
+    }
+    // Handle versioned glibc dentry names such as libc.so.6 -> libc-2.31.so.
+    if (const std::size_t so_pos = d_base.find(".so"); so_pos != std::string_view::npos && so_pos > 0u) {
+        const std::string_view stem = d_base.substr(0u, so_pos);
+        if (loaded_basename.size() > stem.size() + 4u &&
+            loaded_basename.starts_with(stem) &&
+            loaded_basename[stem.size()] == '-' &&
+            loaded_basename.find(".so", stem.size() + 1u) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool is_main_executable_module(
+    const ModuleInfo& mod,
+    std::size_t mod_index,
+    const std::filesystem::path& main_executable_path,
+    Format declared_format) {
+    const std::string mod_path_clean =
+        std::string(strip_deleted_proc_suffix(mod.path.generic_string()));
+    const std::string main_path_clean =
+        std::string(strip_deleted_proc_suffix(main_executable_path.generic_string()));
+    if (!mod_path_clean.empty() && !main_path_clean.empty()) {
+        if (declared_format == Format::PE) {
+            if (ascii_lower(mod_path_clean) == ascii_lower(main_path_clean)) {
+                return true;
+            }
+        } else if (mod_path_clean == main_path_clean) {
+            return true;
+        }
+    }
+
+    const std::string mod_base = !mod.path.empty()
+                                     ? extract_filename_component(mod.path.generic_string())
+                                     : extract_filename_component(mod.name);
+    const std::string main_base = extract_filename_component(main_path_clean);
+    if (!mod_base.empty() && !main_base.empty()) {
+        if (declared_format == Format::PE) {
+            if (ascii_lower(mod_base) == ascii_lower(main_base)) {
+                return true;
+            }
+        } else if (mod_base == main_base) {
+            return true;
+        }
+    }
+
+    if (mod_index == 0u && main_base.empty() &&
+        declared_format == Format::PE && ascii_lower(mod_base).ends_with(".exe")) {
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+EnvironmentVariableEntry parse_and_format_environment_entry(
+    std::string_view raw_key_value,
+    EnvironmentRedactionPolicy policy) {
+    const std::size_t eq = raw_key_value.find('=');
+    if (eq == std::string_view::npos) {
+        return format_environment_variable_entry(raw_key_value, {}, policy);
+    }
+    return format_environment_variable_entry(
+        raw_key_value.substr(0u, eq),
+        raw_key_value.substr(eq + 1u),
+        policy);
+}
+
+Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
+    const Observed<DeclaredSettings>& declared_in_file,
+    const Observed<std::vector<ModuleInfo>>& loaded_modules,
+    const std::filesystem::path& main_executable_path,
+    std::span<const std::uint64_t> timeline_proven_dynamic_bases) {
+    const ProvenanceTag prov = loaded_modules.provenance;
+    if (!loaded_modules.has_value() || loaded_modules.is_unavailable()) {
+        CaptureStamp s = loaded_modules.stamp;
+        s.availability = CaptureAvailability::Unavailable;
+        return Observed<DeclaredVsLoadedModuleComparison>::unavailable(
+            prov,
+            "Loaded module list unavailable; declared vs loaded module reconciliation skipped.",
+            std::move(s));
+    }
+    if (!declared_in_file.has_value() || declared_in_file.is_unavailable()) {
+        CaptureStamp s = loaded_modules.stamp;
+        s.availability = CaptureAvailability::Unavailable;
+        return Observed<DeclaredVsLoadedModuleComparison>::unavailable(
+            prov,
+            "Static declared dependency metadata unavailable (disk image not loaded); declared vs loaded reconciliation skipped.",
+            std::move(s));
+    }
+
+    const DeclaredSettings& decl = *declared_in_file.value;
+    const auto& mods = *loaded_modules.value;
+    const bool is_pe = (decl.format == Format::PE);
+
+    std::vector<std::string> declared_libs = decl.declared_dependencies;
+    const auto push_unique_decl = [&](std::string_view lib) {
+        if (lib.empty()) {
+            return;
+        }
+        const bool exists = std::ranges::any_of(declared_libs, [&](const std::string& cur) {
+            return is_pe ? (ascii_lower(cur) == ascii_lower(lib)) : (cur == lib);
+        });
+        if (!exists) {
+            declared_libs.emplace_back(lib);
+        }
+    };
+
+    if (!is_pe && decl.elf_settings.has_value()) {
+        for (const std::string& needed : decl.elf_settings.value->needed_libraries) {
+            push_unique_decl(needed);
+        }
+    }
+
+    std::optional<std::string> elf_interp_base{};
+    std::optional<std::string> elf_soname{};
+    if (!is_pe && decl.elf_settings.has_value()) {
+        if (decl.elf_settings.value->interpreter.has_value()) {
+            elf_interp_base = extract_filename_component(*decl.elf_settings.value->interpreter);
+        }
+        if (decl.elf_settings.value->soname.has_value()) {
+            elf_soname = *decl.elf_settings.value->soname;
+        }
+    }
+
+    std::vector<std::string> mod_basenames;
+    mod_basenames.reserve(mods.size());
+    for (const ModuleInfo& m : mods) {
+        const std::string base = !m.path.empty()
+                                     ? extract_filename_component(m.path.generic_string())
+                                     : extract_filename_component(m.name);
+        mod_basenames.push_back(base);
+    }
+
+    std::vector<std::uint8_t> mod_accounted(mods.size(), 0u);
+    for (std::size_t mi = 0u; mi < mods.size(); ++mi) {
+        if (is_main_executable_module(mods[mi], mi, main_executable_path, decl.format)) {
+            mod_accounted[mi] = 1u;
+            continue;
+        }
+        if (elf_interp_base.has_value() &&
+            elf_declared_matches_loaded(*elf_interp_base, mod_basenames[mi])) {
+            mod_accounted[mi] = 1u;
+            continue;
+        }
+        if (elf_soname.has_value() &&
+            elf_declared_matches_loaded(*elf_soname, mod_basenames[mi])) {
+            mod_accounted[mi] = 1u;
+            continue;
+        }
+    }
+
+    DeclaredVsLoadedModuleComparison cmp{};
+    for (const std::string& decl_lib : declared_libs) {
+        bool matched_any = false;
+        for (std::size_t mi = 0u; mi < mods.size(); ++mi) {
+            const bool matches = is_pe
+                                     ? pe_declared_matches_loaded(decl_lib, mod_basenames[mi])
+                                     : elf_declared_matches_loaded(decl_lib, mod_basenames[mi]);
+            if (matches) {
+                matched_any = true;
+                mod_accounted[mi] = 1u;
+            }
+        }
+        if (matched_any) {
+            cmp.matched_declared.push_back(decl_lib);
+        } else {
+            cmp.missing_declared.push_back(decl_lib);
+        }
+    }
+
+    bool any_timeline_proven = false;
+    for (std::size_t mi = 0u; mi < mods.size(); ++mi) {
+        if (mod_accounted[mi] != 0u) {
+            continue;
+        }
+        const ModuleInfo& m = mods[mi];
+        const bool proven_dynamic =
+            std::ranges::find(timeline_proven_dynamic_bases, m.base_address) !=
+            timeline_proven_dynamic_bases.end();
+        any_timeline_proven = any_timeline_proven || proven_dynamic;
+
+        UnmatchedLoadedModule um{};
+        um.module_name = !m.name.empty() ? m.name : mod_basenames[mi];
+        um.path = m.path;
+        um.base_address = m.base_address;
+        um.provenance_note = proven_dynamic
+                                 ? "Observed newly loaded across session snapshots (runtime LoadLibrary/dlopen or late load); not listed in root image declared imports."
+                                 : "Loaded in process address space without matching a root executable declared import (may be a transitive dependency, preloaded library, or prior runtime load; not asserted as LoadLibrary/dlopen without snapshot timeline delta).";
+        cmp.unmatched_loaded.push_back(std::move(um));
+    }
+
+    cmp.runtime_load_proven_by_timeline = any_timeline_proven;
+    const bool partial_inputs =
+        (loaded_modules.availability != CaptureAvailability::Complete) ||
+        (declared_in_file.availability != CaptureAvailability::Complete);
+
+    if (partial_inputs) {
+        cmp.summary = std::format(
+            "Partial reconciliation: {}/{} root declared dependencies observed loaded ({} not observed in partial capture), {} unmatched loaded module(s).",
+            cmp.matched_declared.size(),
+            declared_libs.size(),
+            cmp.missing_declared.size(),
+            cmp.unmatched_loaded.size());
+        CaptureStamp s = loaded_modules.stamp;
+        s.availability = CaptureAvailability::Partial;
+        return Observed<DeclaredVsLoadedModuleComparison>::partial(
+            std::move(cmp),
+            prov,
+            "Loaded module list or static dependency table was partial.",
+            std::move(s));
+    }
+
+    cmp.summary = std::format(
+        "{}/{} root declared dependencies loaded ({} not currently loaded), {} unmatched loaded module(s){}.",
+        cmp.matched_declared.size(),
+        declared_libs.size(),
+        cmp.missing_declared.size(),
+        cmp.unmatched_loaded.size(),
+        any_timeline_proven ? " (includes timeline-proven runtime load)" : "");
+
+    CaptureStamp s = loaded_modules.stamp;
+    s.availability = CaptureAvailability::Complete;
+    std::vector<Evidence> ev = {
+        Evidence{.tag = declared_in_file.provenance, .source = "declared_dependencies"},
+        Evidence{.tag = loaded_modules.provenance, .source = "loaded_modules"},
+    };
+    return Observed<DeclaredVsLoadedModuleComparison>::complete(
+        std::move(cmp), prov, std::move(s), std::move(ev));
+}
+
+Observed<LaunchEnvironmentSettings> extract_launch_environment_settings(
+    IProcessSession& session,
+    const TargetInstanceId& target_id,
+    std::uint64_t snapshot_revision,
+    const RuntimeSettingsOptions& options,
+    const Observed<ProcessSecurityProfile>* pre_captured_security,
+    const std::string* fallback_cwd) {
+    const bool paused = session.is_suspended() || session.is_crash_dump();
+    const ProvenanceTag prov =
+        session.is_crash_dump() ? ProvenanceTag::CrashDump : ProvenanceTag::ProcOrOsApi;
+
+    if (!session.is_alive()) {
+        const CaptureStamp unavail_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        return Observed<LaunchEnvironmentSettings>::unavailable(
+            prov, "Target process is no longer alive.", unavail_stamp);
+    }
+
+    LaunchEnvironmentSettings le{};
+    if (session.is_crash_dump()) {
+        le.capture_origin = EnvironmentCaptureOrigin::CrashDumpState;
+    } else if (options.launched_by_session) {
+        le.capture_origin = EnvironmentCaptureOrigin::LaunchCaptured;
+    } else {
+        le.capture_origin = EnvironmentCaptureOrigin::AttachedCurrentState;
+    }
+    le.redaction_policy = options.redaction_policy;
+
+    const ProcessInfo info = session.info();
+    le.executable_path = !options.resolved_executable_path.empty()
+                             ? options.resolved_executable_path
+                             : info.executable_path;
+
+    // 1. argv
+    if (!info.command_line.empty()) {
+        const bool windows_cmd_style =
+            le.executable_path.generic_string().find(':') != std::string::npos ||
+            ascii_lower(le.executable_path.generic_string()).ends_with(".exe");
+        std::vector<std::string> args =
+            split_command_line_args(info.command_line, windows_cmd_style);
+        const CaptureStamp argv_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Complete);
+        le.argv = Observed<std::vector<std::string>>::complete(
+            std::move(args), prov, argv_stamp);
+    } else {
+        const CaptureStamp argv_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        le.argv = Observed<std::vector<std::string>>::unavailable(
+            prov, "Command-line arguments unavailable for target.", argv_stamp);
+    }
+
+    // 2. cwd
+    if (!info.working_directory.empty()) {
+        const CaptureStamp cwd_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Complete);
+        le.cwd = Observed<std::filesystem::path>::complete(
+            info.working_directory, prov, cwd_stamp);
+    } else if (fallback_cwd != nullptr && !fallback_cwd->empty()) {
+        const CaptureStamp cwd_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Complete);
+        le.cwd = Observed<std::filesystem::path>::complete(
+            std::filesystem::path(*fallback_cwd), ProvenanceTag::LiveMemory, cwd_stamp);
+    } else {
+        const CaptureStamp cwd_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        le.cwd = Observed<std::filesystem::path>::unavailable(
+            prov, "Current working directory unavailable for target.", cwd_stamp);
+    }
+
+    // 3. Environment variables (redacted by default unless explicitly opted in)
+    ForgivingValue<std::vector<std::string>> raw_env = session.environment_variables();
+    if (raw_env.status.has_data() && raw_env.value.has_value()) {
+        std::vector<EnvironmentVariableEntry> formatted;
+        formatted.reserve(raw_env.value->size());
+        std::size_t redacted_count = 0u;
+        for (const std::string& kv : *raw_env.value) {
+            EnvironmentVariableEntry entry =
+                parse_and_format_environment_entry(kv, options.redaction_policy);
+            if (entry.redacted) {
+                ++redacted_count;
+            }
+            formatted.push_back(std::move(entry));
+        }
+        const CaptureAvailability env_avail =
+            (raw_env.status.availability == Availability::Partial)
+                ? CaptureAvailability::Partial
+                : CaptureAvailability::Complete;
+        const CaptureStamp env_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, env_avail);
+        if (env_avail == CaptureAvailability::Complete) {
+            le.environment = Observed<std::vector<EnvironmentVariableEntry>>::complete(
+                std::move(formatted), prov, env_stamp);
+            if (redacted_count > 0u) {
+                le.environment.note = std::format(
+                    "{} sensitive environment value(s) redacted under policy {}.",
+                    redacted_count,
+                    to_string(options.redaction_policy));
+            }
+        } else {
+            le.environment = Observed<std::vector<EnvironmentVariableEntry>>::partial(
+                std::move(formatted),
+                prov,
+                raw_env.status.detail.empty()
+                    ? "Environment block partially captured."
+                    : raw_env.status.detail,
+                env_stamp);
+        }
+    } else {
+        const CaptureStamp env_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        le.environment = Observed<std::vector<EnvironmentVariableEntry>>::unavailable(
+            prov,
+            raw_env.status.detail.empty()
+                ? "Environment block unavailable for target."
+                : raw_env.status.detail,
+            env_stamp);
+    }
+
+    // 4. Security profile
+    if (pre_captured_security != nullptr) {
+        le.security_profile = *pre_captured_security;
+    } else if (options.query_process_internals) {
+        ProcessInternalsSnapshot internals = inspect_process_internals(session);
+        const CaptureAvailability sec_avail =
+            to_capture_availability(internals.security.status.availability);
+        const CaptureStamp sec_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, sec_avail);
+        le.security_profile = Observed<ProcessSecurityProfile>::from_forgiving(
+            std::move(internals.security), prov, sec_stamp);
+    } else {
+        const CaptureStamp sec_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        le.security_profile = Observed<ProcessSecurityProfile>::unavailable(
+            prov, "Security profile query skipped.", sec_stamp);
+    }
+
+    const bool any_present =
+        !le.argv.is_unavailable() ||
+        !le.cwd.is_unavailable() ||
+        !le.environment.is_unavailable() ||
+        !le.security_profile.is_unavailable();
+
+    const std::string origin_note =
+        le.capture_origin == EnvironmentCaptureOrigin::LaunchCaptured
+            ? "Captured from debugger-launched target state."
+            : (le.capture_origin == EnvironmentCaptureOrigin::CrashDumpState
+                   ? "Extracted from post-mortem crash dump state."
+                   : "Observed current process state after attach (process cwd/environment may have mutated since initial launch).");
+
+    if (!any_present) {
+        const CaptureStamp unavail_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        return Observed<LaunchEnvironmentSettings>::unavailable(
+            prov, "Process launch/current environment fields are all unavailable.", unavail_stamp);
+    }
+
+    const bool all_complete =
+        le.argv.availability == CaptureAvailability::Complete &&
+        le.cwd.availability == CaptureAvailability::Complete &&
+        le.environment.availability == CaptureAvailability::Complete &&
+        le.security_profile.availability == CaptureAvailability::Complete;
+
+    const CaptureStamp overall_stamp = CaptureStamp::capture_now(
+        target_id,
+        snapshot_revision,
+        paused,
+        all_complete ? CaptureAvailability::Complete : CaptureAvailability::Partial);
+
+    if (all_complete) {
+        auto obs = Observed<LaunchEnvironmentSettings>::complete(
+            std::move(le), prov, overall_stamp);
+        obs.note = origin_note;
+        return obs;
+    }
+    return Observed<LaunchEnvironmentSettings>::partial(
+        std::move(le), prov, origin_note, overall_stamp);
+}
+
+void populate_runtime_executable_settings(
+    ExecutableSettingsReport& report,
+    IProcessSession& session,
+    const TargetInstanceId& target_id,
+    std::uint64_t snapshot_revision,
+    const RuntimeSettingsOptions& options,
+    const ProcessInternalsSnapshot* cached_internals,
+    const CaptureStamp* cached_internals_stamp,
+    std::span<const ModuleInfo> cached_modules,
+    const CaptureStamp* cached_modules_stamp,
+    const std::string* fallback_cwd) {
+    const bool paused = session.is_suspended() || session.is_crash_dump();
+    const ProvenanceTag prov =
+        session.is_crash_dump() ? ProvenanceTag::CrashDump : ProvenanceTag::ProcOrOsApi;
+
+    std::optional<ProcessInternalsSnapshot> owned_internals{};
+    const ProcessInternalsSnapshot* internals_ptr = cached_internals;
+    if (internals_ptr == nullptr && options.query_process_internals && session.is_alive()) {
+        owned_internals.emplace(inspect_process_internals(session));
+        internals_ptr = &*owned_internals;
+    }
+
+    Observed<ProcessSecurityProfile> sec_obs{};
+    Observed<std::vector<ProcessHandleEntry>> handles_obs{};
+    Observed<std::vector<ProcessSocketEntry>> sockets_obs{};
+
+    if (internals_ptr != nullptr) {
+        const auto make_stamp = [&](Availability avail) {
+            if (cached_internals_stamp != nullptr) {
+                CaptureStamp s = *cached_internals_stamp;
+                s.availability = to_capture_availability(avail);
+                return s;
+            }
+            return CaptureStamp::capture_now(
+                target_id, snapshot_revision, paused, to_capture_availability(avail));
+        };
+        sec_obs = Observed<ProcessSecurityProfile>::from_forgiving(
+            internals_ptr->security, prov, make_stamp(internals_ptr->security.status.availability));
+        handles_obs = Observed<std::vector<ProcessHandleEntry>>::from_forgiving(
+            internals_ptr->handles, prov, make_stamp(internals_ptr->handles.status.availability));
+        sockets_obs = Observed<std::vector<ProcessSocketEntry>>::from_forgiving(
+            internals_ptr->sockets, prov, make_stamp(internals_ptr->sockets.status.availability));
+    } else {
+        const CaptureStamp unavail_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        sec_obs = Observed<ProcessSecurityProfile>::unavailable(
+            prov, "Process internals not queried.", unavail_stamp);
+        handles_obs = Observed<std::vector<ProcessHandleEntry>>::unavailable(
+            prov, "Process handles not queried.", unavail_stamp);
+        sockets_obs = Observed<std::vector<ProcessSocketEntry>>::unavailable(
+            prov, "Process sockets not queried.", unavail_stamp);
+    }
+
+    report.launch_environment = extract_launch_environment_settings(
+        session,
+        target_id,
+        snapshot_revision,
+        options,
+        &sec_obs,
+        fallback_cwd);
+
+    Observed<std::vector<ModuleInfo>> modules_obs{};
+    if (cached_modules_stamp != nullptr) {
+        std::vector<ModuleInfo> mods_copy(cached_modules.begin(), cached_modules.end());
+        CaptureStamp mod_stamp = *cached_modules_stamp;
+        if (mod_stamp.availability == CaptureAvailability::Unavailable) {
+            modules_obs = Observed<std::vector<ModuleInfo>>::unavailable(
+                prov, "Module list unavailable.", mod_stamp);
+        } else if (mod_stamp.availability == CaptureAvailability::Partial) {
+            modules_obs = Observed<std::vector<ModuleInfo>>::partial(
+                std::move(mods_copy), prov, "Module list partially captured.", mod_stamp);
+        } else {
+            mod_stamp.availability = CaptureAvailability::Complete;
+            modules_obs = Observed<std::vector<ModuleInfo>>::complete(
+                std::move(mods_copy), prov, mod_stamp);
+        }
+    } else if (session.is_alive()) {
+        if (auto mods_res = session.modules(); mods_res.has_value()) {
+            const CaptureStamp mod_stamp = CaptureStamp::capture_now(
+                target_id, snapshot_revision, paused, CaptureAvailability::Complete);
+            modules_obs = Observed<std::vector<ModuleInfo>>::complete(
+                std::move(*mods_res), prov, mod_stamp);
+        } else {
+            const CaptureStamp mod_stamp = CaptureStamp::capture_now(
+                target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+            modules_obs = Observed<std::vector<ModuleInfo>>::unavailable(
+                prov, mods_res.error().message, mod_stamp);
+        }
+    } else {
+        const CaptureStamp mod_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        modules_obs = Observed<std::vector<ModuleInfo>>::unavailable(
+            prov, "Target process is no longer alive.", mod_stamp);
+    }
+
+    const std::filesystem::path main_exe =
+        !options.resolved_executable_path.empty()
+            ? options.resolved_executable_path
+            : session.info().executable_path;
+
+    ObservedRuntimeConfiguration runtime{};
+    runtime.loaded_modules = std::move(modules_obs);
+    runtime.open_handles = std::move(handles_obs);
+    runtime.sockets = std::move(sockets_obs);
+    runtime.declared_vs_loaded = reconcile_declared_vs_loaded_modules(
+        report.declared_in_file,
+        runtime.loaded_modules,
+        main_exe,
+        options.timeline_proven_dynamic_bases);
+
+    const bool any_rt =
+        !runtime.loaded_modules.is_unavailable() ||
+        !runtime.open_handles.is_unavailable() ||
+        !runtime.sockets.is_unavailable();
+
+    if (!any_rt) {
+        const CaptureStamp unavail_stamp = CaptureStamp::capture_now(
+            target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
+        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::unavailable(
+            prov,
+            "All runtime collections (modules, handles, sockets) are unavailable.",
+            unavail_stamp);
+        return;
+    }
+
+    const bool all_complete =
+        runtime.loaded_modules.availability == CaptureAvailability::Complete &&
+        runtime.open_handles.availability == CaptureAvailability::Complete &&
+        runtime.sockets.availability == CaptureAvailability::Complete;
+
+    const CaptureStamp rt_stamp = CaptureStamp::capture_now(
+        target_id,
+        snapshot_revision,
+        paused,
+        all_complete ? CaptureAvailability::Complete : CaptureAvailability::Partial);
+
+    if (all_complete) {
+        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::complete(
+            std::move(runtime), prov, rt_stamp);
+    } else {
+        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::partial(
+            std::move(runtime),
+            prov,
+            "One or more runtime collections (modules, handles, sockets) are partial or unavailable.",
+            rt_stamp);
+    }
+}
+
+ExecutableSettingsReport extract_executable_settings_for_session(
+    const IBinaryImage* image,
+    std::span<const std::uint8_t> raw_bytes,
+    IProcessSession& session,
+    const RuntimeSettingsOptions& options,
+    const CaptureStamp& static_stamp) {
+    ExecutableSettingsReport report{};
+    if (image != nullptr) {
+        report = extract_executable_settings(*image, raw_bytes, static_stamp);
+    } else {
+        const CaptureStamp unavail_static = CaptureStamp::capture_now(
+            TargetInstanceId{.backend = BackendKind::StaticFile},
+            1u,
+            true,
+            CaptureAvailability::Unavailable);
+        report.declared_in_file = Observed<DeclaredSettings>::unavailable(
+            ProvenanceTag::DiskFile,
+            "Backing disk executable image unavailable; static declared settings omitted.",
+            unavail_static);
+    }
+
+    const bool dbg_active = !session.is_read_only() && !session.is_crash_dump();
+    report.target_profile = derive_target_profile(image, &session, dbg_active, false);
+
+    TargetInstanceId tid{};
+    tid.backend = report.target_profile.backend;
+    tid.pid = session.pid();
+    if (!session.is_crash_dump() && tid.pid != 0u) {
+        tid.creation_identity = query_process_creation_identity(tid.pid);
+    }
+    if (!tid.creation_identity.has_value()) {
+        const auto raw_ptr = reinterpret_cast<std::uintptr_t>(&session);
+        tid.session_nonce = raw_ptr != 0u ? static_cast<std::uint64_t>(raw_ptr) : 1u;
+    }
+
+    populate_runtime_executable_settings(report, session, tid, 1u, options);
+    return report;
+}
+
 std::string format_executable_settings_json(
     const ExecutableSettingsReport& report,
     std::size_t base_indent) {
@@ -2496,6 +3150,10 @@ std::string format_executable_settings_json(
     append_json_string(out, report.launch_environment.note);
     if (report.launch_environment.has_value()) {
         const LaunchEnvironmentSettings& le = *report.launch_environment.value;
+        out += ",\n";
+        append_indent(out, base_indent + 4u);
+        out += "\"capture_origin\": ";
+        append_json_string(out, to_string(le.capture_origin));
         out += ",\n";
         append_indent(out, base_indent + 4u);
         out += "\"executable_path\": ";
