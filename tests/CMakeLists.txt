@@ -65,6 +65,7 @@ add_executable(peelf_tests
   decompiler_test.cpp
   recent_binaries_test.cpp
   shellcode_converter_test.cpp
+  subprocess_test.cpp
   assembler_dependency_test.cpp
   assembler_patch_bundle_test.cpp
   patching_test.cpp

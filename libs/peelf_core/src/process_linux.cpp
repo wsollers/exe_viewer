@@ -988,9 +988,12 @@ class LinuxProcessSession final : public IProcessSession {
 public:
     explicit LinuxProcessSession(ProcessInfo info) : info_(std::move(info)) {}
 
-    ~LinuxProcessSession() override {
-        if (suspended_ || !stopped_threads_.empty() || process_sigstopped_) {
-            (void)resume();
+    ~LinuxProcessSession() noexcept override {
+        if (suspended_ || !suspended_tids_.empty() || process_sigstopped_) {
+            try {
+                (void)resume();
+            } catch (...) {
+            }
         }
         if (mem_read_fd_ >= 0) {
             ::close(mem_read_fd_);
@@ -1175,9 +1178,13 @@ public:
             if (tids.empty() && pass == 0) {
                 return make_error(last_err);
             }
+            // Pre-reserve contiguous tracking capacity before invoking ptrace/tgkill so recording
+            // a stopped thread can never fail with std::bad_alloc.
+            suspended_tids_.reserve(suspended_tids_.size() + tids.size());
+
             bool added_in_pass = false;
             for (const ThreadId tid : tids) {
-                if (stopped_threads_.contains(tid)) {
+                if (has_suspended_tid(tid)) {
                     continue;
                 }
                 auto res = stop_single_thread(tid);
@@ -1193,28 +1200,58 @@ public:
             }
         }
 
-        if (stopped_count == 0 && stopped_threads_.empty()) {
+        if (stopped_count == 0 && suspended_tids_.empty()) {
             return make_error("failed to suspend process: " + last_err);
         }
-        suspended_ = true;
+        suspended_ = !suspended_tids_.empty();
         return {};
     }
 
     [[nodiscard]] Result<void> resume() override {
-        for (const auto& [tid, mech] : stopped_threads_) {
-            if (mech == StopMechanism::PtraceSeize) {
-                (void)::ptrace(PTRACE_DETACH, static_cast<pid_t>(tid), nullptr, nullptr);
-            } else {
-                (void)::syscall(
-                    SYS_tgkill, static_cast<pid_t>(info_.pid), static_cast<pid_t>(tid), SIGCONT);
+        std::size_t write_idx = 0;
+        std::size_t failed_count = 0;
+        std::string detail;
+
+        for (std::size_t i = 0; i < suspended_tids_.size(); ++i) {
+            const SuspendedThreadEntry entry = suspended_tids_[i];
+            if (auto r = resume_single_entry(entry); !r.has_value()) {
+                suspended_tids_[write_idx++] = entry;
+                ++failed_count;
+                if (detail.empty()) {
+                    detail = std::format("TID {}: {}", entry.tid, r.error().message);
+                } else {
+                    detail += std::format("; TID {}: {}", entry.tid, r.error().message);
+                }
             }
         }
+        suspended_tids_.resize(write_idx);
+
         if (process_sigstopped_) {
-            (void)::kill(static_cast<pid_t>(info_.pid), SIGCONT);
-            process_sigstopped_ = false;
+            const bool any_sigstop_left = std::ranges::any_of(
+                suspended_tids_, [](const SuspendedThreadEntry& e) {
+                    return e.mechanism == StopMechanism::SigStop;
+                });
+            if (::kill(static_cast<pid_t>(info_.pid), SIGCONT) == 0 ||
+                (errno == ESRCH && !is_alive())) {
+                process_sigstopped_ = any_sigstop_left;
+            } else {
+                const int err = errno;
+                ++failed_count;
+                const std::string msg =
+                    std::format("PID {}: kill(SIGCONT) failed: {}", info_.pid, std::strerror(err));
+                if (detail.empty()) {
+                    detail = msg;
+                } else {
+                    detail += "; " + msg;
+                }
+            }
         }
-        stopped_threads_.clear();
-        suspended_ = false;
+
+        suspended_ = !suspended_tids_.empty() || process_sigstopped_;
+        if (failed_count > 0) {
+            return make_error(
+                std::format("failed to resume {} target(s): {}", failed_count, detail));
+        }
         return {};
     }
 
@@ -1229,27 +1266,32 @@ public:
     }
 
     [[nodiscard]] Result<void> resume_thread(ThreadId tid) override {
-        const auto it = stopped_threads_.find(tid);
-        if (it == stopped_threads_.end()) {
+        const auto it = find_suspended_tid(tid);
+        if (it == suspended_tids_.end()) {
             return {};
         }
-        if (it->second == StopMechanism::PtraceSeize) {
-            (void)::ptrace(PTRACE_DETACH, static_cast<pid_t>(tid), nullptr, nullptr);
-            stopped_threads_.erase(it);
+        const StopMechanism mech = it->mechanism;
+        if (auto r = resume_single_entry(*it); !r.has_value()) {
+            return r;
+        }
+        if (mech == StopMechanism::PtraceSeize) {
+            suspended_tids_.erase(it);
         } else {
-            (void)::syscall(
-                SYS_tgkill, static_cast<pid_t>(info_.pid), static_cast<pid_t>(tid), SIGCONT);
             if (process_sigstopped_) {
-                (void)::kill(static_cast<pid_t>(info_.pid), SIGCONT);
-                process_sigstopped_ = false;
+                if (::kill(static_cast<pid_t>(info_.pid), SIGCONT) == 0 ||
+                    (errno == ESRCH && !is_alive())) {
+                    process_sigstopped_ = false;
+                } else {
+                    const int err = errno;
+                    return make_error(
+                        std::format("kill(SIGCONT) failed: {}", std::strerror(err)));
+                }
             }
-            std::erase_if(stopped_threads_, [](const auto& kv) {
-                return kv.second == StopMechanism::SigStop;
+            std::erase_if(suspended_tids_, [](const SuspendedThreadEntry& e) {
+                return e.mechanism == StopMechanism::SigStop;
             });
         }
-        if (stopped_threads_.empty()) {
-            suspended_ = false;
-        }
+        suspended_ = !suspended_tids_.empty() || process_sigstopped_;
         return {};
     }
 
@@ -1311,7 +1353,7 @@ public:
             if (stat_sample.valid) {
                 ti.state = decode_proc_stat_state(stat_sample.state_char);
                 ti.is_suspended = (stat_sample.state_char == 'T' || stat_sample.state_char == 't' ||
-                                   stopped_threads_.contains(tid) || suspended_);
+                                   has_suspended_tid(tid) || suspended_);
                 ti.stack_pointer = stat_sample.kstkesp;
                 ti.instruction_pointer = stat_sample.kstkeip;
                 ti.user_time_ns = (stat_sample.utime_ticks * 1'000'000'000ULL) / clk_tck;
@@ -1343,9 +1385,9 @@ public:
             }
 
             // If this thread is already ptrace-stopped by this session, enrich exact IP/SP/TLS.
-            if (const auto stop_it = stopped_threads_.find(tid);
-                stop_it != stopped_threads_.end() &&
-                stop_it->second == StopMechanism::PtraceSeize) {
+            if (const auto stop_it = find_suspended_tid(tid);
+                stop_it != suspended_tids_.end() &&
+                stop_it->mechanism == StopMechanism::PtraceSeize) {
                 ThreadContext stopped_ctx;
                 stopped_ctx.tid = tid;
                 stopped_ctx.layout = target_layout();
@@ -1419,8 +1461,8 @@ public:
         }
 
         // Tier 1: Thread is already ptrace-seized by this session.
-        if (const auto it = stopped_threads_.find(tid);
-            it != stopped_threads_.end() && it->second == StopMechanism::PtraceSeize) {
+        if (const auto it = find_suspended_tid(tid);
+            it != suspended_tids_.end() && it->mechanism == StopMechanism::PtraceSeize) {
             if (capture_ptrace_regsets(tid, ctx)) {
                 ctx.status = SubsystemStatus::available("ptrace(NT_PRSTATUS)", "full register set");
                 return ctx;
@@ -1602,15 +1644,73 @@ private:
         }
     }
 
-    [[nodiscard]] Result<void> stop_single_thread(ThreadId tid) {
-        if (stopped_threads_.contains(tid)) {
+    struct SuspendedThreadEntry {
+        ThreadId tid{0};
+        StopMechanism mechanism{StopMechanism::PtraceSeize};
+    };
+
+    [[nodiscard]] std::vector<SuspendedThreadEntry>::iterator find_suspended_tid(
+        ThreadId tid) noexcept {
+        return std::ranges::find(suspended_tids_, tid, &SuspendedThreadEntry::tid);
+    }
+
+    [[nodiscard]] std::vector<SuspendedThreadEntry>::const_iterator find_suspended_tid(
+        ThreadId tid) const noexcept {
+        return std::ranges::find(suspended_tids_, tid, &SuspendedThreadEntry::tid);
+    }
+
+    [[nodiscard]] bool has_suspended_tid(ThreadId tid) const noexcept {
+        return find_suspended_tid(tid) != suspended_tids_.end();
+    }
+
+    [[nodiscard]] bool is_thread_still_present(ThreadId tid) const noexcept {
+        const std::filesystem::path stat_path = std::filesystem::path("/proc") /
+                                                std::to_string(info_.pid) / "task" /
+                                                std::to_string(tid) / "stat";
+        const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path));
+        if (!st.valid) {
+            return false;
+        }
+        return st.state_char != 'Z' && st.state_char != 'X' && st.state_char != 'x';
+    }
+
+    [[nodiscard]] Result<void> resume_single_entry(const SuspendedThreadEntry& entry) {
+        if (entry.mechanism == StopMechanism::PtraceSeize) {
+            if (::ptrace(PTRACE_DETACH, static_cast<pid_t>(entry.tid), nullptr, nullptr) == 0) {
+                return {};
+            }
+            const int err = errno;
+            if (err == ESRCH && !is_thread_still_present(entry.tid)) {
+                return {};
+            }
+            return make_error(
+                std::format("ptrace(PTRACE_DETACH) failed: {}", std::strerror(err)));
+        }
+
+        if (::syscall(
+                SYS_tgkill, static_cast<pid_t>(info_.pid), static_cast<pid_t>(entry.tid), SIGCONT) ==
+            0) {
             return {};
         }
+        const int err = errno;
+        if (err == ESRCH && !is_thread_still_present(entry.tid)) {
+            return {};
+        }
+        return make_error(std::format("tgkill(SIGCONT) failed: {}", std::strerror(err)));
+    }
+
+    [[nodiscard]] Result<void> stop_single_thread(ThreadId tid) {
+        if (has_suspended_tid(tid)) {
+            return {};
+        }
+
+        // Pre-reserve contiguous capacity BEFORE OS ptrace/tgkill so tracking push_back cannot throw.
+        suspended_tids_.reserve(suspended_tids_.size() + 1u);
 
         if (::ptrace(PTRACE_SEIZE, static_cast<pid_t>(tid), nullptr, nullptr) == 0) {
             if (::ptrace(PTRACE_INTERRUPT, static_cast<pid_t>(tid), nullptr, nullptr) == 0 &&
                 wait_for_ptrace_stop(tid, 250)) {
-                stopped_threads_.emplace(tid, StopMechanism::PtraceSeize);
+                suspended_tids_.push_back(SuspendedThreadEntry{tid, StopMechanism::PtraceSeize});
                 return {};
             }
             (void)::ptrace(PTRACE_DETACH, static_cast<pid_t>(tid), nullptr, nullptr);
@@ -1623,7 +1723,7 @@ private:
                 0 ||
             ::kill(static_cast<pid_t>(info_.pid), SIGSTOP) == 0) {
             wait_for_proc_stop_state(tid, 250);
-            stopped_threads_.emplace(tid, StopMechanism::SigStop);
+            suspended_tids_.push_back(SuspendedThreadEntry{tid, StopMechanism::SigStop});
             process_sigstopped_ = true;
             return {};
         }
@@ -1779,7 +1879,7 @@ private:
 
     ProcessInfo info_;
     int mem_read_fd_{-1};
-    std::unordered_map<ThreadId, StopMechanism> stopped_threads_;
+    std::vector<SuspendedThreadEntry> suspended_tids_;
     bool process_sigstopped_{false};
     bool suspended_{false};
 };

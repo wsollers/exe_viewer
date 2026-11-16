@@ -7,6 +7,13 @@
 #include <vector>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <io.h>
 #else
 #include <unistd.h>
@@ -67,6 +74,65 @@ int main(int argc, char** argv) {
 #endif
         std::this_thread::sleep_for(std::chrono::seconds(30));
         return 0;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "echo-stdio") {
+        std::string in_data((std::istreambuf_iterator<char>(std::cin)),
+                            std::istreambuf_iterator<char>());
+        std::cout << "OUT:" << in_data;
+        std::cout.flush();
+        if (argc >= 3) {
+            std::cerr << "ERR:" << argv[2];
+            std::cerr.flush();
+        }
+        return 0;
+    }
+    if (argc == 2 && std::string(argv[1]) == "spawn-grandchild-hold") {
+        std::cout << "parent-done";
+        std::cout.flush();
+        std::cerr << "parent-err";
+        std::cerr.flush();
+#if defined(_WIN32)
+        wchar_t self_path[MAX_PATH]{};
+        const DWORD len = ::GetModuleFileNameW(nullptr, self_path, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) {
+            return 2;
+        }
+        std::wstring cmd = L"\"";
+        cmd += self_path;
+        cmd += L"\" sleep";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+        si.hStdOutput = ::GetStdHandle(STD_OUTPUT_HANDLE);
+        si.hStdError = ::GetStdHandle(STD_ERROR_HANDLE);
+        PROCESS_INFORMATION pi{};
+        if (!::CreateProcessW(self_path,
+                              cmd.data(),
+                              nullptr,
+                              nullptr,
+                              TRUE,
+                              CREATE_NO_WINDOW,
+                              nullptr,
+                              nullptr,
+                              &si,
+                              &pi)) {
+            return 3;
+        }
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        return 0;
+#else
+        const pid_t gc = ::fork();
+        if (gc < 0) {
+            return 3;
+        }
+        if (gc == 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            _exit(0);
+        }
+        return 0;
+#endif
     }
     return 7;
 }

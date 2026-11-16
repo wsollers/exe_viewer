@@ -1,19 +1,14 @@
 #include "graph/call_graph.hpp"
 #include "graph/call_graph_internal.hpp"
 
+#include <peelf/subprocess.hpp>
+
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace viewer {
 namespace {
@@ -126,43 +121,6 @@ using detail::format_hex;
     }
     return label;
 }
-
-#ifdef _WIN32
-[[nodiscard]] std::wstring widen(std::string_view text) {
-    if (text.empty()) {
-        return {};
-    }
-    const int required = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    std::wstring out(static_cast<std::size_t>(required), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), required);
-    return out;
-}
-
-[[nodiscard]] std::wstring quote_windows_arg(std::wstring_view arg) {
-    std::wstring quoted = L"\"";
-    for (const wchar_t ch : arg) {
-        if (ch == L'\\' || ch == L'"') {
-            quoted.push_back(L'\\');
-        }
-        quoted.push_back(ch);
-    }
-    quoted.push_back(L'"');
-    return quoted;
-}
-#else
-[[nodiscard]] std::string quote_shell_arg(std::string_view arg) {
-    std::string quoted = "'";
-    for (const char ch : arg) {
-        if (ch == '\'') {
-            quoted += "'\\''";
-        } else {
-            quoted.push_back(ch);
-        }
-    }
-    quoted.push_back('\'');
-    return quoted;
-}
-#endif
 
 } // namespace
 
@@ -290,52 +248,51 @@ GraphRenderResult render_graph_with_graphviz(const CallGraph& graph,
 
 GraphRenderResult DefaultProcessRunner::run(std::string_view executable,
                                             std::span<const std::string> arguments) const {
-#ifdef _WIN32
-    std::wstring command_line = quote_windows_arg(widen(executable));
-    for (const std::string& argument : arguments) {
-        command_line.push_back(L' ');
-        command_line += quote_windows_arg(widen(argument));
-    }
+    peelf::SubprocessOptions opts{};
+    opts.timeout = timeout_;
+    opts.stop_token = stop_token_;
+    opts.search_path = true;
 
-    STARTUPINFOW startup_info{};
-    startup_info.cb = sizeof(startup_info);
-    PROCESS_INFORMATION process_info{};
-    std::wstring mutable_command_line = command_line;
-    const BOOL created = CreateProcessW(nullptr,
-                                        mutable_command_line.data(),
-                                        nullptr,
-                                        nullptr,
-                                        FALSE,
-                                        CREATE_NO_WINDOW,
-                                        nullptr,
-                                        nullptr,
-                                        &startup_info,
-                                        &process_info);
-    if (!created) {
-        return GraphRenderResult{.success = false,
-                                 .exit_code = static_cast<std::int32_t>(GetLastError()),
-                                 .diagnostic = "CreateProcessW failed"};
-    }
+    const peelf::SubprocessResult sub =
+        peelf::run_subprocess_bounded(std::filesystem::path(executable), arguments, opts);
 
-    WaitForSingleObject(process_info.hProcess, INFINITE);
-    DWORD exit_code = 1;
-    GetExitCodeProcess(process_info.hProcess, &exit_code);
-    CloseHandle(process_info.hThread);
-    CloseHandle(process_info.hProcess);
-    return GraphRenderResult{.success = exit_code == 0,
-                             .exit_code = static_cast<std::int32_t>(exit_code),
-                             .diagnostic = exit_code == 0 ? std::string{} : "Graphviz dot failed"};
-#else
-    std::string command = quote_shell_arg(executable);
-    for (const std::string& argument : arguments) {
-        command.push_back(' ');
-        command += quote_shell_arg(argument);
+    if (sub.cancelled) {
+        return GraphRenderResult{
+            .success = false,
+            .exit_code = -1,
+            .diagnostic = "Graphviz dot cancelled",
+        };
     }
-    const int exit_code = std::system(command.c_str());
-    return GraphRenderResult{.success = exit_code == 0,
-                             .exit_code = exit_code,
-                             .diagnostic = exit_code == 0 ? std::string{} : "Graphviz dot failed"};
-#endif
+    if (sub.timed_out) {
+        return GraphRenderResult{
+            .success = false,
+            .exit_code = -1,
+            .diagnostic = "Graphviz dot timed out",
+        };
+    }
+    if (!sub.launched) {
+        return GraphRenderResult{
+            .success = false,
+            .exit_code = -1,
+            .diagnostic = sub.launch_error.empty() ? "Failed to launch Graphviz dot" : sub.launch_error,
+        };
+    }
+    if (sub.exit_code != 0) {
+        std::string diag = sub.stderr_text;
+        while (!diag.empty() && (diag.back() == '\n' || diag.back() == '\r')) {
+            diag.pop_back();
+        }
+        return GraphRenderResult{
+            .success = false,
+            .exit_code = static_cast<std::int32_t>(sub.exit_code),
+            .diagnostic = diag.empty() ? "Graphviz dot failed" : std::move(diag),
+        };
+    }
+    return GraphRenderResult{
+        .success = true,
+        .exit_code = 0,
+        .diagnostic = {},
+    };
 }
 
 } // namespace viewer

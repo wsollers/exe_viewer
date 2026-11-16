@@ -28,6 +28,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/dependency_tree.cpp
   src/demangle.cpp
   src/dwarf.cpp
+  src/subprocess.cpp
   src/assembler.cpp
   src/patching.cpp
   src/patch_bundle.cpp
@@ -67,6 +68,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/dependency_tree.hpp
   include/peelf/demangle.hpp
   include/peelf/dwarf.hpp
+  include/peelf/subprocess.hpp
   include/peelf/assembler.hpp
   include/peelf/patching.hpp
   include/peelf/patch_bundle.hpp

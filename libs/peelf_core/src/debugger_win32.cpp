@@ -1,4 +1,5 @@
 #include <peelf/debugger.hpp>
+#include <peelf/subprocess.hpp>
 
 #ifdef _WIN32
 
@@ -56,24 +57,18 @@ constexpr DWORD kStatusWx86SingleStep = 0x4000001EUL;
 }
 
 [[nodiscard]] std::wstring quote_win32_arg(std::string_view s) {
-    const int wide_len = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    const std::string quoted_utf8 = quote_windows_arg(s);
+    if (quoted_utf8.empty()) {
+        return {};
+    }
+    const int wide_len = ::MultiByteToWideChar(
+        CP_UTF8, 0, quoted_utf8.data(), static_cast<int>(quoted_utf8.size()), nullptr, 0);
     std::wstring w(static_cast<std::size_t>(std::max(0, wide_len)), L'\0');
     if (wide_len > 0) {
-        ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), wide_len);
+        ::MultiByteToWideChar(
+            CP_UTF8, 0, quoted_utf8.data(), static_cast<int>(quoted_utf8.size()), w.data(), wide_len);
     }
-    if (!w.empty() && w.find_first_of(L" \t\"") == std::wstring::npos) {
-        return w;
-    }
-    std::wstring quoted = L"\"";
-    for (wchar_t ch : w) {
-        if (ch == L'"') {
-            quoted += L"\\\"";
-        } else {
-            quoted.push_back(ch);
-        }
-    }
-    quoted.push_back(L'"');
-    return quoted;
+    return w;
 }
 
 [[nodiscard]] Result<void> win32_write_process_bytes(HANDLE hproc,
@@ -166,10 +161,13 @@ public:
         }
     }
 
-    ~Win32DebugSession() override {
+    ~Win32DebugSession() noexcept override {
         const DebugSessionState cur = state_.load(std::memory_order_acquire);
         if (cur == DebugSessionState::Running || cur == DebugSessionState::Paused) {
-            (void)detach();
+            try {
+                (void)detach();
+            } catch (...) {
+            }
         }
         {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -539,25 +537,78 @@ private:
         return {};
     }
 
+    [[nodiscard]] Result<void> clear_win_hw_breakpoints_locked() {
+#if defined(_M_X64) || defined(__x86_64__)
+        std::string errs;
+        for (auto& [tid, ht] : thread_handles_) {
+            if (ht == nullptr) continue;
+            DWORD exit_code = 0;
+            if (::GetExitCodeThread(ht, &exit_code) && exit_code != STILL_ACTIVE) {
+                continue;
+            }
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+            if (!::GetThreadContext(ht, &ctx)) {
+                const DWORD err = ::GetLastError();
+                if (!errs.empty()) errs += "; ";
+                errs += std::format("GetThreadContext(TID {}) failed (Win32 error {})", tid, err);
+                continue;
+            }
+            ctx.Dr0 = 0ULL;
+            ctx.Dr1 = 0ULL;
+            ctx.Dr2 = 0ULL;
+            ctx.Dr3 = 0ULL;
+            ctx.Dr6 = 0ULL;
+            ctx.Dr7 = 0ULL;
+            if (!::SetThreadContext(ht, &ctx)) {
+                const DWORD err = ::GetLastError();
+                if (!errs.empty()) errs += "; ";
+                errs += std::format("SetThreadContext(TID {}) failed (Win32 error {})", tid, err);
+            }
+        }
+        if (!errs.empty()) {
+            return make_error(errs);
+        }
+        hw_plan_ = X86DebugRegisterPlan{};
+        return {};
+#else
+        return make_error("Hardware breakpoints unsupported on non-x64 Win32 build");
+#endif
+    }
+
     [[nodiscard]] Result<void> disarm_sw_bp_locked(BreakpointDescriptor& bp) {
         if (!bp.armed_in_target || bp.original_bytes.empty()) {
             bp.armed_in_target = false;
             return {};
         }
         auto wr = win32_write_process_bytes(process_handle_, bp.address, bp.original_bytes);
+        if (!wr.has_value()) {
+            bp.status = SubsystemStatus::unavailable("debugger_bp", wr.error().message);
+            return wr;
+        }
         bp.armed_in_target = false;
-        return wr;
+        bp.status = SubsystemStatus::available("debugger_bp", "Disarmed (original bytes restored)");
+        return {};
+    }
+
+    [[nodiscard]] Result<void> try_disarm_temp_bp_locked() {
+        if (!temp_step_bp_.has_value()) {
+            return {};
+        }
+        if (temp_step_bp_->armed && !temp_step_bp_->original_bytes.empty()) {
+            if (auto wr = win32_write_process_bytes(
+                    process_handle_, temp_step_bp_->address, temp_step_bp_->original_bytes);
+                !wr.has_value()) {
+                return wr;
+            }
+        }
+        temp_step_bp_.reset();
+        return {};
     }
 
     void disarm_temp_bp_locked() noexcept {
-        if (temp_step_bp_.has_value()) {
-            if (temp_step_bp_->armed && !temp_step_bp_->original_bytes.empty()) {
-                (void)win32_write_process_bytes(process_handle_,
-                                                temp_step_bp_->address,
-                                                temp_step_bp_->original_bytes);
-            }
-            temp_step_bp_.reset();
-        }
+        (void)try_disarm_temp_bp_locked();
+        temp_step_bp_.reset();
     }
 
     [[nodiscard]] Result<void> loop_continue(bool pass_exception) {
@@ -805,21 +856,101 @@ private:
             shutdown_requested_ = true;
             return {};
         }
-        disarm_temp_bp_locked();
+
+        if (process_handle_ != nullptr) {
+            DWORD proc_exit = 0;
+            if (::GetExitCodeProcess(process_handle_, &proc_exit) && proc_exit != STILL_ACTIVE) {
+                close_handles_locked();
+                state_.store(DebugSessionState::Exited, std::memory_order_release);
+                ++stop_status_.stop_revision;
+                shutdown_requested_ = true;
+                state_cv_.notify_all();
+                cmd_cv_.notify_all();
+                return {};
+            }
+        }
+
+        auto append_err = [](std::string& dst, std::string_view item) {
+            if (dst.empty()) {
+                dst.assign(item);
+            } else {
+                dst += "; ";
+                dst.append(item);
+            }
+        };
+
+        std::string restore_errors;
+        if (auto tr = try_disarm_temp_bp_locked(); !tr.has_value()) {
+            append_err(restore_errors,
+                       std::format("failed to restore temporary step breakpoint at 0x{:X}: {}",
+                                   temp_step_bp_->address,
+                                   tr.error().message));
+        }
+
+        bool any_hw_armed = (hw_plan_.dr7 != 0u);
         for (BreakpointDescriptor& bp : breakpoints_) {
             if (bp.kind == BreakpointKind::Software && bp.armed_in_target) {
-                (void)disarm_sw_bp_locked(bp);
+                if (auto dr = disarm_sw_bp_locked(bp); !dr.has_value()) {
+                    append_err(restore_errors,
+                               std::format("failed to restore software breakpoint #{} at 0x{:X}: {}",
+                                           bp.id,
+                                           bp.address,
+                                           dr.error().message));
+                } else {
+                    bp.enabled = false;
+                }
+            } else if (is_hardware_breakpoint(bp.kind) && bp.armed_in_target) {
+                any_hw_armed = true;
             }
-            bp.enabled = false;
-            bp.armed_in_target = false;
         }
-        (void)apply_win_hw_plan_locked();
+
+        if (any_hw_armed) {
+            if (auto hr = clear_win_hw_breakpoints_locked(); !hr.has_value()) {
+                append_err(restore_errors,
+                           "failed to clear hardware debug registers: " + hr.error().message);
+            } else {
+                for (BreakpointDescriptor& bp : breakpoints_) {
+                    if (is_hardware_breakpoint(bp.kind)) {
+                        bp.enabled = false;
+                        bp.armed_in_target = false;
+                    }
+                }
+            }
+        }
+
+        if (!restore_errors.empty()) {
+            // Preserve attached state and un-restored breakpoint descriptors on failure.
+            return make_error("detach aborted before DebugActiveProcessStop: " + restore_errors);
+        }
+
         if (cur == DebugSessionState::Paused && pid_ != 0u && active_tid_ != 0u) {
-            (void)::ContinueDebugEvent(static_cast<DWORD>(pid_), static_cast<DWORD>(active_tid_), DBG_CONTINUE);
+            if (!::ContinueDebugEvent(
+                    static_cast<DWORD>(pid_), static_cast<DWORD>(active_tid_), DBG_CONTINUE)) {
+                const DWORD err = ::GetLastError();
+                return make_error(std::format(
+                    "ContinueDebugEvent(PID {}, TID {}) failed during detach (Win32 error {})",
+                    pid_,
+                    active_tid_,
+                    err));
+            }
+            state_.store(DebugSessionState::Running, std::memory_order_release);
         }
+
         if (pid_ != 0u) {
-            (void)::DebugActiveProcessStop(static_cast<DWORD>(pid_));
+            if (!::DebugActiveProcessStop(static_cast<DWORD>(pid_))) {
+                const DWORD err = ::GetLastError();
+                DWORD proc_exit = 0;
+                const bool target_exited =
+                    process_handle_ != nullptr &&
+                    ::GetExitCodeProcess(process_handle_, &proc_exit) &&
+                    proc_exit != STILL_ACTIVE;
+                if (!target_exited) {
+                    return make_error(std::format(
+                        "DebugActiveProcessStop(PID {}) failed (Win32 error {})", pid_, err));
+                }
+            }
         }
+
         close_handles_locked();
         state_.store(DebugSessionState::Detached, std::memory_order_release);
         ++stop_status_.stop_revision;

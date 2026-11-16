@@ -410,9 +410,12 @@ public:
           has_vm_read_(has_vm_read),
           peb_data_(std::move(peb_data)) {}
 
-    ~Win32ProcessSession() override {
+    ~Win32ProcessSession() noexcept override {
         if (suspended_ || !suspended_tids_.empty()) {
-            (void)resume();
+            try {
+                (void)resume();
+            } catch (...) {
+            }
         }
         handle_.reset();
     }
@@ -775,6 +778,9 @@ public:
             return make_error("no threads found for process");
         }
 
+        // Pre-reserve tracking capacity before suspending OS threads so push_back cannot throw.
+        suspended_tids_.reserve(suspended_tids_.size() + tids.size());
+
         std::size_t count = 0;
         for (const ThreadId tid : tids) {
             if (suspend_thread(tid)) {
@@ -784,17 +790,34 @@ public:
         if (count == 0 && suspended_tids_.empty()) {
             return make_error("failed to suspend any threads in target process");
         }
-        suspended_ = true;
+        suspended_ = !suspended_tids_.empty();
         return {};
     }
 
     [[nodiscard]] Result<void> resume() override {
-        const std::vector<ThreadId> copy = suspended_tids_;
-        for (const ThreadId tid : copy) {
-            (void)resume_thread(tid);
+        std::size_t write_idx = 0;
+        std::size_t failed_count = 0;
+        std::string detail;
+
+        for (std::size_t i = 0; i < suspended_tids_.size(); ++i) {
+            const ThreadId tid = suspended_tids_[i];
+            if (auto r = resume_os_thread(tid); !r.has_value()) {
+                suspended_tids_[write_idx++] = tid;
+                ++failed_count;
+                if (detail.empty()) {
+                    detail = std::format("TID {}: {}", tid, r.error().message);
+                } else {
+                    detail += std::format("; TID {}: {}", tid, r.error().message);
+                }
+            }
         }
-        suspended_tids_.clear();
-        suspended_ = false;
+
+        suspended_tids_.resize(write_idx);
+        suspended_ = !suspended_tids_.empty();
+        if (failed_count > 0) {
+            return make_error(
+                std::format("failed to resume {} thread(s): {}", failed_count, detail));
+        }
         return {};
     }
 
@@ -802,6 +825,9 @@ public:
         if (info_.pid == current_process_id()) {
             return make_error("cannot suspend the inspector process itself");
         }
+        // Pre-reserve before invoking SuspendThread so tracking cannot fail with bad_alloc.
+        suspended_tids_.reserve(suspended_tids_.size() + 1u);
+
         ScopedWinHandle th(::OpenThread(THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
                                         FALSE,
                                         static_cast<DWORD>(tid)));
@@ -826,18 +852,11 @@ public:
         if (it == suspended_tids_.end()) {
             return {};
         }
-        ScopedWinHandle th(
-            ::OpenThread(THREAD_SUSPEND_RESUME, FALSE, static_cast<DWORD>(tid)));
-        if (!th.valid()) {
-            return make_error("OpenThread(THREAD_SUSPEND_RESUME) failed");
-        }
-        if (::ResumeThread(th.get()) == static_cast<DWORD>(-1)) {
-            return make_error("ResumeThread failed");
+        if (auto r = resume_os_thread(tid); !r.has_value()) {
+            return r;
         }
         suspended_tids_.erase(it);
-        if (suspended_tids_.empty()) {
-            suspended_ = false;
-        }
+        suspended_ = !suspended_tids_.empty();
         return {};
     }
 
@@ -1163,6 +1182,24 @@ private:
         }
         std::ranges::sort(tids);
         return tids;
+    }
+
+    [[nodiscard]] Result<void> resume_os_thread(ThreadId tid) {
+        ScopedWinHandle th(
+            ::OpenThread(THREAD_SUSPEND_RESUME, FALSE, static_cast<DWORD>(tid)));
+        if (!th.valid()) {
+            const DWORD err = ::GetLastError();
+            if (err == ERROR_INVALID_PARAMETER && !is_alive()) {
+                return {};
+            }
+            return make_error(
+                std::format("OpenThread(THREAD_SUSPEND_RESUME) failed (Win32 error {})", err));
+        }
+        if (::ResumeThread(th.get()) == static_cast<DWORD>(-1)) {
+            const DWORD err = ::GetLastError();
+            return make_error(std::format("ResumeThread failed (Win32 error {})", err));
+        }
+        return {};
     }
 
     ProcessInfo info_;

@@ -1,10 +1,12 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -167,8 +169,17 @@ public:
 
 class DefaultProcessRunner final : public IProcessRunner {
 public:
+    DefaultProcessRunner() = default;
+    explicit DefaultProcessRunner(std::chrono::milliseconds timeout,
+                                  std::stop_token stop_token = {}) noexcept
+        : timeout_(timeout), stop_token_(std::move(stop_token)) {}
+
     [[nodiscard]] GraphRenderResult run(std::string_view executable,
                                         std::span<const std::string> arguments) const override;
+
+private:
+    std::chrono::milliseconds timeout_{15000};
+    std::stop_token stop_token_{};
 };
 
 using GraphByteReader = std::function<std::vector<std::uint8_t>(std::uint64_t offset, std::size_t size)>;

@@ -378,10 +378,13 @@ public:
         }
     }
 
-    ~LinuxDebugSession() override {
+    ~LinuxDebugSession() noexcept override {
         const DebugSessionState cur = state_.load(std::memory_order_acquire);
         if (cur == DebugSessionState::Running || cur == DebugSessionState::Paused) {
-            (void)detach();
+            try {
+                (void)detach();
+            } catch (...) {
+            }
         }
         {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -817,21 +820,34 @@ private:
         }
         const ThreadId tid = active_tid_ != 0u ? active_tid_ : pid_;
         auto wr = ptrace_write_bytes(tid, bp.address, bp.original_bytes);
-        bp.armed_in_target = false;
-        if (wr.has_value()) {
-            bp.status = SubsystemStatus::available("debugger_bp", "Disarmed (original bytes restored)");
+        if (!wr.has_value()) {
+            bp.status = SubsystemStatus::unavailable("debugger_bp", wr.error().message);
+            return wr;
         }
-        return wr;
+        bp.armed_in_target = false;
+        bp.status = SubsystemStatus::available("debugger_bp", "Disarmed (original bytes restored)");
+        return {};
+    }
+
+    [[nodiscard]] Result<void> try_disarm_temp_step_bp_locked() {
+        if (!temp_step_bp_.has_value()) {
+            return {};
+        }
+        if (temp_step_bp_->armed && !temp_step_bp_->original_bytes.empty()) {
+            const ThreadId tid = active_tid_ != 0u ? active_tid_ : pid_;
+            if (auto wr = ptrace_write_bytes(
+                    tid, temp_step_bp_->address, temp_step_bp_->original_bytes);
+                !wr.has_value()) {
+                return wr;
+            }
+        }
+        temp_step_bp_.reset();
+        return {};
     }
 
     void disarm_temp_step_bp_locked() noexcept {
-        if (temp_step_bp_.has_value()) {
-            if (temp_step_bp_->armed && !temp_step_bp_->original_bytes.empty()) {
-                const ThreadId tid = active_tid_ != 0u ? active_tid_ : pid_;
-                (void)ptrace_write_bytes(tid, temp_step_bp_->address, temp_step_bp_->original_bytes);
-            }
-            temp_step_bp_.reset();
-        }
+        (void)try_disarm_temp_step_bp_locked();
+        temp_step_bp_.reset();
     }
 
     [[nodiscard]] Result<void> sync_hardware_breakpoints_locked() {
@@ -1554,37 +1570,133 @@ private:
             return {};
         }
 
+        auto append_err = [](std::string& dst, std::string_view item) {
+            if (dst.empty()) {
+                dst.assign(item);
+            } else {
+                dst += "; ";
+                dst.append(item);
+            }
+        };
+
         // 1. If currently running, stop traced threads first so we can safely restore original code bytes!
         if (cur == DebugSessionState::Running && pid_ > 0u) {
+            std::set<ThreadId> live_tids;
             for (ThreadId tid : traced_tids_) {
-                (void)::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(tid), SIGSTOP);
+                if (::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(tid), SIGSTOP) ==
+                        0 ||
+                    errno != ESRCH) {
+                    live_tids.insert(tid);
+                }
             }
-            for (ThreadId tid : traced_tids_) {
+            for (ThreadId tid : live_tids) {
                 int wstatus = 0;
-                (void)::waitpid(static_cast<pid_t>(tid), &wstatus, __WALL);
+                pid_t wr = 0;
+                do {
+                    wr = ::waitpid(static_cast<pid_t>(tid), &wstatus, __WALL);
+                } while (wr < 0 && errno == EINTR);
+                if (wr > 0 && (WIFEXITED(wstatus) || WIFSIGNALED(wstatus))) {
+                    traced_tids_.erase(tid);
+                }
             }
+            if (traced_tids_.empty()) {
+                handle_process_exit_locked(0);
+                shutdown_requested_ = true;
+                return {};
+            }
+            active_tid_ = traced_tids_.contains(pid_) ? pid_ : *traced_tids_.begin();
+            refresh_paused_snapshot_locked();
+            state_.store(DebugSessionState::Paused, std::memory_order_release);
+            state_cv_.notify_all();
         }
 
         // 2. Disarm ALL temporary and user software breakpoints (restoring original instruction bytes!)
-        //    and clear hardware debug registers (`DR0..DR7`)!
-        disarm_temp_step_bp_locked();
+        //    and clear hardware debug registers (`DR0..DR7`) when armed.
+        std::string restore_errors;
+        if (auto tr = try_disarm_temp_step_bp_locked(); !tr.has_value()) {
+            append_err(restore_errors,
+                       std::format("failed to restore temporary step breakpoint at 0x{:X}: {}",
+                                   temp_step_bp_->address,
+                                   tr.error().message));
+        }
+
+        bool any_hw_armed = (hw_plan_.dr7 != 0u);
         for (BreakpointDescriptor& bp : breakpoints_) {
             if (bp.kind == BreakpointKind::Software && bp.armed_in_target) {
-                (void)disarm_software_bp_locked(bp);
-            } else {
-                bp.armed_in_target = false;
+                if (auto dr = disarm_software_bp_locked(bp); !dr.has_value()) {
+                    append_err(restore_errors,
+                               std::format("failed to restore software breakpoint #{} at 0x{:X}: {}",
+                                           bp.id,
+                                           bp.address,
+                                           dr.error().message));
+                }
+            } else if (is_hardware_breakpoint(bp.kind) && bp.armed_in_target) {
+                any_hw_armed = true;
             }
         }
-        const X86DebugRegisterPlan zero_hw{};
-        for (ThreadId tid : traced_tids_) {
-            (void)apply_x86_debug_registers(tid, zero_hw);
+
+        if (any_hw_armed) {
+            const X86DebugRegisterPlan zero_hw{};
+            bool hw_clear_failed = false;
+            for (ThreadId tid : traced_tids_) {
+                if (auto hr = apply_x86_debug_registers(tid, zero_hw); !hr.has_value()) {
+                    if (::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(tid), 0) ==
+                            0 ||
+                        errno != ESRCH) {
+                        hw_clear_failed = true;
+                        append_err(
+                            restore_errors,
+                            std::format("failed to clear hardware debug registers on TID {}: {}",
+                                        tid,
+                                        hr.error().message));
+                    }
+                }
+            }
+            if (!hw_clear_failed) {
+                hw_plan_ = zero_hw;
+                for (BreakpointDescriptor& bp : breakpoints_) {
+                    if (is_hardware_breakpoint(bp.kind)) {
+                        bp.armed_in_target = false;
+                    }
+                }
+            }
+        }
+
+        if (!restore_errors.empty()) {
+            // Preserve attached Paused state and un-restored breakpoint descriptors so callers can
+            // recover or terminate rather than detaching with live trap instructions in target memory.
+            return make_error("detach aborted before PTRACE_DETACH: " + restore_errors);
         }
 
         // 3. Detach cleanly from every traced thread without delivering synthetic SIGSTOP.
+        std::string detach_errors;
+        std::set<ThreadId> remaining_tids;
         for (ThreadId tid : traced_tids_) {
-            (void)::ptrace(PTRACE_DETACH, static_cast<pid_t>(tid), nullptr, reinterpret_cast<void*>(0L));
+            if (::ptrace(PTRACE_DETACH,
+                         static_cast<pid_t>(tid),
+                         nullptr,
+                         reinterpret_cast<void*>(0L)) != 0) {
+                const int err = errno;
+                if (err == ESRCH &&
+                    ::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(tid), 0) !=
+                        0 &&
+                    errno == ESRCH) {
+                    continue;
+                }
+                remaining_tids.insert(tid);
+                append_err(detach_errors,
+                           std::format("PTRACE_DETACH(TID {}) failed: {}", tid, std::strerror(err)));
+            }
         }
-        traced_tids_.clear();
+        traced_tids_ = std::move(remaining_tids);
+
+        if (!detach_errors.empty()) {
+            if (!traced_tids_.empty() && !traced_tids_.contains(active_tid_)) {
+                active_tid_ = *traced_tids_.begin();
+            }
+            return make_error("detach failed: " + detach_errors);
+        }
+
         paused_contexts_.clear();
         paused_threads_.clear();
 
@@ -1876,6 +1988,13 @@ private:
         }
 
         std::lock_guard<std::mutex> lk(mutex_);
+        for (ThreadId tid : traced_tids_) {
+            (void)::ptrace(PTRACE_DETACH,
+                           static_cast<pid_t>(tid),
+                           nullptr,
+                           reinterpret_cast<void*>(0L));
+        }
+        traced_tids_.clear();
         while (!cmd_queue_.empty()) {
             cmd_queue_.front()->done.set_value(make_error("Debugger session closed"));
             cmd_queue_.pop_front();

@@ -13,6 +13,7 @@
 #include <peelf/binary_image.hpp>
 #include <peelf/error.hpp>
 #include <peelf/forgiving.hpp>
+#include <peelf/subprocess.hpp>
 
 namespace peelf {
 
@@ -109,18 +110,9 @@ private:
     SubsystemStatus status_{};
 };
 
-struct SubprocessResult {
-    int exit_code{-1};
-    bool launched{false};
-    bool timed_out{false};
-    std::string stdout_text{};
-    std::string stderr_text{};
-    std::string launch_error{};
-};
-
 /// Executes a child process directly via `argv` (never through a shell), multiplexing
 /// `stdin_payload` concurrently with `stdout` and `stderr` drains and enforcing `timeout`
-/// across the full child lifetime (terminating and reaping hung processes cleanly).
+/// across the full child + descendant lifetime (terminating and reaping hung processes cleanly).
 [[nodiscard]] SubprocessResult run_argv_process(
     const std::filesystem::path& exe_path,
     std::span<const std::string> args,
