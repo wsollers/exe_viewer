@@ -19,6 +19,10 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/file_reader.cpp
   src/sha256.cpp
   src/endian_reader.cpp
+  src/image_internal.hpp
+  src/image_mapping.cpp
+  src/pe_image.cpp
+  src/elf_image.cpp
   src/binary_image.cpp
   src/binary_diff.cpp
   src/dependency_tree.cpp

@@ -105,7 +105,7 @@ Full architectural specifications, file boundaries, and test criteria are docume
 - [x] **WU-19b** — **GUI / Vulkan Staged RAII & Lifecycle Controllers (`peelf_gui`).** *(Depends on: `WU-19a`)*
   - Replace monolithic `initialized_`-gated teardown in `VulkanManager` with staged RAII wrappers and `UniqueVulkanTexture` handle guards; replace raw `UiApp*` in `Application` with `std::unique_ptr<UiApp>` + GLFW/NFD RAII guards.
   - Replace drop-while-busy `std::future<DecompiledUnit>` with latest-request `DecompileController` (`std::jthread` + `std::stop_source` cancellation), unify `peelf::Architecture <-> viewer::Architecture` conversion, and replace C `%llX` `snprintf` formatting with `std::format`.
-- [ ] **WU-19c** — **Core Parser Modularization (`libs/peelf_core/src/`).** *(Depends on: `WU-19b`)*
+- [x] **WU-19c** — **Core Parser Modularization (`libs/peelf_core/src/`).** *(Depends on: `WU-19b`)*
   - Split `libs/peelf_core/src/binary_image.cpp` into `image_internal.hpp`, `image_mapping.cpp`, `pe_image.cpp`, `elf_image.cpp`, and `binary_image.cpp` dispatch while preserving `<peelf/binary_image.hpp>` source compatibility.
 - [ ] **WU-19d** — **Viewer & Model Modularization (`apps/viewer/src/`).** *(Depends on: `WU-19c`)*
   - Split `apps/viewer/src/ui/ui_app.cpp` into `ui_app_project.cpp`, `ui_app_menus_docking.cpp`, `ui_app_process.cpp`, `ui_app_graph.cpp`, `ui_app_navigation.cpp`, and `ui_app.cpp`; separate `call_graph.cpp` (`call_graph_build.cpp` / `call_graph_dot.cpp`) and `binary_model.cpp` (`binary_model.cpp` / `binary_model_live.cpp`) by responsibility.
