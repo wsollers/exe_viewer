@@ -887,6 +887,16 @@ Result<BinaryDiffReport> compare_binaries(
     const IBinaryImage& rhs_image,
     std::span<const std::uint8_t> rhs_bytes,
     const BinaryDiffOptions& options) {
+    auto report_progress = [&](std::size_t completed, std::size_t total, std::string_view stage) {
+        if (options.progress_callback) {
+            options.progress_callback(completed, total, stage);
+        }
+    };
+    if (options.stop_token.stop_requested()) {
+        return make_error("Binary diff cancelled");
+    }
+    report_progress(0u, 5u, "Comparing headers & cryptographic hashes");
+
     BinaryDiffReport report;
 
     // 1. Header & identity comparison
@@ -1101,7 +1111,15 @@ Result<BinaryDiffReport> compare_binaries(
     std::vector<bool> r_matched(r_secs.size(), false);
     std::unordered_map<std::string, std::size_t> lhs_name_occ;
 
+    if (options.stop_token.stop_requested()) {
+        return make_error("Binary diff cancelled");
+    }
+    report_progress(1u, 5u, "Comparing sections & byte hunks");
+
     for (const Section& ls : l_secs) {
+        if (options.stop_token.stop_requested()) {
+            return make_error("Binary diff cancelled");
+        }
         const std::size_t occ = lhs_name_occ[ls.name]++;
         std::size_t cur_occ = 0;
         std::optional<std::size_t> match_idx;
@@ -1224,6 +1242,10 @@ Result<BinaryDiffReport> compare_binaries(
     }
 
     // 3. Import comparison
+    if (options.stop_token.stop_requested()) {
+        return make_error("Binary diff cancelled");
+    }
+    report_progress(2u, 5u, "Comparing imports & exports");
     auto import_key = [](const ImportEntry& imp, Format fmt) -> std::pair<std::string, std::string> {
         const std::string lib = (fmt == Format::PE) ? to_lower_ascii(imp.library) : imp.library;
         const std::string sym = imp.import_by_ordinal
@@ -1369,8 +1391,16 @@ Result<BinaryDiffReport> compare_binaries(
     }
 
     // 5. Three-tier relocation- & address-shift-tolerant function matching
+    if (options.stop_token.stop_requested()) {
+        return make_error("Binary diff cancelled");
+    }
+    report_progress(3u, 5u, "Extracting & normalizing functions");
     const std::vector<ExtractedFunction> l_funcs = extract_functions_for_diff(lhs_image, lhs_bytes);
+    if (options.stop_token.stop_requested()) {
+        return make_error("Binary diff cancelled");
+    }
     const std::vector<ExtractedFunction> r_funcs = extract_functions_for_diff(rhs_image, rhs_bytes);
+    report_progress(4u, 5u, "Matching functions across builds");
 
     std::vector<bool> l_used(l_funcs.size(), false);
     std::vector<bool> r_used(r_funcs.size(), false);
@@ -1476,6 +1506,9 @@ Result<BinaryDiffReport> compare_binaries(
 
     // Pass 3: Size & normalized 4-gram similarity fallback for modified anonymous/renamed functions
     for (std::size_t li = 0; li < l_funcs.size(); ++li) {
+        if (options.stop_token.stop_requested()) {
+            return make_error("Binary diff cancelled");
+        }
         if (l_used[li] || l_funcs[li].size < 8u) {
             continue;
         }
@@ -1545,6 +1578,7 @@ Result<BinaryDiffReport> compare_binaries(
         return std::tie(va_a, a.display_name) < std::tie(va_b, b.display_name);
     });
 
+    report_progress(5u, 5u, "Comparison complete");
     return report;
 }
 
@@ -1587,8 +1621,10 @@ Result<BinaryDiffReport> compare_binary_files(
 
     auto lhs = read_all(lhs_path);
     if (!lhs.has_value()) return std::unexpected(lhs.error());
+    if (options.stop_token.stop_requested()) return make_error("Binary diff cancelled");
     auto rhs = read_all(rhs_path);
     if (!rhs.has_value()) return std::unexpected(rhs.error());
+    if (options.stop_token.stop_requested()) return make_error("Binary diff cancelled");
 
     BinaryDiffOptions eff = options;
     if (eff.lhs_label == "Primary") eff.lhs_label = lhs_path.filename().string();
@@ -1612,6 +1648,15 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
     if (live_module.base_address == 0u) {
         return make_error("Live module base address is zero");
     }
+    auto report_progress = [&](std::size_t completed, std::size_t total, std::string_view stage) {
+        if (options.progress_callback) {
+            options.progress_callback(completed, total, stage);
+        }
+    };
+    if (options.stop_token.stop_requested()) {
+        return make_error("Live integrity diff cancelled");
+    }
+    report_progress(0u, 3u, "Preparing expected module sections & relocations");
 
     LiveModuleIntegrityReport report;
     report.module_name = live_module.name;
@@ -1852,8 +1897,15 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
     }
 
     // Evaluate IAT / GOT pointer slots against live RAM
+    if (options.stop_token.stop_requested()) {
+        return make_error("Live integrity diff cancelled");
+    }
+    report_progress(1u, 3u, "Inspecting live IAT / GOT pointer slots");
     std::set<std::uint64_t> seen_slot_rvas;
     for (const LoaderSlotCandidate& cand : slot_candidates) {
+        if (options.stop_token.stop_requested()) {
+            return make_error("Live integrity diff cancelled");
+        }
         if (!seen_slot_rvas.insert(cand.rva).second) {
             continue;
         }
@@ -1866,6 +1918,9 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
         const std::uint64_t disk_val = read_ptr_endian(ps->expected, off, is64, endian);
         const std::uint64_t slot_va = live_base + cand.rva;
         const MemorySample samp = read_memory_tolerant(session, all_regions, slot_va, ptr_size);
+        if (options.stop_token.stop_requested()) {
+            return make_error("Live integrity diff cancelled");
+        }
         if (samp.readable_count < ptr_size) {
             continue;
         }
@@ -1960,8 +2015,20 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
 
     // Compare each mapped section against live process memory
     bool any_readable = false;
+    std::size_t sec_idx = 0u;
     for (const PreparedSection& ps : prepared) {
+        if (options.stop_token.stop_requested()) {
+            return make_error("Live integrity diff cancelled");
+        }
+        report_progress(
+            2u,
+            3u,
+            std::format("Scanning live section {} ({}/{})", ps.sec->name, sec_idx + 1u, prepared.size()));
+        ++sec_idx;
         const MemorySample live = read_memory_tolerant(session, all_regions, ps.live_va, ps.expected.size());
+        if (options.stop_token.stop_requested()) {
+            return make_error("Live integrity diff cancelled");
+        }
         if (live.readable_count > 0u) {
             any_readable = true;
         }
@@ -2062,6 +2129,11 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
             }
         }
     }
+
+    if (options.stop_token.stop_requested()) {
+        return make_error("Live integrity diff cancelled");
+    }
+    report_progress(3u, 3u, "Live integrity comparison complete");
 
     if (!any_readable) {
         report.status = SubsystemStatus::unavailable(

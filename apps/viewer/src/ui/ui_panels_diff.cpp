@@ -91,24 +91,6 @@ namespace {
     return ImVec4(0.8f, 0.8f, 0.8f, 1.0f);
 }
 
-[[nodiscard]] peelf::Result<std::vector<std::uint8_t>> load_file_bytes(const std::filesystem::path& p) {
-    std::ifstream ifs(p, std::ios::binary | std::ios::ate);
-    if (!ifs) {
-        return peelf::make_error(std::format("Cannot open '{}' for comparison", p.string()));
-    }
-    const auto end_pos = ifs.tellg();
-    if (end_pos < 0) {
-        return peelf::make_error(std::format("Cannot read file size of '{}'", p.string()));
-    }
-    std::vector<std::uint8_t> data(static_cast<std::size_t>(end_pos));
-    ifs.seekg(0, std::ios::beg);
-    if (!data.empty() && !ifs.read(reinterpret_cast<char*>(data.data()),
-                                   static_cast<std::streamsize>(data.size()))) {
-        return peelf::make_error(std::format("Failed reading '{}'", p.string()));
-    }
-    return data;
-}
-
 [[nodiscard]] std::string hex_preview_short(std::span<const std::uint8_t> bytes, std::size_t max_n = 10u) {
     std::string out;
     const std::size_t take = std::min(bytes.size(), max_n);
@@ -136,6 +118,7 @@ BinaryDiffPanel::BinaryDiffPanel(BinaryModel& model,
 }
 
 void BinaryDiffPanel::invalidate() noexcept {
+    differ_.cancel();
     mode_ = ActiveDiffMode::None;
     static_report_.reset();
     live_report_.reset();
@@ -154,16 +137,10 @@ peelf::Result<void> BinaryDiffPanel::compare_with_file(const std::filesystem::pa
     if (!model_.has_file() || model_.image() == nullptr) {
         return peelf::make_error("Load a primary binary or attach to a process before comparing");
     }
-
-    auto rhs_loaded = load_file_bytes(comparison_path);
-    if (!rhs_loaded.has_value()) {
-        status_message_ = rhs_loaded.error().message;
-        return std::unexpected(rhs_loaded.error());
-    }
-    auto rhs_parsed = peelf::parse_image(*rhs_loaded);
-    if (!rhs_parsed.has_value()) {
-        status_message_ = rhs_parsed.error().message;
-        return std::unexpected(rhs_parsed.error());
+    if (comparison_path.empty() || !std::filesystem::exists(comparison_path)) {
+        const std::string msg = std::format("Comparison path '{}' does not exist", comparison_path.string());
+        status_message_ = msg;
+        return peelf::make_error(msg);
     }
 
     // Snapshot primary effective bytes (including staged static patches if any)
@@ -181,69 +158,27 @@ peelf::Result<void> BinaryDiffPanel::compare_with_file(const std::filesystem::pa
         return peelf::make_error("Primary binary has no readable image bytes");
     }
 
-    auto lhs_parsed = peelf::parse_image(primary_buf);
-    if (!lhs_parsed.has_value()) {
-        status_message_ = lhs_parsed.error().message;
-        return std::unexpected(lhs_parsed.error());
-    }
-
     peelf::BinaryDiffOptions opts;
     opts.lhs_label = std::filesystem::path(model_.file_info().path).filename().string();
     if (opts.lhs_label.empty()) opts.lhs_label = "Primary";
     opts.rhs_label = comparison_path.filename().string();
 
-    auto diff = peelf::compare_binaries(**lhs_parsed, primary_buf, **rhs_parsed, *rhs_loaded, opts);
-    if (!diff.has_value()) {
-        status_message_ = diff.error().message;
-        return std::unexpected(diff.error());
-    }
-
     const std::string path_str = comparison_path.string();
     std::snprintf(comparison_path_buf_.data(), comparison_path_buf_.size(), "%s", path_str.c_str());
 
-    lhs_bytes_ = std::move(primary_buf);
-    lhs_owned_image_ = std::move(*lhs_parsed);
-    rhs_bytes_ = std::move(*rhs_loaded);
-    rhs_owned_image_ = std::move(*rhs_parsed);
-
-    live_report_.reset();
-    static_report_ = std::move(*diff);
-    mode_ = ActiveDiffMode::TwoBinaries;
-    selected_hunk_index_ = 0;
-
-    if (const auto arch = to_viewer_arch(lhs_owned_image_->architecture())) {
-        (void)lhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
-    }
-    if (const auto arch = to_viewer_arch(rhs_owned_image_->architecture())) {
-        (void)rhs_disasm_.init(*arch, to_viewer_endian(rhs_owned_image_->endianness()));
-    }
-
-    if (!static_report_->byte_hunks.empty()) {
-        const auto& h0 = static_report_->byte_hunks.front();
-        focus_pair_cursor(h0.lhs_va, h0.rhs_va, h0.lhs_file_offset, h0.rhs_file_offset, 256u, false);
-    } else {
-        focus_pair_cursor(lhs_owned_image_->entry_point(),
-                          rhs_owned_image_->entry_point(),
-                          lhs_owned_image_->virtual_address_to_file_offset(lhs_owned_image_->entry_point()),
-                          rhs_owned_image_->virtual_address_to_file_offset(rhs_owned_image_->entry_point()),
-                          256u,
-                          false);
-    }
-
-    status_message_ = std::format(
-        "Compared '{}' vs '{}': {} modified section(s), {} changed byte(s), {} modified / {} relocated function(s)",
-        opts.lhs_label,
-        opts.rhs_label,
-        static_report_->sections_modified,
-        static_report_->total_changed_bytes,
-        static_report_->functions_modified,
-        static_report_->functions_relocated);
+    status_message_ = std::format("Comparing '{}' vs '{}' in background...", opts.lhs_label, opts.rhs_label);
+    differ_.start_file_diff(
+        model_.active_revision_token(),
+        std::move(primary_buf),
+        comparison_path,
+        std::move(opts));
     set_visible(true);
     return {};
 }
 
 peelf::Result<void> BinaryDiffPanel::compare_active_live_module_vs_disk() {
-    if (!model_.is_live_process() || model_.process_session() == nullptr) {
+    auto session_shared = model_.shared_process_session();
+    if (!model_.is_live_process() || session_shared == nullptr) {
         return peelf::make_error("Attach to a live process first to run Disk-vs-RAM integrity comparison");
     }
 
@@ -263,66 +198,129 @@ peelf::Result<void> BinaryDiffPanel::compare_active_live_module_vs_disk() {
         disk_path = *model_.resolved_executable_path();
     }
     if (disk_path.empty() || !std::filesystem::exists(disk_path)) {
-        return peelf::make_error(
-            std::format("Backing on-disk module '{}' is not accessible on filesystem", fallback_mod.path.string()));
-    }
-
-    auto disk_loaded = load_file_bytes(disk_path);
-    if (!disk_loaded.has_value()) {
-        status_message_ = disk_loaded.error().message;
-        return std::unexpected(disk_loaded.error());
-    }
-    auto disk_parsed = peelf::parse_image(*disk_loaded);
-    if (!disk_parsed.has_value()) {
-        status_message_ = disk_parsed.error().message;
-        return std::unexpected(disk_parsed.error());
+        const std::string msg =
+            std::format("Backing on-disk module '{}' is not accessible on filesystem", fallback_mod.path.string());
+        status_message_ = msg;
+        return peelf::make_error(msg);
     }
 
     peelf::LiveIntegrityDiffOptions opts;
     opts.include_writable_data_hunks = include_writable_live_data_;
 
-    auto live_diff = peelf::compare_module_disk_to_live(
-        **disk_parsed, *disk_loaded, *model_.process_session(), fallback_mod, opts);
-    if (!live_diff.has_value()) {
-        status_message_ = live_diff.error().message;
-        return std::unexpected(live_diff.error());
-    }
-
-    lhs_bytes_ = std::move(*disk_loaded);
-    lhs_owned_image_ = std::move(*disk_parsed);
-    rhs_bytes_.clear();
-    rhs_owned_image_.reset();
-
-    static_report_.reset();
-    live_report_ = std::move(*live_diff);
-    mode_ = ActiveDiffMode::DiskVsLiveRam;
-    selected_hunk_index_ = 0;
-
-    if (const auto arch = to_viewer_arch(lhs_owned_image_->architecture())) {
-        (void)lhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
-        (void)rhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
-    }
-
-    if (!live_report_->findings.empty()) {
-        const auto& h0 = live_report_->findings.front();
-        focus_pair_cursor(h0.lhs_va, h0.rhs_va, h0.lhs_file_offset, std::nullopt, 256u, false);
-    } else {
-        const std::uint64_t entry_rva =
-            lhs_owned_image_->entry_point() >= lhs_owned_image_->image_base()
-                ? (lhs_owned_image_->entry_point() - lhs_owned_image_->image_base())
-                : 0u;
-        focus_pair_cursor(
-            lhs_owned_image_->image_base() + entry_rva,
-            fallback_mod.base_address + entry_rva,
-            lhs_owned_image_->virtual_address_to_file_offset(lhs_owned_image_->image_base() + entry_rva),
-            std::nullopt,
-            256u,
-            false);
-    }
-
-    status_message_ = live_report_->status.detail;
+    status_message_ = std::format(
+        "Comparing live module '{}' (0x{:X}) against '{}' in background...",
+        fallback_mod.name,
+        fallback_mod.base_address,
+        disk_path.filename().string());
+    differ_.start_live_integrity_diff(
+        model_.active_revision_token(),
+        std::move(disk_path),
+        std::move(session_shared),
+        fallback_mod,
+        std::move(opts));
     set_visible(true);
     return {};
+}
+
+void BinaryDiffPanel::poll_async_completion() {
+    auto finished = differ_.poll_completed(model_.active_revision_token());
+    if (!finished.has_value()) {
+        return;
+    }
+
+    if (finished->status == AsyncDiffStatus::Cancelled) {
+        status_message_ = "Binary diff cancelled.";
+        return;
+    }
+    if (finished->status == AsyncDiffStatus::StaleDiscarded) {
+        status_message_ = finished->error_message;
+        return;
+    }
+    if (finished->status != AsyncDiffStatus::Succeeded) {
+        status_message_ = finished->error_message;
+        Log().error("Binary Diff: {}", finished->error_message);
+        return;
+    }
+
+    if (finished->kind == AsyncDiffKind::TwoBinaries && finished->static_report.has_value()) {
+        lhs_bytes_ = std::move(finished->lhs_bytes);
+        lhs_owned_image_ = std::move(finished->lhs_image);
+        rhs_bytes_ = std::move(finished->rhs_bytes);
+        rhs_owned_image_ = std::move(finished->rhs_image);
+
+        live_report_.reset();
+        static_report_ = std::move(finished->static_report);
+        mode_ = ActiveDiffMode::TwoBinaries;
+        selected_hunk_index_ = 0;
+
+        if (lhs_owned_image_ != nullptr) {
+            if (const auto arch = to_viewer_arch(lhs_owned_image_->architecture())) {
+                (void)lhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
+            }
+        }
+        if (rhs_owned_image_ != nullptr) {
+            if (const auto arch = to_viewer_arch(rhs_owned_image_->architecture())) {
+                (void)rhs_disasm_.init(*arch, to_viewer_endian(rhs_owned_image_->endianness()));
+            }
+        }
+
+        if (!static_report_->byte_hunks.empty()) {
+            const auto& h0 = static_report_->byte_hunks.front();
+            focus_pair_cursor(h0.lhs_va, h0.rhs_va, h0.lhs_file_offset, h0.rhs_file_offset, 256u, false);
+        } else if (lhs_owned_image_ != nullptr && rhs_owned_image_ != nullptr) {
+            focus_pair_cursor(lhs_owned_image_->entry_point(),
+                              rhs_owned_image_->entry_point(),
+                              lhs_owned_image_->virtual_address_to_file_offset(lhs_owned_image_->entry_point()),
+                              rhs_owned_image_->virtual_address_to_file_offset(rhs_owned_image_->entry_point()),
+                              256u,
+                              false);
+        }
+
+        status_message_ = std::format(
+            "Compared '{}' vs '{}': {} modified section(s), {} changed byte(s), {} modified / {} relocated function(s)",
+            finished->lhs_label,
+            finished->rhs_label,
+            static_report_->sections_modified,
+            static_report_->total_changed_bytes,
+            static_report_->functions_modified,
+            static_report_->functions_relocated);
+    } else if (finished->kind == AsyncDiffKind::DiskVsLiveRam && finished->live_report.has_value()) {
+        lhs_bytes_ = std::move(finished->lhs_bytes);
+        lhs_owned_image_ = std::move(finished->lhs_image);
+        rhs_bytes_.clear();
+        rhs_owned_image_.reset();
+
+        static_report_.reset();
+        live_report_ = std::move(finished->live_report);
+        mode_ = ActiveDiffMode::DiskVsLiveRam;
+        selected_hunk_index_ = 0;
+
+        if (lhs_owned_image_ != nullptr) {
+            if (const auto arch = to_viewer_arch(lhs_owned_image_->architecture())) {
+                (void)lhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
+                (void)rhs_disasm_.init(*arch, to_viewer_endian(lhs_owned_image_->endianness()));
+            }
+        }
+
+        if (!live_report_->findings.empty()) {
+            const auto& h0 = live_report_->findings.front();
+            focus_pair_cursor(h0.lhs_va, h0.rhs_va, h0.lhs_file_offset, std::nullopt, 256u, false);
+        } else if (lhs_owned_image_ != nullptr) {
+            const std::uint64_t entry_rva =
+                lhs_owned_image_->entry_point() >= lhs_owned_image_->image_base()
+                    ? (lhs_owned_image_->entry_point() - lhs_owned_image_->image_base())
+                    : 0u;
+            focus_pair_cursor(
+                lhs_owned_image_->image_base() + entry_rva,
+                finished->live_module.base_address + entry_rva,
+                lhs_owned_image_->virtual_address_to_file_offset(lhs_owned_image_->image_base() + entry_rva),
+                std::nullopt,
+                256u,
+                false);
+        }
+
+        status_message_ = live_report_->status.detail;
+    }
 }
 
 void BinaryDiffPanel::focus_pair_cursor(std::optional<std::uint64_t> lhs_va,
@@ -392,12 +390,17 @@ void BinaryDiffPanel::refresh_side_by_side_slices() {
 }
 
 void BinaryDiffPanel::draw_contents() {
+    poll_async_completion();
+
     if (!model_.has_file()) {
         ImGui::TextDisabled("Open a primary binary or attach to a process to launch Binary Diff.");
         return;
     }
 
+    const AsyncDiffProgress prog = differ_.progress();
+
     // Top Action Bar
+    ImGui::BeginDisabled(prog.running);
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22.0f);
     ImGui::InputTextWithHint("##DiffPath", "Path to comparison PE/ELF binary...",
                              comparison_path_buf_.data(), comparison_path_buf_.size());
@@ -423,6 +426,22 @@ void BinaryDiffPanel::draw_contents() {
         if (ImGui::Checkbox("Include .data/.bss", &include_writable_live_data_) &&
             mode_ == ActiveDiffMode::DiskVsLiveRam) {
             (void)compare_active_live_module_vs_disk();
+        }
+    }
+    ImGui::EndDisabled();
+
+    if (prog.running) {
+        const float fraction = prog.total_steps > 0u
+            ? std::clamp(static_cast<float>(prog.completed_steps) / static_cast<float>(prog.total_steps), 0.0f, 1.0f)
+            : 0.0f;
+        ImGui::ProgressBar(fraction, ImVec2(ImGui::GetFontSize() * 16.0f, 0.0f));
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) {
+            differ_.cancel();
+        }
+        if (!prog.stage.empty()) {
+            ImGui::SameLine();
+            ImGui::TextUnformatted(prog.stage.c_str());
         }
     }
 

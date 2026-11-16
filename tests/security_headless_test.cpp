@@ -132,7 +132,15 @@ std::vector<std::uint8_t> build_hardened_pe64(std::uint16_t dll_chars_override =
     put32(b, 0x1000u, 16u);     // dwLength
     put16(b, 0x1004u, 0x0200u); // WIN_CERT_REVISION_2_0
     put16(b, 0x1006u, 0x0002u); // WIN_CERT_TYPE_PKCS_SIGNED_DATA
-    put64(b, 0x1008u, 0x30820100deadbeefULL);
+    // ASN.1 DER SEQUENCE header (0x30 0x06 ...) for structurally valid PKCS#7 SignedData container
+    b[0x1008u] = 0x30u;
+    b[0x1009u] = 0x06u;
+    b[0x100Au] = 0x06u;
+    b[0x100Bu] = 0x04u;
+    b[0x100Cu] = 0x2Au;
+    b[0x100Du] = 0x86u;
+    b[0x100Eu] = 0x48u;
+    b[0x100Fu] = 0x86u;
     // DataDirectory[4] = Security / Certificate Table (opt + 0x70 + 4*8 = opt + 0x90)
     put32(b, opt + 0x90u, 0x1000u);
     put32(b, opt + 0x94u, 16u);
@@ -541,16 +549,28 @@ TEST(SecurityAuditTest, HardenedPe64PassesAllPeRules) {
 
     const peelf::SecurityAuditReport audit = peelf::audit_security(**parsed, raw);
     EXPECT_TRUE(audit.status.has_data());
-    EXPECT_EQ(audit.error_count, 0u);
     EXPECT_EQ(audit.warning_count, 0u);
-    EXPECT_EQ(audit.note_count, 0u);
-    EXPECT_EQ(audit.pass_count, 8u);
+    EXPECT_EQ(audit.pass_count, 7u);
 
-    for (std::string_view id : {"PE1001", "PE1002", "PE1003", "PE1004", "PE1005", "PE1006", "PE1007", "PE1008"}) {
+    for (std::string_view id : {"PE1001", "PE1002", "PE1003", "PE1004", "PE1006", "PE1007", "PE1008"}) {
         const auto* f = find_rule(audit, id);
         ASSERT_NE(f, nullptr) << "Missing rule " << id;
         EXPECT_EQ(f->severity, peelf::SecuritySeverity::Pass) << id << ": " << f->summary << " | " << f->evidence;
     }
+
+    const auto* pe1005 = find_rule(audit, "PE1005");
+    ASSERT_NE(pe1005, nullptr);
+#ifdef _WIN32
+    // Synthetic unsigned DER stub is rejected by offline WinVerifyTrust on Windows.
+    EXPECT_EQ(pe1005->severity, peelf::SecuritySeverity::Error);
+    EXPECT_EQ(audit.error_count, 1u);
+    EXPECT_EQ(audit.note_count, 0u);
+#else
+    // Certificate presence alone never counts as Pass when cryptographic trust cannot be verified on host.
+    EXPECT_EQ(pe1005->severity, peelf::SecuritySeverity::Note);
+    EXPECT_EQ(audit.error_count, 0u);
+    EXPECT_EQ(audit.note_count, 1u);
+#endif
 
     // Without HIGH_ENTROPY_VA on 64-bit, PE1001 degrades to Warning (32-bit entropy ASLR).
     const auto low_entropy_raw = build_hardened_pe64(0x41C0u); // DYNAMIC_BASE without HIGH_ENTROPY_VA

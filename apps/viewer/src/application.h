@@ -10,7 +10,6 @@
 #include "ui/ui_app.hpp"
 #include "vulkan/vulkan_manager.h"
 #include "disasm/disassembler.hpp"
-#include "model/pe_model.hpp"
 namespace viewer {
 
     struct AppConfig {

@@ -212,6 +212,13 @@ struct PeLoadConfigDirectory {
     std::uint64_t guard_eh_continuation_count = 0;
 };
 
+struct PeDataDirectory {
+    std::uint32_t index = 0;
+    std::string name{};
+    std::uint32_t rva = 0;
+    std::uint32_t size = 0;
+};
+
 struct PeHeader {
     std::uint16_t machine = 0;
     std::uint16_t number_of_sections = 0;
@@ -221,6 +228,9 @@ struct PeHeader {
     std::uint16_t optional_header_size = 0;
     std::uint16_t characteristics = 0;
     std::uint16_t optional_magic = 0;
+    std::uint32_t entry_point_rva = 0;
+    std::uint32_t section_alignment = 0;
+    std::uint32_t file_alignment = 0;
     std::uint32_t size_of_image = 0;
     std::uint32_t size_of_headers = 0;
     std::uint32_t checksum = 0;
@@ -282,6 +292,9 @@ struct ElfHeader {
     std::uint16_t section_header_entry_size = 0;
     std::uint16_t section_header_count = 0;
     std::uint16_t section_name_string_table_index = 0;
+    std::uint32_t effective_program_header_count = 0;
+    std::uint32_t effective_section_header_count = 0;
+    std::uint32_t effective_shstrndx = 0;
 };
 
 struct ElfProgramHeader {
@@ -393,6 +406,7 @@ public:
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
     [[nodiscard]] virtual const GnuDebugLink* gnu_debuglink() const noexcept { return nullptr; }
     [[nodiscard]] virtual const PeHeader* pe_header() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<PeDataDirectory>& pe_data_directories() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;
     [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept = 0;

@@ -2,9 +2,86 @@
 #include <peelf/endian_reader.hpp>
 
 #include <algorithm>
+#include <array>
 #include <format>
 
 namespace peelf::debugger {
+
+namespace {
+
+[[nodiscard]] std::uint32_t rd_u32(std::span<const std::uint8_t> b,
+                                   std::size_t off,
+                                   Endianness endian) noexcept {
+    if (endian == Endianness::Big) {
+        return (static_cast<std::uint32_t>(b[off]) << 24u) |
+               (static_cast<std::uint32_t>(b[off + 1u]) << 16u) |
+               (static_cast<std::uint32_t>(b[off + 2u]) << 8u) |
+               static_cast<std::uint32_t>(b[off + 3u]);
+    }
+    return static_cast<std::uint32_t>(b[off]) |
+           (static_cast<std::uint32_t>(b[off + 1u]) << 8u) |
+           (static_cast<std::uint32_t>(b[off + 2u]) << 16u) |
+           (static_cast<std::uint32_t>(b[off + 3u]) << 24u);
+}
+
+[[nodiscard]] std::uint64_t rd_u64(std::span<const std::uint8_t> b,
+                                   std::size_t off,
+                                   Endianness endian) noexcept {
+    if (endian == Endianness::Big) {
+        return (static_cast<std::uint64_t>(rd_u32(b, off, endian)) << 32u) |
+               static_cast<std::uint64_t>(rd_u32(b, off + 4u, endian));
+    }
+    return static_cast<std::uint64_t>(rd_u32(b, off, endian)) |
+           (static_cast<std::uint64_t>(rd_u32(b, off + 4u, endian)) << 32u);
+}
+
+[[nodiscard]] RegisterValue make_reg_val(std::string name,
+                                         RegisterCategory cat,
+                                         std::uint16_t bit_width,
+                                         std::uint64_t val,
+                                         Endianness endian) {
+    RegisterValue rv{};
+    rv.name = std::move(name);
+    rv.category = cat;
+    rv.bit_width = bit_width;
+    rv.value_u64 = val;
+    const std::size_t byte_len = bit_width == 64u ? 8u : 4u;
+    rv.raw_bytes.resize(byte_len);
+    for (std::size_t i = 0; i < byte_len; ++i) {
+        const std::size_t shift = (endian == Endianness::Big)
+                                      ? ((byte_len - 1u - i) * 8u)
+                                      : (i * 8u);
+        rv.raw_bytes[i] = static_cast<std::uint8_t>((val >> shift) & 0xFFu);
+    }
+    rv.formatted = bit_width == 64u ? std::format("0x{:016X}", val)
+                                    : std::format("0x{:08X}", static_cast<std::uint32_t>(val));
+    return rv;
+}
+
+[[nodiscard]] std::vector<FlagBitInfo> decode_x86_flags_common(std::uint64_t rflags) {
+    return {
+        {"CF", 0, ((rflags >> 0u) & 1u) != 0u, "Carry Flag"},
+        {"PF", 2, ((rflags >> 2u) & 1u) != 0u, "Parity Flag"},
+        {"AF", 4, ((rflags >> 4u) & 1u) != 0u, "Auxiliary Carry Flag"},
+        {"ZF", 6, ((rflags >> 6u) & 1u) != 0u, "Zero Flag"},
+        {"SF", 7, ((rflags >> 7u) & 1u) != 0u, "Sign Flag"},
+        {"TF", 8, ((rflags >> 8u) & 1u) != 0u, "Trap Flag"},
+        {"IF", 9, ((rflags >> 9u) & 1u) != 0u, "Interrupt Enable Flag"},
+        {"DF", 10, ((rflags >> 10u) & 1u) != 0u, "Direction Flag"},
+        {"OF", 11, ((rflags >> 11u) & 1u) != 0u, "Overflow Flag"},
+    };
+}
+
+[[nodiscard]] std::vector<FlagBitInfo> decode_arm_pstate_common(std::uint64_t pstate) {
+    return {
+        {"N", 31, ((pstate >> 31u) & 1u) != 0u, "Negative Condition Flag"},
+        {"Z", 30, ((pstate >> 30u) & 1u) != 0u, "Zero Condition Flag"},
+        {"C", 29, ((pstate >> 29u) & 1u) != 0u, "Carry Condition Flag"},
+        {"V", 28, ((pstate >> 28u) & 1u) != 0u, "Overflow Condition Flag"},
+    };
+}
+
+} // namespace
 namespace {
 
 constexpr void store_u16(std::array<std::uint8_t, 4>& out,
@@ -497,6 +574,279 @@ std::optional<std::uint8_t> match_x86_dr6_triggered_slot(
         }
     }
     return std::nullopt;
+}
+
+ThreadContext decode_linux_prstatus_regset(
+    ThreadId tid,
+    const TargetLayout& layout,
+    std::span<const std::uint8_t> raw_regset) {
+    ThreadContext ctx{};
+    ctx.tid = tid;
+    ctx.layout = layout;
+
+    const Endianness endian = layout.endianness;
+
+    switch (layout.architecture) {
+        case Architecture::X86_64: {
+            // Linux x86_64 user_regs_struct: 27 x uint64_t = 216 bytes
+            constexpr std::size_t kMinBytes = 27u * 8u;
+            if (raw_regset.size() < kMinBytes) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "debugger_ptrace",
+                    std::format("NT_PRSTATUS register payload truncated for X86_64 ({} bytes, expected >= {})",
+                                raw_regset.size(),
+                                kMinBytes));
+                return ctx;
+            }
+            const auto reg = [&](std::size_t idx) noexcept {
+                return rd_u64(raw_regset, idx * 8u, endian);
+            };
+            const std::uint64_t r15 = reg(0);
+            const std::uint64_t r14 = reg(1);
+            const std::uint64_t r13 = reg(2);
+            const std::uint64_t r12 = reg(3);
+            const std::uint64_t rbp = reg(4);
+            const std::uint64_t rbx = reg(5);
+            const std::uint64_t r11 = reg(6);
+            const std::uint64_t r10 = reg(7);
+            const std::uint64_t r9 = reg(8);
+            const std::uint64_t r8 = reg(9);
+            const std::uint64_t rax = reg(10);
+            const std::uint64_t rcx = reg(11);
+            const std::uint64_t rdx = reg(12);
+            const std::uint64_t rsi = reg(13);
+            const std::uint64_t rdi = reg(14);
+            const std::uint64_t orig_rax = reg(15);
+            const std::uint64_t rip = reg(16);
+            const std::uint64_t cs = reg(17);
+            const std::uint64_t rflags = reg(18);
+            const std::uint64_t rsp = reg(19);
+            const std::uint64_t ss = reg(20);
+            const std::uint64_t fs_base = reg(21);
+            const std::uint64_t gs_base = reg(22);
+
+            ctx.instruction_pointer = rip;
+            ctx.stack_pointer = rsp;
+            ctx.frame_pointer = rbp;
+            if (fs_base != 0u) {
+                ctx.tls_pointer = fs_base;
+            }
+            ctx.flags_value = rflags;
+            ctx.decoded_flags = decode_x86_flags_common(rflags);
+
+            ctx.registers.reserve(23u);
+            ctx.registers.push_back(make_reg_val("rip", RegisterCategory::InstructionPointer, 64u, rip, endian));
+            ctx.registers.push_back(make_reg_val("rsp", RegisterCategory::StackPointer, 64u, rsp, endian));
+            ctx.registers.push_back(make_reg_val("rbp", RegisterCategory::FramePointer, 64u, rbp, endian));
+            ctx.registers.push_back(make_reg_val("rflags", RegisterCategory::Flags, 64u, rflags, endian));
+            ctx.registers.push_back(make_reg_val("rax", RegisterCategory::General, 64u, rax, endian));
+            ctx.registers.push_back(make_reg_val("rbx", RegisterCategory::General, 64u, rbx, endian));
+            ctx.registers.push_back(make_reg_val("rcx", RegisterCategory::General, 64u, rcx, endian));
+            ctx.registers.push_back(make_reg_val("rdx", RegisterCategory::General, 64u, rdx, endian));
+            ctx.registers.push_back(make_reg_val("rsi", RegisterCategory::General, 64u, rsi, endian));
+            ctx.registers.push_back(make_reg_val("rdi", RegisterCategory::General, 64u, rdi, endian));
+            ctx.registers.push_back(make_reg_val("r8", RegisterCategory::General, 64u, r8, endian));
+            ctx.registers.push_back(make_reg_val("r9", RegisterCategory::General, 64u, r9, endian));
+            ctx.registers.push_back(make_reg_val("r10", RegisterCategory::General, 64u, r10, endian));
+            ctx.registers.push_back(make_reg_val("r11", RegisterCategory::General, 64u, r11, endian));
+            ctx.registers.push_back(make_reg_val("r12", RegisterCategory::General, 64u, r12, endian));
+            ctx.registers.push_back(make_reg_val("r13", RegisterCategory::General, 64u, r13, endian));
+            ctx.registers.push_back(make_reg_val("r14", RegisterCategory::General, 64u, r14, endian));
+            ctx.registers.push_back(make_reg_val("r15", RegisterCategory::General, 64u, r15, endian));
+            ctx.registers.push_back(make_reg_val("orig_rax", RegisterCategory::System, 64u, orig_rax, endian));
+            ctx.registers.push_back(make_reg_val("cs", RegisterCategory::SegmentOrTls, 64u, cs, endian));
+            ctx.registers.push_back(make_reg_val("ss", RegisterCategory::SegmentOrTls, 64u, ss, endian));
+            ctx.registers.push_back(make_reg_val("fs_base", RegisterCategory::SegmentOrTls, 64u, fs_base, endian));
+            ctx.registers.push_back(make_reg_val("gs_base", RegisterCategory::SegmentOrTls, 64u, gs_base, endian));
+            ctx.status = SubsystemStatus::available("debugger_ptrace", "Decoded Linux X86_64 NT_PRSTATUS registers");
+            return ctx;
+        }
+        case Architecture::X86: {
+            // Linux i386 user_regs_struct: 17 x uint32_t = 68 bytes
+            constexpr std::size_t kMinBytes = 17u * 4u;
+            if (raw_regset.size() < kMinBytes) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "debugger_ptrace",
+                    std::format("NT_PRSTATUS register payload truncated for X86 ({} bytes, expected >= {})",
+                                raw_regset.size(),
+                                kMinBytes));
+                return ctx;
+            }
+            const auto reg = [&](std::size_t idx) noexcept {
+                return static_cast<std::uint64_t>(rd_u32(raw_regset, idx * 4u, endian));
+            };
+            const std::uint64_t ebx = reg(0);
+            const std::uint64_t ecx = reg(1);
+            const std::uint64_t edx = reg(2);
+            const std::uint64_t esi = reg(3);
+            const std::uint64_t edi = reg(4);
+            const std::uint64_t ebp = reg(5);
+            const std::uint64_t eax = reg(6);
+            const std::uint64_t orig_eax = reg(11);
+            const std::uint64_t eip = reg(12);
+            const std::uint64_t eflags = reg(14);
+            const std::uint64_t esp = reg(15);
+
+            ctx.instruction_pointer = eip;
+            ctx.stack_pointer = esp;
+            ctx.frame_pointer = ebp;
+            ctx.flags_value = eflags;
+            ctx.decoded_flags = decode_x86_flags_common(eflags);
+
+            ctx.registers.push_back(make_reg_val("eip", RegisterCategory::InstructionPointer, 32u, eip, endian));
+            ctx.registers.push_back(make_reg_val("esp", RegisterCategory::StackPointer, 32u, esp, endian));
+            ctx.registers.push_back(make_reg_val("ebp", RegisterCategory::FramePointer, 32u, ebp, endian));
+            ctx.registers.push_back(make_reg_val("eflags", RegisterCategory::Flags, 32u, eflags, endian));
+            ctx.registers.push_back(make_reg_val("eax", RegisterCategory::General, 32u, eax, endian));
+            ctx.registers.push_back(make_reg_val("ebx", RegisterCategory::General, 32u, ebx, endian));
+            ctx.registers.push_back(make_reg_val("ecx", RegisterCategory::General, 32u, ecx, endian));
+            ctx.registers.push_back(make_reg_val("edx", RegisterCategory::General, 32u, edx, endian));
+            ctx.registers.push_back(make_reg_val("esi", RegisterCategory::General, 32u, esi, endian));
+            ctx.registers.push_back(make_reg_val("edi", RegisterCategory::General, 32u, edi, endian));
+            ctx.registers.push_back(make_reg_val("orig_eax", RegisterCategory::System, 32u, orig_eax, endian));
+            ctx.status = SubsystemStatus::available("debugger_ptrace", "Decoded Linux X86 NT_PRSTATUS registers");
+            return ctx;
+        }
+        case Architecture::ARM64: {
+            // Linux AArch64 user_pt_regs: x0..x30 (31), sp (31), pc (32), pstate (33) = 34 x uint64_t = 272 bytes
+            constexpr std::size_t kMinBytes = 34u * 8u;
+            if (raw_regset.size() < kMinBytes) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "debugger_ptrace",
+                    std::format("NT_PRSTATUS register payload truncated for ARM64 ({} bytes, expected >= {})",
+                                raw_regset.size(),
+                                kMinBytes));
+                return ctx;
+            }
+            const auto reg = [&](std::size_t idx) noexcept {
+                return rd_u64(raw_regset, idx * 8u, endian);
+            };
+            const std::uint64_t fp = reg(29);
+            const std::uint64_t lr = reg(30);
+            const std::uint64_t sp = reg(31);
+            const std::uint64_t pc = reg(32);
+            const std::uint64_t pstate = reg(33);
+
+            ctx.instruction_pointer = pc;
+            ctx.stack_pointer = sp;
+            ctx.frame_pointer = fp;
+            ctx.link_register = lr;
+            ctx.flags_value = pstate;
+            ctx.decoded_flags = decode_arm_pstate_common(pstate);
+
+            ctx.registers.reserve(34u);
+            ctx.registers.push_back(make_reg_val("pc", RegisterCategory::InstructionPointer, 64u, pc, endian));
+            ctx.registers.push_back(make_reg_val("sp", RegisterCategory::StackPointer, 64u, sp, endian));
+            ctx.registers.push_back(make_reg_val("x29", RegisterCategory::FramePointer, 64u, fp, endian));
+            ctx.registers.push_back(make_reg_val("x30", RegisterCategory::General, 64u, lr, endian));
+            ctx.registers.push_back(make_reg_val("pstate", RegisterCategory::Flags, 64u, pstate, endian));
+            for (std::size_t i = 0u; i <= 28u; ++i) {
+                ctx.registers.push_back(
+                    make_reg_val(std::format("x{}", i), RegisterCategory::General, 64u, reg(i), endian));
+            }
+            ctx.status = SubsystemStatus::available("debugger_ptrace", "Decoded Linux ARM64 NT_PRSTATUS registers");
+            return ctx;
+        }
+        case Architecture::RISCV64: {
+            // Linux RISC-V 64 user_regs_struct: pc, ra, sp, gp, tp, t0..t2, s0..s1, a0..a7, s2..s11, t3..t6 = 32 x uint64_t = 256 bytes
+            constexpr std::size_t kMinBytes = 32u * 8u;
+            if (raw_regset.size() < kMinBytes) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "debugger_ptrace",
+                    std::format("NT_PRSTATUS register payload truncated for RISCV64 ({} bytes, expected >= {})",
+                                raw_regset.size(),
+                                kMinBytes));
+                return ctx;
+            }
+            static constexpr std::array<std::string_view, 32> kRiscvNames = {
+                "pc", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+                "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+                "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+                "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6",
+            };
+            const auto reg = [&](std::size_t idx) noexcept {
+                return rd_u64(raw_regset, idx * 8u, endian);
+            };
+            ctx.instruction_pointer = reg(0);
+            ctx.link_register = reg(1);
+            ctx.stack_pointer = reg(2);
+            ctx.frame_pointer = reg(8);
+
+            ctx.registers.reserve(32u);
+            for (std::size_t i = 0u; i < 32u; ++i) {
+                RegisterCategory cat = RegisterCategory::General;
+                if (i == 0u) cat = RegisterCategory::InstructionPointer;
+                else if (i == 2u) cat = RegisterCategory::StackPointer;
+                else if (i == 8u) cat = RegisterCategory::FramePointer;
+                ctx.registers.push_back(make_reg_val(std::string(kRiscvNames[i]), cat, 64u, reg(i), endian));
+            }
+            ctx.status = SubsystemStatus::available("debugger_ptrace", "Decoded Linux RISCV64 NT_PRSTATUS registers");
+            return ctx;
+        }
+        case Architecture::ARM: {
+            // Linux ARM32 pt_regs: r0..r10, fp(11), ip(12), sp(13), lr(14), pc(15), cpsr(16) >= 17 x uint32_t = 68 bytes
+            constexpr std::size_t kMinBytes = 17u * 4u;
+            if (raw_regset.size() < kMinBytes) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "debugger_ptrace",
+                    std::format("NT_PRSTATUS register payload truncated for ARM ({} bytes, expected >= {})",
+                                raw_regset.size(),
+                                kMinBytes));
+                return ctx;
+            }
+            const auto reg = [&](std::size_t idx) noexcept {
+                return static_cast<std::uint64_t>(rd_u32(raw_regset, idx * 4u, endian));
+            };
+            const std::uint64_t fp = reg(11);
+            const std::uint64_t sp = reg(13);
+            const std::uint64_t lr = reg(14);
+            const std::uint64_t pc = reg(15);
+            const std::uint64_t cpsr = reg(16);
+
+            ctx.instruction_pointer = pc;
+            ctx.stack_pointer = sp;
+            ctx.frame_pointer = fp;
+            ctx.link_register = lr;
+            ctx.flags_value = cpsr;
+            ctx.decoded_flags = decode_arm_pstate_common(cpsr);
+
+            ctx.registers.reserve(17u);
+            ctx.registers.push_back(make_reg_val("pc", RegisterCategory::InstructionPointer, 32u, pc, endian));
+            ctx.registers.push_back(make_reg_val("sp", RegisterCategory::StackPointer, 32u, sp, endian));
+            ctx.registers.push_back(make_reg_val("fp", RegisterCategory::FramePointer, 32u, fp, endian));
+            ctx.registers.push_back(make_reg_val("lr", RegisterCategory::General, 32u, lr, endian));
+            ctx.registers.push_back(make_reg_val("cpsr", RegisterCategory::Flags, 32u, cpsr, endian));
+            for (std::size_t i = 0u; i <= 12u; ++i) {
+                if (i == 11u) continue;
+                ctx.registers.push_back(
+                    make_reg_val(std::format("r{}", i), RegisterCategory::General, 32u, reg(i), endian));
+            }
+            ctx.status = SubsystemStatus::available("debugger_ptrace", "Decoded Linux ARM NT_PRSTATUS registers");
+            return ctx;
+        }
+        default: {
+            if (!raw_regset.empty()) {
+                RegisterValue raw_blob{};
+                raw_blob.name = "nt_prstatus_raw";
+                raw_blob.category = RegisterCategory::System;
+                raw_blob.bit_width = static_cast<std::uint16_t>(std::min<std::size_t>(raw_regset.size() * 8u, 0xFFFFu));
+                raw_blob.raw_bytes.assign(raw_regset.begin(), raw_regset.end());
+                raw_blob.formatted = std::format("{} raw byte(s)", raw_regset.size());
+                ctx.registers.push_back(std::move(raw_blob));
+                ctx.status = SubsystemStatus::partial(
+                    "debugger_ptrace",
+                    std::format("Captured {} raw NT_PRSTATUS byte(s), but register ABI decoding is unsupported for {}",
+                                raw_regset.size(),
+                                to_string(layout.architecture)));
+            } else {
+                ctx.status = SubsystemStatus::unavailable(
+                    "debugger_ptrace",
+                    std::format("Register ABI decoding is unsupported for {} (empty NT_PRSTATUS payload)",
+                                to_string(layout.architecture)));
+            }
+            return ctx;
+        }
+    }
 }
 
 }  // namespace peelf::debugger

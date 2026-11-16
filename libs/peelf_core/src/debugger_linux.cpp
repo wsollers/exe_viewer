@@ -98,36 +98,6 @@ constexpr std::size_t kMaxEventHistory = 512u;
     }
 }
 
-[[nodiscard]] RegisterValue make_gpr64(std::string name,
-                                       RegisterCategory cat,
-                                       std::uint64_t val) {
-    RegisterValue rv{};
-    rv.name = std::move(name);
-    rv.category = cat;
-    rv.bit_width = 64u;
-    rv.value_u64 = val;
-    rv.raw_bytes.resize(8u);
-    for (std::size_t i = 0; i < 8u; ++i) {
-        rv.raw_bytes[i] = static_cast<std::uint8_t>((val >> (i * 8u)) & 0xFFu);
-    }
-    rv.formatted = std::format("0x{:016X}", val);
-    return rv;
-}
-
-[[nodiscard]] std::vector<FlagBitInfo> decode_x86_flags_bits(std::uint64_t rflags) {
-    return {
-        {"CF", 0, ((rflags >> 0u) & 1u) != 0u, "Carry Flag"},
-        {"PF", 2, ((rflags >> 2u) & 1u) != 0u, "Parity Flag"},
-        {"AF", 4, ((rflags >> 4u) & 1u) != 0u, "Auxiliary Carry Flag"},
-        {"ZF", 6, ((rflags >> 6u) & 1u) != 0u, "Zero Flag"},
-        {"SF", 7, ((rflags >> 7u) & 1u) != 0u, "Sign Flag"},
-        {"TF", 8, ((rflags >> 8u) & 1u) != 0u, "Trap Flag"},
-        {"IF", 9, ((rflags >> 9u) & 1u) != 0u, "Interrupt Enable Flag"},
-        {"DF", 10, ((rflags >> 10u) & 1u) != 0u, "Direction Flag"},
-        {"OF", 11, ((rflags >> 11u) & 1u) != 0u, "Overflow Flag"},
-    };
-}
-
 [[nodiscard]] Result<void> ptrace_read_bytes(ThreadId tid,
                                              std::uint64_t address,
                                              std::span<std::uint8_t> out) {
@@ -205,56 +175,30 @@ constexpr std::size_t kMaxEventHistory = 512u;
     return {};
 }
 
-#if defined(__x86_64__)
 [[nodiscard]] Result<ThreadContext> read_ptrace_thread_context(ThreadId tid) {
-    user_regs_struct regs{};
+    std::array<std::uint8_t, 512> raw_regs{};
     iovec iov{};
-    iov.iov_base = &regs;
-    iov.iov_len = sizeof(regs);
+    iov.iov_base = raw_regs.data();
+    iov.iov_len = raw_regs.size();
     if (::ptrace(PTRACE_GETREGSET, static_cast<pid_t>(tid), reinterpret_cast<void*>(NT_PRSTATUS), &iov) == -1L) {
         return make_error(std::format("PTRACE_GETREGSET failed for TID {}: {}", tid, std::strerror(errno)));
     }
-
-    ThreadContext ctx{};
-    ctx.tid = tid;
-    ctx.layout = TargetLayout::from_arch(Architecture::X86_64, true, Endianness::Little);
-    ctx.instruction_pointer = regs.rip;
-    ctx.stack_pointer = regs.rsp;
-    ctx.frame_pointer = regs.rbp;
-    if (regs.fs_base != 0u) {
-        ctx.tls_pointer = regs.fs_base;
-    }
-    ctx.flags_value = regs.eflags;
-    ctx.decoded_flags = decode_x86_flags_bits(regs.eflags);
-
-    ctx.registers = {
-        make_gpr64("rip", RegisterCategory::InstructionPointer, regs.rip),
-        make_gpr64("rsp", RegisterCategory::StackPointer, regs.rsp),
-        make_gpr64("rbp", RegisterCategory::FramePointer, regs.rbp),
-        make_gpr64("rax", RegisterCategory::General, regs.rax),
-        make_gpr64("rbx", RegisterCategory::General, regs.rbx),
-        make_gpr64("rcx", RegisterCategory::General, regs.rcx),
-        make_gpr64("rdx", RegisterCategory::General, regs.rdx),
-        make_gpr64("rsi", RegisterCategory::General, regs.rsi),
-        make_gpr64("rdi", RegisterCategory::General, regs.rdi),
-        make_gpr64("r8", RegisterCategory::General, regs.r8),
-        make_gpr64("r9", RegisterCategory::General, regs.r9),
-        make_gpr64("r10", RegisterCategory::General, regs.r10),
-        make_gpr64("r11", RegisterCategory::General, regs.r11),
-        make_gpr64("r12", RegisterCategory::General, regs.r12),
-        make_gpr64("r13", RegisterCategory::General, regs.r13),
-        make_gpr64("r14", RegisterCategory::General, regs.r14),
-        make_gpr64("r15", RegisterCategory::General, regs.r15),
-        make_gpr64("rflags", RegisterCategory::Flags, regs.eflags),
-        make_gpr64("fs_base", RegisterCategory::SegmentOrTls, regs.fs_base),
-        make_gpr64("gs_base", RegisterCategory::SegmentOrTls, regs.gs_base),
-        make_gpr64("cs", RegisterCategory::SegmentOrTls, regs.cs),
-        make_gpr64("ss", RegisterCategory::SegmentOrTls, regs.ss),
+    const TargetLayout host_layout{
+        .architecture = host_debug_arch(),
+        .address_width = sizeof(void*) == 8u ? AddressWidth::Bits64 : AddressWidth::Bits32,
+        .endianness = host_debug_endian(),
     };
-    ctx.status = SubsystemStatus::available("debugger_ptrace", "Captured live x86_64 registers via PTRACE_GETREGSET");
+    ThreadContext ctx = decode_linux_prstatus_regset(
+        tid,
+        host_layout,
+        std::span<const std::uint8_t>(raw_regs.data(), iov.iov_len));
+    if (ctx.status.availability == Availability::Unavailable) {
+        return make_error(ctx.status.detail);
+    }
     return ctx;
 }
 
+#if defined(__x86_64__)
 [[nodiscard]] Result<void> write_ptrace_register_by_name(ThreadId tid,
                                                          std::string_view reg_name,
                                                          std::uint64_t val) {
@@ -352,25 +296,6 @@ void clear_x86_dr6(ThreadId tid) noexcept {
                    reinterpret_cast<void*>(0UL));
 }
 #else
-[[nodiscard]] Result<ThreadContext> read_ptrace_thread_context(ThreadId tid) {
-    ThreadContext ctx{};
-    ctx.tid = tid;
-    ctx.layout = TargetLayout::from_arch(host_debug_arch(), sizeof(void*) == 8u, host_debug_endian());
-    std::array<std::uint64_t, 64> raw_regs{};
-    iovec iov{raw_regs.data(), sizeof(raw_regs)};
-    if (::ptrace(PTRACE_GETREGSET, static_cast<pid_t>(tid), reinterpret_cast<void*>(NT_PRSTATUS), &iov) == -1L) {
-        return make_error(std::format("PTRACE_GETREGSET failed for TID {}: {}", tid, std::strerror(errno)));
-    }
-#if defined(__aarch64__)
-    ctx.stack_pointer = raw_regs[31];
-    ctx.instruction_pointer = raw_regs[32];
-    ctx.frame_pointer = raw_regs[29];
-    ctx.link_register = raw_regs[30];
-#endif
-    ctx.status = SubsystemStatus::available("debugger_ptrace", "Captured registers via PTRACE_GETREGSET");
-    return ctx;
-}
-
 [[nodiscard]] Result<void> write_ptrace_register_by_name(ThreadId tid,
                                                          std::string_view reg_name,
                                                          std::uint64_t val) {

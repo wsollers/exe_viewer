@@ -246,7 +246,6 @@ namespace viewer {
         std::string call_graph_status_;
         char graph_search_[128] = {};
         std::filesystem::path loaded_call_graph_bmp_;
-        PeModel pe_model_;
         std::vector<Instruction> current_instructions_;
         struct DisassemblyLocation {
             std::size_t file_offset;

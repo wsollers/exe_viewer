@@ -73,9 +73,11 @@ add_executable(peelf_tests
   live_process_self_test.cpp
   multiarch_subsystems_test.cpp
   live_child_inspection_test.cpp
+  review_bugs_regression_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/async_binary_diff.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/reference_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/strings_index.cpp
@@ -88,7 +90,6 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/binary_model.cpp
-  ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/pe_parser.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/tools/shellcode_converter.cpp
 )
 

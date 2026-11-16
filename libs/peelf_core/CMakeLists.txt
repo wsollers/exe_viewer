@@ -1,4 +1,10 @@
-add_library(peelf_core
+if(PEELF_BUILD_SHARED)
+  set(_peelf_core_lib_type SHARED)
+else()
+  set(_peelf_core_lib_type STATIC)
+endif()
+
+add_library(peelf_core ${_peelf_core_lib_type}
   src/pe/pe_parser.cpp
   src/elf/elf_parser.cpp
   src/file_reader.cpp
@@ -56,7 +62,6 @@ add_library(peelf_core
   src/mapping/map_errors.cpp
   src/mapping/file_mapping_posix.cpp
   src/mapping/file_mapping_win32.cpp
-  include/pe/pe_parser.h
 )
 
 add_library(peelf::core ALIAS peelf_core)
@@ -73,9 +78,12 @@ target_link_libraries(peelf_core PRIVATE peelf::asmtk)
 
 peelf_apply_project_warnings(peelf_core)
 
+set_target_properties(peelf_core PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+)
+
 if(PEELF_BUILD_SHARED)
   set_target_properties(peelf_core PROPERTIES
-    POSITION_INDEPENDENT_CODE ON
     WINDOWS_EXPORT_ALL_SYMBOLS ON
   )
 endif()
@@ -89,5 +97,5 @@ if(MSVC)
 endif()
 
 if(WIN32)
-  target_link_libraries(peelf_core PRIVATE ws2_32 advapi32)
+  target_link_libraries(peelf_core PRIVATE ws2_32 advapi32 wintrust crypt32)
 endif()

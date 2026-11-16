@@ -1,43 +1,34 @@
+#include <peelf/binary_image.hpp>
 #include <peelf/peelf.hpp>
-
-#include <cstdint>
-
-#include "elf/elf_definitions.h"
 
 namespace peelf {
 
-
-
-
-
-static std::uint16_t read_u16_le(std::span<const std::uint8_t> b, std::size_t off) {
-    return static_cast<std::uint16_t>(b[off] | (static_cast<std::uint16_t>(b[off + 1]) << 8));
-}
-
 Result<FileInfo> parse_elf_bytes(std::span<const std::uint8_t> bytes) {
-    if (bytes.size() < 0x20) {
+    if (bytes.size() < 0x34u) {
         return make_error("ELF file too small");
     }
-
-    const std::uint8_t ei_class = bytes[4];
-    const std::uint8_t ei_data  = bytes[5];
-
-    if (ei_data != 1) {
-        return make_error("ELF big-endian not supported yet");
+    if (!(bytes[0] == 0x7Fu && bytes[1] == 'E' && bytes[2] == 'L' && bytes[3] == 'F')) {
+        return make_error("Missing ELF magic");
     }
 
-    const std::uint16_t e_type = read_u16_le(bytes, 0x10);
-    const std::uint16_t e_machine = read_u16_le(bytes, 0x12);
+    auto parsed = parse_image(bytes);
+    if (!parsed.has_value()) {
+        return std::unexpected(parsed.error());
+    }
+    const ElfHeader* hdr = (*parsed)->elf_header();
+    if (hdr == nullptr) {
+        return make_error("Not a valid ELF image");
+    }
 
-    FileInfo info;
+    FileInfo info{};
     info.kind = FileKind::ELF;
     info.summary = ElfSummary{
-        .ei_class = ei_class,
-        .ei_data = ei_data,
-        .e_type = e_type,
-        .e_machine = e_machine,
+        .ei_class = hdr->elf_class,
+        .ei_data = hdr->data_encoding,
+        .e_type = hdr->type,
+        .e_machine = hdr->machine,
     };
     return info;
 }
 
-} // namespace peelf
+}  // namespace peelf

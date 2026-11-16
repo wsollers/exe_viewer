@@ -16,7 +16,6 @@
 #include "vulkan/vulkan_manager.h"
 #include "peelf/peelf.hpp"
 #include "mapping/file_mapping.hpp"
-#include "pe/pe_parser.h"
 #include "ui/logger.hpp"
 #include "disasm/disassembler.hpp"
 

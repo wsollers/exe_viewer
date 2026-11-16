@@ -1,6 +1,7 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
-#include "model/pe_model.hpp"
+
+#include <string>
 
 namespace viewer {
 
@@ -12,8 +13,8 @@ namespace viewer {
     }
 
     void PeExportsPanel::draw_contents() {
-        const PeModel* pe = model_.pe();
-        if (!pe) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr || img->format() != peelf::Format::PE) {
             ImGui::TextUnformatted("No PE file loaded.");
             return;
         }
@@ -31,14 +32,20 @@ namespace viewer {
         ImGui::Text("Name"); ImGui::NextColumn();
         ImGui::Separator();
 
-        for (const auto& e : pe->exports) {
+        const std::uint64_t base = img->image_base();
+        for (const auto& e : img->exports()) {
+            const std::string display_name =
+                !e.forwarder.empty()
+                    ? (e.name + " -> " + e.forwarder)
+                    : e.name;
             if (has_filter) {
-                if (e.name.find(filter) == std::string::npos) continue;
+                if (display_name.find(filter) == std::string::npos) continue;
             }
 
-            ImGui::Text("%u", e.ordinal); ImGui::NextColumn();
-            ImGui::Text("0x%08X", e.rva); ImGui::NextColumn();
-            ImGui::TextUnformatted(e.name.c_str()); ImGui::NextColumn();
+            const std::uint64_t rva = e.virtual_address >= base ? (e.virtual_address - base) : e.virtual_address;
+            ImGui::Text("%u", static_cast<unsigned int>(e.ordinal)); ImGui::NextColumn();
+            ImGui::Text("0x%08X", static_cast<unsigned int>(rva)); ImGui::NextColumn();
+            ImGui::TextUnformatted(display_name.c_str()); ImGui::NextColumn();
         }
 
         ImGui::Columns(1);

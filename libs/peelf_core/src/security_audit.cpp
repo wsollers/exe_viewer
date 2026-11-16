@@ -19,6 +19,18 @@
 #include <unordered_map>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <softpub.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <atomic>
+#include <filesystem>
 #include <process.h>
 #else
 #include <unistd.h>
@@ -118,14 +130,94 @@ void tally_finding(SecurityAuditReport& report, SecurityFinding finding) {
         (static_cast<std::uint32_t>(raw_bytes[0x3Du]) << 8u) |
         (static_cast<std::uint32_t>(raw_bytes[0x3Eu]) << 16u) |
         (static_cast<std::uint32_t>(raw_bytes[0x3Fu]) << 24u);
-    if (static_cast<std::size_t>(lfanew) + 24u > raw_bytes.size()) {
+    if (static_cast<std::uint64_t>(lfanew) + 24u > static_cast<std::uint64_t>(raw_bytes.size())) {
         return std::nullopt;
     }
-    if (raw_bytes[lfanew] != 'P' || raw_bytes[lfanew + 1u] != 'E') {
+    const auto sig_off = static_cast<std::size_t>(lfanew);
+    if (raw_bytes[sig_off] != 'P' || raw_bytes[sig_off + 1u] != 'E') {
         return std::nullopt;
     }
     return static_cast<std::uint64_t>(lfanew) + 24u;
 }
+
+#ifdef _WIN32
+struct WinVerifyOutcome {
+    LONG status{TRUST_E_NOSIGNATURE};
+    bool signature_valid{false};
+    bool publisher_trusted{false};
+};
+
+[[nodiscard]] WinVerifyOutcome verify_authenticode_offline_win32(
+    std::span<const std::uint8_t> raw_bytes) {
+    WinVerifyOutcome out{};
+    if (raw_bytes.empty()) {
+        return out;
+    }
+
+    wchar_t temp_dir[MAX_PATH] = {};
+    const DWORD dir_len = ::GetTempPathW(MAX_PATH, temp_dir);
+    if (dir_len == 0u || dir_len >= MAX_PATH) {
+        out.status = ERROR_PATH_NOT_FOUND;
+        return out;
+    }
+
+    static std::atomic<std::uint64_t> s_seq{0};
+    const std::uint64_t seq = s_seq.fetch_add(1u, std::memory_order_relaxed);
+    const std::filesystem::path tmp_path =
+        std::filesystem::path(temp_dir) /
+        std::format(L"peelf_wvt_{}_{}.bin", ::GetCurrentProcessId(), seq);
+
+    struct ScopedTempCleanup {
+        std::filesystem::path path;
+        ~ScopedTempCleanup() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{tmp_path};
+
+    {
+        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
+        if (!ofs.write(reinterpret_cast<const char*>(raw_bytes.data()),
+                       static_cast<std::streamsize>(raw_bytes.size()))) {
+            out.status = ERROR_WRITE_FAULT;
+            return out;
+        }
+    }
+
+    const std::wstring wide_path = tmp_path.wstring();
+    WINTRUST_FILE_INFO file_info{};
+    file_info.cbStruct = sizeof(file_info);
+    file_info.pcwszFilePath = wide_path.c_str();
+    file_info.hFile = nullptr;
+    file_info.pgKnownSubject = nullptr;
+
+    GUID action_guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_DATA wvt{};
+    wvt.cbStruct = sizeof(wvt);
+    wvt.dwUIChoice = WTD_UI_NONE;
+    wvt.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wvt.dwUnionChoice = WTD_CHOICE_FILE;
+    wvt.pFile = &file_info;
+    wvt.dwStateAction = WTD_STATEACTION_VERIFY;
+    wvt.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_NONE;
+
+    out.status = ::WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_guid, &wvt);
+    wvt.dwStateAction = WTD_STATEACTION_CLOSE;
+    (void)::WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &action_guid, &wvt);
+
+    if (out.status == ERROR_SUCCESS) {
+        out.signature_valid = true;
+        out.publisher_trusted = true;
+    } else if (out.status == static_cast<LONG>(CERT_E_UNTRUSTEDROOT) ||
+               out.status == static_cast<LONG>(CERT_E_CHAINING) ||
+               out.status == static_cast<LONG>(CERT_E_EXPIRED) ||
+               out.status == static_cast<LONG>(TRUST_E_EXPLICIT_DISTRUST)) {
+        out.signature_valid = true;
+        out.publisher_trusted = false;
+    }
+    return out;
+}
+#endif
 
 void evaluate_pe_rules(const IBinaryImage& image,
                        std::span<const std::uint8_t> raw_bytes,
@@ -312,8 +404,20 @@ void evaluate_pe_rules(const IBinaryImage& image,
     }
 
     // PE1005: Authenticode `CertificateTable` / `FORCE_INTEGRITY`
+    // Separates (1) CertificateTable presence, (2) structural/cryptographic signature validity,
+    // and (3) publisher trust chain verification.
     {
         const auto& certs = image.pe_certificates();
+        std::uint32_t cert_dir_file_off = 0u;
+        std::uint32_t cert_dir_size = 0u;
+        for (const PeDataDirectory& dd : image.pe_data_directories()) {
+            if (dd.index == 4u) { // Security / Certificate Table
+                cert_dir_file_off = dd.rva;
+                cert_dir_size = dd.size;
+                break;
+            }
+        }
+
         SecurityFinding f;
         f.rule_id = "PE1005";
         f.rule_name = "SignBinaryWithAuthenticode";
@@ -321,31 +425,113 @@ void evaluate_pe_rules(const IBinaryImage& image,
         f.subject = "CertificateTable";
         f.remediation = "Sign distributable PE binaries with Authenticode (signtool.exe) and enable /INTEGRITYCHECK when required.";
 
-        if (!certs.empty()) {
-            f.severity = SecuritySeverity::Pass;
-            f.file_offset = certs.front().file_offset;
-            f.summary = std::format("Embedded Authenticode CertificateTable present ({} entry/entries{}).",
-                                    certs.size(),
-                                    force_integrity ? ", FORCE_INTEGRITY=1" : "");
+        const bool dir_claims_cert = (cert_dir_file_off != 0u || cert_dir_size != 0u);
+        if (certs.empty() && dir_claims_cert) {
+            f.severity = SecuritySeverity::Error;
+            f.virtual_address = base_va;
+            f.file_offset = cert_dir_file_off != 0u ? std::optional<std::uint64_t>(cert_dir_file_off) : dll_chars_off;
+            f.summary = "Authenticode CertificateTable DataDirectory is non-empty, but the WIN_CERTIFICATE table is truncated or out of bounds.";
             f.evidence = std::format(
-                "Cert[0]@file+0x{:X} (len={} bytes, rev=0x{:04X}, type=0x{:04X}), FORCE_INTEGRITY={}",
-                certs.front().file_offset,
-                certs.front().length,
-                certs.front().revision,
-                certs.front().certificate_type,
+                "presence=corrupt_directory, signature_validity=invalid, publisher_trust=untrusted, CertDirFileOffset=0x{:X}, CertDirSize={}, ParsedCerts=0, FORCE_INTEGRITY={}",
+                cert_dir_file_off,
+                cert_dir_size,
                 force_integrity ? 1 : 0);
+        } else if (!certs.empty()) {
+            f.file_offset = certs.front().file_offset;
+            bool structure_valid = true;
+            std::string struct_reason;
+            for (std::size_t ci = 0u; ci < certs.size(); ++ci) {
+                const PeCertificate& c = certs[ci];
+                const bool valid_rev = (c.revision == 0x0200u || c.revision == 0x0100u);
+                const bool valid_type = (c.certificate_type == 0x0002u); // WIN_CERT_TYPE_PKCS_SIGNED_DATA
+                const bool valid_der_seq = (c.length >= 12u && c.certificate.size() >= 4u && c.certificate[0] == 0x30u);
+                if (!valid_rev || !valid_type || !valid_der_seq) {
+                    structure_valid = false;
+                    struct_reason = std::format(
+                        "Cert[{}]@file+0x{:X} malformed/unsupported (len={}, payload={}B, rev=0x{:04X}, type=0x{:04X}, tag=0x{:02X})",
+                        ci,
+                        c.file_offset,
+                        c.length,
+                        c.certificate.size(),
+                        c.revision,
+                        c.certificate_type,
+                        c.certificate.empty() ? 0u : static_cast<unsigned>(c.certificate[0]));
+                    break;
+                }
+            }
+
+            if (!structure_valid) {
+                f.severity = SecuritySeverity::Error;
+                f.summary = "Embedded Authenticode WIN_CERTIFICATE entry is malformed or not PKCS#7 SignedData.";
+                f.evidence = std::format(
+                    "presence=present, signature_validity=corrupt_structure, publisher_trust=untrusted, {}, FORCE_INTEGRITY={}",
+                    struct_reason,
+                    force_integrity ? 1 : 0);
+            } else {
+#ifdef _WIN32
+                const WinVerifyOutcome wvt = verify_authenticode_offline_win32(raw_bytes);
+                if (wvt.signature_valid && wvt.publisher_trusted) {
+                    f.severity = SecuritySeverity::Pass;
+                    f.summary = std::format(
+                        "Authenticode signature and publisher trust verified ({} entry/entries{}).",
+                        certs.size(),
+                        force_integrity ? ", FORCE_INTEGRITY=1" : "");
+                    f.evidence = std::format(
+                        "presence=present, signature_validity=valid, publisher_trust=trusted, WinVerifyTrust=0x{:08X}, Cert[0]@file+0x{:X} (len={} bytes), FORCE_INTEGRITY={}",
+                        static_cast<std::uint32_t>(wvt.status),
+                        certs.front().file_offset,
+                        certs.front().length,
+                        force_integrity ? 1 : 0);
+                } else if (wvt.signature_valid && !wvt.publisher_trusted) {
+                    f.severity = SecuritySeverity::Warning;
+                    f.summary = "Authenticode signature digest is intact, but the signing certificate chain is untrusted or expired.";
+                    f.evidence = std::format(
+                        "presence=present, signature_validity=valid, publisher_trust=untrusted_or_expired, WinVerifyTrust=0x{:08X}, Cert[0]@file+0x{:X} (len={} bytes), FORCE_INTEGRITY={}",
+                        static_cast<std::uint32_t>(wvt.status),
+                        certs.front().file_offset,
+                        certs.front().length,
+                        force_integrity ? 1 : 0);
+                } else {
+                    f.severity = SecuritySeverity::Error;
+                    f.summary = "Embedded Authenticode CertificateTable failed cryptographic signature verification.";
+                    f.evidence = std::format(
+                        "presence=present, signature_validity=invalid, publisher_trust=untrusted, WinVerifyTrust=0x{:08X}, Cert[0]@file+0x{:X} (len={} bytes), FORCE_INTEGRITY={}",
+                        static_cast<std::uint32_t>(wvt.status),
+                        certs.front().file_offset,
+                        certs.front().length,
+                        force_integrity ? 1 : 0);
+                }
+#else
+                f.severity = SecuritySeverity::Note;
+                f.summary = std::format(
+                    "Embedded Authenticode CertificateTable present ({} PKCS#7 entry/entries{}; cryptographic signature & publisher trust not verified on this host).",
+                    certs.size(),
+                    force_integrity ? ", FORCE_INTEGRITY=1" : "");
+                f.evidence = std::format(
+                    "presence=present, signature_validity=unverified_host, publisher_trust=unverified_host, Cert[0]@file+0x{:X} (len={} bytes, rev=0x{:04X}, type=0x{:04X}), FORCE_INTEGRITY={}",
+                    certs.front().file_offset,
+                    certs.front().length,
+                    certs.front().revision,
+                    certs.front().certificate_type,
+                    force_integrity ? 1 : 0);
+#endif
+            }
         } else if (force_integrity) {
             f.severity = SecuritySeverity::Error;
             f.virtual_address = base_va;
             f.file_offset = dll_chars_off;
             f.summary = "FORCE_INTEGRITY (0x0080) is set, but no Authenticode CertificateTable is present.";
-            f.evidence = std::format("DllCharacteristics=0x{:04X} (FORCE_INTEGRITY=1), Certificates=0", dll_ch);
+            f.evidence = std::format(
+                "presence=absent, signature_validity=absent, publisher_trust=absent, DllCharacteristics=0x{:04X} (FORCE_INTEGRITY=1), Certificates=0",
+                dll_ch);
         } else {
             f.severity = SecuritySeverity::Note;
             f.virtual_address = base_va;
             f.file_offset = dll_chars_off;
             f.summary = "Binary is unsigned (no Authenticode CertificateTable present).";
-            f.evidence = std::format("Certificates=0, FORCE_INTEGRITY=0 (DllCharacteristics=0x{:04X})", dll_ch);
+            f.evidence = std::format(
+                "presence=absent, signature_validity=absent, publisher_trust=absent, Certificates=0, FORCE_INTEGRITY=0 (DllCharacteristics=0x{:04X})",
+                dll_ch);
         }
         tally_finding(report, std::move(f));
     }

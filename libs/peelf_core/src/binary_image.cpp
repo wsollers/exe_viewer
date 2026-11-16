@@ -76,6 +76,10 @@ public:
     [[nodiscard]] const GnuDebugLink* gnu_debuglink() const noexcept override {
         return gnu_debuglink_.has_value() ? &*gnu_debuglink_ : nullptr;
     }
+    [[nodiscard]] const std::vector<PeDataDirectory>& pe_data_directories() const noexcept override {
+        static const std::vector<PeDataDirectory> empty;
+        return empty;
+    }
     [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
         static const std::vector<PeBaseRelocationBlock> empty;
         return empty;
@@ -304,6 +308,12 @@ public:
     void rebase_to_live_base(std::uint64_t live_base);
 
 private:
+    void recover_dynamic_from_program_headers(std::span<const std::uint8_t> b,
+                                              bool is64,
+                                              bool big,
+                                              std::uint64_t live_base,
+                                              std::uint64_t static_base);
+
     ElfHeader elf_header_;
     std::vector<ElfProgramHeader> program_headers_;
     std::vector<ElfSectionHeader> section_headers_;
@@ -320,6 +330,9 @@ class PeImage final : public ImageBase {
 public:
     [[nodiscard]] const PeHeader* pe_header() const noexcept override {
         return &pe_header_;
+    }
+    [[nodiscard]] const std::vector<PeDataDirectory>& pe_data_directories() const noexcept override {
+        return data_directories_;
     }
     [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
         return base_relocations_;
@@ -356,6 +369,7 @@ public:
 
 private:
     PeHeader pe_header_;
+    std::vector<PeDataDirectory> data_directories_;
     std::vector<PeBaseRelocationBlock> base_relocations_;
     std::vector<PeDebugDirectory> debug_directories_;
     std::optional<PeTlsDirectory> tls_directory_;
@@ -1305,14 +1319,14 @@ void parse_elf_gnu_hash(std::span<const std::uint8_t> b, bool is64, bool big,
 
 void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t phoff, std::uint16_t phentsize,
-                        std::uint16_t phnum, std::vector<ElfProgramHeader>& headers_out,
+                        std::uint32_t phnum, std::vector<ElfProgramHeader>& headers_out,
                         std::vector<Segment>& segments_out, std::string& interpreter_out,
                         std::vector<ElfNote>& notes_out) {
     if (phoff == 0 || phnum == 0 || phentsize == 0) {
         return;
     }
     const std::uint16_t min_ph = is64 ? 0x38 : 0x20;
-    if (phentsize < min_ph) {
+    if (phentsize < min_ph || phnum > 65536u) {
         return;
     }
     const std::uint64_t table_size = static_cast<std::uint64_t>(phnum) * phentsize;
@@ -1322,7 +1336,7 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 
     headers_out.reserve(phnum);
     segments_out.reserve(phnum);
-    for (std::uint16_t i = 0; i < phnum; ++i) {
+    for (std::uint32_t i = 0; i < phnum; ++i) {
         const std::uint64_t hdr64 = phoff + static_cast<std::uint64_t>(i) * phentsize;
         const std::size_t hdr = static_cast<std::size_t>(hdr64);
 
@@ -1373,7 +1387,7 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
 // has already succeeded by the time this runs).
 void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint64_t shoff, std::uint16_t shentsize,
-                        std::uint16_t shnum, std::uint16_t shstrndx,
+                        std::uint32_t shnum, std::uint32_t shstrndx,
                         std::vector<ElfSectionHeader>& headers, std::vector<Section>& out,
                         std::vector<ElfSymbol>& elf_symbols_out, std::vector<Symbol>& symbols_out,
                         std::vector<ElfDynamicEntry>& dynamic_entries_out,
@@ -1386,7 +1400,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         return;
     }
     const std::uint16_t min_sh = is64 ? 0x40 : 0x28;
-    if (shentsize < min_sh) {
+    if (shentsize < min_sh || shnum > 262144u) {
         return;
     }
     const std::uint64_t table_size = static_cast<std::uint64_t>(shnum) * shentsize;
@@ -1421,15 +1435,15 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     };
 
     headers.reserve(shnum);
-    for (std::uint16_t i = 0; i < shnum; ++i) {
+    for (std::uint32_t i = 0; i < shnum; ++i) {
         const std::uint64_t hdr = shoff + static_cast<std::uint64_t>(i) * shentsize;
         headers.push_back(read_sh(static_cast<std::size_t>(hdr)));
     }
 
-    // Section-name string table = section[e_shstrndx].
+    // Section-name string table = section[eff_shstrndx].
     std::uint64_t strtab_off = 0;
     std::uint64_t strtab_size = 0;
-    if (shstrndx != 0 && shstrndx < shnum && shstrndx != 0xFFFF) {
+    if (shstrndx != 0 && shstrndx < shnum) {
         const auto& sh = headers[shstrndx];
         strtab_off = sh.offset;
         strtab_size = sh.size;
@@ -1458,15 +1472,15 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
     };
 
     out.reserve(shnum);
-    for (std::uint16_t i = 0; i < shnum; ++i) {
+    for (std::uint32_t i = 0; i < shnum; ++i) {
         const auto& sh = headers[i];
         Section sec;
         headers[i].name = read_section_name(sh.name_offset);
         sec.name            = headers[i].name;
         sec.virtual_address = sh.address;
-        sec.virtual_size    = sh.size;
+        sec.virtual_size    = (sh.type == 0u) ? 0u : sh.size; // SHT_NULL sh_size stores extended e_shnum
         sec.file_offset     = sh.offset;
-        sec.file_size       = (sh.type == 8) ? 0 : sh.size;  // SHT_NOBITS has no file data
+        sec.file_size       = (sh.type == 0u || sh.type == 8u) ? 0u : sh.size; // SHT_NULL / SHT_NOBITS have no file data
         sec.raw_flags       = sh.flags;
         sec.readable   = (sh.flags & 0x2) != 0;  // SHF_ALLOC
         sec.writable   = (sh.flags & 0x1) != 0;  // SHF_WRITE
@@ -1474,7 +1488,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
         out.push_back(std::move(sec));
     }
 
-    for (std::uint16_t section_index = 0; section_index < shnum; ++section_index) {
+    for (std::uint32_t section_index = 0; section_index < shnum; ++section_index) {
         const auto& sh = headers[section_index];
         const bool is_symtab = sh.type == 2;   // SHT_SYMTAB
         const bool is_dynsym = sh.type == 11;  // SHT_DYNSYM
@@ -1741,6 +1755,34 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
     const std::uint16_t e_shnum = rd16(b, is64 ? 0x3C : 0x30, big);
     const std::uint16_t e_shstrndx = rd16(b, is64 ? 0x3E : 0x32, big);
 
+    // ELF extended numbering (P1-5): shdr[0] carries overflow counts when
+    // e_shnum == 0, e_shstrndx == SHN_XINDEX (0xFFFF), or e_phnum == PN_XNUM (0xFFFF).
+    std::uint32_t eff_phnum = e_phnum == 0xFFFFu ? 0u : static_cast<std::uint32_t>(e_phnum);
+    std::uint32_t eff_shnum = static_cast<std::uint32_t>(e_shnum);
+    std::uint32_t eff_shstrndx = e_shstrndx == 0xFFFFu ? 0u : static_cast<std::uint32_t>(e_shstrndx);
+    const std::uint16_t min_shent = is64 ? 0x40u : 0x28u;
+    if ((e_shnum == 0u || e_shstrndx == 0xFFFFu || e_phnum == 0xFFFFu) &&
+        e_shoff != 0u && e_shentsize >= min_shent &&
+        fits_range(e_shoff, e_shentsize, static_cast<std::uint64_t>(b.size()))) {
+        const auto sh0 = static_cast<std::size_t>(e_shoff);
+        const std::uint32_t sh0_type = rd32(b, sh0 + 4u, big);
+        if (sh0_type == 0u) {
+            const std::uint64_t sh0_size = is64 ? rd64(b, sh0 + 0x20u, big)
+                                                : static_cast<std::uint64_t>(rd32(b, sh0 + 0x14u, big));
+            const std::uint32_t sh0_link = rd32(b, sh0 + (is64 ? 0x28u : 0x18u), big);
+            const std::uint32_t sh0_info = rd32(b, sh0 + (is64 ? 0x2Cu : 0x1Cu), big);
+            if (e_shnum == 0u && sh0_size > 0u && sh0_size <= 262144ull) {
+                eff_shnum = static_cast<std::uint32_t>(sh0_size);
+            }
+            if (e_shstrndx == 0xFFFFu) {
+                eff_shstrndx = sh0_link;
+            }
+            if (e_phnum == 0xFFFFu && sh0_info <= 65536u) {
+                eff_phnum = sh0_info;
+            }
+        }
+    }
+
     auto img = std::unique_ptr<ElfImage>(new ElfImage());
     img->format_ = Format::ELF;
     img->is_64_  = is64;
@@ -1767,10 +1809,13 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
         .section_header_entry_size = e_shentsize,
         .section_header_count = e_shnum,
         .section_name_string_table_index = e_shstrndx,
+        .effective_program_header_count = eff_phnum,
+        .effective_section_header_count = eff_shnum,
+        .effective_shstrndx = eff_shstrndx,
     };
 
     // Sections (P2-1), best-effort: identity above is already valid.
-    parse_elf_segments(b, is64, big, e_phoff, e_phentsize, e_phnum,
+    parse_elf_segments(b, is64, big, e_phoff, e_phentsize, eff_phnum,
                        img->program_headers_, img->segments_, img->interpreter_, img->notes_);
 
     // Determine static link-time load base from PT_LOAD segments (0 for PIE/ET_DYN, e.g. 0x400000 for ET_EXEC).
@@ -1797,10 +1842,13 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse(std::span<const std::uint8
         img->image_base_ = min_load_base;
     }
 
-    parse_elf_sections(b, is64, big, e_shoff, e_shentsize, e_shnum, e_shstrndx,
+    parse_elf_sections(b, is64, big, e_shoff, e_shentsize, eff_shnum, eff_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
                        img->gnu_hash_tables_, img->imports_);
+    // Recover PT_DYNAMIC entries, DT_NEEDED dependencies, dynamic symbols, hash tables, and
+    // dynamic relocations on sectionless / sstrip ELFs where the section header table is absent.
+    img->recover_dynamic_from_program_headers(b, is64, big, 0u, img->image_base_);
     if (img->elf_header_.type == 3 &&
         (!img->interpreter_.empty() || std::any_of(img->dynamic_entries_.begin(), img->dynamic_entries_.end(),
             [](const auto& entry) { return entry.tag == 0x6ffffffb && (entry.value & 0x08000000u) != 0; })))
@@ -1973,6 +2021,9 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         .optional_header_size = size_of_opt,
         .characteristics = characteristics,
         .optional_magic = magic,
+        .entry_point_rva = entry_rva,
+        .section_alignment = size_of_opt >= 0x24 ? rd32(b, opt + 0x20, false) : 0u,
+        .file_alignment = size_of_opt >= 0x28 ? rd32(b, opt + 0x24, false) : 0u,
         .size_of_image = size_of_opt >= 0x3C ? rd32(b, opt + 0x38, false) : 0u,
         .size_of_headers = size_of_opt >= 0x40 ? rd32(b, opt + 0x3C, false) : 0u,
         .checksum = size_of_opt >= 0x44 ? rd32(b, opt + 0x40, false) : 0u,
@@ -1987,6 +2038,30 @@ Result<std::unique_ptr<IBinaryImage>> PeImage::parse(std::span<const std::uint8_
         .heap_commit = is64 ? (size_of_opt >= 0x68 ? rd64(b, opt + 0x60, false) : 0ull)
                             : (size_of_opt >= 0x58 ? static_cast<std::uint64_t>(rd32(b, opt + 0x54, false)) : 0ull),
     };
+    {
+        static constexpr std::array<std::string_view, 16> kPeDirNames = {
+            "Export", "Import", "Resource", "Exception",
+            "Security", "BaseReloc", "Debug", "Architecture",
+            "GlobalPtr", "TLS", "LoadConfig", "BoundImport",
+            "IAT", "DelayImport", "CLRRuntime", "Reserved",
+        };
+        const std::size_t dd_base_off = opt + (is64 ? 0x70u : 0x60u);
+        const std::uint32_t capped_dirs = std::min<std::uint32_t>(directory_count, 16u);
+        img->data_directories_.reserve(capped_dirs);
+        for (std::uint32_t di = 0u; di < capped_dirs; ++di) {
+            const std::size_t entry_off = dd_base_off + static_cast<std::size_t>(di) * 8u;
+            if (entry_off + 8u > opt + size_of_opt ||
+                !fits_range(entry_off, 8u, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+            img->data_directories_.push_back(PeDataDirectory{
+                .index = di,
+                .name = std::string(kPeDirNames[di]),
+                .rva = rd32(b, entry_off + 0u, false),
+                .size = rd32(b, entry_off + 4u, false),
+            });
+        }
+    }
     const std::size_t   sect_table   = opt + size_of_opt;
     constexpr std::size_t kSectHdr = 0x28;  // 40-byte section header
     img->sections_.reserve(num_sections);
@@ -2444,6 +2519,276 @@ void ElfImage::rebase_to_live_base(std::uint64_t live_base) {
     }
 }
 
+void ElfImage::recover_dynamic_from_program_headers(
+    std::span<const std::uint8_t> b,
+    bool is64,
+    bool big,
+    std::uint64_t live_base,
+    std::uint64_t static_base) {
+    if (!dynamic_entries_.empty()) {
+        return;
+    }
+
+    auto resolve_ptr = [&](std::uint64_t val) -> std::optional<std::size_t> {
+        if (val == 0u) {
+            return std::nullopt;
+        }
+        if (const auto off = virtual_address_to_file_offset(val);
+            off.has_value() && *off < b.size()) {
+            return static_cast<std::size_t>(*off);
+        }
+        return normalize_dynamic_ptr_to_offset(val, live_base, static_base, b.size());
+    };
+
+    for (const ElfProgramHeader& ph : program_headers_) {
+        if (ph.type != 2u || ph.file_size == 0u ||
+            !fits_range(ph.offset, ph.file_size, static_cast<std::uint64_t>(b.size()))) {
+            continue;
+        }
+        const std::size_t dyn_ent_sz = is64 ? 16u : 8u;
+        const std::size_t count = static_cast<std::size_t>(ph.file_size) / dyn_ent_sz;
+        std::optional<std::size_t> strtab_off;
+        std::uint64_t strtab_sz = 0u;
+        std::optional<std::size_t> symtab_off;
+        std::uint64_t syment_sz = is64 ? 24u : 16u;
+        std::optional<std::size_t> sysv_hash_off;
+        std::optional<std::size_t> gnu_hash_off;
+        std::optional<std::size_t> rela_off;
+        std::uint64_t rela_sz = 0u;
+        std::uint64_t rela_ent = is64 ? 24u : 12u;
+        std::optional<std::size_t> rel_off;
+        std::uint64_t rel_sz = 0u;
+        std::uint64_t rel_ent = is64 ? 16u : 8u;
+        std::optional<std::size_t> jmprel_off;
+        std::uint64_t jmprel_sz = 0u;
+        std::uint64_t pltrel_kind = is64 ? 7u : 17u; // DT_RELA (7) or DT_REL (17)
+
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::size_t off = static_cast<std::size_t>(ph.offset) + i * dyn_ent_sz;
+            const std::int64_t tag =
+                is64 ? static_cast<std::int64_t>(rd64(b, off, big))
+                     : static_cast<std::int64_t>(static_cast<std::int32_t>(rd32(b, off, big)));
+            const std::uint64_t val =
+                is64 ? rd64(b, off + 8u, big)
+                     : static_cast<std::uint64_t>(rd32(b, off + 4u, big));
+            ElfDynamicEntry de;
+            de.tag = static_cast<std::uint64_t>(tag);
+            de.value = val;
+            dynamic_entries_.push_back(de);
+            if (tag == 0) {
+                break;
+            }
+            switch (tag) {
+                case 2:  jmprel_sz = val; break;                     // DT_PLTRELSZ
+                case 4:  sysv_hash_off = resolve_ptr(val); break;    // DT_HASH
+                case 5:  strtab_off = resolve_ptr(val); break;       // DT_STRTAB
+                case 6:  symtab_off = resolve_ptr(val); break;       // DT_SYMTAB
+                case 7:  rela_off = resolve_ptr(val); break;         // DT_RELA
+                case 8:  rela_sz = val; break;                       // DT_RELASZ
+                case 9:  if (val != 0u) rela_ent = val; break;       // DT_RELAENT
+                case 10: strtab_sz = val; break;                     // DT_STRSZ
+                case 11: if (val != 0u) syment_sz = val; break;      // DT_SYMENT
+                case 17: rel_off = resolve_ptr(val); break;          // DT_REL
+                case 18: rel_sz = val; break;                        // DT_RELSZ
+                case 19: if (val != 0u) rel_ent = val; break;        // DT_RELENT
+                case 20: pltrel_kind = val; break;                   // DT_PLTREL
+                case 23: jmprel_off = resolve_ptr(val); break;       // DT_JMPREL
+                case 0x6ffffef5ll: gnu_hash_off = resolve_ptr(val); break; // DT_GNU_HASH
+                default: break;
+            }
+        }
+
+        if (sysv_hash_off && sysv_hash_tables_.empty() && *sysv_hash_off < b.size()) {
+            ElfSectionHeader synthetic_sh{};
+            synthetic_sh.name = ".hash";
+            synthetic_sh.offset = *sysv_hash_off;
+            synthetic_sh.size = b.size() - *sysv_hash_off;
+            parse_elf_sysv_hash(b, big, synthetic_sh, sysv_hash_tables_);
+        }
+
+        std::uint32_t gnu_sym_end = 0u;
+        if (gnu_hash_off && *gnu_hash_off < b.size()) {
+            gnu_sym_end = count_gnu_hash_dynsyms(b, *gnu_hash_off, is64, big);
+            if (gnu_hash_tables_.empty() && fits_range(*gnu_hash_off, 16u, static_cast<std::uint64_t>(b.size()))) {
+                const std::uint32_t nbuckets = rd32(b, *gnu_hash_off + 0u, big);
+                const std::uint32_t symoffset = rd32(b, *gnu_hash_off + 4u, big);
+                const std::uint32_t bloom_cnt = rd32(b, *gnu_hash_off + 8u, big);
+                const std::uint64_t bloom_sz = static_cast<std::uint64_t>(bloom_cnt) * (is64 ? 8ull : 4ull);
+                const std::uint64_t chain_cnt = gnu_sym_end > symoffset ? (gnu_sym_end - symoffset) : 0u;
+                const std::uint64_t total_sz = 16ull + bloom_sz +
+                                               static_cast<std::uint64_t>(nbuckets) * 4ull +
+                                               chain_cnt * 4ull;
+                if (fits_range(*gnu_hash_off, total_sz, static_cast<std::uint64_t>(b.size()))) {
+                    ElfSectionHeader synthetic_sh{};
+                    synthetic_sh.name = ".gnu.hash";
+                    synthetic_sh.offset = *gnu_hash_off;
+                    synthetic_sh.size = total_sz;
+                    parse_elf_gnu_hash(b, is64, big, synthetic_sh, gnu_hash_tables_);
+                }
+            }
+        }
+
+        if (strtab_off && *strtab_off < b.size()) {
+            const std::size_t max_str =
+                strtab_sz != 0u
+                    ? static_cast<std::size_t>(std::min<std::uint64_t>(
+                          strtab_sz, static_cast<std::uint64_t>(b.size() - *strtab_off)))
+                    : (b.size() - *strtab_off);
+            const auto read_dynstr = [&](std::uint32_t name_off) -> std::string {
+                if (name_off >= max_str) {
+                    return {};
+                }
+                return read_c_string(
+                    std::span<const std::uint8_t>(b.data() + *strtab_off, max_str),
+                    name_off);
+            };
+
+            for (ElfDynamicEntry& de : dynamic_entries_) {
+                if ((de.tag == 1u || de.tag == 14u || de.tag == 15u || de.tag == 29u) &&
+                    de.value <= std::numeric_limits<std::uint32_t>::max()) {
+                    de.string_value = read_dynstr(static_cast<std::uint32_t>(de.value));
+                    if (de.tag == 1u) {  // DT_NEEDED
+                        de.needed_library = de.string_value;
+                        if (!de.needed_library.empty()) {
+                            ImportEntry imp;
+                            imp.library = de.needed_library;
+                            imports_.push_back(std::move(imp));
+                        }
+                    }
+                }
+            }
+
+            if (symtab_off && elf_symbols_.empty() && syment_sz >= (is64 ? 24u : 16u)) {
+                std::uint32_t sym_count = 0u;
+                if (sysv_hash_off &&
+                    fits_range(*sysv_hash_off, 8u, static_cast<std::uint64_t>(b.size()))) {
+                    sym_count = rd32(b, *sysv_hash_off + 4u, big);
+                } else if (gnu_sym_end > 0u) {
+                    sym_count = gnu_sym_end;
+                } else if (*strtab_off > *symtab_off) {
+                    sym_count = static_cast<std::uint32_t>(
+                        (*strtab_off - *symtab_off) / static_cast<std::size_t>(syment_sz));
+                }
+
+                constexpr std::uint32_t kMaxSyms = 262144u;
+                sym_count = std::min(sym_count, kMaxSyms);
+                // Include index 0 (STN_UNDEF) in elf_symbols_ so relocation symbol_index lookups align 1:1!
+                for (std::uint32_t idx = 0u; idx < sym_count; ++idx) {
+                    const std::uint64_t ent_off64 =
+                        static_cast<std::uint64_t>(*symtab_off) +
+                        static_cast<std::uint64_t>(idx) * syment_sz;
+                    if (!fits_range(ent_off64, syment_sz, static_cast<std::uint64_t>(b.size()))) {
+                        break;
+                    }
+                    const auto ent = static_cast<std::size_t>(ent_off64);
+                    std::uint32_t st_name = 0u;
+                    std::uint8_t st_info = 0u;
+                    std::uint8_t st_other = 0u;
+                    std::uint16_t st_shndx = 0u;
+                    std::uint64_t st_value = 0u;
+                    std::uint64_t st_size = 0u;
+                    if (is64) {
+                        st_name = rd32(b, ent + 0u, big);
+                        st_info = b[ent + 4u];
+                        st_other = b[ent + 5u];
+                        st_shndx = rd16(b, ent + 6u, big);
+                        st_value = rd64(b, ent + 8u, big);
+                        st_size = rd64(b, ent + 16u, big);
+                    } else {
+                        st_name = rd32(b, ent + 0u, big);
+                        st_value = rd32(b, ent + 4u, big);
+                        st_size = rd32(b, ent + 8u, big);
+                        st_info = b[ent + 12u];
+                        st_other = b[ent + 13u];
+                        st_shndx = rd16(b, ent + 14u, big);
+                    }
+
+                    ElfSymbol es;
+                    es.name_offset = st_name;
+                    es.name = idx == 0u ? std::string{} : read_dynstr(st_name);
+                    es.info = st_info;
+                    es.other = st_other;
+                    es.value = st_value;
+                    es.size = st_size;
+                    es.binding = static_cast<std::uint8_t>(st_info >> 4u);
+                    es.type = static_cast<std::uint8_t>(st_info & 0x0Fu);
+                    es.visibility = static_cast<std::uint8_t>(st_other & 0x03u);
+                    es.section_index = st_shndx;
+                    es.dynamic = true;
+
+                    if (idx > 0u && !es.name.empty()) {
+                        Symbol s;
+                        s.name = es.name;
+                        s.virtual_address = st_value;
+                        s.size = st_size;
+                        s.binding = es.binding;
+                        s.type = es.type;
+                        s.section_index = st_shndx;
+                        s.dynamic = true;
+                        symbols_.push_back(std::move(s));
+                    }
+                    elf_symbols_.push_back(std::move(es));
+                }
+            }
+        }
+
+        auto parse_dyn_reloc_table = [&](std::optional<std::size_t> table_off,
+                                         std::uint64_t table_sz,
+                                         std::uint64_t ent_sz,
+                                         bool has_addend,
+                                         std::string_view sec_label) {
+            if (!table_off.has_value() || table_sz == 0u) {
+                return;
+            }
+            const std::uint64_t min_ent = has_addend ? (is64 ? 24u : 12u) : (is64 ? 16u : 8u);
+            if (ent_sz < min_ent ||
+                !fits_range(*table_off, table_sz, static_cast<std::uint64_t>(b.size()))) {
+                return;
+            }
+            const std::uint64_t rel_count = std::min<std::uint64_t>(table_sz / ent_sz, 262144ull);
+            for (std::uint64_t i = 0u; i < rel_count; ++i) {
+                const auto roff = static_cast<std::size_t>(*table_off + i * ent_sz);
+                ElfRelocation rel{};
+                rel.section_name = std::string(sec_label);
+                rel.has_addend = has_addend;
+                if (is64) {
+                    rel.offset = rd64(b, roff + 0u, big);
+                    rel.info = rd64(b, roff + 8u, big);
+                    rel.symbol_index = rel.info >> 32u;
+                    rel.type = rel.info & 0xFFFF'FFFFull;
+                    if (has_addend) {
+                        rel.addend = static_cast<std::int64_t>(rd64(b, roff + 16u, big));
+                    }
+                } else {
+                    rel.offset = rd32(b, roff + 0u, big);
+                    rel.info = rd32(b, roff + 4u, big);
+                    rel.symbol_index = rel.info >> 8u;
+                    rel.type = rel.info & 0xFFull;
+                    if (has_addend) {
+                        rel.addend = static_cast<std::int32_t>(rd32(b, roff + 8u, big));
+                    }
+                }
+                if (rel.symbol_index > 0u && rel.symbol_index < elf_symbols_.size()) {
+                    rel.symbol_name = elf_symbols_[static_cast<std::size_t>(rel.symbol_index)].name;
+                }
+                relocations_.push_back(std::move(rel));
+            }
+        };
+
+        if (relocations_.empty()) {
+            parse_dyn_reloc_table(rela_off, rela_sz, rela_ent, true, ".rela.dyn");
+            parse_dyn_reloc_table(rel_off, rel_sz, rel_ent, false, ".rel.dyn");
+            const bool plt_is_rela = (pltrel_kind == 7u);
+            parse_dyn_reloc_table(jmprel_off,
+                                  jmprel_sz,
+                                  plt_is_rela ? (is64 ? 24u : 12u) : (is64 ? 16u : 8u),
+                                  plt_is_rela,
+                                  plt_is_rela ? ".rela.plt" : ".rel.plt");
+        }
+        break;
+    }
+}
+
 Result<std::unique_ptr<IBinaryImage>> ElfImage::parse_mapped(
     std::span<const std::uint8_t> mapped_bytes,
     std::uint64_t live_base) {
@@ -2573,160 +2918,11 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse_mapped(
     }
 
     auto* elf = static_cast<ElfImage*>(parsed->get());
-
-    // Recover dynamic entries, DT_NEEDED imports, and .dynsym symbols directly from PT_DYNAMIC
-    // when section headers were absent in memory.
-    if (elf->dynamic_entries_.empty()) {
-        for (const ElfProgramHeader& ph : elf->program_headers_) {
-            if (ph.type != 2 || ph.file_size == 0 ||
-                !fits_range(ph.offset, ph.file_size, static_cast<std::uint64_t>(norm.size()))) {
-                continue;
-            }
-            const std::size_t dyn_ent_sz = is64 ? 16u : 8u;
-            const std::size_t count = static_cast<std::size_t>(ph.file_size) / dyn_ent_sz;
-            std::optional<std::size_t> strtab_off;
-            std::uint64_t strtab_sz = 0;
-            std::optional<std::size_t> symtab_off;
-            std::uint64_t syment_sz = is64 ? 24u : 16u;
-            std::optional<std::size_t> sysv_hash_off;
-            std::optional<std::size_t> gnu_hash_off;
-
-            for (std::size_t i = 0; i < count; ++i) {
-                const std::size_t off = static_cast<std::size_t>(ph.offset) + i * dyn_ent_sz;
-                const std::int64_t tag =
-                    is64 ? static_cast<std::int64_t>(rd64(norm, off, big))
-                         : static_cast<std::int64_t>(static_cast<std::int32_t>(rd32(norm, off, big)));
-                const std::uint64_t val =
-                    is64 ? rd64(norm, off + 8, big)
-                         : static_cast<std::uint64_t>(rd32(norm, off + 4, big));
-                ElfDynamicEntry de;
-                de.tag = static_cast<std::uint64_t>(tag);
-                de.value = val;
-                elf->dynamic_entries_.push_back(de);
-                if (tag == 0) {
-                    break;
-                }
-                if (tag == 5) {  // DT_STRTAB
-                    strtab_off = normalize_dynamic_ptr_to_offset(
-                        val, live_base, static_base, norm.size());
-                } else if (tag == 10) {  // DT_STRSZ
-                    strtab_sz = val;
-                } else if (tag == 6) {  // DT_SYMTAB
-                    symtab_off = normalize_dynamic_ptr_to_offset(
-                        val, live_base, static_base, norm.size());
-                } else if (tag == 11 && val != 0) {  // DT_SYMENT
-                    syment_sz = val;
-                } else if (tag == 4) {  // DT_HASH
-                    sysv_hash_off = normalize_dynamic_ptr_to_offset(
-                        val, live_base, static_base, norm.size());
-                } else if (tag == 0x6ffffef5ll) {  // DT_GNU_HASH
-                    gnu_hash_off = normalize_dynamic_ptr_to_offset(
-                        val, live_base, static_base, norm.size());
-                }
-            }
-
-            if (strtab_off && *strtab_off < norm.size()) {
-                const std::size_t max_str =
-                    strtab_sz != 0
-                        ? static_cast<std::size_t>(std::min<std::uint64_t>(
-                              strtab_sz, static_cast<std::uint64_t>(norm.size() - *strtab_off)))
-                        : (norm.size() - *strtab_off);
-                const auto read_dynstr = [&](std::uint32_t name_off) -> std::string {
-                    if (name_off >= max_str) {
-                        return {};
-                    }
-                    return read_c_string(
-                        std::span<const std::uint8_t>(norm.data() + *strtab_off, max_str),
-                        name_off);
-                };
-
-                for (ElfDynamicEntry& de : elf->dynamic_entries_) {
-                    if ((de.tag == 1 || de.tag == 14 || de.tag == 15 || de.tag == 29) &&
-                        de.value <= std::numeric_limits<std::uint32_t>::max()) {
-                        de.string_value = read_dynstr(static_cast<std::uint32_t>(de.value));
-                        if (de.tag == 1) {  // DT_NEEDED
-                            de.needed_library = de.string_value;
-                            if (!de.needed_library.empty()) {
-                                ImportEntry imp;
-                                imp.library = de.needed_library;
-                                elf->imports_.push_back(std::move(imp));
-                            }
-                        }
-                    }
-                }
-
-                if (symtab_off && elf->symbols_.empty() && syment_sz >= (is64 ? 24u : 16u)) {
-                    std::uint32_t sym_count = 0;
-                    if (sysv_hash_off &&
-                        fits_range(*sysv_hash_off, 8, static_cast<std::uint64_t>(norm.size()))) {
-                        sym_count = rd32(norm, *sysv_hash_off + 4, big);
-                    } else if (gnu_hash_off) {
-                        sym_count = count_gnu_hash_dynsyms(norm, *gnu_hash_off, is64, big);
-                    } else if (*strtab_off > *symtab_off) {
-                        sym_count = static_cast<std::uint32_t>(
-                            (*strtab_off - *symtab_off) / static_cast<std::size_t>(syment_sz));
-                    }
-
-                    constexpr std::uint32_t kMaxSyms = 262144u;
-                    sym_count = std::min(sym_count, kMaxSyms);
-                    for (std::uint32_t idx = 1; idx < sym_count; ++idx) {
-                        const std::uint64_t ent_off64 =
-                            static_cast<std::uint64_t>(*symtab_off) +
-                            static_cast<std::uint64_t>(idx) * syment_sz;
-                        if (!fits_range(ent_off64, syment_sz, static_cast<std::uint64_t>(norm.size()))) {
-                            break;
-                        }
-                        const auto ent = static_cast<std::size_t>(ent_off64);
-                        std::uint32_t st_name = 0;
-                        std::uint8_t st_info = 0;
-                        std::uint8_t st_other = 0;
-                        std::uint16_t st_shndx = 0;
-                        std::uint64_t st_value = 0;
-                        std::uint64_t st_size = 0;
-                        if (is64) {
-                            st_name = rd32(norm, ent + 0, big);
-                            st_info = norm[ent + 4];
-                            st_other = norm[ent + 5];
-                            st_shndx = rd16(norm, ent + 6, big);
-                            st_value = rd64(norm, ent + 8, big);
-                            st_size = rd64(norm, ent + 16, big);
-                        } else {
-                            st_name = rd32(norm, ent + 0, big);
-                            st_value = rd32(norm, ent + 4, big);
-                            st_size = rd32(norm, ent + 8, big);
-                            st_info = norm[ent + 12];
-                            st_other = norm[ent + 13];
-                            st_shndx = rd16(norm, ent + 14, big);
-                        }
-
-                        ElfSymbol es;
-                        es.name_offset = st_name;
-                        es.name = read_dynstr(st_name);
-                        es.value = st_value;
-                        es.size = st_size;
-                        es.binding = static_cast<std::uint8_t>(st_info >> 4);
-                        es.type = static_cast<std::uint8_t>(st_info & 0x0Fu);
-                        es.visibility = static_cast<std::uint8_t>(st_other & 0x03u);
-                        es.other = st_other;
-                        es.section_index = st_shndx;
-                        es.dynamic = true;
-
-                        Symbol s;
-                        s.name = es.name;
-                        s.virtual_address = st_value;
-                        s.size = st_size;
-                        s.binding = es.binding;
-                        s.type = es.type;
-                        s.section_index = st_shndx;
-                        s.dynamic = true;
-
-                        elf->elf_symbols_.push_back(std::move(es));
-                        elf->symbols_.push_back(std::move(s));
-                    }
-                }
-            }
-            break;
-        }
+    // When ld.so has relocated DT_STRTAB / DT_SYMTAB in-place to live_base + rva,
+    // recover_dynamic_from_program_headers with live_base resolves them cleanly.
+    if (elf->elf_symbols_.empty()) {
+        elf->dynamic_entries_.clear();
+        elf->recover_dynamic_from_program_headers(norm, is64, big, live_base, static_base);
     }
 
     elf->rebase_to_live_base(live_base);

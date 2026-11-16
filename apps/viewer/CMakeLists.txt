@@ -34,10 +34,7 @@ add_library(peelf_gui SHARED
         src/application.cpp
         src/vulkan/vulkan_manager.h
         src/vulkan/vulkan_manager.cpp
-        src/model/pe_model.hpp
         src/model/binary_model.hpp
-        src/model/pe_parser.cpp
-        src/model/pe_parser.hpp
         src/model/binary_model.cpp
         src/ui/ui_panel.hpp
         src/ui/ui_panels.hpp
@@ -73,6 +70,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_diff.cpp
         src/ui/ui_panels_debugger.hpp
         src/ui/ui_panels_debugger.cpp
+        src/analysis/async_binary_diff.hpp
+        src/analysis/async_binary_diff.cpp
         src/analysis/function_index.hpp
         src/analysis/function_index.cpp
         src/analysis/reference_index.cpp

@@ -279,4 +279,13 @@ public:
 /// Win32 debug-event loop thread on Windows).
 [[nodiscard]] std::shared_ptr<IDebugBackend> create_native_debug_backend();
 
+/// Decodes a Linux `NT_PRSTATUS` general-purpose register payload for the given target layout.
+/// Returns `SubsystemStatus::available` only when the target ABI register layout is decoded;
+/// returns `SubsystemStatus::partial` or `SubsystemStatus::unavailable` when the ABI is unhandled
+/// or the payload is truncated (never returning false `available` with zeroed IP/SP).
+[[nodiscard]] ThreadContext decode_linux_prstatus_regset(
+    ThreadId tid,
+    const TargetLayout& layout,
+    std::span<const std::uint8_t> raw_regset);
+
 }  // namespace peelf::debugger

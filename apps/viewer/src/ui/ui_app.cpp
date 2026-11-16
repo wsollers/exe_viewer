@@ -3139,12 +3139,6 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
             file_loaded_ = false;
         }
 
-        if (const PeModel* pe = model_.pe()) {
-            pe_model_ = *pe;
-        } else {
-            pe_model_ = {};
-        }
-
         if (navigate_to_entry) {
             current_instructions_.clear();
             disasm_status_.clear();
@@ -3295,14 +3289,6 @@ void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& docksp
         if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             hex_panel_.navigate_to_range(clamp_to_size_t(*entry_offset), 1);
             last_navigation_selection_ = current_selection_;
-        }
-
-        // Keep legacy metadata for PE-only tools, but decode both formats from
-        // the same effective-byte source used by the hex editor.
-        if (const PeModel* pe = model_.pe()) {
-            pe_model_ = *pe;
-        }
-        if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
             disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
         }
 
@@ -3542,29 +3528,45 @@ void UiApp::switch_analysis_view(bool graph) {
 
 
     void UiApp::disassemble_section(const std::string& section_name, std::size_t max_size) {
-        const auto* section = pe_model_.section_by_name(section_name);
-        if (!section) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr) {
+            fprintf(stderr, "No binary image loaded\n");
+            return;
+        }
+        const peelf::Section* section = nullptr;
+        for (const auto& s : img->sections()) {
+            if (s.name == section_name) {
+                section = &s;
+                break;
+            }
+        }
+        if (section == nullptr) {
             fprintf(stderr, "Section '%s' not found\n", section_name.c_str());
             return;
         }
-
-        // Check if section is executable
-        if (!(section->characteristics & 0x20000000)) {
+        if (!section->executable) {
             fprintf(stderr, "Warning: Section '%s' is not marked executable\n", section_name.c_str());
         }
 
-        std::size_t size = std::min(max_size, static_cast<std::size_t>(section->raw_size));
-        const std::uint8_t* code = pe_model_.data_at_offset(section->raw_offset, size);
-        if (!code) {
+        const std::uint64_t window_off = model_.is_live_process()
+            ? model_.virtual_address_to_offset(section->virtual_address).value_or(0u)
+            : section->file_offset;
+        const std::size_t size = std::min<std::size_t>(
+            max_size,
+            static_cast<std::size_t>(section->file_size != 0u ? section->file_size : section->virtual_size));
+        const auto sample = model_.read_effective_bytes(window_off, size);
+        if (!sample.has_value() || sample->empty()) {
             fprintf(stderr, "Failed to read section data\n");
             return;
         }
 
-        std::uint64_t va = pe_model_.rva_to_va(section->virtual_address);
-        auto instructions = disasm_.disassemble(code, size, va);
+        const std::uint64_t va = section->virtual_address;
+        const auto instructions = disasm_.disassemble(sample->data(), sample->size(), va);
 
         printf("Section: %s (0x%llX - 0x%llX)\n",
-               section_name.c_str(), va, va + section->virtual_size);
+               section_name.c_str(),
+               static_cast<unsigned long long>(va),
+               static_cast<unsigned long long>(va + section->virtual_size));
         printf("----------------------------------------\n");
 
         for (const auto& inst : instructions) {
@@ -3576,34 +3578,34 @@ void UiApp::switch_analysis_view(bool graph) {
             }
 
             printf("%016llX  %-24s  %s\n",
-                   inst.address,
+                   static_cast<unsigned long long>(inst.address),
                    bytes_str.c_str(),
                    inst.to_string().c_str());
         }
     }
     void UiApp::disassemble_at(std::uint64_t rva, std::size_t size) {
-        // Get file offset from RVA
-        auto file_offset = pe_model_.rva_to_offset(static_cast<std::uint32_t>(rva));
-        if (!file_offset) {
-            fprintf(stderr, "Failed to convert RVA 0x%llX to file offset\n", rva);
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr) {
+            fprintf(stderr, "No binary image loaded\n");
+            return;
+        }
+        const std::uint64_t va = img->image_base() + rva;
+        const auto window_off = model_.virtual_address_to_offset(va);
+        if (!window_off.has_value()) {
+            fprintf(stderr, "Failed to convert RVA 0x%llX to offset\n",
+                    static_cast<unsigned long long>(rva));
             return;
         }
 
-        // Get pointer to code
-        const std::uint8_t* code = pe_model_.data_at_offset(*file_offset, size);
-        if (!code) {
-            fprintf(stderr, "Failed to read %zu bytes at offset 0x%zX\n", size, *file_offset);
+        const auto sample = model_.read_effective_bytes(*window_off, size);
+        if (!sample.has_value() || sample->empty()) {
+            fprintf(stderr, "Failed to read %zu bytes at offset 0x%llX\n",
+                    size, static_cast<unsigned long long>(*window_off));
             return;
         }
 
-        // Convert RVA to VA for disassembly
-        std::uint64_t va = pe_model_.rva_to_va(static_cast<std::uint32_t>(rva));
-
-        // Disassemble
-        auto instructions = disasm_.disassemble(code, size, va);
-
+        const auto instructions = disasm_.disassemble(sample->data(), sample->size(), va);
         for (const auto& inst : instructions) {
-            // Format bytes
             std::string bytes_str;
             for (std::uint8_t b : inst.bytes) {
                 char buf[4];
@@ -3612,7 +3614,7 @@ void UiApp::switch_analysis_view(bool graph) {
             }
 
             printf("%016llX  %-24s  %s\n",
-                   inst.address,
+                   static_cast<unsigned long long>(inst.address),
                    bytes_str.c_str(),
                    inst.to_string().c_str());
         }
@@ -3669,33 +3671,35 @@ void UiApp::switch_analysis_view(bool graph) {
 
     void UiApp::disassemble_entry_point(std::size_t max_size) {
         current_instructions_.clear();
-        auto offset = pe_model_.entry_point_offset();
-        if (!offset) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr) {
+            Log().error("Failed to get loaded binary image\n");
+            return;
+        }
+
+        const std::uint64_t va = img->entry_point();
+        const auto offset = model_.virtual_address_to_offset(va);
+        if (!offset.has_value()) {
             Log().error("Failed to get entry point offset\n");
             return;
         }
 
-        // Get the section containing the entry point to limit size
-        const auto* section = pe_model_.entry_point_section();
-        if (section) {
-            // Don't read past section end
-            const std::uint32_t offset_in_section = pe_model_.entry_point_rva - section->virtual_address;
-            if (offset_in_section >= section->raw_size) {
-                Log().error("Entry point is outside the section's raw bytes\n");
-                return;
+        for (const auto& s : img->sections()) {
+            const std::uint64_t sec_span = s.file_size != 0u ? s.file_size : s.virtual_size;
+            if (va >= s.virtual_address && (va - s.virtual_address) < sec_span) {
+                const auto remaining = static_cast<std::size_t>(sec_span - (va - s.virtual_address));
+                max_size = std::min(max_size, remaining);
+                break;
             }
-            std::size_t section_remaining = static_cast<std::size_t>(section->raw_size - offset_in_section);
-            max_size = std::min(max_size, section_remaining);
         }
 
-        const std::uint8_t* code = pe_model_.data_at_offset(*offset, max_size);
-        if (!code) {
+        const auto sample = model_.read_effective_bytes(*offset, max_size);
+        if (!sample.has_value() || sample->empty()) {
             Log().error("Failed to read entry point code\n");
             return;
         }
 
-        std::uint64_t va = pe_model_.entry_point_va();
-        current_instructions_ = disasm_.disassemble(code, max_size, va);
+        current_instructions_ = disasm_.disassemble(sample->data(), sample->size(), va);
 
         Log().info("Entry Point: 0x{:X}", va);
         printf("----------------------------------------\n");

@@ -1,6 +1,4 @@
 #include "binary_model.hpp"
-#include "pe_model.hpp"
-#include "pe_parser.hpp"
 #include "symbols/debug_symbols.hpp"
 
 #include <peelf/dwarf.hpp>
@@ -64,79 +62,79 @@ std::filesystem::path utf8_path(std::string_view text) {
 
 class DebugSessionProcessProxy final : public peelf::IProcessSession {
 public:
-    explicit DebugSessionProcessProxy(peelf::debugger::IDebugSession& dbg) noexcept
-        : dbg_(dbg) {}
+    explicit DebugSessionProcessProxy(std::shared_ptr<peelf::debugger::IDebugSession> dbg) noexcept
+        : dbg_(std::move(dbg)) {}
 
     [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override {
-        return dbg_.session().info();
+        return dbg_->session().info();
     }
     [[nodiscard]] bool is_alive() const noexcept override {
-        return dbg_.session().is_alive();
+        return dbg_->session().is_alive();
     }
     [[nodiscard]] bool is_read_only() const noexcept override {
-        return dbg_.session().is_read_only();
+        return dbg_->session().is_read_only();
     }
     [[nodiscard]] bool is_crash_dump() const noexcept override {
-        return dbg_.session().is_crash_dump();
+        return dbg_->session().is_crash_dump();
     }
     [[nodiscard]] bool is_suspended() const noexcept override {
-        return dbg_.state() == peelf::debugger::DebugSessionState::Paused ||
-               dbg_.session().is_suspended();
+        return dbg_->state() == peelf::debugger::DebugSessionState::Paused ||
+               dbg_->session().is_suspended();
     }
     [[nodiscard]] peelf::Result<void> suspend() override {
-        return dbg_.pause_execution();
+        return dbg_->pause_execution();
     }
     [[nodiscard]] peelf::Result<void> resume() override {
-        return dbg_.continue_execution(false);
+        return dbg_->continue_execution(false);
     }
     [[nodiscard]] peelf::Result<void> suspend_thread(peelf::ThreadId tid) override {
-        return dbg_.session().suspend_thread(tid);
+        return dbg_->session().suspend_thread(tid);
     }
     [[nodiscard]] peelf::Result<void> resume_thread(peelf::ThreadId tid) override {
-        return dbg_.session().resume_thread(tid);
+        return dbg_->session().resume_thread(tid);
     }
     [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
-        return dbg_.session().memory_regions();
+        return dbg_->session().memory_regions();
     }
     [[nodiscard]] peelf::ForgivingValue<peelf::ProcessMemorySummary> memory_summary(
         std::span<const peelf::MemoryRegion> regions) override {
-        return dbg_.session().memory_summary(regions);
+        return dbg_->session().memory_summary(regions);
     }
     [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
-        return dbg_.session().modules();
+        return dbg_->session().modules();
     }
     [[nodiscard]] peelf::Result<std::vector<peelf::ThreadInfo>> threads() override {
-        return dbg_.session().threads();
+        return dbg_->session().threads();
     }
     [[nodiscard]] peelf::ThreadContext thread_context(peelf::ThreadId tid) override {
-        return dbg_.session().thread_context(tid);
+        return dbg_->session().thread_context(tid);
     }
     [[nodiscard]] peelf::ForgivingValue<std::vector<std::uint8_t>> proc_auxv() override {
-        return dbg_.session().proc_auxv();
+        return dbg_->session().proc_auxv();
     }
     [[nodiscard]] peelf::ForgivingValue<std::string> proc_status_text() override {
-        return dbg_.session().proc_status_text();
+        return dbg_->session().proc_status_text();
     }
     [[nodiscard]] peelf::ForgivingValue<std::vector<std::string>> environment_variables() override {
-        return dbg_.session().environment_variables();
+        return dbg_->session().environment_variables();
     }
     [[nodiscard]] peelf::ForgivingValue<std::uint64_t> process_environment_block_address() override {
-        return dbg_.session().process_environment_block_address();
+        return dbg_->session().process_environment_block_address();
     }
     [[nodiscard]] peelf::Result<std::size_t> read_memory(
         std::uint64_t address,
         std::span<std::uint8_t> buffer) override {
-        return dbg_.session().read_memory(address, buffer);
+        return dbg_->session().read_memory(address, buffer);
     }
     [[nodiscard]] peelf::Result<std::size_t> write_memory(
         std::uint64_t address,
         std::span<const std::uint8_t> data,
         peelf::MemoryWriteOptions options) override {
-        return dbg_.session().write_memory(address, data, options);
+        return dbg_->session().write_memory(address, data, options);
     }
 
 private:
-    peelf::debugger::IDebugSession& dbg_;
+    std::shared_ptr<peelf::debugger::IDebugSession> dbg_;
 };
 
 } // namespace
@@ -155,9 +153,7 @@ private:
         bytes_.clear();
         live_backing_file_bytes_.clear();
         live_module_snapshot_bytes_.clear();
-        live_pe_backing_bytes_.clear();
         sections_.clear();
-        pe_.reset();
         image_.reset();
         editable_image_.reset();
         symbol_index_ = {};
@@ -472,16 +468,12 @@ private:
             endianness_ = image_->endianness();
         }
 
-        // PE (MZ) -> legacy PE model, which drives the PE-specific panels.
+        // PE (MZ) -> unified PeImage.
         if (bytes_[0] == 'M' && bytes_[1] == 'Z') {
             const bool loaded = load_pe(path);
             if (loaded) {
                 ++content_generation_;
                 source_kind_ = BinarySourceKind::StaticFile;
-                if (architecture_ == peelf::Architecture::Unknown && pe_) {
-                    architecture_ = pe_->is_pe32_plus ? peelf::Architecture::X86_64
-                                                      : peelf::Architecture::X86;
-                }
                 if (auto editable = peelf::PagedBinaryImage::open(utf8_path(path))) {
                     editable_image_ = std::move(*editable);
                 }
@@ -634,8 +626,8 @@ private:
         }
 
         reset_all();
-        debug_session_ = std::move(debug_session);
-        session_ = std::make_unique<DebugSessionProcessProxy>(*debug_session_);
+        debug_session_ = std::shared_ptr<peelf::debugger::IDebugSession>(std::move(debug_session));
+        session_ = std::make_shared<DebugSessionProcessProxy>(debug_session_);
         source_kind_ = BinarySourceKind::LiveProcess;
         architecture_ = session_->info().architecture != peelf::Architecture::Unknown
                             ? session_->info().architecture
@@ -896,32 +888,6 @@ private:
         return {};
     }
 
-    void BinaryModel::populate_live_pe_legacy_model(const peelf::ModuleInfo& module) {
-        pe_.reset();
-        live_pe_backing_bytes_.clear();
-        if (!session_ || !image_ || image_->format() != peelf::Format::PE) {
-            return;
-        }
-        constexpr std::uint64_t kMaxPeLegacySample = 16ull * 1024ull * 1024ull;
-        const std::size_t sample_size = static_cast<std::size_t>(
-            std::min<std::uint64_t>(std::max<std::uint64_t>(module.size, 0x10000u), kMaxPeLegacySample));
-        const peelf::MemorySample sample =
-            peelf::read_memory_tolerant(*session_, regions_, module.base_address, sample_size);
-        if (sample.readable_count < 0x100) {
-            return;
-        }
-        live_pe_backing_bytes_ =
-            peelf::normalize_mapped_pe_for_file_parsers(sample.bytes, module.base_address);
-        PeModel parsed_pe;
-        const PeParseResult res = PeParser::parse(live_pe_backing_bytes_, parsed_pe);
-        if (res.success) {
-            parsed_pe.image_base = module.base_address;
-            pe_ = std::make_unique<PeModel>(std::move(parsed_pe));
-        } else {
-            live_pe_backing_bytes_.clear();
-        }
-    }
-
     peelf::Result<void> BinaryModel::select_process_module(std::size_t module_index) {
         if (!is_live_process()) {
             return peelf::make_error("not attached to a live process");
@@ -943,7 +909,6 @@ private:
 
         live_target_kind_ = LiveViewTargetKind::Module;
         ++content_generation_;
-        pe_.reset();
         image_.reset();
         sections_.clear();
 
@@ -956,10 +921,6 @@ private:
             endianness_ = image_->endianness();
             live_window_base_ = mod.base_address;
             live_window_size_ = compute_image_mapped_span(*image_, mod.base_address, mod.size);
-
-            if (format_ == BinaryFormat::PE) {
-                populate_live_pe_legacy_model(mod);
-            }
 
             const std::string display_path = !mod.path.empty() ? mod.path.string() : mod.name;
             file_info_.path = display_path;
@@ -1069,7 +1030,6 @@ private:
         live_window_base_ = reg.start_address;
         live_window_size_ = reg.size();
 
-        pe_.reset();
         image_.reset();
         live_backing_file_bytes_.clear();
         live_module_snapshot_bytes_.clear();
@@ -1452,35 +1412,36 @@ private:
     }
 
     bool BinaryModel::load_pe(const std::string& path) {
-        PeModel pe_model;
-        PeParseResult result = PeParser::parse(bytes_, pe_model);
-        if (!result.success) {
+        if (!image_ || image_->format() != peelf::Format::PE) {
             format_ = BinaryFormat::None;
-            pe_.reset();
             sections_.clear();
             return false;
         }
 
         format_ = BinaryFormat::PE;
-        pe_ = std::make_unique<PeModel>(std::move(pe_model));
-        // The legacy model borrows storage owned by this BinaryModel.
-        pe_->raw_data = bytes_.data();
-        pe_->raw_size = bytes_.size();
 
         file_info_.path = path;
         file_info_.format_str = "PE";
-        file_info_.arch_str = image_ ? std::string(peelf::to_string(image_->architecture())) : "Unknown";
+        file_info_.arch_str = std::string(peelf::to_string(image_->architecture()));
         file_info_.size_bytes = bytes_.size();
-        file_info_.entry_point = image_ ? image_->entry_point() : result.entry_point_va;
-        file_info_.flags = result.flags;
+        file_info_.entry_point = image_->entry_point();
+
+        file_info_.flags.clear();
+        file_info_.flags.push_back(image_->is_64bit() ? "64-bit" : "32-bit");
+        if (const peelf::PeHeader* hdr = image_->pe_header(); hdr != nullptr) {
+            if ((hdr->characteristics & 0x0002u) != 0u) file_info_.flags.push_back("Executable");
+            if ((hdr->characteristics & 0x2000u) != 0u) file_info_.flags.push_back("DLL");
+            if ((hdr->characteristics & 0x1000u) != 0u) file_info_.flags.push_back("System");
+            if ((hdr->characteristics & 0x0020u) != 0u) file_info_.flags.push_back("LargeAddressAware");
+        }
 
         sections_.clear();
-        for (const auto& s : pe_->sections) {
+        for (const auto& s : image_->sections()) {
             sections_.push_back(SectionInfo{
                 .name = s.name,
-                .address = result.image_base + s.virtual_address,
-                .size = s.virtual_size,
-                .flags = s.characteristics
+                .address = s.virtual_address,
+                .size = s.virtual_size != 0u ? s.virtual_size : s.file_size,
+                .flags = static_cast<std::uint32_t>(s.raw_flags)
             });
         }
 

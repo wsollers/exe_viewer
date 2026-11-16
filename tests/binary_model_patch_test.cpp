@@ -137,12 +137,10 @@ INSTANTIATE_TEST_SUITE_P(AllCpuFamilies, InstructionPatchRoundTrip, testing::Val
 TEST(BinaryModelPatching, ViewerExecutableEntryBytesAreReadableAndDecode) {
     viewer::BinaryModel model;
     ASSERT_TRUE(model.load_file(PEELF_VIEWER_DEBUG_EXE));
-    ASSERT_NE(model.pe(), nullptr);
     ASSERT_NE(model.image(), nullptr);
     const auto entry = model.image()->entry_point();
     const auto offset = model.image()->virtual_address_to_file_offset(entry);
     ASSERT_TRUE(offset);
-    ASSERT_NE(model.pe()->data_at_offset(static_cast<std::size_t>(*offset)), nullptr);
     const auto bytes = model.read_effective_bytes(*offset, 16);
     ASSERT_TRUE(bytes);
     viewer::Disassembler decoder;

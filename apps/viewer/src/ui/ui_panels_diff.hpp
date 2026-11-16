@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../analysis/async_binary_diff.hpp"
 #include "../disasm/disassembler.hpp"
 #include "../model/binary_model.hpp"
 #include "../navigation/viewer_navigation.hpp"
@@ -50,6 +51,7 @@ private:
                            std::size_t window_hint = 256u,
                            bool also_jump_main_view = true);
     void refresh_side_by_side_slices();
+    void poll_async_completion();
 
     void draw_overview_tab();
     void draw_sections_tab();
@@ -61,6 +63,7 @@ private:
     BinaryModel& model_;
     NavigateCallback on_navigate_;
     BrowseFileCallback on_browse_file_;
+    AsyncBinaryDiffer differ_{};
 
     ActiveDiffMode mode_{ActiveDiffMode::None};
     std::array<char, 1024> comparison_path_buf_{};

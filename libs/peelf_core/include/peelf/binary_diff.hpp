@@ -3,8 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -189,6 +191,8 @@ struct BinaryDiffOptions {
     std::size_t max_byte_hunks{4096};
     std::size_t sample_bytes_per_hunk{24};
     double min_function_similarity{0.55};
+    std::stop_token stop_token{};
+    std::function<void(std::size_t completed, std::size_t total, std::string_view stage)> progress_callback{};
 };
 
 struct BinaryDiffReport {
@@ -270,6 +274,8 @@ struct LiveIntegrityDiffOptions {
     std::size_t max_hunks{2048};
     std::size_t sample_bytes_per_hunk{24};
     bool include_writable_data_hunks{false};
+    std::stop_token stop_token{};
+    std::function<void(std::size_t completed, std::size_t total, std::string_view stage)> progress_callback{};
 };
 
 struct LiveModuleIntegrityReport {

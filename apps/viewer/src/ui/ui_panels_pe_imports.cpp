@@ -1,6 +1,7 @@
 #include "ui_panels.hpp"
 #include <imgui.h>
-#include "model/pe_model.hpp"
+
+#include <string>
 
 namespace viewer {
 
@@ -12,8 +13,8 @@ namespace viewer {
     }
 
     void PeImportsPanel::draw_contents() {
-        const PeModel* pe = model_.pe();
-        if (!pe) {
+        const peelf::IBinaryImage* img = model_.image();
+        if (img == nullptr || img->format() != peelf::Format::PE) {
             ImGui::TextUnformatted("No PE file loaded.");
             return;
         }
@@ -31,16 +32,22 @@ namespace viewer {
         ImGui::Text("Address"); ImGui::NextColumn();
         ImGui::Separator();
 
-        for (const auto& imp : pe->imports) {
+        for (const auto& imp : img->imports()) {
+            const std::string func_display =
+                !imp.name.empty()
+                    ? imp.name
+                    : ((imp.import_by_ordinal || imp.ordinal != 0u)
+                           ? ("Ordinal#" + std::to_string(imp.ordinal))
+                           : "<unnamed>");
             if (has_filter) {
-                if (imp.dll.find(filter) == std::string::npos &&
-                    imp.function.find(filter) == std::string::npos) {
+                if (imp.library.find(filter) == std::string::npos &&
+                    func_display.find(filter) == std::string::npos) {
                     continue;
-                    }
+                }
             }
 
-            ImGui::TextUnformatted(imp.dll.c_str()); ImGui::NextColumn();
-            ImGui::TextUnformatted(imp.function.c_str()); ImGui::NextColumn();
+            ImGui::TextUnformatted(imp.library.c_str()); ImGui::NextColumn();
+            ImGui::TextUnformatted(func_display.c_str()); ImGui::NextColumn();
             ImGui::Text("0x%llX",
                         static_cast<unsigned long long>(imp.address)); ImGui::NextColumn();
         }

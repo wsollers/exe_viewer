@@ -1,12 +1,6 @@
 #include <peelf/peelf.hpp>
 
-#include <cstddef>
-#include <cstdint>
-#include <fstream>
-#include <vector>
-
-
-#include"../include/pe/pe_parser.h"
+#include <string_view>
 
 namespace peelf {
 

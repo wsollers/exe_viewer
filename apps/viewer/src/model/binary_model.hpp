@@ -12,7 +12,6 @@
 #include <vector>
 
 #include "analysis/function_index.hpp"
-#include "pe_model.hpp"
 #include "symbols/data_types.hpp"
 #include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
@@ -73,9 +72,6 @@ namespace viewer {
         std::uint64_t entry_point = 0;
         std::vector<std::string> flags;
     };
-
-    class PeModel;
-    class ElfModel;
 
     class BinaryModel {
     public:
@@ -152,8 +148,6 @@ namespace viewer {
         [[nodiscard]] const std::vector<SectionInfo>& sections() const { return sections_; }
         [[nodiscard]] const std::string& last_diagnostic() const noexcept { return last_diagnostic_; }
 
-        [[nodiscard]] const PeModel* pe() const { return pe_.get(); }
-
         // Unified core image (format-agnostic identity). Non-null once a PE or ELF
         // file or live module parses.
         [[nodiscard]] const peelf::IBinaryImage* image() const { return image_.get(); }
@@ -164,6 +158,9 @@ namespace viewer {
         // Live process state accessors.
         [[nodiscard]] const peelf::IProcessSession* process_session() const noexcept { return session_.get(); }
         [[nodiscard]] peelf::IProcessSession* process_session() noexcept { return session_.get(); }
+        [[nodiscard]] std::shared_ptr<peelf::IProcessSession> shared_process_session() const noexcept {
+            return session_;
+        }
         [[nodiscard]] const std::optional<std::filesystem::path>& resolved_executable_path() const noexcept {
             return resolved_exe_path_;
         }
@@ -327,6 +324,10 @@ namespace viewer {
             const peelf::PatchBundleApplyOptions& options = {});
 
         [[nodiscard]] std::uint64_t edit_revision() const noexcept { return edit_revision_; }
+        [[nodiscard]] std::uint64_t content_generation() const noexcept { return content_generation_; }
+        [[nodiscard]] std::uint64_t active_revision_token() const noexcept {
+            return (content_generation_ << 32u) ^ edit_revision_;
+        }
         [[nodiscard]] const std::string& content_sha256() const;
 
     private:
@@ -342,9 +343,7 @@ namespace viewer {
         std::vector<std::uint8_t> bytes_;
         std::vector<std::uint8_t> live_backing_file_bytes_;
         std::vector<std::uint8_t> live_module_snapshot_bytes_;
-        std::vector<std::uint8_t> live_pe_backing_bytes_;
         std::vector<SectionInfo> sections_;
-        std::unique_ptr<PeModel> pe_;
         std::unique_ptr<peelf::IBinaryImage> image_;
         std::optional<peelf::PagedBinaryImage> editable_image_;
         SymbolIndex symbol_index_;
@@ -370,8 +369,8 @@ namespace viewer {
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
         std::shared_ptr<peelf::debugger::IDebugBackend> debug_backend_;
-        std::unique_ptr<peelf::debugger::IDebugSession> debug_session_;
-        std::unique_ptr<peelf::IProcessSession> session_;
+        std::shared_ptr<peelf::debugger::IDebugSession> debug_session_;
+        std::shared_ptr<peelf::IProcessSession> session_;
         std::vector<peelf::debugger::BreakpointDescriptor> debug_breakpoints_;
         std::uint64_t last_synced_debug_stop_revision_ = 0;
         std::map<std::string, std::uint64_t, std::less<>> previous_debug_registers_;
@@ -417,7 +416,6 @@ namespace viewer {
         void load_live_module_backing_bytes(const peelf::ModuleInfo& module);
         bool load_pe(const std::string& path);
         bool load_elf(const std::string& path);
-        void populate_live_pe_legacy_model(const peelf::ModuleInfo& module);
     };
 
 } // namespace viewer
