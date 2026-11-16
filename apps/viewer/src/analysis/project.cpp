@@ -581,15 +581,36 @@ peelf::Result<std::string> read_project_file(const std::filesystem::path& path) 
 }
 
 peelf::Result<void> write_analysis_file(const std::filesystem::path& path, std::string_view text) {
+    struct TempFileGuard {
+        std::filesystem::path path;
+        bool active{true};
+        ~TempFileGuard() {
+            if (active && !path.empty()) {
+                std::error_code rm_ec;
+                std::filesystem::remove(path, rm_ec);
+            }
+        }
+        void release() noexcept { active = false; }
+    };
+
     static std::atomic<std::uint64_t> tmp_counter{0};
     std::error_code dir_ec;
     if (path.has_parent_path() && !path.parent_path().empty()) {
         std::filesystem::create_directories(path.parent_path(), dir_ec);
     }
+
+    const std::uint64_t pid =
+#ifdef _WIN32
+        static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+        static_cast<std::uint64_t>(::getpid());
+#endif
     auto tmp = path;
-    tmp += std::format(".tmp-{}-{}",
+    tmp += std::format(".{}-{}-{}.tmp",
+                       pid,
                        std::chrono::steady_clock::now().time_since_epoch().count(),
                        ++tmp_counter);
+    TempFileGuard tmp_guard{tmp};
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) return peelf::make_error("Cannot create analysis file");
@@ -597,8 +618,6 @@ peelf::Result<void> write_analysis_file(const std::filesystem::path& path, std::
         out.flush();
         out.close();
         if (!out) {
-            std::error_code ec;
-            std::filesystem::remove(tmp, ec);
             return peelf::make_error("Cannot write analysis file");
         }
     }
@@ -611,10 +630,9 @@ peelf::Result<void> write_analysis_file(const std::filesystem::path& path, std::
     std::filesystem::rename(tmp, path, ec);
 #endif
     if (ec) {
-        std::error_code rm_ec;
-        std::filesystem::remove(tmp, rm_ec);
         return peelf::make_error("Cannot replace analysis file");
     }
+    tmp_guard.release();
     return {};
 }
 

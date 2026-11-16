@@ -95,6 +95,8 @@ public:
                                            std::string label);
     [[nodiscard]] Result<void> undo();
     [[nodiscard]] Result<void> redo();
+    [[nodiscard]] Result<void> save_as(const std::filesystem::path& output_path,
+                                       bool overwrite = false) const;
     [[nodiscard]] Result<void> write_effective_to(const std::filesystem::path& output_path,
                                                   bool overwrite = false) const;
 

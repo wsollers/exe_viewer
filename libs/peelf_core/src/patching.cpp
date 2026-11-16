@@ -1,9 +1,24 @@
 #include "peelf/patching.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <format>
 #include <fstream>
 #include <limits>
 #include <utility>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace peelf {
 namespace {
@@ -14,6 +29,129 @@ namespace {
 
 [[nodiscard]] std::uint64_t span_end(std::uint64_t offset, std::uint64_t size) noexcept {
     return offset + size;
+}
+
+struct TempFileGuard {
+    std::filesystem::path path;
+    bool active{true};
+
+    explicit TempFileGuard(std::filesystem::path p) : path(std::move(p)) {}
+
+    ~TempFileGuard() {
+        if (active && !path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+
+    TempFileGuard(const TempFileGuard&) = delete;
+    TempFileGuard& operator=(const TempFileGuard&) = delete;
+
+    void release() noexcept { active = false; }
+};
+
+[[nodiscard]] std::uint64_t current_process_tag() noexcept {
+#ifdef _WIN32
+    return static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+    return static_cast<std::uint64_t>(::getpid());
+#endif
+}
+
+[[nodiscard]] std::filesystem::path make_unique_sibling_temp_path(
+    const std::filesystem::path& output_base,
+    const std::filesystem::path& filename) {
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t pid = current_process_tag();
+    const std::filesystem::path base_name =
+        filename.empty() ? std::filesystem::path("patched.bin") : filename;
+    for (unsigned attempt = 0; attempt < 64u; ++attempt) {
+        const auto ticks = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const std::uint64_t seq = ++counter;
+        std::filesystem::path candidate = output_base / base_name;
+        candidate += std::format(".{}-{}-{}.tmp", pid, ticks, seq);
+        std::error_code ec;
+        if (!std::filesystem::exists(candidate, ec) && !ec) {
+            return candidate;
+        }
+    }
+    std::filesystem::path fallback = output_base / base_name;
+    fallback += std::format(".{}-{}.tmp", pid, ++counter);
+    return fallback;
+}
+
+void rebuild_committed_interval_into(
+    std::map<std::uint64_t, CommittedPatchInterval>& committed_map,
+    const std::map<std::uint64_t, std::uint8_t>& original_ram,
+    std::uint64_t address,
+    std::span<const std::uint8_t> written_bytes) {
+    if (written_bytes.empty()) {
+        return;
+    }
+
+    std::uint64_t union_begin = address;
+    std::uint64_t union_end = address + static_cast<std::uint64_t>(written_bytes.size());
+
+    auto erase_begin = committed_map.lower_bound(address);
+    if (erase_begin != committed_map.begin()) {
+        auto prev = erase_begin;
+        --prev;
+        if (prev->second.end_address() >= address) {
+            erase_begin = prev;
+        }
+    }
+
+    auto erase_end = erase_begin;
+    while (erase_end != committed_map.end() && erase_end->second.address <= union_end) {
+        union_begin = std::min(union_begin, erase_end->second.address);
+        union_end = std::max(union_end, erase_end->second.end_address());
+        ++erase_end;
+    }
+
+    const auto union_len = static_cast<std::size_t>(union_end - union_begin);
+    std::vector<std::uint8_t> orig(union_len, 0);
+    std::vector<std::uint8_t> curr(union_len, 0);
+
+    for (std::size_t i = 0; i < union_len; ++i) {
+        const std::uint64_t va = union_begin + static_cast<std::uint64_t>(i);
+        if (const auto it = original_ram.find(va); it != original_ram.end()) {
+            orig[i] = it->second;
+            curr[i] = it->second;
+        }
+    }
+
+    for (auto it = erase_begin; it != erase_end; ++it) {
+        const auto rel = static_cast<std::ptrdiff_t>(it->second.address - union_begin);
+        std::copy(it->second.committed.begin(), it->second.committed.end(), curr.begin() + rel);
+    }
+
+    const auto write_rel = static_cast<std::ptrdiff_t>(address - union_begin);
+    std::copy(written_bytes.begin(), written_bytes.end(), curr.begin() + write_rel);
+
+    committed_map.erase(erase_begin, erase_end);
+
+    std::size_t run_begin = 0;
+    bool in_run = false;
+    for (std::size_t i = 0; i < union_len; ++i) {
+        const bool diff = curr[i] != orig[i];
+        if (diff && !in_run) {
+            run_begin = i;
+            in_run = true;
+        }
+        const bool at_end = (i + 1 == union_len);
+        if (in_run && (!diff || at_end)) {
+            const std::size_t run_end = (diff && at_end) ? (i + 1) : i;
+            CommittedPatchInterval ci;
+            ci.address = union_begin + static_cast<std::uint64_t>(run_begin);
+            ci.original.assign(orig.begin() + static_cast<std::ptrdiff_t>(run_begin),
+                               orig.begin() + static_cast<std::ptrdiff_t>(run_end));
+            ci.committed.assign(curr.begin() + static_cast<std::ptrdiff_t>(run_begin),
+                                curr.begin() + static_cast<std::ptrdiff_t>(run_end));
+            committed_map.emplace(ci.address, std::move(ci));
+            in_run = false;
+        }
+    }
 }
 
 } // namespace
@@ -163,7 +301,37 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::read_file_range(std::uint64_
 
 Result<std::vector<std::uint8_t>> PagedBinaryImage::read_original(std::uint64_t offset,
                                                                   std::uint64_t size) const {
-    return read_file_range(offset, size);
+    auto bytes = read_file_range(offset, size);
+    if (!bytes || size == 0 || patches_.empty()) {
+        return bytes;
+    }
+
+    const std::uint64_t end = span_end(offset, size);
+    auto it = patches_.upper_bound(offset);
+    if (it != patches_.begin()) {
+        --it;
+    }
+
+    for (; it != patches_.end(); ++it) {
+        const PatchInterval& patch = it->second;
+        if (patch.offset >= end) {
+            break;
+        }
+        if (patch.end_offset() <= offset) {
+            continue;
+        }
+
+        const std::uint64_t copy_begin = std::max(offset, patch.offset);
+        const std::uint64_t copy_end = std::min(end, patch.end_offset());
+        const std::uint64_t patch_start = copy_begin - patch.offset;
+        const std::uint64_t output_start = copy_begin - offset;
+        const std::uint64_t copy_size = copy_end - copy_begin;
+        std::copy_n(patch.original.begin() + static_cast<std::ptrdiff_t>(patch_start),
+                    static_cast<std::ptrdiff_t>(copy_size),
+                    bytes->begin() + static_cast<std::ptrdiff_t>(output_start));
+    }
+
+    return bytes;
 }
 
 Result<std::vector<std::uint8_t>> PagedBinaryImage::read_effective(std::uint64_t offset,
@@ -323,8 +491,10 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
     }
 
     // Retain sparse intervals for rollback; never snapshot gaps between writes.
+    undo_stack_.reserve(undo_stack_.size() + 1);
     auto saved = patches_;
     std::vector<PatchEdit> edits;
+    edits.reserve(writes.size());
     try {
         for (const auto& write : writes) {
             auto before = read_effective(write.offset, write.bytes.size());
@@ -333,7 +503,12 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
                 return std::unexpected(before.error());
             }
             if (*before == write.bytes) continue;
-            edits.push_back(PatchEdit{.offset = write.offset, .before = std::move(*before), .after = write.bytes, .label = label});
+            edits.push_back(PatchEdit{
+                .offset = write.offset,
+                .before = std::move(*before),
+                .after = write.bytes,
+                .label = label,
+            });
             auto applied = apply_replacement_no_history(write.offset, write.bytes);
             if (!applied) {
                 patches_.swap(saved);
@@ -348,6 +523,7 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
         patches_.swap(saved);
         throw;
     }
+
     return {};
 }
 
@@ -366,6 +542,7 @@ Result<void> PagedBinaryImage::undo() {
         return make_error("no patch edit to undo");
     }
 
+    redo_stack_.reserve(redo_stack_.size() + 1);
     auto saved = patches_;
     try {
         // Reverse order is essential for overlapping writes in a transaction.
@@ -376,7 +553,7 @@ Result<void> PagedBinaryImage::undo() {
                 return std::unexpected(applied.error());
             }
         }
-        redo_stack_.push_back(undo_stack_.back());
+        redo_stack_.push_back(std::move(undo_stack_.back()));
         undo_stack_.pop_back();
     } catch (...) {
         patches_.swap(saved);
@@ -387,6 +564,7 @@ Result<void> PagedBinaryImage::undo() {
 
 Result<void> PagedBinaryImage::redo() {
     if (redo_stack_.empty()) return make_error("no patch edit to redo");
+    undo_stack_.reserve(undo_stack_.size() + 1);
     auto saved = patches_;
     try {
         for (const auto& edit : redo_stack_.back()) {
@@ -396,7 +574,7 @@ Result<void> PagedBinaryImage::redo() {
                 return std::unexpected(applied.error());
             }
         }
-        undo_stack_.push_back(redo_stack_.back());
+        undo_stack_.push_back(std::move(redo_stack_.back()));
         redo_stack_.pop_back();
     } catch (...) {
         patches_.swap(saved);
@@ -405,59 +583,117 @@ Result<void> PagedBinaryImage::redo() {
     return {};
 }
 
-Result<void> PagedBinaryImage::write_effective_to(const std::filesystem::path& output_path,
-                                                  bool overwrite) const {
+Result<void> PagedBinaryImage::save_as(const std::filesystem::path& output_path,
+                                       bool overwrite) const {
     if (output_path.empty()) {
         return make_error("output path is empty");
     }
 
     std::error_code ec;
     const auto input_absolute = std::filesystem::weakly_canonical(path_, ec);
-    const std::filesystem::path normalized_input = ec ? std::filesystem::absolute(path_) : input_absolute;
+    const std::filesystem::path normalized_input =
+        ec ? std::filesystem::absolute(path_) : input_absolute;
     ec.clear();
     const auto output_parent = output_path.parent_path();
     const std::filesystem::path output_base =
-        output_parent.empty() ? std::filesystem::current_path(ec) : std::filesystem::weakly_canonical(output_parent, ec);
+        output_parent.empty()
+            ? std::filesystem::current_path(ec)
+            : std::filesystem::weakly_canonical(output_parent, ec);
     if (ec) {
         return make_error("failed to resolve output directory");
     }
     const std::filesystem::path normalized_output = output_base / output_path.filename();
-    if (normalized_input == normalized_output && !overwrite) {
-        return make_error("refusing to overwrite the input file");
-    }
 
-    if (!overwrite && std::filesystem::exists(output_path, ec)) {
-        return make_error("output file already exists");
-    }
+    ec.clear();
+    const bool output_exists = std::filesystem::exists(output_path, ec);
     if (ec) {
         return make_error("failed to query output path");
     }
 
-    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-        return make_error("failed to open output file");
+    std::error_code eq_ec;
+    const bool same_file =
+        (normalized_input == normalized_output) ||
+        (output_exists && std::filesystem::equivalent(path_, output_path, eq_ec) && !eq_ec);
+
+    if (same_file && !overwrite) {
+        return make_error("refusing to overwrite the input file");
+    }
+    if (!overwrite && output_exists) {
+        return make_error("output file already exists");
     }
 
-    std::uint64_t offset = 0;
-    while (offset < size_) {
-        const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
-        auto bytes = read_effective(offset, chunk_size);
-        if (!bytes) {
-            return std::unexpected(bytes.error());
-        }
-        output.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
+    const std::filesystem::path temp_path =
+        make_unique_sibling_temp_path(output_base, output_path.filename());
+    TempFileGuard temp_guard{temp_path};
+
+    {
+        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
         if (!output) {
-            return make_error("failed to write output file");
+            return make_error("failed to open temporary output file");
         }
-        offset += chunk_size;
+
+        std::uint64_t offset = 0;
+        while (offset < size_) {
+            const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
+            auto bytes = read_effective(offset, chunk_size);
+            if (!bytes) {
+                return std::unexpected(bytes.error());
+            }
+            output.write(reinterpret_cast<const char*>(bytes->data()),
+                         static_cast<std::streamsize>(bytes->size()));
+            if (!output) {
+                return make_error("failed to write output file");
+            }
+            offset += chunk_size;
+        }
+
+        output.flush();
+        output.close();
+        if (!output) {
+            return make_error("failed to flush output file");
+        }
     }
 
-    output.flush();
-    if (!output) {
-        return make_error("failed to flush output file");
+    const bool reopen_backing_stream = same_file && input_.is_open();
+    if (reopen_backing_stream) {
+        input_.close();
+    }
+
+    std::error_code replace_ec;
+#ifdef _WIN32
+    if (!MoveFileExW(temp_path.c_str(),
+                     output_path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        replace_ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+    }
+#else
+    std::filesystem::rename(temp_path, output_path, replace_ec);
+#endif
+    if (replace_ec) {
+        if (reopen_backing_stream) {
+            input_.clear();
+            input_.open(path_, std::ios::binary);
+        }
+        return make_error("failed to replace output file");
+    }
+
+    temp_guard.release();
+
+    if (same_file) {
+        page_cache_.clear();
+        input_.clear();
+        input_.open(path_, std::ios::binary);
+        if (!input_) {
+            return make_error("failed to reopen binary image file after overwrite");
+        }
     }
 
     return {};
+}
+
+Result<void> PagedBinaryImage::write_effective_to(const std::filesystem::path& output_path,
+                                                  bool overwrite) const {
+    return save_as(output_path, overwrite);
 }
 
 // =============================================================================
@@ -801,37 +1037,50 @@ Result<void> LiveMemoryPatchSpace::stage_writes(IProcessSession& session,
         snapshots.push_back(PatchSpanSnapshot{r.begin, std::move(*before), {}});
     }
 
-    for (const auto& w : writes) {
-        if (auto applied = apply_staged_replacement_no_history(session, w.offset, w.bytes);
-            !applied) {
-            return std::unexpected(applied.error());
+    undo_stack_.reserve(undo_stack_.size() + 1);
+    auto saved_staged = staged_;
+    auto saved_orig = original_ram_;
+    try {
+        for (const auto& w : writes) {
+            if (auto applied = apply_staged_replacement_no_history(session, w.offset, w.bytes);
+                !applied) {
+                staged_.swap(saved_staged);
+                original_ram_.swap(saved_orig);
+                return std::unexpected(applied.error());
+            }
         }
-    }
 
-    std::vector<PatchSpanSnapshot> changed;
-    changed.reserve(snapshots.size());
-    for (PatchSpanSnapshot& snap : snapshots) {
-        auto after = read_effective(session, snap.offset, snap.before.size());
-        if (!after) {
-            return std::unexpected(after.error());
+        std::vector<PatchSpanSnapshot> changed;
+        changed.reserve(snapshots.size());
+        for (PatchSpanSnapshot& snap : snapshots) {
+            auto after = read_effective(session, snap.offset, snap.before.size());
+            if (!after) {
+                staged_.swap(saved_staged);
+                original_ram_.swap(saved_orig);
+                return std::unexpected(after.error());
+            }
+            if (snap.before != *after) {
+                snap.after = std::move(*after);
+                changed.push_back(std::move(snap));
+            }
         }
-        if (snap.before != *after) {
-            snap.after = std::move(*after);
-            changed.push_back(std::move(snap));
-        }
-    }
 
-    if (!changed.empty()) {
-        PatchEdit edit;
-        edit.label = std::move(label);
-        if (changed.size() == 1) {
-            edit.offset = changed.front().offset;
-            edit.before = changed.front().before;
-            edit.after = changed.front().after;
+        if (!changed.empty()) {
+            PatchEdit edit;
+            edit.label = std::move(label);
+            if (changed.size() == 1) {
+                edit.offset = changed.front().offset;
+                edit.before = changed.front().before;
+                edit.after = changed.front().after;
+            }
+            edit.spans = std::move(changed);
+            undo_stack_.push_back(std::move(edit));
+            redo_stack_.clear();
         }
-        edit.spans = std::move(changed);
-        undo_stack_.push_back(std::move(edit));
-        redo_stack_.clear();
+    } catch (...) {
+        staged_.swap(saved_staged);
+        original_ram_.swap(saved_orig);
+        throw;
     }
 
     return {};
@@ -852,15 +1101,26 @@ Result<void> LiveMemoryPatchSpace::undo(IProcessSession& session) {
     if (undo_stack_.empty()) {
         return make_error("no staged patch to undo");
     }
-    PatchEdit edit = std::move(undo_stack_.back());
-    undo_stack_.pop_back();
-    for (const PatchSpanSnapshot& snap : edit.spans) {
-        if (auto applied = apply_staged_replacement_no_history(session, snap.offset, snap.before);
-            !applied) {
-            return std::unexpected(applied.error());
+    redo_stack_.reserve(redo_stack_.size() + 1);
+    auto saved_staged = staged_;
+    auto saved_orig = original_ram_;
+    try {
+        const PatchEdit& edit = undo_stack_.back();
+        for (auto it = edit.spans.rbegin(); it != edit.spans.rend(); ++it) {
+            if (auto applied = apply_staged_replacement_no_history(session, it->offset, it->before);
+                !applied) {
+                staged_.swap(saved_staged);
+                original_ram_.swap(saved_orig);
+                return std::unexpected(applied.error());
+            }
         }
+        redo_stack_.push_back(std::move(undo_stack_.back()));
+        undo_stack_.pop_back();
+    } catch (...) {
+        staged_.swap(saved_staged);
+        original_ram_.swap(saved_orig);
+        throw;
     }
-    redo_stack_.push_back(std::move(edit));
     return {};
 }
 
@@ -868,87 +1128,33 @@ Result<void> LiveMemoryPatchSpace::redo(IProcessSession& session) {
     if (redo_stack_.empty()) {
         return make_error("no staged patch to redo");
     }
-    PatchEdit edit = std::move(redo_stack_.back());
-    redo_stack_.pop_back();
-    for (const PatchSpanSnapshot& snap : edit.spans) {
-        if (auto applied = apply_staged_replacement_no_history(session, snap.offset, snap.after);
-            !applied) {
-            return std::unexpected(applied.error());
+    undo_stack_.reserve(undo_stack_.size() + 1);
+    auto saved_staged = staged_;
+    auto saved_orig = original_ram_;
+    try {
+        const PatchEdit& edit = redo_stack_.back();
+        for (const PatchSpanSnapshot& snap : edit.spans) {
+            if (auto applied = apply_staged_replacement_no_history(session, snap.offset, snap.after);
+                !applied) {
+                staged_.swap(saved_staged);
+                original_ram_.swap(saved_orig);
+                return std::unexpected(applied.error());
+            }
         }
+        undo_stack_.push_back(std::move(redo_stack_.back()));
+        redo_stack_.pop_back();
+    } catch (...) {
+        staged_.swap(saved_staged);
+        original_ram_.swap(saved_orig);
+        throw;
     }
-    undo_stack_.push_back(std::move(edit));
     return {};
 }
 
 void LiveMemoryPatchSpace::rebuild_committed_interval_for_range(
     std::uint64_t address,
     std::span<const std::uint8_t> written_bytes) {
-    if (written_bytes.empty()) {
-        return;
-    }
-
-    std::uint64_t union_begin = address;
-    std::uint64_t union_end = address + static_cast<std::uint64_t>(written_bytes.size());
-
-    auto erase_begin = committed_.lower_bound(address);
-    if (erase_begin != committed_.begin()) {
-        auto prev = erase_begin;
-        --prev;
-        if (prev->second.end_address() >= address) {
-            erase_begin = prev;
-        }
-    }
-
-    auto erase_end = erase_begin;
-    while (erase_end != committed_.end() && erase_end->second.address <= union_end) {
-        union_begin = std::min(union_begin, erase_end->second.address);
-        union_end = std::max(union_end, erase_end->second.end_address());
-        ++erase_end;
-    }
-
-    const auto union_len = static_cast<std::size_t>(union_end - union_begin);
-    std::vector<std::uint8_t> orig(union_len, 0);
-    std::vector<std::uint8_t> curr(union_len, 0);
-
-    for (std::size_t i = 0; i < union_len; ++i) {
-        const std::uint64_t va = union_begin + static_cast<std::uint64_t>(i);
-        if (const auto it = original_ram_.find(va); it != original_ram_.end()) {
-            orig[i] = it->second;
-            curr[i] = it->second;
-        }
-    }
-
-    for (auto it = erase_begin; it != erase_end; ++it) {
-        const auto rel = static_cast<std::ptrdiff_t>(it->second.address - union_begin);
-        std::copy(it->second.committed.begin(), it->second.committed.end(), curr.begin() + rel);
-    }
-
-    const auto write_rel = static_cast<std::ptrdiff_t>(address - union_begin);
-    std::copy(written_bytes.begin(), written_bytes.end(), curr.begin() + write_rel);
-
-    committed_.erase(erase_begin, erase_end);
-
-    std::size_t run_begin = 0;
-    bool in_run = false;
-    for (std::size_t i = 0; i < union_len; ++i) {
-        const bool diff = curr[i] != orig[i];
-        if (diff && !in_run) {
-            run_begin = i;
-            in_run = true;
-        }
-        const bool at_end = (i + 1 == union_len);
-        if (in_run && (!diff || at_end)) {
-            const std::size_t run_end = (diff && at_end) ? (i + 1) : i;
-            CommittedPatchInterval ci;
-            ci.address = union_begin + static_cast<std::uint64_t>(run_begin);
-            ci.original.assign(orig.begin() + static_cast<std::ptrdiff_t>(run_begin),
-                               orig.begin() + static_cast<std::ptrdiff_t>(run_end));
-            ci.committed.assign(curr.begin() + static_cast<std::ptrdiff_t>(run_begin),
-                                curr.begin() + static_cast<std::ptrdiff_t>(run_end));
-            committed_.emplace(ci.address, std::move(ci));
-            in_run = false;
-        }
-    }
+    rebuild_committed_interval_into(committed_, original_ram_, address, written_bytes);
 }
 
 Result<std::size_t> LiveMemoryPatchSpace::commit_to_process(IProcessSession& session,
@@ -957,10 +1163,36 @@ Result<std::size_t> LiveMemoryPatchSpace::commit_to_process(IProcessSession& ses
         return std::size_t{0};
     }
 
+    // Stage all map/vector allocations into local copies before writing to target RAM
+    // so neither allocation failure nor partial write_memory failure leaves state inconsistent.
+    auto next_orig = original_ram_;
+    for (const auto& [addr, interval] : staged_) {
+        bool missing_any = false;
+        for (std::size_t i = 0; i < interval.patched.size(); ++i) {
+            if (!next_orig.contains(addr + static_cast<std::uint64_t>(i))) {
+                missing_any = true;
+                break;
+            }
+        }
+        if (missing_any) {
+            auto current = read_live_baseline(session, addr, interval.patched.size());
+            if (!current) {
+                return std::unexpected(current.error());
+            }
+            for (std::size_t i = 0; i < interval.patched.size(); ++i) {
+                next_orig.try_emplace(addr + static_cast<std::uint64_t>(i), (*current)[i]);
+            }
+        }
+    }
+
+    auto next_committed = committed_;
+    for (const auto& [addr, interval] : staged_) {
+        rebuild_committed_interval_into(next_committed, next_orig, addr, interval.patched);
+    }
+
     struct AppliedSpan {
         std::uint64_t address{0};
-        std::vector<std::uint8_t> previous_live;
-        std::vector<std::uint8_t> written;
+        const std::vector<std::uint8_t>* previous_live{nullptr};
     };
 
     std::vector<AppliedSpan> applied;
@@ -968,30 +1200,22 @@ Result<std::size_t> LiveMemoryPatchSpace::commit_to_process(IProcessSession& ses
     std::size_t total_bytes = 0;
 
     for (const auto& [addr, interval] : staged_) {
-        if (auto orig_ok =
-                record_original_ram_if_missing(session, addr, interval.patched.size());
-            !orig_ok) {
-            return std::unexpected(orig_ok.error());
-        }
-
         auto write_res = session.write_memory(addr, interval.patched, options);
         if (!write_res || *write_res != interval.patched.size()) {
             // Best-effort rollback of any intervals already written in this transaction.
-            for (const AppliedSpan& prev : applied) {
-                (void)session.write_memory(prev.address, prev.previous_live, options);
+            for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+                (void)session.write_memory(it->address, *it->previous_live, options);
             }
             return make_error(write_res ? "partial write while committing patch to process memory"
                                         : std::string(write_res.error().message));
         }
 
-        applied.push_back(AppliedSpan{addr, interval.original, interval.patched});
+        applied.push_back(AppliedSpan{addr, &interval.original});
         total_bytes += interval.patched.size();
     }
 
-    for (const AppliedSpan& span : applied) {
-        rebuild_committed_interval_for_range(span.address, span.written);
-    }
-
+    original_ram_.swap(next_orig);
+    committed_.swap(next_committed);
     staged_.clear();
     undo_stack_.clear();
     redo_stack_.clear();
@@ -1004,13 +1228,24 @@ Result<std::size_t> LiveMemoryPatchSpace::revert_committed(IProcessSession& sess
         return std::size_t{0};
     }
 
+    struct RevertedSpan {
+        std::uint64_t address{0};
+        const std::vector<std::uint8_t>* committed_bytes{nullptr};
+    };
+
+    std::vector<RevertedSpan> reverted;
+    reverted.reserve(committed_.size());
     std::size_t total_reverted = 0;
     for (const auto& [addr, interval] : committed_) {
         auto write_res = session.write_memory(addr, interval.original, options);
         if (!write_res || *write_res != interval.original.size()) {
+            for (auto it = reverted.rbegin(); it != reverted.rend(); ++it) {
+                (void)session.write_memory(it->address, *it->committed_bytes, options);
+            }
             return make_error(write_res ? "partial write while reverting committed RAM patch"
                                         : std::string(write_res.error().message));
         }
+        reverted.push_back(RevertedSpan{addr, &interval.committed});
         total_reverted += interval.original.size();
     }
 
@@ -1043,13 +1278,16 @@ Result<void> LiveMemoryPatchSpace::revert_committed_interval(IProcessSession& se
         orig_bytes[i] = it->second;
     }
 
+    auto next_committed = committed_;
+    rebuild_committed_interval_into(next_committed, original_ram_, address, orig_bytes);
+
     auto write_res = session.write_memory(address, orig_bytes, options);
     if (!write_res || *write_res != orig_bytes.size()) {
         return make_error(write_res ? "partial write while reverting committed RAM interval"
                                     : std::string(write_res.error().message));
     }
 
-    rebuild_committed_interval_for_range(address, orig_bytes);
+    committed_.swap(next_committed);
     return {};
 }
 

@@ -157,11 +157,14 @@ TEST(AnalysisProject, PortableRelativePathResolutionRelocationAndSha256Mismatch)
     fs::create_directories(ws_a_proj.parent_path());
     fs::copy_file(fs::path(PEELF_TEST_FIXTURES_DIR) / "known-win-x64.exe", ws_a_bin);
 
-    viewer::BinaryModel m;
-    ASSERT_TRUE(m.load_file(ws_a_bin.string()));
-    const auto proj = viewer::build_analysis_project(m, ws_a_proj);
-    EXPECT_EQ(proj.relative_source, "../bin/sample.exe");
-    ASSERT_TRUE(viewer::write_analysis_file(ws_a_proj, viewer::encode_project(proj)));
+    // Release BinaryModel's file handle before renaming workspace directories on Windows.
+    {
+        viewer::BinaryModel m;
+        ASSERT_TRUE(m.load_file(ws_a_bin.string()));
+        const auto proj = viewer::build_analysis_project(m, ws_a_proj);
+        EXPECT_EQ(proj.relative_source, "../bin/sample.exe");
+        ASSERT_TRUE(viewer::write_analysis_file(ws_a_proj, viewer::encode_project(proj)));
+    }
 
     // Move the entire workspace directory from ws_a -> ws_b so the original absolute path breaks.
     const fs::path ws_b = scratch / "ws_b";
@@ -192,6 +195,17 @@ TEST(AnalysisProject, PortableRelativePathResolutionRelocationAndSha256Mismatch)
     EXPECT_EQ(relocated.status, viewer::ProjectBinaryMatchStatus::ExactMatch);
     EXPECT_TRUE(fs::equivalent(relocated.resolved_path, external_bin));
 
+    // Test SHA-256 enforcement when fingerprint matches but SHA-256 differs,
+    // closing the reloaded model before mutating/removing external_bin on Windows.
+    {
+        viewer::BinaryModel verify_model;
+        ASSERT_TRUE(verify_model.load_file(external_bin.string()));
+        auto tampered_sha_proj = *decoded;
+        tampered_sha_proj.source_sha256 = std::string(64, '0');
+        EXPECT_FALSE(viewer::restore_project_patches(verify_model, tampered_sha_proj, false));
+        EXPECT_TRUE(viewer::restore_project_patches(verify_model, tampered_sha_proj, true));
+    }
+
     // Mutate one byte in place (preserving file size) and verify SHA-256 mismatch detection.
     {
         std::fstream mut(external_bin, std::ios::in | std::ios::out | std::ios::binary);
@@ -206,12 +220,6 @@ TEST(AnalysisProject, PortableRelativePathResolutionRelocationAndSha256Mismatch)
     const auto mismatch = viewer::resolve_project_binary_path(*decoded, ws_b_proj, external_bin);
     EXPECT_EQ(mismatch.status, viewer::ProjectBinaryMatchStatus::ModifiedMismatch);
     EXPECT_NE(mismatch.actual_sha256, decoded->source_sha256);
-
-    // Also test SHA-256 enforcement when fingerprint matches but SHA-256 differs.
-    auto tampered_sha_proj = *decoded;
-    tampered_sha_proj.source_sha256 = std::string(64, '0');
-    EXPECT_FALSE(viewer::restore_project_patches(m, tampered_sha_proj, false));
-    EXPECT_TRUE(viewer::restore_project_patches(m, tampered_sha_proj, true));
 
     fs::remove_all(scratch, ec);
 }

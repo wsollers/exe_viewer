@@ -62,6 +62,31 @@ namespace {
     return out;
 }
 
+[[nodiscard]] constexpr bool add_u64_overflows(std::uint64_t a, std::uint64_t b) noexcept {
+    return b > std::numeric_limits<std::uint64_t>::max() - a;
+}
+
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_add_u64(
+    std::uint64_t a,
+    std::uint64_t b) noexcept {
+    if (add_u64_overflows(a, b)) {
+        return std::nullopt;
+    }
+    return a + b;
+}
+
+[[nodiscard]] constexpr std::uint64_t saturating_add_u64(
+    std::uint64_t a,
+    std::uint64_t b) noexcept {
+    return add_u64_overflows(a, b) ? std::numeric_limits<std::uint64_t>::max() : (a + b);
+}
+
+[[nodiscard]] constexpr std::uint64_t add_signed_offset_wrapping(
+    std::uint64_t base,
+    std::int64_t offset) noexcept {
+    return base + static_cast<std::uint64_t>(offset);
+}
+
 [[nodiscard]] std::span<const std::uint8_t> slice_safe(
     std::span<const std::uint8_t> bytes,
     std::uint64_t offset,
@@ -83,12 +108,17 @@ namespace {
     for (const Section& sec : img.sections()) {
         const std::uint64_t span = std::max(sec.virtual_size, sec.file_size);
         if (sec.virtual_address >= base && span > 0u) {
-            max_end = std::max(max_end, sec.virtual_address + span);
+            if (const auto end = checked_add_u64(sec.virtual_address, span); end.has_value()) {
+                max_end = std::max(max_end, *end);
+            }
         }
     }
     for (const Segment& seg : img.segments()) {
         if (seg.virtual_address >= base && seg.virtual_size > 0u) {
-            max_end = std::max(max_end, seg.virtual_address + seg.virtual_size);
+            if (const auto end = checked_add_u64(seg.virtual_address, seg.virtual_size);
+                end.has_value()) {
+                max_end = std::max(max_end, *end);
+            }
         }
     }
     const std::uint64_t computed = max_end > base ? (max_end - base) : 0u;
@@ -196,15 +226,20 @@ struct VaInterval {
                 default: break;
             }
             if (width > 0u) {
-                const std::uint64_t va = base + e.rva;
-                out.push_back(VaInterval{va, va + width});
+                if (const auto va = checked_add_u64(base, e.rva); va.has_value()) {
+                    if (const auto va_end = checked_add_u64(*va, width); va_end.has_value()) {
+                        out.push_back(VaInterval{*va, *va_end});
+                    }
+                }
             }
         }
     }
     const std::uint64_t ptr_sz = img.is_64bit() ? 8u : 4u;
     for (const ElfRelocation& rel : img.elf_relocations()) {
         if (rel.offset != 0u) {
-            out.push_back(VaInterval{rel.offset, rel.offset + ptr_sz});
+            if (const auto rel_end = checked_add_u64(rel.offset, ptr_sz); rel_end.has_value()) {
+                out.push_back(VaInterval{rel.offset, *rel_end});
+            }
         }
     }
     std::ranges::sort(out, [](const VaInterval& a, const VaInterval& b) {
@@ -241,7 +276,9 @@ void mask_x86_function_displacements(std::span<std::uint8_t> buf,
                                      bool is64,
                                      std::uint64_t image_base,
                                      std::uint64_t image_end) noexcept {
-    const std::uint64_t func_end = func_va + static_cast<std::uint64_t>(buf.size());
+    const auto in_func = [&](std::uint64_t target) noexcept {
+        return target >= func_va && (target - func_va) < buf.size();
+    };
     std::size_t i = 0;
     while (i < buf.size()) {
         const std::size_t insn_start = i;
@@ -292,9 +329,9 @@ void mask_x86_function_displacements(std::span<std::uint8_t> buf,
             if (i < buf.size()) {
                 const auto rel8 = static_cast<std::int8_t>(buf[i]);
                 const std::uint64_t next_va = func_va + static_cast<std::uint64_t>(i + 1u);
-                const std::uint64_t target = static_cast<std::uint64_t>(
-                    static_cast<std::int64_t>(next_va) + static_cast<std::int64_t>(rel8));
-                if (target < func_va || target >= func_end) {
+                const std::uint64_t target =
+                    add_signed_offset_wrapping(next_va, static_cast<std::int64_t>(rel8));
+                if (!in_func(target)) {
                     buf[i] = 0u;
                 }
                 ++i;
@@ -307,9 +344,9 @@ void mask_x86_function_displacements(std::span<std::uint8_t> buf,
             if (i + 4u <= buf.size()) {
                 const auto rel32 = static_cast<std::int32_t>(read_le32(buf, i));
                 const std::uint64_t next_va = func_va + static_cast<std::uint64_t>(i + 4u);
-                const std::uint64_t target = static_cast<std::uint64_t>(
-                    static_cast<std::int64_t>(next_va) + static_cast<std::int64_t>(rel32));
-                if (op == 0xE8u || target < func_va || target >= func_end) {
+                const std::uint64_t target =
+                    add_signed_offset_wrapping(next_va, static_cast<std::int64_t>(rel32));
+                if (op == 0xE8u || !in_func(target)) {
                     std::fill_n(buf.begin() + static_cast<std::ptrdiff_t>(i), 4, std::uint8_t{0});
                 }
                 i += 4u;
@@ -332,9 +369,9 @@ void mask_x86_function_displacements(std::span<std::uint8_t> buf,
                 if (i + 4u <= buf.size()) {
                     const auto rel32 = static_cast<std::int32_t>(read_le32(buf, i));
                     const std::uint64_t next_va = func_va + static_cast<std::uint64_t>(i + 4u);
-                    const std::uint64_t target = static_cast<std::uint64_t>(
-                        static_cast<std::int64_t>(next_va) + static_cast<std::int64_t>(rel32));
-                    if (target < func_va || target >= func_end) {
+                    const std::uint64_t target =
+                        add_signed_offset_wrapping(next_va, static_cast<std::int64_t>(rel32));
+                    if (!in_func(target)) {
                         std::fill_n(buf.begin() + static_cast<std::ptrdiff_t>(i), 4, std::uint8_t{0});
                     }
                     i += 4u;
@@ -500,7 +537,9 @@ void mask_fixed_width_risc_displacements(std::span<std::uint8_t> buf,
                                          std::uint64_t func_va,
                                          Architecture arch,
                                          Endianness endian) noexcept {
-    const std::uint64_t func_end = func_va + static_cast<std::uint64_t>(buf.size());
+    const auto in_func = [&](std::uint64_t target) noexcept {
+        return target >= func_va && (target - func_va) < buf.size();
+    };
     for (std::size_t off = 0; off + 4u <= buf.size(); off += 4u) {
         const std::uint64_t pc = func_va + static_cast<std::uint64_t>(off);
         std::uint32_t insn = read_u32_endian(buf, off, endian);
@@ -514,10 +553,9 @@ void mask_fixed_width_risc_displacements(std::span<std::uint8_t> buf,
                     if ((imm26 & (1ll << 25)) != 0) {
                         imm26 -= (1ll << 26);
                     }
-                    const std::uint64_t target = static_cast<std::uint64_t>(
-                        static_cast<std::int64_t>(pc) + (imm26 * 4));
+                    const std::uint64_t target = add_signed_offset_wrapping(pc, imm26 * 4);
                     const bool is_bl = (insn & 0x8000'0000u) != 0u;
-                    if (is_bl || target < func_va || target >= func_end) {
+                    if (is_bl || !in_func(target)) {
                         insn &= 0xFC00'0000u;
                         modified = true;
                     }
@@ -535,10 +573,9 @@ void mask_fixed_width_risc_displacements(std::span<std::uint8_t> buf,
                     if ((imm24 & (1ll << 23)) != 0) {
                         imm24 -= (1ll << 24);
                     }
-                    const std::uint64_t target = static_cast<std::uint64_t>(
-                        static_cast<std::int64_t>(pc + 8u) + (imm24 * 4));
+                    const std::uint64_t target = add_signed_offset_wrapping(pc + 8u, imm24 * 4);
                     const bool is_bl = (insn & 0x0100'0000u) != 0u;
-                    if (is_bl || target < func_va || target >= func_end) {
+                    if (is_bl || !in_func(target)) {
                         insn &= 0xFF00'0000u;
                         modified = true;
                     }
@@ -604,7 +641,7 @@ struct ExtractedFunction {
             continue;
         }
         const std::uint64_t span = std::max(sec.virtual_size, sec.file_size);
-        if (va >= sec.virtual_address && va < sec.virtual_address + span) {
+        if (va >= sec.virtual_address && (va - sec.virtual_address) < span) {
             return &sec;
         }
     }
@@ -663,10 +700,12 @@ struct ExtractedFunction {
     const std::uint64_t base = img.image_base();
     for (const PeRuntimeFunction& rf : img.pe_runtime_functions()) {
         if (rf.end_address_rva > rf.begin_address_rva) {
-            upsert(base + rf.begin_address_rva,
-                   static_cast<std::uint64_t>(rf.end_address_rva - rf.begin_address_rva),
-                   {},
-                   1);
+            if (const auto fn_va = checked_add_u64(base, rf.begin_address_rva); fn_va.has_value()) {
+                upsert(*fn_va,
+                       static_cast<std::uint64_t>(rf.end_address_rva - rf.begin_address_rva),
+                       {},
+                       1);
+            }
         }
     }
 
@@ -694,17 +733,17 @@ struct ExtractedFunction {
             continue;
         }
 
-        const std::uint64_t sec_end_va =
-            sec->virtual_address + std::min(std::max(sec->virtual_size, sec->file_size), sec->file_size > 0 ? sec->file_size : sec->virtual_size);
+        const std::uint64_t sec_limit_span =
+            sec->file_size > 0u ? sec->file_size : sec->virtual_size;
+        const std::uint64_t offset_in_sec = c.va - sec->virtual_address;
         std::uint64_t sz = c.explicit_size;
         if (sz == 0u) {
-            std::uint64_t limit_va = sec_end_va;
-            if (idx + 1u < ordered.size() && ordered[idx + 1u].va < limit_va) {
-                limit_va = ordered[idx + 1u].va;
+            std::uint64_t max_rem =
+                offset_in_sec < sec_limit_span ? (sec_limit_span - offset_in_sec) : 0u;
+            if (idx + 1u < ordered.size() && ordered[idx + 1u].va > c.va) {
+                max_rem = std::min(max_rem, ordered[idx + 1u].va - c.va);
             }
-            if (limit_va > c.va) {
-                sz = std::min<std::uint64_t>(limit_va - c.va, 4096u);
-            }
+            sz = std::min<std::uint64_t>(max_rem, 4096u);
         }
         if (sz == 0u) {
             continue;
@@ -853,16 +892,19 @@ std::vector<std::uint8_t> normalize_function_bytes_for_diff(
         return norm;
     }
 
-    const std::uint64_t func_end = func_va + static_cast<std::uint64_t>(norm.size());
+    const std::uint64_t norm_len = static_cast<std::uint64_t>(norm.size());
     const std::vector<VaInterval> relocs = collect_relocation_va_intervals(image);
 
-    // 1. Mask explicit PE/ELF relocation fixup spans inside [func_va, func_end)
+    // 1. Mask explicit PE/ELF relocation fixup spans inside [func_va, func_va + norm_len)
     for (const VaInterval& iv : relocs) {
-        if (iv.end <= func_va || iv.start >= func_end) {
+        if (iv.end <= func_va || iv.start >= iv.end) {
             continue;
         }
-        const std::uint64_t s = std::max(iv.start, func_va) - func_va;
-        const std::uint64_t e = std::min(iv.end, func_end) - func_va;
+        const std::uint64_t s = (iv.start > func_va) ? (iv.start - func_va) : 0u;
+        if (s >= norm_len) {
+            continue;
+        }
+        const std::uint64_t e = std::min(iv.end - func_va, norm_len);
         std::fill(norm.begin() + static_cast<std::ptrdiff_t>(s),
                   norm.begin() + static_cast<std::ptrdiff_t>(e),
                   std::uint8_t{0});
@@ -870,7 +912,7 @@ std::vector<std::uint8_t> normalize_function_bytes_for_diff(
 
     // 2. Mask PC/RIP-relative call/branch displacements and absolute image-base addresses
     const std::uint64_t img_base = image.image_base();
-    const std::uint64_t img_end = img_base + estimate_image_span(image);
+    const std::uint64_t img_end = saturating_add_u64(img_base, estimate_image_span(image));
     const Architecture arch = image.architecture();
     if (arch == Architecture::X86 || arch == Architecture::X86_64) {
         mask_x86_function_displacements(norm, func_va, image.is_64bit(), img_base, img_end);
@@ -1018,16 +1060,16 @@ Result<BinaryDiffReport> compare_binaries(
                 }
             }
 
-            changed_total += diff_cnt;
+            changed_total = saturating_add_u64(changed_total, diff_cnt);
             if (report.byte_hunks.size() < options.max_byte_hunks) {
                 const std::size_t hunk_len = hunk_end - hunk_start;
                 const std::size_t samp_len = std::min(hunk_len, options.sample_bytes_per_hunk);
                 ByteDiffHunk hunk;
                 hunk.section_name = std::string(sec_name);
-                hunk.lhs_file_offset = l_file_base + hunk_start;
-                hunk.rhs_file_offset = r_file_base + hunk_start;
-                if (l_va_base.has_value()) hunk.lhs_va = *l_va_base + hunk_start;
-                if (r_va_base.has_value()) hunk.rhs_va = *r_va_base + hunk_start;
+                hunk.lhs_file_offset = saturating_add_u64(l_file_base, hunk_start);
+                hunk.rhs_file_offset = saturating_add_u64(r_file_base, hunk_start);
+                if (l_va_base.has_value()) hunk.lhs_va = checked_add_u64(*l_va_base, hunk_start);
+                if (r_va_base.has_value()) hunk.rhs_va = checked_add_u64(*r_va_base, hunk_start);
                 hunk.size = hunk_len;
                 hunk.differing_bytes = diff_cnt;
                 hunk.lhs_sample.assign(lb.begin() + static_cast<std::ptrdiff_t>(hunk_start),
@@ -1036,9 +1078,13 @@ Result<BinaryDiffReport> compare_binaries(
                                        rb.begin() + static_cast<std::ptrdiff_t>(hunk_start + samp_len));
 
                 ByteHunkClassification cls = default_cls;
-                if (hunk.lhs_va.has_value() && hunk.rhs_va.has_value() &&
-                    (range_fully_covered_by_relocs(lhs_relocs, *hunk.lhs_va, *hunk.lhs_va + hunk_len) ||
-                     range_fully_covered_by_relocs(rhs_relocs, *hunk.rhs_va, *hunk.rhs_va + hunk_len))) {
+                const auto lhs_va_end =
+                    hunk.lhs_va.has_value() ? checked_add_u64(*hunk.lhs_va, hunk_len) : std::nullopt;
+                const auto rhs_va_end =
+                    hunk.rhs_va.has_value() ? checked_add_u64(*hunk.rhs_va, hunk_len) : std::nullopt;
+                if (lhs_va_end.has_value() && rhs_va_end.has_value() &&
+                    (range_fully_covered_by_relocs(lhs_relocs, *hunk.lhs_va, *lhs_va_end) ||
+                     range_fully_covered_by_relocs(rhs_relocs, *hunk.rhs_va, *rhs_va_end))) {
                     cls = ByteHunkClassification::RelocationOnly;
                 }
                 hunk.classification = cls;
@@ -1050,15 +1096,15 @@ Result<BinaryDiffReport> compare_binaries(
 
         if (lb.size() != rb.size()) {
             const std::size_t extra = std::max(lb.size(), rb.size()) - common;
-            changed_total += extra;
+            changed_total = saturating_add_u64(changed_total, extra);
             if (report.byte_hunks.size() < options.max_byte_hunks) {
                 const std::size_t samp_len = std::min(extra, options.sample_bytes_per_hunk);
                 ByteDiffHunk tail;
                 tail.section_name = std::string(sec_name);
-                tail.lhs_file_offset = l_file_base + common;
-                tail.rhs_file_offset = r_file_base + common;
-                if (l_va_base.has_value()) tail.lhs_va = *l_va_base + common;
-                if (r_va_base.has_value()) tail.rhs_va = *r_va_base + common;
+                tail.lhs_file_offset = saturating_add_u64(l_file_base, common);
+                tail.rhs_file_offset = saturating_add_u64(r_file_base, common);
+                if (l_va_base.has_value()) tail.lhs_va = checked_add_u64(*l_va_base, common);
+                if (r_va_base.has_value()) tail.rhs_va = checked_add_u64(*r_va_base, common);
                 tail.size = extra;
                 tail.differing_bytes = extra;
                 tail.classification = default_cls;
@@ -1520,7 +1566,7 @@ Result<BinaryDiffReport> compare_binaries(
             }
             const std::uint64_t min_sz = std::min(l_funcs[li].size, r_funcs[ri].size);
             const std::uint64_t max_sz = std::max(l_funcs[li].size, r_funcs[ri].size);
-            if (min_sz * 2u < max_sz) {
+            if ((max_sz - min_sz) > min_sz) {
                 continue;
             }
             const double sim = compute_normalized_similarity(
@@ -1710,7 +1756,7 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
 
     auto find_module_for_va = [&](std::uint64_t va) -> const ModuleInfo* {
         for (const ModuleInfo& m : all_modules) {
-            if (m.size > 0u && va >= m.base_address && va < m.base_address + m.size) {
+            if (m.size > 0u && va >= m.base_address && (va - m.base_address) < m.size) {
                 return &m;
             }
         }
@@ -1736,13 +1782,16 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
     for (const Symbol& s : disk_image.symbols()) {
         if (s.virtual_address >= static_base && !s.name.empty()) {
             const std::uint64_t rva = s.virtual_address - static_base;
-            sym_spans.push_back(SymSpan{rva, rva + std::max<std::uint64_t>(s.size, 1u), demangle_or_raw(s.name)});
+            sym_spans.push_back(SymSpan{
+                rva,
+                saturating_add_u64(rva, std::max<std::uint64_t>(s.size, 1u)),
+                demangle_or_raw(s.name)});
         }
     }
     for (const ExportEntry& e : disk_image.exports()) {
         if (e.forwarder.empty() && e.virtual_address >= static_base && !e.name.empty()) {
             const std::uint64_t rva = e.virtual_address - static_base;
-            sym_spans.push_back(SymSpan{rva, rva + 16u, demangle_or_raw(e.name)});
+            sym_spans.push_back(SymSpan{rva, saturating_add_u64(rva, 16u), demangle_or_raw(e.name)});
         }
     }
     auto resolve_rva_symbol = [&](std::uint64_t rva) -> std::string {
@@ -1769,14 +1818,22 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
             sec.file_size > 0u
                 ? std::min<std::uint64_t>(std::max(sec.virtual_size, sec.file_size), 64ull * 1024ull * 1024ull)
                 : 0u;
-        if (map_len == 0u || sec.virtual_address < static_base) {
+        if (map_len == 0u || sec.virtual_address < static_base ||
+            add_u64_overflows(sec.virtual_address, map_len)) {
             continue;
         }
         const std::uint64_t rva = sec.virtual_address - static_base;
+        if (add_u64_overflows(rva, map_len)) {
+            continue;
+        }
+        const auto live_va = checked_add_u64(live_base, rva);
+        if (!live_va.has_value() || add_u64_overflows(*live_va, map_len)) {
+            continue;
+        }
         PreparedSection ps;
         ps.sec = &sec;
         ps.rva = rva;
-        ps.live_va = live_base + rva;
+        ps.live_va = *live_va;
         ps.expected.assign(static_cast<std::size_t>(map_len), 0u);
         ps.ignore_mask.assign(static_cast<std::size_t>(map_len), 0u);
 
@@ -1787,7 +1844,9 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
 
     auto find_prepared_rva = [&](std::uint64_t rva, std::size_t width) -> std::pair<PreparedSection*, std::size_t> {
         for (PreparedSection& ps : prepared) {
-            if (rva >= ps.rva && rva + width <= ps.rva + ps.expected.size()) {
+            if (rva >= ps.rva &&
+                width <= ps.expected.size() &&
+                (rva - ps.rva) <= (ps.expected.size() - width)) {
                 return {&ps, static_cast<std::size_t>(rva - ps.rva)};
             }
         }
@@ -1896,7 +1955,7 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
                 } else {
                     const std::uint64_t expected_val =
                         rel.has_addend
-                            ? static_cast<std::uint64_t>(static_cast<std::int64_t>(live_base) + rel.addend)
+                            ? add_signed_offset_wrapping(live_base, rel.addend)
                             : (read_ptr_endian(ps->expected, off, is64, endian) + bias_u64);
                     write_ptr_endian(ps->expected, off, expected_val, is64, endian);
                 }
@@ -1926,6 +1985,7 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
         return make_error("Live integrity diff cancelled");
     }
     report_progress(1u, 3u, "Inspecting live IAT / GOT pointer slots");
+    const std::uint64_t disk_image_span = estimate_image_span(disk_image);
     std::set<std::uint64_t> seen_slot_rvas;
     for (const LoaderSlotCandidate& cand : slot_candidates) {
         if (options.stop_token.stop_requested()) {
@@ -1941,7 +2001,7 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
         std::fill_n(ps->ignore_mask.begin() + static_cast<std::ptrdiff_t>(off), ptr_size, std::uint8_t{1});
 
         const std::uint64_t disk_val = read_ptr_endian(ps->expected, off, is64, endian);
-        const std::uint64_t slot_va = live_base + cand.rva;
+        const std::uint64_t slot_va = ps->live_va + off;
         const MemorySample samp = read_memory_tolerant(session, all_regions, slot_va, ptr_size);
         if (options.stop_token.stop_requested()) {
             return make_error("Live integrity diff cancelled");
@@ -1967,7 +2027,7 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
         }
 
         const std::uint64_t rebased_disk_val =
-            (disk_val >= static_base && disk_val < static_base + estimate_image_span(disk_image))
+            (disk_val >= static_base && (disk_val - static_base) < disk_image_span)
                 ? (disk_val + bias_u64)
                 : disk_val;
 
@@ -2019,8 +2079,8 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
             if (report.findings.size() < options.max_hunks) {
                 ByteDiffHunk h;
                 h.section_name = ps->sec->name;
-                h.lhs_file_offset = ps->sec->file_offset + off;
-                h.lhs_va = static_base + cand.rva;
+                h.lhs_file_offset = saturating_add_u64(ps->sec->file_offset, off);
+                h.lhs_va = ps->sec->virtual_address + off;
                 h.rhs_va = slot_va;
                 h.size = ptr_size;
                 h.differing_bytes = ptr_size;
@@ -2123,9 +2183,9 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
             if (report.findings.size() < options.max_hunks) {
                 ByteDiffHunk h;
                 h.section_name = ps.sec->name;
-                h.lhs_file_offset = ps.sec->file_offset + hunk_start;
-                h.lhs_va = static_base + hunk_rva;
-                h.rhs_va = live_base + hunk_rva;
+                h.lhs_file_offset = saturating_add_u64(ps.sec->file_offset, hunk_start);
+                h.lhs_va = ps.sec->virtual_address + hunk_start;
+                h.rhs_va = ps.live_va + hunk_start;
                 h.size = hunk_len;
                 h.differing_bytes = diff_cnt;
                 h.classification = cls;

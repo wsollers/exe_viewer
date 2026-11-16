@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -758,4 +759,237 @@ TEST(BinaryDiffTest, DiskVsLiveRamDistinguishesAslrRelocationsFromInlineAndIatHo
     ASSERT_NE(iat_it, hooked->findings.end());
     EXPECT_EQ(iat_it->symbol_context, "Sleep");
     EXPECT_NE(iat_it->detail.find("injected_hook.dll"), std::string::npos);
+}
+
+TEST(BinaryDiffTest, AdversarialNearUint64MaxRelocAndSecurityCookieRvasDoNotOverflow) {
+    class AdversarialImage final : public peelf::IBinaryImage {
+    public:
+        explicit AdversarialImage(const peelf::IBinaryImage& base) : base_(base) {
+            sections_ = base.sections();
+            for (peelf::Section& sec : sections_) {
+                if (sec.virtual_address >= base.image_base()) {
+                    sec.virtual_address -= base.image_base(); // static_base == 0 (PIE-style)
+                }
+            }
+            // Add an adversarial section whose virtual_address + size would wrap 64-bit arithmetic.
+            sections_.push_back(peelf::Section{
+                .name = ".wrap",
+                .virtual_address = 0xFFFF'FFFF'FFFF'FF80ull,
+                .virtual_size = 0x200ull,
+                .file_offset = 0x400ull,
+                .file_size = 0x100ull,
+                .readable = true,
+                .writable = false,
+                .executable = true,
+            });
+
+            // Crafted near-UINT64_MAX security_cookie RVA (0xFFFFFFFFFFFFFFFC + 8 wraps to 4).
+            load_config_.security_cookie = 0xFFFF'FFFF'FFFF'FFFCull;
+
+            // Crafted PE .reloc entries near 32-bit max and past section end.
+            pe_relocs_.push_back(peelf::PeBaseRelocationBlock{
+                .page_rva = 0xFFFF'F000u,
+                .block_size = 16u,
+                .entries = {
+                    peelf::PeBaseRelocationEntry{.page_rva = 0xFFFF'F000u, .type = 10u, .offset = 0xFFCu, .rva = 0xFFFF'FFFCu},
+                    peelf::PeBaseRelocationEntry{.page_rva = 0x1000u, .type = 10u, .offset = 0x1FCu, .rva = 0x11FCu},
+                },
+            });
+
+            // Crafted ELF relative & GOT relocations with near-UINT64_MAX offsets and extreme signed addends.
+            elf_relocs_ = {
+                peelf::ElfRelocation{
+                    .section_name = ".rela.dyn",
+                    .offset = 0xFFFF'FFFF'FFFF'FFFCull,
+                    .info = 8u,
+                    .symbol_index = 0u,
+                    .type = 8u, // R_X86_64_RELATIVE
+                    .addend = std::numeric_limits<std::int64_t>::max(),
+                    .has_addend = true,
+                    .symbol_name = {},
+                },
+                peelf::ElfRelocation{
+                    .section_name = ".rela.plt",
+                    .offset = 0xFFFF'FFFF'FFFF'FFF8ull,
+                    .info = 7u,
+                    .symbol_index = 1u,
+                    .type = 7u, // R_X86_64_JUMP_SLOT
+                    .addend = 0,
+                    .has_addend = true,
+                    .symbol_name = "crafted_got_sym",
+                },
+                peelf::ElfRelocation{
+                    .section_name = ".rela.dyn",
+                    .offset = 0x1010ull, // Valid in-bounds R_X86_64_RELATIVE inside .text
+                    .info = 8u,
+                    .symbol_index = 0u,
+                    .type = 8u,
+                    .addend = -16,
+                    .has_addend = true,
+                    .symbol_name = {},
+                },
+            };
+
+            // Crafted IAT slot at near-UINT64_MAX RVA.
+            imports_ = {
+                peelf::ImportEntry{
+                    .library = "kernel32.dll",
+                    .name = "CraftedWrapImport",
+                    .ordinal = 0u,
+                    .address = 0xFFFF'FFFF'FFFF'FFFCull,
+                    .import_by_ordinal = false,
+                    .delay_load = false,
+                },
+            };
+        }
+
+        [[nodiscard]] peelf::Format format() const noexcept override { return base_.format(); }
+        [[nodiscard]] peelf::ImageKind kind() const noexcept override { return base_.kind(); }
+        [[nodiscard]] peelf::Architecture architecture() const noexcept override { return base_.architecture(); }
+        [[nodiscard]] peelf::Endianness endianness() const noexcept override { return base_.endianness(); }
+        [[nodiscard]] bool is_64bit() const noexcept override { return true; }
+        [[nodiscard]] std::uint64_t image_base() const noexcept override { return 0ull; }
+        [[nodiscard]] std::uint64_t entry_point() const noexcept override { return 0x1000ull; }
+        [[nodiscard]] const std::vector<peelf::Section>& sections() const noexcept override { return sections_; }
+        [[nodiscard]] const std::vector<peelf::Segment>& segments() const noexcept override { return base_.segments(); }
+        [[nodiscard]] const std::vector<peelf::Symbol>& symbols() const noexcept override { return base_.symbols(); }
+        [[nodiscard]] const std::vector<peelf::ImportEntry>& imports() const noexcept override { return imports_; }
+        [[nodiscard]] const std::vector<peelf::ExportEntry>& exports() const noexcept override { return base_.exports(); }
+        [[nodiscard]] const peelf::PeHeader* pe_header() const noexcept override { return base_.pe_header(); }
+        [[nodiscard]] const std::vector<peelf::PeDataDirectory>& pe_data_directories() const noexcept override {
+            return base_.pe_data_directories();
+        }
+        [[nodiscard]] const std::vector<peelf::PeBaseRelocationBlock>& pe_base_relocations() const noexcept override {
+            return pe_relocs_;
+        }
+        [[nodiscard]] const std::vector<peelf::PeDebugDirectory>& pe_debug_directories() const noexcept override {
+            return base_.pe_debug_directories();
+        }
+        [[nodiscard]] const peelf::PeTlsDirectory* pe_tls_directory() const noexcept override { return nullptr; }
+        [[nodiscard]] const std::vector<peelf::PeCertificate>& pe_certificates() const noexcept override {
+            return base_.pe_certificates();
+        }
+        [[nodiscard]] const peelf::PeLoadConfigDirectory* pe_load_config_directory() const noexcept override {
+            return &load_config_;
+        }
+        [[nodiscard]] const std::vector<peelf::PeRuntimeFunction>& pe_runtime_functions() const noexcept override {
+            return base_.pe_runtime_functions();
+        }
+        [[nodiscard]] const std::vector<peelf::PeBoundImport>& pe_bound_imports() const noexcept override {
+            return base_.pe_bound_imports();
+        }
+        [[nodiscard]] const peelf::PeResourceDirectory* pe_resource_directory() const noexcept override {
+            return nullptr;
+        }
+        [[nodiscard]] const std::vector<peelf::PeResourceDataEntry>& pe_resource_data_entries() const noexcept override {
+            return base_.pe_resource_data_entries();
+        }
+        [[nodiscard]] const peelf::PeClrHeader* pe_clr_header() const noexcept override { return nullptr; }
+        [[nodiscard]] const peelf::ElfHeader* elf_header() const noexcept override { return nullptr; }
+        [[nodiscard]] const std::vector<peelf::ElfProgramHeader>& elf_program_headers() const noexcept override {
+            return base_.elf_program_headers();
+        }
+        [[nodiscard]] const std::vector<peelf::ElfSectionHeader>& elf_section_headers() const noexcept override {
+            return base_.elf_section_headers();
+        }
+        [[nodiscard]] const std::vector<peelf::ElfSymbol>& elf_symbols() const noexcept override {
+            return base_.elf_symbols();
+        }
+        [[nodiscard]] const std::vector<peelf::ElfDynamicEntry>& elf_dynamic_entries() const noexcept override {
+            return base_.elf_dynamic_entries();
+        }
+        [[nodiscard]] const std::vector<peelf::ElfRelocation>& elf_relocations() const noexcept override {
+            return elf_relocs_;
+        }
+        [[nodiscard]] const std::vector<peelf::ElfNote>& elf_notes() const noexcept override {
+            return base_.elf_notes();
+        }
+        [[nodiscard]] const std::vector<peelf::ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept override {
+            return base_.elf_sysv_hash_tables();
+        }
+        [[nodiscard]] const std::vector<peelf::ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept override {
+            return base_.elf_gnu_hash_tables();
+        }
+        [[nodiscard]] std::string_view elf_interpreter() const noexcept override { return {}; }
+        [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(
+            std::uint64_t file_offset) const noexcept override {
+            return base_.file_offset_to_virtual_address(file_offset);
+        }
+        [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
+            std::uint64_t virtual_address) const noexcept override {
+            return base_.virtual_address_to_file_offset(virtual_address);
+        }
+
+    private:
+        const peelf::IBinaryImage& base_;
+        std::vector<peelf::Section> sections_{};
+        peelf::PeLoadConfigDirectory load_config_{};
+        std::vector<peelf::PeBaseRelocationBlock> pe_relocs_{};
+        std::vector<peelf::ElfRelocation> elf_relocs_{};
+        std::vector<peelf::ImportEntry> imports_{};
+    };
+
+    PeDiffTestSpec spec;
+    spec.image_base = 0x140000000ull;
+    const std::vector<std::uint8_t> disk_pe = build_pe64_for_diff(spec);
+    auto parsed = peelf::parse_image(disk_pe);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    AdversarialImage adv(**parsed);
+
+    // High canonical/kernel-style live base >= 0x8000000000000000 exercises signed-addend wrapping safely.
+    constexpr std::uint64_t kHighLiveBase = 0x8000'0000'0000'0000ull;
+    peelf::ProcessInfo pinfo{};
+    pinfo.pid = 9001;
+    pinfo.name = "adv.exe";
+    pinfo.architecture = peelf::Architecture::X86_64;
+    pinfo.is_64bit = true;
+
+    MockLiveSession session(pinfo);
+    std::vector<std::uint8_t> live_text(disk_pe.begin() + 0x400, disk_pe.begin() + 0x600);
+    // Apply the one valid in-bounds relative relocation at RVA 0x1010 (offset 0x10 in .text): live_base - 16
+    put64(live_text, 0x10u, kHighLiveBase - 16ull);
+
+    session.add_region(peelf::MemoryRegion{
+        .start_address = kHighLiveBase + 0x1000ull,
+        .end_address = kHighLiveBase + 0x1200ull,
+        .protection = {.readable = true, .writable = false, .executable = true},
+        .kind = peelf::MemoryRegionKind::Image,
+        .pathname = "adv.exe",
+    }, live_text);
+
+    session.add_region(peelf::MemoryRegion{
+        .start_address = kHighLiveBase + 0x2000ull,
+        .end_address = kHighLiveBase + 0x2600ull,
+        .protection = {.readable = true, .writable = false, .executable = false},
+        .kind = peelf::MemoryRegionKind::Image,
+        .pathname = "adv.exe",
+    }, std::vector<std::uint8_t>(disk_pe.begin() + 0x600, disk_pe.begin() + 0xC00));
+
+    session.add_region(peelf::MemoryRegion{
+        .start_address = kHighLiveBase + 0x3000ull,
+        .end_address = kHighLiveBase + 0x3200ull,
+        .protection = {.readable = true, .writable = true, .executable = false},
+        .kind = peelf::MemoryRegionKind::Image,
+        .pathname = "adv.exe",
+    }, std::vector<std::uint8_t>(disk_pe.begin() + 0xC00, disk_pe.begin() + 0xE00));
+
+    const peelf::ModuleInfo live_mod{
+        .name = "adv.exe",
+        .path = "adv.exe",
+        .base_address = kHighLiveBase,
+        .size = 0x5000ull,
+    };
+    session.set_modules({live_mod});
+
+    const auto report = peelf::compare_module_disk_to_live(adv, disk_pe, session, live_mod);
+    ASSERT_TRUE(report.has_value()) << report.error().message;
+    // Only the single valid RVA 0x1010 relocation is applied; all near-UINT64_MAX RVAs are rejected cleanly.
+    EXPECT_EQ(report->normalized_relocation_count, 1u);
+    EXPECT_EQ(report->inline_code_hook_count, 0u);
+    EXPECT_EQ(report->iat_got_hook_count, 0u);
+
+    // Also verify normalize_function_bytes_for_diff handles function VAs near UINT64_MAX without wrapping.
+    const std::array<std::uint8_t, 8> near_max_code{0xE8u, 0x10u, 0x00u, 0x00u, 0x00u, 0xEBu, 0x04u, 0xC3u};
+    const auto norm = peelf::normalize_function_bytes_for_diff(near_max_code, 0xFFFF'FFFF'FFFF'FFFCull, adv);
+    EXPECT_EQ(norm.size(), near_max_code.size());
 }

@@ -2,13 +2,19 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -232,4 +238,156 @@ TEST(PagedBinaryImage, FailedCommitRestoresPatchesAndHistory) {
     ASSERT_TRUE(image->undo());
     EXPECT_FALSE(image->dirty());
     EXPECT_FALSE(image->can_undo());
+}
+
+TEST(PagedBinaryImage, SameFileSaveAsOverwritePreservesUncachedPagesAndReopensCleanly) {
+    constexpr std::uint64_t kPageSize = 64;
+    constexpr std::size_t kTotalSize = 8 * static_cast<std::size_t>(kPageSize); // 8 pages
+    std::vector<std::uint8_t> initial(kTotalSize);
+    for (std::size_t i = 0; i < initial.size(); ++i) {
+        initial[i] = static_cast<std::uint8_t>((i * 37u + 0x5Au) & 0xFFu);
+    }
+
+    const std::filesystem::path input_path = write_temp_binary(initial);
+    {
+        auto image = peelf::PagedBinaryImage::open(input_path, kPageSize);
+        ASSERT_TRUE(image.has_value()) << image.error().message;
+
+        // Patch only page 0 and page 5; pages 1..4 and 6..7 remain completely uncached in memory.
+        const std::vector<std::uint8_t> p0{0xDE, 0xAD, 0xBE, 0xEF};
+        const std::vector<std::uint8_t> p5{0xCA, 0xFE};
+        ASSERT_TRUE(image->apply_patch(4, p0, "patch page 0").has_value());
+        ASSERT_TRUE(image->apply_patch(5 * kPageSize + 10, p5, "patch page 5").has_value());
+
+        std::vector<std::uint8_t> expected = initial;
+        std::copy(p0.begin(), p0.end(), expected.begin() + 4);
+        std::copy(p5.begin(), p5.end(), expected.begin() + static_cast<std::ptrdiff_t>(5 * kPageSize + 10));
+
+        // Without overwrite=true, same-file save_as must refuse without truncating input_path.
+        EXPECT_FALSE(image->save_as(input_path, /*overwrite=*/false).has_value());
+
+        // With overwrite=true, same-file save_as must stage to a sibling temp file, atomically replace
+        // input_path without truncating uncached pages, and reopen the backing stream cleanly.
+        ASSERT_TRUE(image->save_as(input_path, /*overwrite=*/true).has_value());
+
+        // Existing PagedBinaryImage handle must remain readable across all pages after reopen.
+        auto effective_after = image->read_effective(0, image->size());
+        ASSERT_TRUE(effective_after.has_value()) << effective_after.error().message;
+        EXPECT_EQ(*effective_after, expected);
+
+        // Freshly reopened PagedBinaryImage must observe 100% of uncached pages and patched bytes intact.
+        auto reopened = peelf::PagedBinaryImage::open(input_path, kPageSize);
+        ASSERT_TRUE(reopened.has_value()) << reopened.error().message;
+        EXPECT_FALSE(reopened->dirty());
+        auto disk_bytes = reopened->read_original(0, reopened->size());
+        ASSERT_TRUE(disk_bytes.has_value()) << disk_bytes.error().message;
+        EXPECT_EQ(*disk_bytes, expected);
+
+        // Ensure no leftover temporary sibling files remain.
+        const std::string prefix = input_path.filename().string() + ".";
+        for (const auto& entry : std::filesystem::directory_iterator(input_path.parent_path())) {
+            const std::string fname = entry.path().filename().string();
+            EXPECT_FALSE(fname.starts_with(prefix) && fname.ends_with(".tmp"))
+                << "Leftover temp file: " << entry.path().string();
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(input_path, ec);
+}
+
+TEST(LiveMemoryPatchSpace, TransactionalRollbackPreservesStateOnReadOrWriteFailure) {
+    constexpr std::uint64_t kFaultyBase = 0x1000ull;
+
+    class FaultyLiveSession final : public peelf::IProcessSession {
+    public:
+        explicit FaultyLiveSession(std::vector<std::uint8_t> ram) : ram_(std::move(ram)) {
+            info_.pid = 1234;
+            info_.is_64bit = true;
+        }
+
+        [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override { return info_; }
+        [[nodiscard]] bool is_alive() const noexcept override { return true; }
+        [[nodiscard]] bool is_read_only() const noexcept override { return false; }
+
+        [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
+            return std::vector<peelf::MemoryRegion>{};
+        }
+        [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
+            return std::vector<peelf::ModuleInfo>{};
+        }
+
+        [[nodiscard]] peelf::Result<std::size_t> read_memory(
+            std::uint64_t address,
+            std::span<std::uint8_t> buffer) override {
+            if (fail_reads_at.has_value() && address >= *fail_reads_at) {
+                return peelf::make_error("simulated read failure");
+            }
+            if (address < kFaultyBase || (address - kFaultyBase) >= ram_.size()) {
+                return peelf::make_error("unmapped");
+            }
+            const std::size_t off = static_cast<std::size_t>(address - kFaultyBase);
+            const std::size_t n = std::min(buffer.size(), ram_.size() - off);
+            std::copy_n(ram_.begin() + static_cast<std::ptrdiff_t>(off), n, buffer.begin());
+            return n;
+        }
+
+        [[nodiscard]] peelf::Result<std::size_t> write_memory(
+            std::uint64_t address,
+            std::span<const std::uint8_t> buffer,
+            peelf::MemoryWriteOptions) override {
+            if (fail_writes_at.has_value() && address >= *fail_writes_at) {
+                return peelf::make_error("simulated write failure");
+            }
+            if (address < kFaultyBase || (address - kFaultyBase) + buffer.size() > ram_.size()) {
+                return peelf::make_error("unmapped write");
+            }
+            const std::size_t off = static_cast<std::size_t>(address - kFaultyBase);
+            std::copy(buffer.begin(), buffer.end(), ram_.begin() + static_cast<std::ptrdiff_t>(off));
+            return buffer.size();
+        }
+
+        std::vector<std::uint8_t> ram_;
+        std::optional<std::uint64_t> fail_reads_at{};
+        std::optional<std::uint64_t> fail_writes_at{};
+
+    private:
+        peelf::ProcessInfo info_{};
+    };
+
+    FaultyLiveSession session(std::vector<std::uint8_t>(64, 0x11u));
+    peelf::LiveMemoryPatchSpace space;
+
+    const std::array<peelf::PendingPatchWrite, 2> writes{{
+        {kFaultyBase + 0u, {0xAAu, 0xBBu}},
+        {kFaultyBase + 16u, {0xCCu, 0xDDu}},
+    }};
+    ASSERT_TRUE(space.stage_writes(session, writes, "two-span stage").has_value());
+    EXPECT_TRUE(space.can_undo());
+
+    // Simulate transient read failure on second span during undo: undo_stack_ & staged_ must remain intact.
+    session.fail_reads_at = kFaultyBase + 16u;
+    EXPECT_FALSE(space.undo(session).has_value());
+    EXPECT_TRUE(space.can_undo());
+    EXPECT_FALSE(space.can_redo());
+    session.fail_reads_at.reset();
+    EXPECT_EQ(*space.read_effective(session, kFaultyBase, 2u),
+              (std::vector<std::uint8_t>{0xAAu, 0xBBu}));
+
+    // Simulate write failure on second span during commit_to_process: first span in RAM must roll back,
+    // and staged_ / committed_ must remain consistent.
+    session.fail_writes_at = kFaultyBase + 16u;
+    EXPECT_FALSE(space.commit_to_process(session).has_value());
+    EXPECT_EQ(session.ram_[0], 0x11u);
+    EXPECT_EQ(session.ram_[1], 0x11u);
+    EXPECT_FALSE(space.has_committed_patches());
+    EXPECT_TRUE(space.has_staged_patches());
+
+    // Clear fault and verify commit succeeds cleanly.
+    session.fail_writes_at.reset();
+    auto committed = space.commit_to_process(session);
+    ASSERT_TRUE(committed.has_value()) << committed.error().message;
+    EXPECT_EQ(*committed, 4u);
+    EXPECT_TRUE(space.has_committed_patches());
+    EXPECT_FALSE(space.has_staged_patches());
 }
