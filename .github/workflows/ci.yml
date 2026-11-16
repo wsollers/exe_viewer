@@ -109,9 +109,11 @@ jobs:
 
       - name: Run CTest suite under ASan + UBSan
         env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          # Ubuntu 24.04 links libc++abi.so.1 with -Bsymbolic-functions, causing
+          # std::system_error::~system_error to bypass ASan's operator delete PLT hook.
+          ASAN_OPTIONS: detect_leaks=0:alloc_dealloc_mismatch=0:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --parallel "$(nproc)"
+        run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --parallel 2
 
   windows-msvc:
     name: Windows MSVC 2022 (${{ matrix.build_type }})

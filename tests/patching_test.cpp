@@ -2,16 +2,29 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
 
 [[nodiscard]] std::filesystem::path write_temp_binary(std::vector<std::uint8_t> bytes) {
+    static std::atomic<std::uint64_t> counter{0};
+    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+    const std::string test_name = info != nullptr ? info->name() : "case";
+    const auto nonce = static_cast<std::uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
     const auto path = std::filesystem::temp_directory_path() /
-                      std::filesystem::path("peelf_patching_test.bin");
+                      std::filesystem::path(std::format(
+                          "peelf_patching_{}_{}_{}.bin",
+                          test_name,
+                          nonce,
+                          counter.fetch_add(1, std::memory_order_relaxed)));
     std::ofstream file(path, std::ios::binary | std::ios::trunc);
     file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     return path;

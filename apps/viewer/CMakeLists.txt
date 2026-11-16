@@ -42,11 +42,19 @@ add_library(peelf_gui SHARED
         src/vulkan/vulkan_manager.h
         src/vulkan/vulkan_manager.cpp
         src/model/binary_model.hpp
+        src/model/binary_model_internal.hpp
         src/model/binary_model.cpp
+        src/model/binary_model_live.cpp
         src/ui/ui_panel.hpp
         src/ui/ui_panels.hpp
         src/ui/ui_app.hpp
+        src/ui/ui_app_internal.hpp
         src/ui/ui_app.cpp
+        src/ui/ui_app_project.cpp
+        src/ui/ui_app_menus_docking.cpp
+        src/ui/ui_app_process.cpp
+        src/ui/ui_app_graph.cpp
+        src/ui/ui_app_navigation.cpp
         src/ui/ui_panels_file.cpp
         src/ui/ui_panels_memmap.cpp
         src/ui/ui_panels_pe_headers.cpp
@@ -112,7 +120,10 @@ add_library(peelf_gui SHARED
         src/navigation/viewer_navigation.hpp
         src/navigation/viewer_navigation.cpp
         src/graph/call_graph.hpp
-        src/graph/call_graph.cpp
+        src/graph/call_graph_internal.hpp
+        src/graph/call_graph_dot.cpp
+        src/graph/call_graph_build.cpp
+        src/graph/call_graph_cfg.cpp
         src/symbols/symbol_index.hpp
         src/symbols/symbol_index.cpp
         src/symbols/debug_symbols.hpp

@@ -76,7 +76,9 @@ add_executable(peelf_tests
   review_bugs_regression_test.cpp
   malformed_inputs_matrix_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
-  ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_dot.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_build.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_cfg.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/async_binary_diff.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp
@@ -92,6 +94,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/debug_symbols.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/binary_model.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/model/binary_model_live.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/tools/shellcode_converter.cpp
 )
 

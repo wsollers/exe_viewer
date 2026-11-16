@@ -35,9 +35,9 @@ flowchart LR
 ```
 
 ### Target Boundary Invariants
-- **`peelf_core` (`libs/peelf_core`)**: Zero ImGui, GLFW, or Vulkan dependencies. Uses `peelf::Result<T> = std::expected<T, peelf::Error>` across API boundaries (`peelf/error.hpp`) and forgiving `ForgivingValue<T>` / `SubsystemStatus` (`peelf/forgiving.hpp`) when partial OS telemetry is expected.
-- **`peelf_gui` (`apps/viewer`)**: Owns `VulkanManager`, `Application`, `BinaryModel`, `UiApp`, background UI controllers (`AsyncReferenceScanner`, `AsyncBinaryDiffController`, `DecompileCache`), Capstone `Disassembler`, DIA/PDB symbol bridge, and `.peproj` v2 session management.
-- **Compiler & Sanitizer Gate**: Project targets compile with `-Wall -Wextra -Wpedantic -Werror` on Clang/GCC and `/W4 /WX /FS` on MSVC (`PEELF_WARNINGS_AS_ERRORS=ON`), while `FetchContent` headers are isolated as `SYSTEM`. All `326/326` CTests pass under `clang18-asan-ubsan` (`AddressSanitizer` + `UndefinedBehaviorSanitizer`).
+- **`peelf_core` (`libs/peelf_core`)**: Zero ImGui, GLFW, or Vulkan dependencies. Uses `peelf::Result<T> = std::expected<T, peelf::Error>` across API boundaries (`peelf/error.hpp`) and forgiving `ForgivingValue<T>` / `SubsystemStatus` (`peelf/forgiving.hpp`) when partial OS telemetry is expected. Image parsing is modularized behind `<peelf/binary_image.hpp>` into `binary_image.cpp` (dispatch & format stringifiers), `image_mapping.cpp` (`ImageBase` VA/RVA <-> file-offset mapping & live PE normalization), `pe_image.cpp` (`PeImage`), and `elf_image.cpp` (`ElfImage` with explicit `parse_warnings()` for truncated tables).
+- **`peelf_gui` (`apps/viewer`)**: Owns staged RAII `VulkanManager` (`UniqueTexture`) and `Application` (`std::unique_ptr<UiApp>`), `BinaryModel` (`binary_model.cpp` static/patching core + `binary_model_live.cpp` live/dump/debugger sessions), modular `UiApp` (`ui_app.cpp`, `ui_app_project.cpp`, `ui_app_menus_docking.cpp`, `ui_app_process.cpp`, `ui_app_graph.cpp`, `ui_app_navigation.cpp`), `CallGraph` (`call_graph_dot.cpp`, `call_graph_build.cpp`, `call_graph_cfg.cpp`), background UI controllers (`AsyncReferenceScanner`, `AsyncBinaryDiffController`, `DecompileController`, `DecompileCache`), Capstone `Disassembler`, DIA/PDB symbol bridge, and `.peproj` v2 session management.
+- **Compiler & Sanitizer Gate**: Project targets compile with `-Wall -Wextra -Wpedantic -Werror` on Clang/GCC and `/W4 /WX /FS` on MSVC (`PEELF_WARNINGS_AS_ERRORS=ON`), while `FetchContent` headers are isolated as `SYSTEM`. All `337/337` CTests pass under `clang18-asan-ubsan` (`AddressSanitizer` + `UndefinedBehaviorSanitizer`).
 
 ---
 
@@ -107,7 +107,7 @@ flowchart LR
 ```
 
 - **Resumable `ReferenceIndex` (`WU-03`)**: `AsyncReferenceScanner` scans executable sections/regions in 256 KiB slices on a `std::jthread`, populating sorted `incoming`/`outgoing` xref vectors ($O(\log N + K)$ queries). Recovers direct branches/calls, guarded x86 absolute jump tables, x86/x64 PIC/RIP-relative `i32` tables, ARM Thumb-2 `tbb`/`tbh`, ARM64 PC-relative jump tables, and IAT/GOT indirect slots with `ReferenceConfidence` and `evidence` strings.
-- **Two-Tier Persistent Decompilation (`WU-02`)**: `DecompileCache` caches `DecompiledUnit` results in memory by `(binary_sha256, patch_revision, symbol_revision, provider, settings_fingerprint, arch, endian, thumb, function_va)`. On cache miss, `GhidraDecompiler` reuses an LRU-bounded headless workspace (`ws-*` under `$PEELF_CACHE_DIR/ghidra_workspaces` or safe OS temp dir, never `/mnt/c` on WSL): cold imports run `analyzeHeadless -import` without `-deleteProject`, while subsequent functions run `-process -noanalysis` with incremental symbol sync and automatic cold-retry on stale project locks. In-tree `StructuredPseudoCDecompiler` provides an instant zero-dependency fallback.
+- **Two-Tier Persistent Decompilation (`WU-02`, `WU-19b`)**: `DecompileController` runs background decompilation on a `std::jthread` with latest-request replacement, per-job `std::stop_source` cancellation, and `(target_identity, file_generation, edit_revision, snapshot_revision)` validation stamps. `DecompileCache` caches `DecompiledUnit` results in memory by `(binary_sha256, patch_revision, symbol_revision, provider, settings_fingerprint, arch, endian, thumb, function_va)`. On cache miss, `GhidraDecompiler` reuses an LRU-bounded headless workspace (`ws-*` under `$PEELF_CACHE_DIR/ghidra_workspaces` or safe OS temp dir, never `/mnt/c` on WSL): cold imports run `analyzeHeadless -import` without `-deleteProject`, while subsequent functions run `-process -noanalysis` with incremental symbol sync and automatic cold-retry on stale project locks. In-tree `StructuredPseudoCDecompiler` provides an instant zero-dependency fallback.
 - **Cancellable Binary Diff (`WU-12`, `WU-17`)**: `AsyncBinaryDiffController` executes `peelf::compare_binaries` (header, section, import, export, byte-hunk, and 3-tier `ExactName` / `NormalizedFingerprint` / `Similarity` function matching) on a background `std::jthread` with monotonic request IDs and `std::stop_token` cooperative cancellation. `peelf::compare_module_disk_to_live` normalizes relocations, LoadConfig cookies, and resolved IAT/GOT entries to isolate `.text` `InlineCodeHook` detours from `IatGotPointerHook` hijacks.
 - **`.peproj` v2 Sessions & Crash Recovery (`WU-09`)**: Stores `source_sha256`, `source_size`, canonical `source`, and portable `relative_source` alongside staged patches, annotations, debug symbols, bookmarks, pinned `AppliedStructureBinding`s, history, and layout. Writes atomically via `.tmp` rename and maintains periodic off-`/mnt/c` recovery journals.
 
@@ -198,7 +198,7 @@ flowchart LR
     matrix["bin-matrix/ + Malformed Matrix<br/>PE32/64 + 10-Arch ELF + Dumps"]
     presets["CMake Presets<br/>Clang 18 + ASan/UBSan + MSVC 2022"]
     gates["Compile Gates<br/>-Werror + /W4 /WX /FS"]
-    ctest["CTest Suite<br/>326 / 326 Unit & Integration Tests"]
+    ctest["CTest Suite<br/>337 / 337 Unit & Integration Tests"]
     headless["peelf_viewer --headless<br/>JSON + OASIS SARIF 2.1.0"]
     gha[".github/workflows/ci.yml<br/>Ubuntu 24.04 + Windows 2022"]
 

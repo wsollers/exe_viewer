@@ -206,4 +206,4 @@ using GraphByteReader = std::function<std::vector<std::uint8_t>(std::uint64_t of
                                                            GraphRenderFormat format,
                                                            const IProcessRunner& runner);
 
-} // namespace viewe
+} // namespace viewer
