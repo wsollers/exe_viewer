@@ -193,17 +193,10 @@ void AsyncBinaryDiffer::start_file_diff(std::uint64_t expected_revision,
                 }
 
                 update_progress("Parsing primary & comparison images...", 1u, 6u);
-                auto lhs_parsed = peelf::parse_image(lhs_buf);
-                if (!lhs_parsed.has_value()) {
+                auto opened = peelf::open_matched_diff_images(lhs_buf, *rhs_loaded, opts);
+                if (!opened.has_value()) {
                     out.status = AsyncDiffStatus::Failed;
-                    out.error_message = lhs_parsed.error().message;
-                    publish_outcome(std::move(out));
-                    return;
-                }
-                auto rhs_parsed = peelf::parse_image(*rhs_loaded);
-                if (!rhs_parsed.has_value()) {
-                    out.status = AsyncDiffStatus::Failed;
-                    out.error_message = rhs_parsed.error().message;
+                    out.error_message = opened.error().message;
                     publish_outcome(std::move(out));
                     return;
                 }
@@ -220,8 +213,8 @@ void AsyncBinaryDiffer::start_file_diff(std::uint64_t expected_revision,
                     }
                 };
 
-                auto diff =
-                    peelf::compare_binaries(**lhs_parsed, lhs_buf, **rhs_parsed, *rhs_loaded, opts);
+                auto diff = peelf::compare_binaries(
+                    *opened->lhs_image, lhs_buf, *opened->rhs_image, *rhs_loaded, opts);
                 if (!diff.has_value()) {
                     out.status = stop_token.stop_requested() ? AsyncDiffStatus::Cancelled
                                                              : AsyncDiffStatus::Failed;
@@ -232,9 +225,9 @@ void AsyncBinaryDiffer::start_file_diff(std::uint64_t expected_revision,
 
                 out.status = AsyncDiffStatus::Succeeded;
                 out.lhs_bytes = std::move(lhs_buf);
-                out.lhs_image = std::move(*lhs_parsed);
+                out.lhs_image = std::move(opened->lhs_image);
                 out.rhs_bytes = std::move(*rhs_loaded);
-                out.rhs_image = std::move(*rhs_parsed);
+                out.rhs_image = std::move(opened->rhs_image);
                 out.static_report = std::move(*diff);
                 publish_outcome(std::move(out));
             } catch (const std::bad_alloc&) {

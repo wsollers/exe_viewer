@@ -447,6 +447,8 @@ void ExecutableSettingsPanel::draw_declared_section(const peelf::ExecutableSetti
         draw_pe_clr_block(d);
     } else if (d.format == peelf::Format::ELF) {
         draw_elf_settings_block(d);
+    } else if (d.format == peelf::Format::MachO) {
+        draw_macho_settings_block(d);
     }
 }
 
@@ -695,6 +697,209 @@ void ExecutableSettingsPanel::draw_elf_settings_block(const peelf::DeclaredSetti
         ImGui::BulletText("DT_RUNPATH: %s", e.raw_runpath.c_str());
     }
     for (const std::string& w : e.warnings) {
+        ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.28f, 1.0f), "Warning: %s", w.c_str());
+    }
+
+    ImGui::TreePop();
+}
+
+void ExecutableSettingsPanel::draw_macho_settings_block(const peelf::DeclaredSettings& d) {
+    ImGui::AlignTextToFramePadding();
+    const bool open = ImGui::TreeNodeEx(
+        "Mach-O Load Commands, Code Signature & Platform Posture",
+        ImGuiTreeNodeFlags_DefaultOpen);
+    ImGui::SameLine();
+    draw_metadata_state_badge(d.macho_settings_state);
+    if (!open) {
+        return;
+    }
+
+    if (!d.macho_settings.has_value()) {
+        ImGui::TextDisabled("%s", d.macho_settings.note.c_str());
+        ImGui::TreePop();
+        return;
+    }
+
+    const peelf::MachODeclaredSettings& m = *d.macho_settings.value;
+    const std::string_view filter(filter_buf_);
+
+    ImGui::Text("Arch: %s (CPU 0x%08X / Subtype 0x%08X)  |  FileType: %s (0x%X)  |  Header Flags: 0x%08X",
+                m.arch_name.c_str(),
+                m.cpu_type,
+                m.cpu_subtype,
+                m.file_type_name.c_str(),
+                m.file_type,
+                m.header_flags);
+
+    if (m.is_universal_slice) {
+        ImGui::BulletText("Universal Container Slice #%zu (Offset 0x%" PRIX64 ", Size 0x%" PRIX64 ")",
+                          m.slice_index,
+                          m.slice_file_offset,
+                          m.slice_file_size);
+    }
+
+    if (!m.decoded_header_flags.empty()) {
+        std::string flags_txt;
+        for (std::size_t i = 0u; i < m.decoded_header_flags.size(); ++i) {
+            if (i > 0u) flags_txt += " | ";
+            flags_txt += m.decoded_header_flags[i];
+        }
+        ImGui::BulletText("MH_* Flags: %s", flags_txt.c_str());
+    }
+
+    ImGui::BulletText(
+        "Hardening Posture: PIE=%s  |  __PAGEZERO=%s (0x%" PRIX64 ")  |  MH_TWOLEVEL=%s  |  "
+        "StackExec=%s  |  NoHeapExec=%s  |  __RESTRICT=%s  |  arm64e PAC=%s",
+        m.is_pie ? "yes" : "no",
+        m.has_pagezero ? "yes" : "no",
+        m.pagezero_size,
+        m.two_level_namespace ? "yes" : "no",
+        m.allow_stack_execution ? "ALLOWED (unsafe)" : "no",
+        m.no_heap_execution ? "yes" : "no",
+        m.has_restrict_section ? "yes" : "no",
+        m.is_arm64e_pac ? "enabled" : "no");
+
+    ImGui::BulletText("LC_UUID: %s", m.uuid_hex.has_value() ? m.uuid_hex->c_str() : "<absent>");
+    ImGui::BulletText("LC_LOAD_DYLINKER: %s", m.dylinker.has_value() ? m.dylinker->c_str() : "<absent>");
+    if (m.dylib_id.has_value()) {
+        ImGui::BulletText("LC_ID_DYLIB: %s", m.dylib_id->c_str());
+    }
+    if (m.source_version.has_value()) {
+        ImGui::BulletText("LC_SOURCE_VERSION: %s", m.source_version->c_str());
+    }
+    if (m.entry_source.has_value()) {
+        if (m.entry_offset.has_value()) {
+            ImGui::BulletText("Entry Command: %s (entryoff=0x%" PRIX64 ", stacksize=0x%" PRIX64 ")",
+                              m.entry_source->c_str(),
+                              *m.entry_offset,
+                              m.initial_stack_size.value_or(0u));
+        } else {
+            ImGui::BulletText("Entry Command: %s (VA 0x%" PRIX64 ")",
+                              m.entry_source->c_str(),
+                              d.entry_point);
+        }
+    }
+
+    if (!m.build_platforms.empty() &&
+        ImGui::TreeNodeEx("Build Platforms (LC_BUILD_VERSION / LC_VERSION_MIN_*)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginTable("##macho_platforms", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Command", ImGuiTableColumnFlags_WidthStretch, 0.30f);
+            ImGui::TableSetupColumn("Platform", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+            ImGui::TableSetupColumn("Min OS", ImGuiTableColumnFlags_WidthStretch, 0.20f);
+            ImGui::TableSetupColumn("SDK", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+            ImGui::TableHeadersRow();
+            for (const peelf::MachOBuildPlatformSetting& bp : m.build_platforms) {
+                if (!matches_case_insensitive(bp.platform_name, filter) &&
+                    !matches_case_insensitive(bp.minos, filter) &&
+                    !matches_case_insensitive(bp.sdk, filter)) {
+                    continue;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(bp.source_cmd_name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%s (%u)", bp.platform_name.c_str(), bp.platform);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(bp.minos.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(bp.sdk.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (!m.rpaths.empty() && ImGui::TreeNodeEx("LC_RPATH Entries", ImGuiTreeNodeFlags_DefaultOpen)) {
+        for (const std::string& rp : m.rpaths) {
+            if (matches_case_insensitive(rp, filter)) {
+                ImGui::BulletText("%s", rp.c_str());
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    if (!m.dylibs.empty() && ImGui::TreeNodeEx("Declared Dylibs (LC_LOAD_*_DYLIB)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        if (ImGui::BeginTable("##macho_dylibs", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Install Name", ImGuiTableColumnFlags_WidthStretch, 0.50f);
+            ImGui::TableSetupColumn("Command", ImGuiTableColumnFlags_WidthStretch, 0.22f);
+            ImGui::TableSetupColumn("Current Ver", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+            ImGui::TableSetupColumn("Compat Ver", ImGuiTableColumnFlags_WidthStretch, 0.14f);
+            ImGui::TableHeadersRow();
+            for (const peelf::MachODylibSetting& dy : m.dylibs) {
+                if (!matches_case_insensitive(dy.install_name, filter) &&
+                    !matches_case_insensitive(dy.cmd_name, filter)) {
+                    continue;
+                }
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(dy.install_name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(dy.cmd_name.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(dy.current_version.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(dy.compatibility_version.c_str());
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    if (ImGui::TreeNodeEx("Code Signature (LC_CODE_SIGNATURE)", ImGuiTreeNodeFlags_DefaultOpen)) {
+        const peelf::MachOCodeSignatureSetting& cs = m.code_signature;
+        if (!cs.present) {
+            ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.28f, 1.0f),
+                               "Unsigned (no LC_CODE_SIGNATURE load command present).");
+        } else {
+            ImGui::BulletText(
+                "Structural SuperBlob: %s  |  Flags: 0x%08X  |  Hash: %s",
+                cs.parsed_ok ? "valid" : "INVALID",
+                cs.flags,
+                cs.hash_type_name.c_str());
+            ImGui::BulletText(
+                "Identity: Identifier='%s'  |  TeamID='%s'  |  Ad-Hoc=%s  |  Hardened Runtime=%s  |  CMS=%s (%u B)",
+                cs.identifier.empty() ? "<none>" : cs.identifier.c_str(),
+                cs.team_id.empty() ? "<none>" : cs.team_id.c_str(),
+                cs.is_adhoc ? "yes" : "no",
+                cs.hardened_runtime ? "yes" : "no",
+                cs.has_cms_signature ? "present" : "absent",
+                cs.cms_blob_size);
+            if (!cs.decoded_flags.empty()) {
+                std::string cs_flags_txt;
+                for (std::size_t i = 0u; i < cs.decoded_flags.size(); ++i) {
+                    if (i > 0u) cs_flags_txt += " | ";
+                    cs_flags_txt += cs.decoded_flags[i];
+                }
+                ImGui::BulletText("CS_* Flags: %s", cs_flags_txt.c_str());
+            }
+            if (!cs.cryptographically_verified) {
+                ImGui::TextColored(
+                    ImVec4(1.00f, 0.78f, 0.30f, 1.0f),
+                    "Trust Provenance: %s (structural LC_CODE_SIGNATURE only; cryptographic CMS/notarization trust unverified offline)",
+                    cs.trust_provenance.c_str());
+            } else {
+                ImGui::TextColored(
+                    ImVec4(0.38f, 0.92f, 0.56f, 1.0f),
+                    "Trust Provenance: Cryptographically verified by OS.");
+            }
+        }
+        ImGui::TreePop();
+    }
+
+    if (m.encryption.present) {
+        ImGui::TextColored(
+            m.encryption.is_encrypted
+                ? ImVec4(1.00f, 0.45f, 0.45f, 1.0f)
+                : ImVec4(0.65f, 0.85f, 0.70f, 1.0f),
+            "LC_ENCRYPTION_INFO%s: cryptid=%u (%s), cryptoff=0x%X, cryptsize=0x%X",
+            d.is_64bit ? "_64" : "",
+            m.encryption.cryptid,
+            m.encryption.is_encrypted ? "ENCRYPTED - static analysis degraded" : "unencrypted",
+            m.encryption.cryptoff,
+            m.encryption.cryptsize);
+    }
+
+    for (const std::string& w : m.warnings) {
         ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.28f, 1.0f), "Warning: %s", w.c_str());
     }
 

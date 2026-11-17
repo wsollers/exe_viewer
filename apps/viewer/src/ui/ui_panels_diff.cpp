@@ -144,6 +144,9 @@ peelf::Result<void> BinaryDiffPanel::compare_with_file(const std::filesystem::pa
     opts.lhs_label = std::filesystem::path(model_.file_info().path).filename().string();
     if (opts.lhs_label.empty()) opts.lhs_label = "Primary";
     opts.rhs_label = comparison_path.filename().string();
+    if (model_.image()->is_universal_slice()) {
+        opts.lhs_slice_index = model_.image()->container_slice_index();
+    }
 
     const std::string path_str = comparison_path.string();
     std::snprintf(comparison_path_buf_.data(), comparison_path_buf_.size(), "%s", path_str.c_str());

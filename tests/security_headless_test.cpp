@@ -469,6 +469,10 @@ struct TempTestDir {
         std::error_code ec;
         std::filesystem::remove_all(dir, ec);
     }
+    TempTestDir(const TempTestDir&) = delete;
+    TempTestDir& operator=(const TempTestDir&) = delete;
+    TempTestDir(TempTestDir&&) = delete;
+    TempTestDir& operator=(TempTestDir&&) = delete;
 };
 
 void write_bytes(const std::filesystem::path& p, std::span<const std::uint8_t> bytes) {
@@ -492,7 +496,7 @@ void write_bytes(const std::filesystem::path& p, std::span<const std::uint8_t> b
 
 TEST(SecurityAuditTest, RuleCatalogCoversAll19FormalizedRules) {
     const auto catalog = peelf::security_rule_catalog();
-    EXPECT_EQ(catalog.size(), 19u);
+    EXPECT_EQ(catalog.size(), 25u);
     EXPECT_EQ(catalog.front().id, "PE1001");
     EXPECT_EQ(catalog.back().id, "LIVE3003");
 }

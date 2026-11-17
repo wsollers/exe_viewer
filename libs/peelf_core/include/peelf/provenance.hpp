@@ -412,6 +412,9 @@ struct BackingImageIdentity {
     std::string elf_build_id_hex{};
     std::optional<std::uint32_t> elf_gnu_debuglink_crc32{};
 
+    // Mach-O build identifier (LC_UUID)
+    std::string macho_uuid_hex{};
+
     // Optional whole-file hash when extracted from raw disk bytes
     std::string file_sha256{};
 

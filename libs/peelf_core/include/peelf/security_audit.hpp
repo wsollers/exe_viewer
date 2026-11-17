@@ -44,13 +44,15 @@ enum class SecuritySeverity : std::uint8_t {
 enum class SecurityRuleDomain : std::uint8_t {
     PE = 0,
     ELF = 1,
-    LiveProcess = 2,
+    MachO = 2,
+    LiveProcess = 3,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(SecurityRuleDomain domain) noexcept {
     switch (domain) {
         case SecurityRuleDomain::PE:          return "PE";
         case SecurityRuleDomain::ELF:         return "ELF";
+        case SecurityRuleDomain::MachO:       return "MachO";
         case SecurityRuleDomain::LiveProcess: return "LiveProcess";
     }
     return "PE";
@@ -90,11 +92,12 @@ struct SecurityAuditReport {
 };
 
 /// Returns the catalog of formalized security & hardening rules (`PE1001..PE1008`,
-/// `ELF2001..ELF2008`, `LIVE3001..LIVE3003`).
+/// `ELF2001..ELF2008`, `MACHO4001..MACHO4006`, `LIVE3001..LIVE3003`).
 [[nodiscard]] std::span<const SecurityRuleDescriptor> security_rule_catalog() noexcept;
 
-/// Evaluates static PE (`PE1001..PE1008`) or ELF (`ELF2001..ELF2008`) security rules
-/// against `image` (plus optional `LIVE3001..LIVE3003` when `live_session != nullptr`).
+/// Evaluates static PE (`PE1001..PE1008`), ELF (`ELF2001..ELF2008`), or Mach-O
+/// (`MACHO4001..MACHO4006`) security rules against `image` (plus optional
+/// `LIVE3001..LIVE3003` when `live_session != nullptr`).
 [[nodiscard]] SecurityAuditReport audit_security(
     const IBinaryImage& image,
     std::span<const std::uint8_t> raw_bytes = {},
@@ -151,6 +154,7 @@ struct HeadlessCliOptions {
     std::filesystem::path binary_path{};
     std::optional<std::filesystem::path> compare_path{};
     std::optional<std::filesystem::path> output_path{};
+    std::optional<std::string> slice_selector{};
     std::vector<std::filesystem::path> search_roots{};
     HeadlessExportFormat format{HeadlessExportFormat::Json};
     HeadlessFailPolicy fail_on{HeadlessFailPolicy::None};
@@ -163,6 +167,9 @@ struct HeadlessAnalysisReport {
     std::filesystem::path binary_path{};
     std::string sha256{};
     std::uint64_t file_size{0};
+    BinaryContainerInfo container_info{};
+    std::size_t selected_slice_index{0};
+    std::string selected_slice_arch{};
     std::unique_ptr<IBinaryImage> image{};
     std::unique_ptr<ICrashDumpSession> crash_dump{};
     TargetProfile target_profile{};

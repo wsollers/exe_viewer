@@ -15,7 +15,7 @@ namespace viewer {
         if (!model_.has_file()) {
             ImGui::TextUnformatted("No file or live process loaded.");
             ImGui::Separator();
-            ImGui::TextWrapped("Open a PE/ELF file from disk or attach to a running process to inspect memory and symbols.");
+            ImGui::TextWrapped("Open a PE/ELF/Mach-O file from disk or attach to a running process to inspect memory and symbols.");
             if (on_attach_requested_ && ImGui::Button("Attach to Process...")) {
                 on_attach_requested_();
             }
@@ -87,6 +87,51 @@ namespace viewer {
             }
         } else {
             ui_provenance::draw_capture_stamp_badge("StaticFile", model_.static_image_stamp());
+            const peelf::BinaryContainerInfo& container = model_.container_info();
+            if (container.is_universal_container && !container.slices.empty()) {
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.42f, 0.84f, 0.98f, 1.0f),
+                                   "[UNIVERSAL MACH-O] %zu architecture slices",
+                                   container.slices.size());
+
+                const auto format_slice_item = [](const peelf::BinarySliceDescriptor& sl) {
+                    const std::string_view arch_label =
+                        sl.arch_name.empty() ? peelf::to_string(sl.arch) : std::string_view(sl.arch_name);
+                    return std::format("#{} — {} ({}-bit {}, off 0x{:X}, {} B)",
+                                       sl.slice_index,
+                                       arch_label,
+                                       sl.bitness,
+                                       peelf::to_string(sl.endianness),
+                                       sl.container_offset,
+                                       sl.slice_size);
+                };
+
+                const std::size_t active_idx =
+                    model_.active_slice_index() < container.slices.size()
+                        ? model_.active_slice_index()
+                        : 0u;
+                const std::string preview = format_slice_item(container.slices[active_idx]);
+
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextDisabled("Active slice:");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-1.0f);
+                if (ImGui::BeginCombo("##UniversalSliceSelector", preview.c_str())) {
+                    for (std::size_t i = 0u; i < container.slices.size(); ++i) {
+                        const bool is_selected = (i == active_idx);
+                        const std::string label = format_slice_item(container.slices[i]);
+                        if (ImGui::Selectable(label.c_str(), is_selected)) {
+                            if (!is_selected && on_slice_selected_) {
+                                on_slice_selected_(i);
+                            }
+                        }
+                        if (is_selected) {
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
+            }
             ImGui::Separator();
         }
 
@@ -107,6 +152,17 @@ namespace viewer {
                 row("Path", info.path);
                 row("Format", info.format_str);
                 row("Architecture", info.arch_str);
+                if (!model_.is_live_process() && model_.container_info().is_universal_container &&
+                    model_.active_slice_index() < model_.container_info().slices.size()) {
+                    const peelf::BinarySliceDescriptor& sl =
+                        model_.container_info().slices[model_.active_slice_index()];
+                    row("Slice range",
+                        std::format("offset 0x{:X} .. 0x{:X} ({} bytes, align 2^{})",
+                                    sl.container_offset,
+                                    sl.container_offset + sl.slice_size,
+                                    sl.slice_size,
+                                    sl.align_log2));
+                }
                 row("Size", std::format("{} bytes", info.size_bytes));
                 row("Window base", std::format("0x{:X}", model_.view_base_address()));
                 row("Entry point", std::format("0x{:X}", info.entry_point));

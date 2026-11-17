@@ -61,6 +61,8 @@ using detail::utf8_path;
         architecture_ = peelf::Architecture::Unknown;
         endianness_ = peelf::Endianness::Little;
         file_info_ = {};
+        container_info_ = {};
+        active_slice_index_ = 0;
         bytes_.clear();
         live_backing_file_bytes_.clear();
         live_module_snapshot_bytes_.clear();
@@ -251,6 +253,9 @@ using detail::utf8_path;
                 }
                 return format_hex_addr(mod->base_address);
             }
+        }
+        if (container_info_.is_universal_container && !file_info_.path.empty()) {
+            return std::format("{}#slice{}", file_info_.path, active_slice_index_);
         }
         return file_info_.path;
     }
@@ -458,8 +463,13 @@ using detail::utf8_path;
             return true;
         }
 
-        if (auto parsed = peelf::parse_image(bytes_)) {
+        if (auto inspected = peelf::inspect_binary_container(bytes_); inspected.has_value()) {
+            container_info_ = std::move(*inspected);
+        }
+
+        if (auto parsed = peelf::open_binary_image(bytes_)) {
             image_ = std::move(*parsed);
+            active_slice_index_ = image_->container_slice_index();
             architecture_ = image_->architecture();
             endianness_ = image_->endianness();
         }
@@ -1100,8 +1110,24 @@ using detail::utf8_path;
         format_ = BinaryFormat::MachO;
 
         file_info_.path = path;
-        file_info_.format_str = std::string(peelf::to_string(image_->format()));
-        file_info_.arch_str = std::string(peelf::to_string(image_->architecture()));
+        if (container_info_.is_universal_container && container_info_.slices.size() > 1u) {
+            file_info_.format_str = std::format(
+                "Mach-O (Universal slice {}/{})",
+                active_slice_index_ + 1u,
+                container_info_.slices.size());
+        } else {
+            file_info_.format_str = std::string(peelf::to_string(image_->format()));
+        }
+
+        if (active_slice_index_ < container_info_.slices.size() &&
+            !container_info_.slices[active_slice_index_].arch_name.empty()) {
+            file_info_.arch_str = std::format(
+                "{} ({})",
+                peelf::to_string(image_->architecture()),
+                container_info_.slices[active_slice_index_].arch_name);
+        } else {
+            file_info_.arch_str = std::string(peelf::to_string(image_->architecture()));
+        }
         file_info_.size_bytes = bytes_.size();
         file_info_.entry_point = image_->entry_point();
 
@@ -1109,6 +1135,17 @@ using detail::utf8_path;
         file_info_.flags.push_back(std::string(peelf::to_string(image_->kind())));
         file_info_.flags.push_back(image_->is_64bit() ? "64-bit" : "32-bit");
         file_info_.flags.push_back(std::string(peelf::to_string(image_->endianness())));
+        if (container_info_.is_universal_container) {
+            file_info_.flags.push_back("Universal Container");
+        }
+        if (const peelf::MachOHeader* mh = image_->macho_header(); mh != nullptr) {
+            if (mh->has_pie()) {
+                file_info_.flags.push_back("MH_PIE");
+            }
+            if (mh->is_arm64e) {
+                file_info_.flags.push_back("arm64e PAC");
+            }
+        }
 
         sections_.clear();
         for (const auto& s : image_->sections()) {
@@ -1124,6 +1161,88 @@ using detail::utf8_path;
             });
         }
 
+        return true;
+    }
+
+    bool BinaryModel::select_container_slice(std::size_t slice_index) {
+        if (is_live_process() || source_kind_ != BinarySourceKind::StaticFile || bytes_.empty()) {
+            last_diagnostic_ = "Universal container slice selection requires a loaded static file";
+            return false;
+        }
+        if (!container_info_.is_universal_container || slice_index >= container_info_.slices.size()) {
+            last_diagnostic_ = std::format(
+                "Universal slice index {} is out of range ({} slice(s) available)",
+                slice_index,
+                container_info_.slices.size());
+            return false;
+        }
+        if (image_ != nullptr && active_slice_index_ == slice_index &&
+            image_->container_slice_index() == slice_index) {
+            last_diagnostic_.clear();
+            return true;
+        }
+
+        peelf::BinaryOpenOptions open_opts{};
+        open_opts.selected_slice_index = slice_index;
+
+        std::vector<std::uint8_t> effective_buf;
+        std::span<const std::uint8_t> parse_span = bytes_;
+        if (!changed_intervals().empty()) {
+            if (auto eff = read_effective_bytes(0u, bytes_.size()); eff.has_value()) {
+                effective_buf = std::move(*eff);
+                parse_span = effective_buf;
+            }
+        }
+
+        auto parsed = peelf::open_binary_image(parse_span, open_opts);
+        if (!parsed.has_value()) {
+            last_diagnostic_ = parsed.error().message;
+            return false;
+        }
+
+        const std::string current_path = file_info_.path;
+        image_ = std::move(*parsed);
+        active_slice_index_ = image_->container_slice_index();
+        architecture_ = image_->architecture();
+        endianness_ = image_->endianness();
+        analysis_thumb_mode_ = false;
+        if (!applied_structures_.empty()) {
+            applied_structures_.clear();
+            ++structure_binding_revision_;
+        }
+        if (!bookmarks_.empty()) {
+            bookmarks_.clear();
+            ++bookmark_revision_;
+        }
+
+        if (!load_macho(current_path)) {
+            last_diagnostic_ = "Selected Universal container slice is not a Mach-O image";
+            return false;
+        }
+
+        ++content_generation_;
+        const peelf::BackingImageIdentity bid = peelf::extract_backing_image_identity(*image_, parse_span);
+        target_instance_id_ = peelf::TargetInstanceId{
+            .backend = peelf::BackendKind::StaticFile,
+            .pid = 0u,
+            .creation_identity = std::nullopt,
+            .image_sha256 = content_sha256(),
+            .build_id_or_pdb_guid = bid.primary_identifier(),
+        };
+        static_image_stamp_ = peelf::CaptureStamp::capture_now(
+            target_instance_id_,
+            ++next_capture_revision_,
+            true,
+            peelf::CaptureAvailability::Complete);
+        (void)auto_load_debug_info_for_current_image(utf8_path(current_path));
+        rebuild_symbol_index();
+        runtime_stamp_ = peelf::CaptureStamp::capture_now(
+            target_instance_id_,
+            ++next_capture_revision_,
+            true,
+            peelf::CaptureAvailability::Partial);
+        recompute_capabilities();
+        last_diagnostic_.clear();
         return true;
     }
 

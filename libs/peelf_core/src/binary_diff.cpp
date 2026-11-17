@@ -18,6 +18,7 @@
 
 #include <peelf/demangle.hpp>
 #include <peelf/endian_reader.hpp>
+#include <peelf/macho_image.hpp>
 #include <peelf/sha256.hpp>
 
 namespace peelf {
@@ -38,6 +39,8 @@ namespace {
     std::string low = to_lower_ascii(base);
     if (low.ends_with(".dll") || low.ends_with(".exe") || low.ends_with(".sys")) {
         low.resize(low.size() - 4u);
+    } else if (low.ends_with(".dylib")) {
+        low.resize(low.size() - 6u);
     } else {
         const std::size_t so_pos = low.find(".so");
         if (so_pos != std::string::npos) {
@@ -45,6 +48,173 @@ namespace {
         }
     }
     return low;
+}
+
+[[nodiscard]] std::string macho_diff_arch_name(const IBinaryImage& img) {
+    const MachOHeader* mh = img.macho_header();
+    if (mh == nullptr) {
+        return std::string(to_string(img.architecture()));
+    }
+    if (mh->cpu_type == macho::kCpuTypeArm64) {
+        return mh->is_arm64e ? "arm64e" : "arm64";
+    }
+    if (mh->cpu_type == macho::kCpuTypeArm64_32) {
+        return "arm64_32";
+    }
+    if (mh->cpu_type == macho::kCpuTypeX86_64) {
+        const std::uint32_t sub = mh->cpu_subtype & ~macho::kCpuSubtypeMask;
+        return sub == macho::kCpuSubtypeX86_64H ? "x86_64h" : "x86_64";
+    }
+    if (mh->cpu_type == macho::kCpuTypeX86) {
+        return "i386";
+    }
+    if (mh->cpu_type == macho::kCpuTypeArm) {
+        return "armv7";
+    }
+    return std::string(to_string(img.architecture()));
+}
+
+[[nodiscard]] std::string macho_diff_filetype_name(std::uint32_t ft) {
+    switch (ft) {
+        case macho::kMhObject:     return std::format("MH_OBJECT (0x{:X})", ft);
+        case macho::kMhExecute:    return std::format("MH_EXECUTE (0x{:X})", ft);
+        case macho::kMhDylib:      return std::format("MH_DYLIB (0x{:X})", ft);
+        case macho::kMhDylinker:   return std::format("MH_DYLINKER (0x{:X})", ft);
+        case macho::kMhBundle:     return std::format("MH_BUNDLE (0x{:X})", ft);
+        case macho::kMhDsym:       return std::format("MH_DSYM (0x{:X})", ft);
+        case macho::kMhKextBundle: return std::format("MH_KEXT_BUNDLE (0x{:X})", ft);
+        case macho::kMhFileset:    return std::format("MH_FILESET (0x{:X})", ft);
+        default:                   return std::format("0x{:X}", ft);
+    }
+}
+
+[[nodiscard]] std::string macho_diff_flags_summary(std::uint32_t flags) {
+    std::vector<std::string_view> names;
+    if ((flags & macho::kMhNoUndefs) != 0u)            names.push_back("MH_NOUNDEFS");
+    if ((flags & macho::kMhDyldLink) != 0u)            names.push_back("MH_DYLDLINK");
+    if ((flags & macho::kMhTwoLevel) != 0u)            names.push_back("MH_TWOLEVEL");
+    if ((flags & macho::kMhForceFlat) != 0u)           names.push_back("MH_FORCE_FLAT");
+    if ((flags & macho::kMhAllowStackExecution) != 0u) names.push_back("MH_ALLOW_STACK_EXECUTION");
+    if ((flags & macho::kMhPie) != 0u)                 names.push_back("MH_PIE");
+    if ((flags & macho::kMhNoHeapExecution) != 0u)     names.push_back("MH_NO_HEAP_EXECUTION");
+    if ((flags & macho::kMhAppExtensionSafe) != 0u)    names.push_back("MH_APP_EXTENSION_SAFE");
+    std::string out = std::format("0x{:08X}", flags);
+    if (!names.empty()) {
+        out += " [";
+        for (std::size_t i = 0u; i < names.size(); ++i) {
+            if (i > 0u) out += " | ";
+            out += names[i];
+        }
+        out += "]";
+    }
+    return out;
+}
+
+[[nodiscard]] std::string macho_diff_uuid_string(const IBinaryImage& img) {
+    const auto uuid = img.macho_uuid();
+    if (!uuid.has_value()) {
+        return "<absent>";
+    }
+    const auto& b = *uuid;
+    return std::format(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-"
+        "{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+[[nodiscard]] std::string macho_diff_platform_summary(const IBinaryImage& img) {
+    if (img.macho_build_versions().empty()) {
+        return "<absent>";
+    }
+    std::string out;
+    for (std::size_t i = 0u; i < img.macho_build_versions().size(); ++i) {
+        if (i > 0u) out += "; ";
+        const MachOBuildVersion& bv = img.macho_build_versions()[i];
+        out += std::format("{} min {} sdk {}",
+                           macho::platform_to_string(bv.platform),
+                           macho::format_packed_version(bv.minos),
+                           macho::format_packed_version(bv.sdk));
+    }
+    return out;
+}
+
+[[nodiscard]] std::string macho_diff_dylibs_summary(const IBinaryImage& img) {
+    std::vector<std::string> items;
+    for (const MachODylibDependency& dy : img.macho_dylibs()) {
+        if (dy.ordinal == 0u) {
+            continue;
+        }
+        items.push_back(std::format("{} ({})",
+                                    dy.name,
+                                    macho::format_packed_version(dy.current_version)));
+    }
+    if (items.empty()) {
+        return "0 []";
+    }
+    std::string joined = std::format("{} [", items.size());
+    for (std::size_t i = 0u; i < items.size(); ++i) {
+        if (i > 0u) joined += ", ";
+        joined += items[i];
+    }
+    joined += "]";
+    return joined;
+}
+
+[[nodiscard]] std::string macho_diff_rpaths_summary(const IBinaryImage& img) {
+    if (img.macho_rpaths().empty()) {
+        return "<none>";
+    }
+    std::string out;
+    for (std::size_t i = 0u; i < img.macho_rpaths().size(); ++i) {
+        if (i > 0u) out += " : ";
+        out += img.macho_rpaths()[i].path;
+    }
+    return out;
+}
+
+[[nodiscard]] std::string macho_diff_codesig_summary(const IBinaryImage& img) {
+    const MachOCodeSignatureInfo* cs = img.macho_code_signature();
+    if (cs == nullptr || !cs->present) {
+        return "Unsigned";
+    }
+    if (!cs->superblob_valid || !cs->has_code_directory) {
+        return "Corrupt / Truncated LC_CODE_SIGNATURE";
+    }
+    return std::format(
+        "flags=0x{:08X}, adhoc={}, runtime={}, id='{}', cms={}, trust={}",
+        cs->cd_flags,
+        cs->is_adhoc() ? 1 : 0,
+        cs->has_hardened_runtime() ? 1 : 0,
+        cs->identifier.empty() ? "<none>" : cs->identifier,
+        cs->has_nonempty_cms_signature ? "nonempty" : "empty",
+        cs->cryptographically_verified ? "verified" : "unverified_offline");
+}
+
+[[nodiscard]] std::string macho_diff_security_posture(const IBinaryImage& img) {
+    const MachOHeader* mh = img.macho_header();
+    if (mh == nullptr) {
+        return "<n/a>";
+    }
+    bool has_pz = false;
+    bool has_rwx = mh->allows_stack_execution();
+    for (const MachOSegmentCommand& seg : img.macho_segments()) {
+        if (seg.is_pagezero() && seg.virtual_address == 0u && seg.virtual_size >= 4096u &&
+            seg.initprot == 0u && seg.maxprot == 0u) {
+            has_pz = true;
+        }
+        if (seg.init_is_wx() || seg.max_is_wx()) {
+            has_rwx = true;
+        }
+    }
+    const MachOEncryptionInfo* enc = img.macho_encryption_info();
+    const bool encrypted = (enc != nullptr && enc->is_encrypted());
+    return std::format("PIE={}, __PAGEZERO={}, W^X={}, PAC={}, Encrypted={}",
+                       mh->has_pie() ? 1 : 0,
+                       has_pz ? 1 : 0,
+                       has_rwx ? "VIOLATION" : "ok",
+                       mh->is_arm64e ? "arm64e" : "none",
+                       encrypted ? 1 : 0);
 }
 
 [[nodiscard]] std::string format_hex(std::uint64_t value, unsigned width = 0u) {
@@ -1003,6 +1173,66 @@ Result<BinaryDiffReport> compare_binaries(
                       std::string(rhs_image.elf_interpreter()));
         }
     }
+    if (const MachOHeader* lmh = lhs_image.macho_header(); lmh != nullptr) {
+        if (const MachOHeader* rmh = rhs_image.macho_header(); rmh != nullptr) {
+            auto describe_slice = [](const IBinaryImage& img, std::span<const std::uint8_t> raw) {
+                if (img.is_universal_slice()) {
+                    return std::format("Universal slice #{} ({}, off=0x{:X}, size={} B)",
+                                       img.container_slice_index(),
+                                       macho_diff_arch_name(img),
+                                       img.container_slice_offset(),
+                                       img.container_slice_size());
+                }
+                return std::format("Thin Mach-O ({}, {} B)",
+                                   macho_diff_arch_name(img),
+                                   raw.size());
+            };
+            add_field("Mach-O Slice",
+                      describe_slice(lhs_image, lhs_bytes),
+                      describe_slice(rhs_image, rhs_bytes));
+            if (lhs_image.is_universal_slice() || rhs_image.is_universal_slice()) {
+                const auto l_sub = lhs_image.is_universal_slice()
+                    ? slice_safe(lhs_bytes, lhs_image.container_slice_offset(), lhs_image.container_slice_size())
+                    : lhs_bytes;
+                const auto r_sub = rhs_image.is_universal_slice()
+                    ? slice_safe(rhs_bytes, rhs_image.container_slice_offset(), rhs_image.container_slice_size())
+                    : rhs_bytes;
+                add_field("Mach-O Slice SHA-256", sha256_hex(l_sub), sha256_hex(r_sub));
+            }
+            add_field("Mach-O CPU / Arch",
+                      std::format("{} (0x{:08X} / 0x{:08X})",
+                                  macho_diff_arch_name(lhs_image), lmh->cpu_type, lmh->cpu_subtype),
+                      std::format("{} (0x{:08X} / 0x{:08X})",
+                                  macho_diff_arch_name(rhs_image), rmh->cpu_type, rmh->cpu_subtype));
+            add_field("Mach-O File Type",
+                      macho_diff_filetype_name(lmh->file_type),
+                      macho_diff_filetype_name(rmh->file_type));
+            add_field("Mach-O Flags",
+                      macho_diff_flags_summary(lmh->flags),
+                      macho_diff_flags_summary(rmh->flags));
+            add_field("Mach-O Load Commands",
+                      std::format("{} cmds ({} B)", lmh->ncmds, lmh->sizeofcmds),
+                      std::format("{} cmds ({} B)", rmh->ncmds, rmh->sizeofcmds));
+            add_field("Mach-O UUID",
+                      macho_diff_uuid_string(lhs_image),
+                      macho_diff_uuid_string(rhs_image));
+            add_field("Mach-O Platform / MinOS",
+                      macho_diff_platform_summary(lhs_image),
+                      macho_diff_platform_summary(rhs_image));
+            add_field("Mach-O Dylibs",
+                      macho_diff_dylibs_summary(lhs_image),
+                      macho_diff_dylibs_summary(rhs_image));
+            add_field("Mach-O RPATHs",
+                      macho_diff_rpaths_summary(lhs_image),
+                      macho_diff_rpaths_summary(rhs_image));
+            add_field("Mach-O Code Signature",
+                      macho_diff_codesig_summary(lhs_image),
+                      macho_diff_codesig_summary(rhs_image));
+            add_field("Mach-O Security Posture",
+                      macho_diff_security_posture(lhs_image),
+                      macho_diff_security_posture(rhs_image));
+        }
+    }
 
     // 2. Section comparison & coalesced byte hunks
     const std::vector<VaInterval> lhs_relocs = collect_relocation_va_intervals(lhs_image);
@@ -1118,26 +1348,39 @@ Result<BinaryDiffReport> compare_binaries(
         return changed_total;
     };
 
-    // Header byte diff before first raw section
-    auto first_raw_section_offset = [](const IBinaryImage& img, std::size_t total_sz) -> std::size_t {
-        std::uint64_t min_off = total_sz;
+    // Header byte diff before first raw section (slice-relative when comparing Universal Mach-O slices)
+    auto slice_header_window = [](const IBinaryImage& img,
+                                  std::span<const std::uint8_t> raw)
+        -> std::pair<std::uint64_t, std::span<const std::uint8_t>> {
+        const std::uint64_t base_off =
+            img.is_universal_slice() ? img.container_slice_offset() : 0u;
+        if (base_off >= raw.size()) {
+            return {base_off, {}};
+        }
+        const std::uint64_t max_avail =
+            img.is_universal_slice() && img.container_slice_size() > 0u
+                ? std::min<std::uint64_t>(img.container_slice_size(), raw.size() - base_off)
+                : (raw.size() - base_off);
+        std::uint64_t min_rel_sec = max_avail;
         for (const Section& s : img.sections()) {
-            if (s.file_size > 0u && s.file_offset > 0u) {
-                min_off = std::min(min_off, s.file_offset);
+            if (s.file_size > 0u && s.file_offset > base_off) {
+                min_rel_sec = std::min<std::uint64_t>(min_rel_sec, s.file_offset - base_off);
             }
         }
-        return static_cast<std::size_t>(std::min<std::uint64_t>(min_off, std::min<std::size_t>(total_sz, 4096u)));
+        const auto hdr_len =
+            static_cast<std::size_t>(std::min<std::uint64_t>(min_rel_sec, std::min<std::uint64_t>(max_avail, 4096u)));
+        return {base_off, raw.subspan(static_cast<std::size_t>(base_off), hdr_len)};
     };
 
-    const std::size_t lhs_hdr_len = first_raw_section_offset(lhs_image, lhs_bytes.size());
-    const std::size_t rhs_hdr_len = first_raw_section_offset(rhs_image, rhs_bytes.size());
-    if (lhs_hdr_len > 0u && rhs_hdr_len > 0u) {
+    const auto [lhs_hdr_base, lhs_hdr_span] = slice_header_window(lhs_image, lhs_bytes);
+    const auto [rhs_hdr_base, rhs_hdr_span] = slice_header_window(rhs_image, rhs_bytes);
+    if (!lhs_hdr_span.empty() && !rhs_hdr_span.empty()) {
         report.total_changed_bytes += append_hunks_between_spans(
             "<headers>",
-            lhs_bytes.subspan(0, lhs_hdr_len),
-            rhs_bytes.subspan(0, rhs_hdr_len),
-            0u,
-            0u,
+            lhs_hdr_span,
+            rhs_hdr_span,
+            lhs_hdr_base,
+            rhs_hdr_base,
             lhs_image.image_base(),
             rhs_image.image_base(),
             ByteHunkClassification::HeaderChange);
@@ -1619,19 +1862,89 @@ Result<BinaryDiffReport> compare_binaries(
     return report;
 }
 
+Result<ResolvedDiffImagePair> open_matched_diff_images(
+    std::span<const std::uint8_t> lhs_bytes,
+    std::span<const std::uint8_t> rhs_bytes,
+    const BinaryDiffOptions& options) {
+    ResolvedDiffImagePair pair{};
+    if (auto lc = inspect_binary_container(lhs_bytes); lc.has_value()) {
+        pair.lhs_container = std::move(*lc);
+    }
+    if (auto rc = inspect_binary_container(rhs_bytes); rc.has_value()) {
+        pair.rhs_container = std::move(*rc);
+    }
+
+    BinaryOpenOptions lhs_opts{};
+    if (options.lhs_slice_index.has_value()) {
+        lhs_opts.selected_slice_index = *options.lhs_slice_index;
+    } else if (!options.lhs_arch_name.empty()) {
+        lhs_opts.preferred_arch_name = options.lhs_arch_name;
+    } else if (pair.lhs_container.is_universal_container &&
+               !pair.rhs_container.is_universal_container &&
+               pair.rhs_container.slices.size() == 1u) {
+        // Match Universal LHS slice against thin RHS architecture automatically.
+        lhs_opts.preferred_arch_name = pair.rhs_container.slices.front().arch_name;
+        lhs_opts.preferred_architecture = pair.rhs_container.slices.front().arch;
+    }
+
+    auto lhs_img = open_binary_image(lhs_bytes, lhs_opts);
+    if (!lhs_img.has_value()) {
+        return std::unexpected(lhs_img.error());
+    }
+    pair.lhs_image = std::move(*lhs_img);
+
+    BinaryOpenOptions rhs_opts{};
+    if (options.rhs_slice_index.has_value()) {
+        rhs_opts.selected_slice_index = *options.rhs_slice_index;
+    } else if (!options.rhs_arch_name.empty()) {
+        rhs_opts.preferred_arch_name = options.rhs_arch_name;
+    } else if (pair.rhs_container.is_universal_container) {
+        // Match Universal RHS slice against the active LHS slice architecture.
+        std::string target_arch_name;
+        const std::size_t l_idx = pair.lhs_image->container_slice_index();
+        if (l_idx < pair.lhs_container.slices.size()) {
+            target_arch_name = pair.lhs_container.slices[l_idx].arch_name;
+        } else {
+            target_arch_name = macho_diff_arch_name(*pair.lhs_image);
+        }
+        const Architecture target_arch = pair.lhs_image->architecture();
+        bool has_compatible_rhs_slice = false;
+        for (const BinarySliceDescriptor& sl : pair.rhs_container.slices) {
+            if (sl.arch == target_arch || (!target_arch_name.empty() && sl.arch_name == target_arch_name)) {
+                has_compatible_rhs_slice = true;
+                break;
+            }
+        }
+        if (has_compatible_rhs_slice) {
+            rhs_opts.preferred_architecture = target_arch;
+            if (!target_arch_name.empty()) {
+                const bool exact_in_rhs = std::ranges::any_of(
+                    pair.rhs_container.slices,
+                    [&](const BinarySliceDescriptor& sl) { return sl.arch_name == target_arch_name; });
+                if (exact_in_rhs) {
+                    rhs_opts.preferred_arch_name = target_arch_name;
+                }
+            }
+        }
+    }
+
+    auto rhs_img = open_binary_image(rhs_bytes, rhs_opts);
+    if (!rhs_img.has_value()) {
+        return std::unexpected(rhs_img.error());
+    }
+    pair.rhs_image = std::move(*rhs_img);
+    return pair;
+}
+
 Result<BinaryDiffReport> compare_binaries(
     std::span<const std::uint8_t> lhs_bytes,
     std::span<const std::uint8_t> rhs_bytes,
     const BinaryDiffOptions& options) {
-    auto lhs_img = parse_image(lhs_bytes);
-    if (!lhs_img.has_value()) {
-        return std::unexpected(lhs_img.error());
+    auto opened = open_matched_diff_images(lhs_bytes, rhs_bytes, options);
+    if (!opened.has_value()) {
+        return std::unexpected(opened.error());
     }
-    auto rhs_img = parse_image(rhs_bytes);
-    if (!rhs_img.has_value()) {
-        return std::unexpected(rhs_img.error());
-    }
-    return compare_binaries(**lhs_img, lhs_bytes, **rhs_img, rhs_bytes, options);
+    return compare_binaries(*opened->lhs_image, lhs_bytes, *opened->rhs_image, rhs_bytes, options);
 }
 
 Result<BinaryDiffReport> compare_binary_files(

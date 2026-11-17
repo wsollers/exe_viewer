@@ -1,4 +1,5 @@
 #include <peelf/dependency_tree.hpp>
+#include <peelf/macho_image.hpp>
 
 #include <mapping/file_mapping.hpp>
 
@@ -146,6 +147,9 @@ struct ParsedModuleEntry {
     std::vector<std::string> rpaths{};
     std::vector<std::string> runpaths{};
     std::string interpreter{};
+    std::string macho_install_name{};
+    std::vector<std::string> macho_rpaths{};
+    std::string macho_dylinker{};
 };
 
 void extract_elf_dynamic_metadata(const IBinaryImage& img,
@@ -167,6 +171,45 @@ void extract_elf_dynamic_metadata(const IBinaryImage& img,
             }
         }
     }
+}
+
+void extract_macho_dynamic_metadata(const IBinaryImage& img,
+                                    std::string& install_name_out,
+                                    std::vector<std::string>& rpaths_out,
+                                    std::string& dylinker_out) {
+    if (img.format() != Format::MachO) {
+        return;
+    }
+    dylinker_out = std::string(img.macho_dylinker());
+    for (const MachODylibDependency& dy : img.macho_dylibs()) {
+        if (dy.ordinal == 0u && !dy.name.empty()) {
+            install_name_out = dy.name;
+        }
+    }
+    for (const MachORpathEntry& rp : img.macho_rpaths()) {
+        push_unique_string(rpaths_out, rp.path);
+    }
+}
+
+[[nodiscard]] std::string macho_parent_slice_arch_hint(const IBinaryImage& img) {
+    const MachOHeader* hdr = img.macho_header();
+    if (hdr == nullptr) {
+        return {};
+    }
+    if (hdr->cpu_type == macho::kCpuTypeArm64) {
+        return hdr->is_arm64e ? "arm64e" : "arm64";
+    }
+    if (hdr->cpu_type == macho::kCpuTypeX86_64) {
+        const std::uint32_t sub = hdr->cpu_subtype & ~macho::kCpuSubtypeMask;
+        return sub == macho::kCpuSubtypeX86_64H ? "x86_64h" : "x86_64";
+    }
+    if (hdr->cpu_type == macho::kCpuTypeX86) {
+        return "i386";
+    }
+    if (hdr->cpu_type == macho::kCpuTypeArm) {
+        return "armv7";
+    }
+    return {};
 }
 
 struct RequestedSymbolRef {
@@ -317,6 +360,86 @@ parse_pe_forwarder_target(const ExportEntry& exp) {
                 requests.push_back(std::move(req));
             }
         }
+    } else if (img.format() == Format::MachO) {
+        std::unordered_map<std::string, std::size_t> by_name;
+        std::unordered_map<std::uint16_t, std::size_t> by_ordinal;
+
+        for (const MachODylibDependency& dy : img.macho_dylibs()) {
+            if (dy.ordinal == 0u || dy.name.empty()) {
+                continue; // LC_ID_DYLIB is the module's own identity, not an import edge
+            }
+            DependencyEdgeKind kind = DependencyEdgeKind::StandardImport;
+            if (dy.weak) {
+                kind = DependencyEdgeKind::WeakDylib;
+            } else if (dy.reexport) {
+                kind = DependencyEdgeKind::ReexportDylib;
+            } else if (dy.lazy) {
+                kind = DependencyEdgeKind::LazyDylib;
+            } else if (dy.upward) {
+                kind = DependencyEdgeKind::UpwardDylib;
+            }
+
+            auto [it, inserted] = by_name.emplace(dy.name, requests.size());
+            if (inserted) {
+                RequestedDependency req;
+                req.requested_name = dy.name;
+                req.kind = kind;
+                requests.push_back(std::move(req));
+            }
+            by_ordinal.emplace(dy.ordinal, it->second);
+        }
+
+        // Attribute two-level namespace undefined symbols to their target dylib ordinal/name.
+        std::unordered_set<std::string> attributed_keys;
+        for (const MachOSymbol& ms : img.macho_symbols()) {
+            if (!ms.is_external || !ms.is_undefined || ms.is_stab || ms.name.empty()) {
+                continue;
+            }
+            std::optional<std::size_t> req_idx;
+            if (ms.library_ordinal > 0u) {
+                if (auto ord_it = by_ordinal.find(ms.library_ordinal); ord_it != by_ordinal.end()) {
+                    req_idx = ord_it->second;
+                }
+            }
+            if (!req_idx.has_value() && !ms.library_name.empty()) {
+                if (auto nm_it = by_name.find(ms.library_name); nm_it != by_name.end()) {
+                    req_idx = nm_it->second;
+                }
+            }
+            if (req_idx.has_value()) {
+                const std::string dedup = std::format("{}:{}", *req_idx, ms.name);
+                if (attributed_keys.insert(dedup).second) {
+                    RequestedSymbolRef sym;
+                    sym.name = ms.name;
+                    sym.weak_symbol = ms.is_weak_ref || ms.is_weak_def;
+                    requests[*req_idx].symbols.push_back(std::move(sym));
+                }
+            }
+        }
+
+        // Fallback if a mock IBinaryImage populates imports() without macho_dylibs()/macho_symbols().
+        for (const ImportEntry& imp : img.imports()) {
+            if (imp.library.empty()) {
+                continue;
+            }
+            auto [it, inserted] = by_name.emplace(imp.library, requests.size());
+            if (inserted) {
+                RequestedDependency req;
+                req.requested_name = imp.library;
+                req.kind = imp.delay_load ? DependencyEdgeKind::LazyDylib
+                                          : DependencyEdgeKind::StandardImport;
+                requests.push_back(std::move(req));
+            }
+            if (!imp.name.empty()) {
+                const std::string dedup = std::format("{}:{}", it->second, imp.name);
+                if (attributed_keys.insert(dedup).second) {
+                    RequestedSymbolRef sym;
+                    sym.name = imp.name;
+                    sym.call_site_va = imp.address;
+                    requests[it->second].symbols.push_back(std::move(sym));
+                }
+            }
+        }
     }
     return requests;
 }
@@ -459,8 +582,14 @@ public:
                                      root.elf_rpaths,
                                      root.elf_runpaths,
                                      root.elf_interpreter);
+        extract_macho_dynamic_metadata(root_image_,
+                                       root.macho_install_name,
+                                       root.macho_rpaths,
+                                       root.macho_dylinker);
         if (!root.soname.empty() && opts_.root_path.empty()) {
             root.display_name = root.soname;
+        } else if (!root.macho_install_name.empty() && opts_.root_path.empty()) {
+            root.display_name = root.macho_install_name;
         }
         graph_.nodes.push_back(std::move(root));
         if (!opts_.root_path.empty()) {
@@ -475,15 +604,19 @@ public:
 
         std::vector<std::size_t> ancestors{0};
         std::vector<std::pair<std::string, std::filesystem::path>> inherited_rpaths;
-        const std::filesystem::path root_origin =
+        root_origin_ =
             !opts_.root_path.empty() ? opts_.root_path.parent_path() : std::filesystem::path{};
-        if (graph_.nodes[0].elf_runpaths.empty()) {
+        if (root_image_.format() == Format::ELF && graph_.nodes[0].elf_runpaths.empty()) {
             for (const std::string& rp : graph_.nodes[0].elf_rpaths) {
-                inherited_rpaths.emplace_back(rp, root_origin);
+                inherited_rpaths.emplace_back(rp, root_origin_);
+            }
+        } else if (root_image_.format() == Format::MachO) {
+            for (const std::string& rp : graph_.nodes[0].macho_rpaths) {
+                inherited_rpaths.emplace_back(rp, root_origin_);
             }
         }
 
-        expand_node(0, root_image_, root_origin, inherited_rpaths, 0, ancestors, graph_.root_tree);
+        expand_node(0, root_image_, root_origin_, inherited_rpaths, 0, ancestors, graph_.root_tree);
         compute_summary();
         return std::move(graph_);
     }
@@ -499,8 +632,19 @@ private:
         std::optional<std::uint64_t> live_base_va{};
     };
 
-    const ParsedModuleEntry* load_or_get_disk_module(const std::filesystem::path& path) {
-        const std::string key = normalize_path_key(path).generic_string();
+    const ParsedModuleEntry* load_or_get_disk_module(
+        const std::filesystem::path& path,
+        const IBinaryImage* parent_hint = nullptr) {
+        BinaryOpenOptions open_opts{};
+        std::string arch_suffix;
+        if (parent_hint != nullptr) {
+            open_opts.preferred_architecture = parent_hint->architecture();
+            open_opts.preferred_arch_name = macho_parent_slice_arch_hint(*parent_hint);
+            arch_suffix = std::format("|{}|{}",
+                                      to_string(parent_hint->architecture()),
+                                      open_opts.preferred_arch_name);
+        }
+        const std::string key = normalize_path_key(path).generic_string() + arch_suffix;
         if (auto it = parsed_cache_.find(key); it != parsed_cache_.end()) {
             return &it->second;
         }
@@ -508,7 +652,7 @@ private:
         if (auto ec = mapped.open(path.string(), MapMode::read_only); ec) {
             return nullptr;
         }
-        auto parsed = parse_image(mapped.view());
+        auto parsed = open_binary_image(mapped.view(), open_opts);
         if (!parsed.has_value() || !*parsed) {
             return nullptr;
         }
@@ -519,6 +663,10 @@ private:
                                      entry.rpaths,
                                      entry.runpaths,
                                      entry.interpreter);
+        extract_macho_dynamic_metadata(**parsed,
+                                       entry.macho_install_name,
+                                       entry.macho_rpaths,
+                                       entry.macho_dylinker);
         for (const ModuleInfo& mod : live_modules_) {
             if (!mod.path.empty() && normalize_path_key(mod.path) == normalize_path_key(path)) {
                 entry.live_base_va = mod.base_address;
@@ -937,6 +1085,312 @@ private:
         return res;
     }
 
+    [[nodiscard]] CandidateResult resolve_macho_dependency(
+        const IBinaryImage& parent_img,
+        const DependencyNode& parent_node,
+        const std::filesystem::path& parent_origin,
+        const std::vector<std::pair<std::string, std::filesystem::path>>& inherited_rpaths,
+        std::string_view requested_name) {
+        CandidateResult res;
+        std::filesystem::path mismatch_path;
+        std::string mismatch_reason;
+
+        auto consider_file = [&](const std::filesystem::path& found_path,
+                                 std::string_view source_label) -> bool {
+            const ParsedModuleEntry* ent = load_or_get_disk_module(found_path, &parent_img);
+            if (ent == nullptr || !ent->image) {
+                return false;
+            }
+            if (!images_compatible(parent_img, *ent->image)) {
+                if (mismatch_path.empty()) {
+                    mismatch_path = found_path;
+                    mismatch_reason = std::format(
+                        "Architecture mismatch in {}: expected {}, found {}",
+                        source_label,
+                        format_image_arch_desc(parent_img),
+                        format_image_arch_desc(*ent->image));
+                }
+                return false;
+            }
+            res.path = found_path;
+            res.parsed_image = ent->image.get();
+            res.live_base_va = ent->live_base_va;
+            res.status = ent->live_base_va.has_value()
+                             ? DependencyResolutionStatus::ResolvedInLiveProcess
+                             : DependencyResolutionStatus::ResolvedOnDisk;
+            res.reason = std::format("Resolved via {}", source_label);
+            return true;
+        };
+
+        auto probe_candidate_file = [&](const std::filesystem::path& cand_path,
+                                        std::string_view source_label) -> bool {
+            const std::filesystem::path norm = cand_path.lexically_normal();
+            push_unique_path(res.searched_paths, norm);
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(norm, ec)) {
+                return consider_file(norm, source_label);
+            }
+            return false;
+        };
+
+        const bool starts_with_rpath =
+            (requested_name == "@rpath") || requested_name.starts_with("@rpath/");
+        const bool starts_with_exec =
+            (requested_name == "@executable_path") || requested_name.starts_with("@executable_path/");
+        const bool starts_with_loader =
+            (requested_name == "@loader_path") || requested_name.starts_with("@loader_path/");
+
+        if (starts_with_rpath) {
+            std::string_view rel_tail =
+                requested_name.size() > 6u ? requested_name.substr(6u) : std::string_view{};
+            while (!rel_tail.empty() && rel_tail.front() == '/') {
+                rel_tail.remove_prefix(1u);
+            }
+            const std::filesystem::path rel_subpath(rel_tail);
+
+            // Search immediate loader's LC_RPATH entries first, then inherited ancestor LC_RPATHs.
+            std::vector<std::pair<std::string, std::filesystem::path>> rpath_chain;
+            for (const std::string& rp : parent_node.macho_rpaths) {
+                rpath_chain.emplace_back(rp, parent_origin);
+            }
+            for (const auto& [rp, orig] : inherited_rpaths) {
+                const bool dup = std::ranges::any_of(
+                    rpath_chain,
+                    [&](const auto& item) { return item.first == rp && item.second == orig; });
+                if (!dup) {
+                    rpath_chain.emplace_back(rp, orig);
+                }
+            }
+
+            for (const auto& [raw_rp, rp_origin] : rpath_chain) {
+                const std::string expanded_rp = expand_macho_loader_tokens(
+                    raw_rp, root_origin_, rp_origin, &res.origin_assumptions);
+                push_unique_string(res.origin_assumptions, "@rpath -> " + expanded_rp);
+                std::filesystem::path base_dir(expanded_rp);
+                if (base_dir.is_relative() && !rp_origin.empty()) {
+                    base_dir = rp_origin / base_dir;
+                }
+                const std::filesystem::path full_cand =
+                    rel_subpath.empty() ? base_dir : (base_dir / rel_subpath);
+                if (probe_candidate_file(full_cand, std::format("LC_RPATH '{}'", raw_rp))) {
+                    return res;
+                }
+            }
+
+            // Fallback: configured search_roots & ld_library_paths (probe both relative subpath and filename)
+            const std::string leaf_name = rel_subpath.filename().string();
+            for (const auto& sr : opts_.search_roots) {
+                if (!rel_subpath.empty() &&
+                    probe_candidate_file(sr / rel_subpath,
+                                         std::format("configured search root '{}'", sr.generic_string()))) {
+                    return res;
+                }
+                if (!leaf_name.empty() && leaf_name != rel_subpath.generic_string() &&
+                    probe_candidate_file(sr / leaf_name,
+                                         std::format("configured search root '{}'", sr.generic_string()))) {
+                    return res;
+                }
+            }
+            for (const auto& lp : opts_.ld_library_paths) {
+                if (!rel_subpath.empty() &&
+                    probe_candidate_file(lp / rel_subpath,
+                                         std::format("library search path '{}'", lp.generic_string()))) {
+                    return res;
+                }
+            }
+        } else if (starts_with_exec || starts_with_loader) {
+            const std::string expanded = expand_macho_loader_tokens(
+                requested_name, root_origin_, parent_origin, &res.origin_assumptions);
+            const std::string_view tok_label =
+                starts_with_exec ? "@executable_path" : "@loader_path";
+            if (probe_candidate_file(std::filesystem::path(expanded), tok_label)) {
+                return res;
+            }
+            const std::string leaf_name = std::filesystem::path(expanded).filename().string();
+            for (const auto& sr : opts_.search_roots) {
+                if (!leaf_name.empty() &&
+                    probe_candidate_file(sr / leaf_name,
+                                         std::format("configured search root '{}'", sr.generic_string()))) {
+                    return res;
+                }
+            }
+        } else {
+            // Absolute or relative install name (e.g. /usr/lib/libSystem.B.dylib, /opt/local/lib/libz.dylib)
+            const std::filesystem::path req_p(requested_name);
+            const std::string leaf_name = req_p.filename().string();
+
+            if (!opts_.sysroot.empty() && requested_name.starts_with('/')) {
+                if (probe_candidate_file(opts_.sysroot / requested_name.substr(1u), "sysroot install name")) {
+                    return res;
+                }
+            }
+            for (const auto& sr : opts_.search_roots) {
+                if (requested_name.starts_with('/') &&
+                    probe_candidate_file(sr / requested_name.substr(1u),
+                                         std::format("configured search root '{}'", sr.generic_string()))) {
+                    return res;
+                }
+                if (!leaf_name.empty() &&
+                    probe_candidate_file(sr / leaf_name,
+                                         std::format("configured search root '{}'", sr.generic_string()))) {
+                    return res;
+                }
+            }
+            if (req_p.is_relative() && !parent_origin.empty()) {
+                if (probe_candidate_file(parent_origin / req_p, "relative Mach-O dylib path")) {
+                    return res;
+                }
+            }
+            if (opts_.include_default_system_dirs || req_p.is_relative()) {
+                if (probe_candidate_file(req_p, "direct Mach-O install name")) {
+                    return res;
+                }
+            }
+        }
+
+        // Check attached live process modules when present
+        if (const ModuleInfo* live_mod = find_matching_live_module(requested_name, false)) {
+            if (!live_mod->path.empty()) {
+                push_unique_path(res.searched_paths, live_mod->path);
+            }
+            if (const ParsedModuleEntry* ent = load_or_get_live_module(*live_mod)) {
+                if (images_compatible(parent_img, *ent->image)) {
+                    res.status = DependencyResolutionStatus::ResolvedInLiveProcess;
+                    res.path = ent->path;
+                    res.parsed_image = ent->image.get();
+                    res.live_base_va = ent->live_base_va;
+                    res.reason = std::format("Resolved from attached live process module at {:#x}",
+                                             live_mod->base_address);
+                    return res;
+                }
+            }
+        }
+
+        // Classify macOS / Darwin dyld shared-cache paths honestly rather than reporting false missing files!
+        if (is_macos_dyld_shared_cache_path(requested_name)) {
+            res.status = DependencyResolutionStatus::SystemSharedCache;
+            res.reason = std::format(
+                "macOS/Darwin dyld shared-cache system library '{}' (resides in OS shared cache, not standalone on host disk)",
+                requested_name);
+            return res;
+        }
+
+        if (!mismatch_path.empty()) {
+            res.status = DependencyResolutionStatus::ArchitectureMismatch;
+            res.path = mismatch_path;
+            res.reason = mismatch_reason;
+            return res;
+        }
+
+        res.status = DependencyResolutionStatus::Unresolved;
+        res.reason = std::format("Unresolved Mach-O dylib '{}' after searching {} path(s)",
+                                 requested_name,
+                                 res.searched_paths.size());
+        return res;
+    }
+
+    [[nodiscard]] std::unordered_map<std::string, std::pair<std::uint64_t, std::string>>
+    collect_macho_exports_for_node(std::size_t node_id, bool& has_shared_cache_reexport) const {
+        std::unordered_map<std::string, std::pair<std::uint64_t, std::string>> out;
+        std::unordered_set<std::size_t> visited;
+        std::vector<std::size_t> queue{node_id};
+        visited.insert(node_id);
+
+        for (std::size_t qi = 0u; qi < queue.size(); ++qi) {
+            const std::size_t cur = queue[qi];
+            const IBinaryImage* img = nullptr;
+            if (auto it = image_by_node_id_.find(cur); it != image_by_node_id_.end()) {
+                img = it->second;
+            } else if (cur == 0u) {
+                img = &root_image_;
+            }
+            if (img != nullptr) {
+                const std::string src_label =
+                    (cur == node_id) ? std::string{} : graph_.nodes[cur].display_name;
+                for (const ExportEntry& exp : img->exports()) {
+                    if (!exp.name.empty()) {
+                        out.try_emplace(exp.name, std::make_pair(exp.virtual_address, src_label));
+                    }
+                }
+            }
+            for (const DependencyEdge& e : graph_.edges) {
+                if (e.parent_node_id != cur || e.kind != DependencyEdgeKind::ReexportDylib) {
+                    continue;
+                }
+                const DependencyResolutionStatus st = graph_.nodes[e.child_node_id].status;
+                if (st == DependencyResolutionStatus::SystemSharedCache) {
+                    has_shared_cache_reexport = true;
+                } else if ((st == DependencyResolutionStatus::ResolvedOnDisk ||
+                            st == DependencyResolutionStatus::ResolvedInLiveProcess) &&
+                           visited.insert(e.child_node_id).second) {
+                    queue.push_back(e.child_node_id);
+                }
+            }
+        }
+        return out;
+    }
+
+    [[nodiscard]] std::vector<ImportedSymbolBinding> bind_macho_symbols(
+        const std::vector<RequestedSymbolRef>& req_syms,
+        DependencyEdgeKind edge_kind,
+        DependencyResolutionStatus child_status,
+        std::size_t child_node_id) const {
+        std::vector<ImportedSymbolBinding> out;
+        out.reserve(req_syms.size());
+
+        bool has_shared_cache_reexport = false;
+        std::unordered_map<std::string, std::pair<std::uint64_t, std::string>> exp_by_name;
+        const bool child_resolved =
+            (child_status == DependencyResolutionStatus::ResolvedOnDisk ||
+             child_status == DependencyResolutionStatus::ResolvedInLiveProcess);
+        if (child_resolved) {
+            exp_by_name = collect_macho_exports_for_node(child_node_id, has_shared_cache_reexport);
+        }
+
+        for (const RequestedSymbolRef& req : req_syms) {
+            ImportedSymbolBinding b;
+            b.name = req.name;
+            b.weak_symbol = req.weak_symbol || (edge_kind == DependencyEdgeKind::WeakDylib);
+            b.delay_load = (edge_kind == DependencyEdgeKind::LazyDylib);
+            b.call_site_va = req.call_site_va;
+            b.note = req.note;
+
+            if (child_status == DependencyResolutionStatus::SystemSharedCache) {
+                b.status = ImportedSymbolStatus::UncheckedSystemSharedCache;
+                if (b.note.empty()) {
+                    b.note = "Target dylib resides in macOS dyld shared cache";
+                }
+            } else if (!child_resolved) {
+                if (b.weak_symbol) {
+                    b.status = ImportedSymbolStatus::BoundWeakOptional;
+                    if (b.note.empty()) {
+                        b.note = "Optional weak Mach-O dylib/symbol";
+                    }
+                } else {
+                    b.status = ImportedSymbolStatus::UncheckedTargetUnavailable;
+                }
+            } else if (auto it = exp_by_name.find(req.name); it != exp_by_name.end()) {
+                b.resolved_export_va = it->second.first;
+                if (!it->second.second.empty()) {
+                    b.status = ImportedSymbolStatus::BoundForwardedExport;
+                    b.forwarded_to = it->second.second;
+                    b.note = std::format("Re-exported via {}", it->second.second);
+                } else {
+                    b.status = ImportedSymbolStatus::BoundExport;
+                }
+            } else if (has_shared_cache_reexport) {
+                b.status = ImportedSymbolStatus::UncheckedSystemSharedCache;
+                b.note = "Re-export chain delegates to macOS dyld shared cache";
+            } else if (b.weak_symbol) {
+                b.status = ImportedSymbolStatus::BoundWeakOptional;
+            } else {
+                b.status = ImportedSymbolStatus::UnboundMissingExport;
+            }
+            out.push_back(std::move(b));
+        }
+        return out;
+    }
+
     [[nodiscard]] std::vector<ImportedSymbolBinding> bind_pe_symbols(
         const std::vector<RequestedSymbolRef>& req_syms,
         DependencyResolutionStatus child_status,
@@ -1019,6 +1473,8 @@ private:
             node_key = "mismatch:" + normalize_path_key(cand.path).generic_string();
         } else if (cand.status == DependencyResolutionStatus::VirtualApiSet) {
             node_key = "apiset:" + to_lower_ascii(requested_name);
+        } else if (cand.status == DependencyResolutionStatus::SystemSharedCache) {
+            node_key = "dyldcache:" + std::string(requested_name);
         } else {
             node_key = "missing:" + std::string(requested_name);
         }
@@ -1056,6 +1512,10 @@ private:
                                          node.elf_rpaths,
                                          node.elf_runpaths,
                                          node.elf_interpreter);
+            extract_macho_dynamic_metadata(*cand.parsed_image,
+                                           node.macho_install_name,
+                                           node.macho_rpaths,
+                                           node.macho_dylinker);
             image_by_node_id_[new_id] = cand.parsed_image;
         } else if (cand.status == DependencyResolutionStatus::ArchitectureMismatch && !cand.path.empty()) {
             if (const ParsedModuleEntry* mis = load_or_get_disk_module(cand.path); mis != nullptr && mis->image) {
@@ -1147,11 +1607,16 @@ private:
 
         for (const RequestedDependency& req : requests) {
             const DependencyNode parent_snapshot = graph_.nodes[parent_id];
-            CandidateResult cand =
-                parent_img.format() == Format::PE
-                    ? resolve_pe_dependency(parent_img, parent_origin, req.requested_name)
-                    : resolve_elf_dependency(parent_img, parent_snapshot, parent_origin,
-                                             inherited_rpaths, req.requested_name);
+            CandidateResult cand;
+            if (parent_img.format() == Format::PE) {
+                cand = resolve_pe_dependency(parent_img, parent_origin, req.requested_name);
+            } else if (parent_img.format() == Format::MachO) {
+                cand = resolve_macho_dependency(parent_img, parent_snapshot, parent_origin,
+                                                inherited_rpaths, req.requested_name);
+            } else {
+                cand = resolve_elf_dependency(parent_img, parent_snapshot, parent_origin,
+                                              inherited_rpaths, req.requested_name);
+            }
 
             const IBinaryImage* child_img = nullptr;
             const std::size_t child_id = get_or_create_node(req.requested_name, cand, child_img);
@@ -1191,7 +1656,7 @@ private:
             });
         }
 
-        // Expand children first so ELF transitive export maps are also available if needed!
+        // Expand children first so ELF transitive export maps and Mach-O LC_REEXPORT_DYLIB chains are populated!
         for (const PendingChild& pc : pending) {
             const bool already_expanded = pc.already_expanded || expanded_nodes_.contains(pc.child_id);
             DependencyTreeItem item;
@@ -1217,10 +1682,25 @@ private:
                         ? graph_.nodes[pc.child_id].resolved_path.parent_path()
                         : parent_origin;
                 std::vector<std::pair<std::string, std::filesystem::path>> child_rpaths;
-                if (graph_.nodes[pc.child_id].elf_runpaths.empty()) {
+                if (pc.child_img->format() == Format::ELF &&
+                    graph_.nodes[pc.child_id].elf_runpaths.empty()) {
                     child_rpaths = inherited_rpaths;
                     for (const std::string& rp : graph_.nodes[pc.child_id].elf_rpaths) {
                         child_rpaths.emplace_back(rp, child_origin);
+                    }
+                } else if (pc.child_img->format() == Format::MachO) {
+                    for (const std::string& rp : parent_img.format() == Format::MachO
+                                                     ? graph_.nodes[parent_id].macho_rpaths
+                                                     : std::vector<std::string>{}) {
+                        child_rpaths.emplace_back(rp, parent_origin);
+                    }
+                    for (const auto& inh : inherited_rpaths) {
+                        const bool dup = std::ranges::any_of(
+                            child_rpaths,
+                            [&](const auto& x) { return x.first == inh.first && x.second == inh.second; });
+                        if (!dup) {
+                            child_rpaths.push_back(inh);
+                        }
                     }
                 }
                 expand_node(pc.child_id, *pc.child_img, child_origin, child_rpaths,
@@ -1231,9 +1711,19 @@ private:
             tree_out.children.push_back(std::move(item));
         }
 
-        // Bind ELF undefined dynamic symbols across resolved child dependencies
+        // Bind ELF undefined dynamic symbols or Mach-O two-level/re-export symbols after child expansion
         if (parent_img.format() == Format::ELF) {
             bind_elf_symbols_for_parent(parent_id, parent_img, pending);
+        } else if (parent_img.format() == Format::MachO) {
+            for (std::size_t idx = 0u; idx < requests.size() && idx < pending.size(); ++idx) {
+                if (!requests[idx].symbols.empty()) {
+                    graph_.edges[pending[idx].edge_idx].symbol_bindings = bind_macho_symbols(
+                        requests[idx].symbols,
+                        pending[idx].kind,
+                        pending[idx].status,
+                        pending[idx].child_id);
+                }
+            }
         }
 
         expanded_subtree_by_node_[parent_id] = tree_out.children;
@@ -1418,6 +1908,9 @@ private:
                 case DependencyResolutionStatus::VirtualApiSet:
                     ++s.virtual_api_sets;
                     break;
+                case DependencyResolutionStatus::SystemSharedCache:
+                    ++s.system_shared_cache;
+                    break;
                 case DependencyResolutionStatus::Unresolved:
                     ++s.missing_libraries;
                     break;
@@ -1456,6 +1949,7 @@ private:
     IProcessSession* live_session_{nullptr};
     std::vector<ModuleInfo> live_modules_{};
     std::vector<std::filesystem::path> env_ld_paths_{};
+    std::filesystem::path root_origin_{};
 
     DependencyGraph graph_{};
     std::unordered_map<std::string, ParsedModuleEntry> parsed_cache_{};
@@ -1496,6 +1990,56 @@ bool is_windows_api_set_dll(std::string_view dll_name) noexcept {
     return istarts_with(stem, "api-ms-win-") ||
            istarts_with(stem, "ext-ms-win-") ||
            istarts_with(stem, "api-ms-onecoreuap-");
+}
+
+bool is_macos_dyld_shared_cache_path(std::string_view install_name) noexcept {
+    constexpr std::array<std::string_view, 6> kSharedCachePrefixes = {
+        "/usr/lib/",
+        "/System/Library/",
+        "/System/iOSSupport/",
+        "/System/Cryptexes/OS/",
+        "/Library/Apple/usr/lib/",
+        "/Library/Apple/System/Library/",
+    };
+    for (const std::string_view pfx : kSharedCachePrefixes) {
+        if (install_name.starts_with(pfx) && install_name.size() > pfx.size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string expand_macho_loader_tokens(
+    std::string_view raw_path,
+    const std::filesystem::path& executable_dir,
+    const std::filesystem::path& loader_dir,
+    std::vector<std::string>* assumptions_out) {
+    constexpr std::string_view kExecTok = "@executable_path";
+    constexpr std::string_view kLoadTok = "@loader_path";
+
+    if (raw_path == kExecTok ||
+        (raw_path.starts_with(kExecTok) && raw_path[kExecTok.size()] == '/')) {
+        const std::string exec_str =
+            executable_dir.empty() ? "." : executable_dir.generic_string();
+        if (assumptions_out != nullptr) {
+            push_unique_string(*assumptions_out, "@executable_path = " + exec_str);
+        }
+        return exec_str + std::string(raw_path.substr(kExecTok.size()));
+    }
+
+    if (raw_path == kLoadTok ||
+        (raw_path.starts_with(kLoadTok) && raw_path[kLoadTok.size()] == '/')) {
+        const std::filesystem::path& eff_dir =
+            !loader_dir.empty() ? loader_dir : executable_dir;
+        const std::string load_str =
+            eff_dir.empty() ? "." : eff_dir.generic_string();
+        if (assumptions_out != nullptr) {
+            push_unique_string(*assumptions_out, "@loader_path = " + load_str);
+        }
+        return load_str + std::string(raw_path.substr(kLoadTok.size()));
+    }
+
+    return std::string(raw_path);
 }
 
 std::string expand_elf_dynamic_tokens(

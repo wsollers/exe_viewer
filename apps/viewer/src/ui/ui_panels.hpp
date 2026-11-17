@@ -31,6 +31,9 @@ namespace viewer {
         void set_refresh_requested_callback(std::function<void()> cb) { on_refresh_requested_ = std::move(cb); }
         void set_detach_requested_callback(std::function<void()> cb) { on_detach_requested_ = std::move(cb); }
         void set_pause_toggle_callback(std::function<void()> cb) { on_pause_toggle_ = std::move(cb); }
+        void set_slice_selected_callback(std::function<void(std::size_t)> cb) {
+            on_slice_selected_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
@@ -39,6 +42,7 @@ namespace viewer {
         std::function<void()> on_refresh_requested_;
         std::function<void()> on_detach_requested_;
         std::function<void()> on_pause_toggle_;
+        std::function<void(std::size_t)> on_slice_selected_;
     };
 
     class MemoryMapPanel : public UiPanel {

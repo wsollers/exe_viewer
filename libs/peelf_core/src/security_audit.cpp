@@ -2,6 +2,7 @@
 
 #include <peelf/demangle.hpp>
 #include <peelf/endian_reader.hpp>
+#include <peelf/macho_image.hpp>
 #include <peelf/sha256.hpp>
 
 #include <algorithm>
@@ -39,7 +40,7 @@
 namespace peelf {
 namespace {
 
-constexpr std::array<SecurityRuleDescriptor, 19> kRuleCatalog = {{
+constexpr std::array<SecurityRuleDescriptor, 25> kRuleCatalog = {{
     {"PE1001", "EnableAddressSpaceLayoutRandomization", SecurityRuleDomain::PE, SecuritySeverity::Error,
      "PE binaries must enable DYNAMIC_BASE (and HIGH_ENTROPY_VA on 64-bit targets).",
      "Link with /DYNAMICBASE (and /HIGHENTROPYVA on 64-bit targets) and retain base relocations."},
@@ -89,6 +90,25 @@ constexpr std::array<SecurityRuleDescriptor, 19> kRuleCatalog = {{
     {"ELF2008", "EnableControlFlowEnforcement", SecurityRuleDomain::ELF, SecuritySeverity::Note,
      "x86/x64 and AArch64 ELF binaries should emit hardware control-flow property notes (CET IBT/SHSTK or BTI/PAC).",
      "Compile x86/x64 with -fcf-protection=full and AArch64 with -mbranch-protection=standard."},
+
+    {"MACHO4001", "EnablePieAndZeroPage", SecurityRuleDomain::MachO, SecuritySeverity::Error,
+     "Mach-O executables should enable MH_PIE and map an unmapped __PAGEZERO guard >= 4 KiB at virtual address 0.",
+     "Link Mach-O executables with -Wl,-pie and preserve the default __PAGEZERO segment (avoid -pagezero_size 0)."},
+    {"MACHO4002", "EnableMemoryProtectionAndWxorX", SecurityRuleDomain::MachO, SecuritySeverity::Error,
+     "Mach-O images must enforce W^X segment/section protections (initprot and maxprot) and avoid executable stack or heap flags.",
+     "Remove -allow_stack_execution, avoid RWX segment initial/maximum protections, and enable MH_NO_HEAP_EXECUTION on 32-bit targets."},
+    {"MACHO4003", "EnableStackProtectorAndArcIndicators", SecurityRuleDomain::MachO, SecuritySeverity::Warning,
+     "Native Mach-O code should emit stack-canary checks (___stack_chk_fail) and Objective-C binaries should use Automatic Reference Counting (ARC).",
+     "Compile C/C++/ObjC code with -fstack-protector-strong and Objective-C targets with -fobjc-arc."},
+    {"MACHO4004", "CodeSignatureAndHardenedRuntime", SecurityRuleDomain::MachO, SecuritySeverity::Warning,
+     "Mach-O binaries should carry a structurally valid LC_CODE_SIGNATURE with Hardened Runtime (CS_RUNTIME); structural presence is distinct from cryptographic Apple trust.",
+     "Sign Mach-O deliverables with codesign --options runtime using a valid Developer ID or platform identity and verify cryptographic trust on macOS."},
+    {"MACHO4005", "SafeDylibRpathAndDyldHardening", SecurityRuleDomain::MachO, SecuritySeverity::Error,
+     "Mach-O dylib install names and LC_RPATH entries must avoid relative, parent-traversal, or world-writable paths and preserve two-level namespace / dyld hardening.",
+     "Use @executable_path, @loader_path, or @rpath without '..' or /tmp entries, keep MH_TWOLEVEL, and add -Wl,-sectcreate,__RESTRICT,__restrict,/dev/null for privileged binaries."},
+    {"MACHO4006", "PointerAuthAndSegmentEncryption", SecurityRuleDomain::MachO, SecuritySeverity::Warning,
+     "ARM64 Mach-O slices benefit from arm64e pointer authentication (PAC), and unencrypted segments (cryptid == 0) are required for complete static inspection.",
+     "Build security-critical Apple Silicon targets for arm64e where supported, and decrypt FairPlay/encrypted slices (cryptid != 0) in an authorized environment before static audit."},
 
     {"LIVE3001", "AvoidLiveReadWriteExecuteRegions", SecurityRuleDomain::LiveProcess, SecuritySeverity::Warning,
      "Running processes should avoid simultaneous read+write+execute (RWX) virtual memory mappings.",
@@ -1442,8 +1462,721 @@ void evaluate_live_rules(IProcessSession& session,
 }
 
 // ---------------------------------------------------------------------------
+// Mach-O Security Audit Rules (`MACHO4001..MACHO4006`)
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] bool is_macho_stack_canary_symbol(std::string_view raw_name) noexcept {
+    while (!raw_name.empty() && raw_name.front() == '_') {
+        raw_name.remove_prefix(1u);
+    }
+    if (const std::size_t at = raw_name.find('@'); at != std::string_view::npos) {
+        raw_name = raw_name.substr(0u, at);
+    }
+    return raw_name == "stack_chk_fail" || raw_name == "stack_chk_guard";
+}
+
+[[nodiscard]] bool is_macho_objc_arc_symbol(std::string_view raw_name) noexcept {
+    while (!raw_name.empty() && raw_name.front() == '_') {
+        raw_name.remove_prefix(1u);
+    }
+    if (const std::size_t at = raw_name.find('@'); at != std::string_view::npos) {
+        raw_name = raw_name.substr(0u, at);
+    }
+    return raw_name == "objc_release" ||
+           raw_name == "objc_retain" ||
+           raw_name == "objc_retainAutoreleasedReturnValue" ||
+           raw_name == "objc_autoreleaseReturnValue" ||
+           raw_name == "objc_storeStrong";
+}
+
+[[nodiscard]] std::string_view macho_audit_filetype_name(std::uint32_t ftype) noexcept {
+    switch (ftype) {
+        case macho::kMhObject:     return "MH_OBJECT";
+        case macho::kMhExecute:    return "MH_EXECUTE";
+        case macho::kMhFvmlib:     return "MH_FVMLIB";
+        case macho::kMhCore:       return "MH_CORE";
+        case macho::kMhPreload:    return "MH_PRELOAD";
+        case macho::kMhDylib:      return "MH_DYLIB";
+        case macho::kMhDylinker:   return "MH_DYLINKER";
+        case macho::kMhBundle:     return "MH_BUNDLE";
+        case macho::kMhDylibStub:  return "MH_DYLIB_STUB";
+        case macho::kMhDsym:       return "MH_DSYM";
+        case macho::kMhKextBundle: return "MH_KEXT_BUNDLE";
+        case macho::kMhFileset:    return "MH_FILESET";
+        default:                   return "MH_UNKNOWN";
+    }
+}
+
+[[nodiscard]] std::string_view macho_audit_load_cmd_name(std::uint32_t cmd) noexcept {
+    switch (cmd) {
+        case macho::kLcIdDylib:         return "LC_ID_DYLIB";
+        case macho::kLcLoadDylib:       return "LC_LOAD_DYLIB";
+        case macho::kLcLoadWeakDylib:   return "LC_LOAD_WEAK_DYLIB";
+        case macho::kLcReexportDylib:   return "LC_REEXPORT_DYLIB";
+        case macho::kLcLazyLoadDylib:   return "LC_LAZY_LOAD_DYLIB";
+        case macho::kLcLoadUpwardDylib: return "LC_LOAD_UPWARD_DYLIB";
+        default:                        return "LC_LOAD_DYLIB";
+    }
+}
+
+[[nodiscard]] bool is_macho_objc_metadata_section(const MachOSection& sec) noexcept {
+    return sec.segment_name == "__OBJC" ||
+           sec.section_name.starts_with("__objc_") ||
+           sec.section_name == "__category_list" ||
+           sec.section_name == "__class_list";
+}
+
+[[nodiscard]] bool has_unsafe_macho_path_traversal(std::string_view path) noexcept {
+    std::size_t pos = 0u;
+    while (pos <= path.size()) {
+        const std::size_t slash = path.find('/', pos);
+        const std::string_view comp = (slash == std::string_view::npos)
+                                          ? path.substr(pos)
+                                          : path.substr(pos, slash - pos);
+        if (comp == ".." || comp == ".") {
+            return true;
+        }
+        if (slash == std::string_view::npos) {
+            break;
+        }
+        pos = slash + 1u;
+    }
+    return false;
+}
+
+[[nodiscard]] bool is_macho_world_writable_prefix(std::string_view path) noexcept {
+    constexpr std::array<std::string_view, 5> kUnsafePrefixes = {
+        "/tmp",
+        "/var/tmp",
+        "/private/tmp",
+        "/private/var/tmp",
+        "/dev/shm",
+    };
+    for (const std::string_view pfx : kUnsafePrefixes) {
+        if (path == pfx) {
+            return true;
+        }
+        if (path.size() > pfx.size() && path.starts_with(pfx) && path[pfx.size()] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool is_macho_anchored_path(std::string_view path) noexcept {
+    if (path.starts_with('/')) {
+        return true;
+    }
+    constexpr std::array<std::string_view, 3> kLoaderTokens = {
+        "@executable_path",
+        "@loader_path",
+        "@rpath",
+    };
+    for (const std::string_view tok : kLoaderTokens) {
+        if (path == tok) {
+            return true;
+        }
+        if (path.size() > tok.size() && path.starts_with(tok) && path[tok.size()] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool is_standard_apple_bundle_sibling_path(std::string_view path) noexcept {
+    // Standard macOS/iOS bundle binaries reside in `Foo.app/Contents/MacOS/Foo` (or
+    // `Foo.framework/Versions/A/Helpers/Bar`) and reference sibling bundle directories via
+    // `@executable_path/../Frameworks` or `@loader_path/../Frameworks`. Allow a single
+    // leading `../<NonEmptySubdir>` ONLY when anchored at `@executable_path/` or `@loader_path/`
+    // and when no remaining path component is `.` or `..` (preventing `../../` bundle escapes).
+    std::string_view rest{};
+    if (path.starts_with("@executable_path/../")) {
+        rest = path.substr(std::string_view("@executable_path/../").size());
+    } else if (path.starts_with("@loader_path/../")) {
+        rest = path.substr(std::string_view("@loader_path/../").size());
+    } else {
+        return false;
+    }
+    while (!rest.empty() && rest.back() == '/') {
+        rest.remove_suffix(1u);
+    }
+    if (rest.empty()) {
+        return false;
+    }
+    return !has_unsafe_macho_path_traversal(rest);
+}
+
+[[nodiscard]] std::optional<std::string> classify_unsafe_macho_loader_path(
+    std::string_view path,
+    bool is_rpath) {
+    if (path.empty()) {
+        return is_rpath ? std::string("empty LC_RPATH entry")
+                        : std::string("empty dylib install name");
+    }
+    if (!is_macho_anchored_path(path)) {
+        return std::format("unanchored relative path '{}'", path);
+    }
+    if (has_unsafe_macho_path_traversal(path) && !is_standard_apple_bundle_sibling_path(path)) {
+        return std::format("relative '.' or '..' traversal segment in '{}'", path);
+    }
+    if (is_macho_world_writable_prefix(path)) {
+        return std::format("world-writable directory prefix in '{}'", path);
+    }
+    return std::nullopt;
+}
+
+void evaluate_macho_rules(
+    const IBinaryImage& image,
+    SecurityAuditReport& report) {
+    const MachOHeader* mh = image.macho_header();
+    if (mh == nullptr) {
+        report.status = SubsystemStatus::unavailable("security_audit", "Mach-O header unavailable");
+        return;
+    }
+
+    const std::uint64_t hdr_off = image.container_slice_offset();
+    const std::uint64_t base_va = image.image_base();
+
+    // MACHO4001: EnablePieAndZeroPage
+    {
+        SecurityFinding f;
+        f.rule_id = "MACHO4001";
+        f.rule_name = "EnablePieAndZeroPage";
+        f.domain = SecurityRuleDomain::MachO;
+        f.subject = "mach_header.flags / __PAGEZERO";
+        f.virtual_address = base_va;
+        f.file_offset = hdr_off;
+        f.remediation = "Link Mach-O executables with -Wl,-pie and preserve the default __PAGEZERO segment (avoid -pagezero_size 0).";
+
+        const MachOSegmentCommand* pagezero = nullptr;
+        for (const MachOSegmentCommand& seg : image.macho_segments()) {
+            if (seg.is_pagezero()) {
+                pagezero = &seg;
+                break;
+            }
+        }
+
+        if (mh->file_type == macho::kMhExecute) {
+            const bool has_pie = mh->has_pie();
+            const bool valid_pz = (pagezero != nullptr) &&
+                                  (pagezero->virtual_address == 0u) &&
+                                  (pagezero->virtual_size >= 4096u) &&
+                                  (pagezero->initprot == 0u) &&
+                                  (pagezero->maxprot == 0u);
+            if (!has_pie || !valid_pz) {
+                f.severity = SecuritySeverity::Error;
+                std::vector<std::string> issues;
+                if (!has_pie) {
+                    issues.emplace_back("MH_PIE (0x200000) is not set");
+                }
+                if (pagezero == nullptr) {
+                    issues.emplace_back("__PAGEZERO segment is missing");
+                } else {
+                    if (pagezero->virtual_address != 0u) {
+                        issues.push_back(std::format("__PAGEZERO vmaddr=0x{:X} (expected 0)", pagezero->virtual_address));
+                    }
+                    if (pagezero->virtual_size < 4096u) {
+                        issues.push_back(std::format("__PAGEZERO vmsize=0x{:X} (< 4096 bytes)", pagezero->virtual_size));
+                    }
+                    if (pagezero->initprot != 0u || pagezero->maxprot != 0u) {
+                        issues.push_back(std::format(
+                            "__PAGEZERO has non-zero protections (initprot=0x{:X}, maxprot=0x{:X})",
+                            pagezero->initprot,
+                            pagezero->maxprot));
+                    }
+                }
+                std::string joined;
+                for (std::size_t i = 0u; i < issues.size(); ++i) {
+                    if (i > 0u) {
+                        joined += "; ";
+                    }
+                    joined += issues[i];
+                }
+                f.summary = "Mach-O executable lacks full ASLR (MH_PIE) or a valid unmapped __PAGEZERO guard segment.";
+                f.evidence = std::format(
+                    "filetype=MH_EXECUTE, flags=0x{:08X}, MH_PIE={}, issues=[{}]",
+                    mh->flags,
+                    has_pie ? 1 : 0,
+                    joined);
+            } else {
+                f.severity = SecuritySeverity::Pass;
+                f.summary = "MH_EXECUTE enables MH_PIE and maps an unmapped __PAGEZERO guard page at VA 0.";
+                f.evidence = std::format(
+                    "filetype=MH_EXECUTE, flags=0x{:08X} (MH_PIE=1), __PAGEZERO=[0x0, 0x{:X}), initprot=0, maxprot=0",
+                    mh->flags,
+                    pagezero->virtual_size);
+            }
+        } else if (mh->file_type == macho::kMhObject || mh->file_type == macho::kMhDsym) {
+            f.severity = SecuritySeverity::Note;
+            f.summary = "Non-linked Mach-O object/dSYM container; MH_PIE and __PAGEZERO apply at final executable link.";
+            f.evidence = std::format("filetype={} (0x{:X}), flags=0x{:08X}",
+                                     macho_audit_filetype_name(mh->file_type),
+                                     mh->file_type,
+                                     mh->flags);
+        } else {
+            f.severity = SecuritySeverity::Pass;
+            f.summary = std::format("{} image is inherently position-independent.",
+                                    macho_audit_filetype_name(mh->file_type));
+            f.evidence = std::format("filetype={} (0x{:X}), flags=0x{:08X}",
+                                     macho_audit_filetype_name(mh->file_type),
+                                     mh->file_type,
+                                     mh->flags);
+        }
+        tally_finding(report, std::move(f));
+    }
+
+    // MACHO4002: EnableMemoryProtectionAndWxorX
+    {
+        SecurityFinding f;
+        f.rule_id = "MACHO4002";
+        f.rule_name = "EnableMemoryProtectionAndWxorX";
+        f.domain = SecurityRuleDomain::MachO;
+        f.subject = "Segments / Sections / Stack & Heap NX";
+        f.virtual_address = base_va;
+        f.file_offset = hdr_off;
+        f.remediation = "Remove -allow_stack_execution, avoid RWX segment initial/maximum protections, and enable MH_NO_HEAP_EXECUTION on 32-bit targets.";
+
+        const bool exec_stack = mh->allows_stack_execution();
+        const bool needs_explicit_heap_nx = (!mh->is_64bit && mh->file_type == macho::kMhExecute);
+        const bool missing_32bit_heap_nx = needs_explicit_heap_nx && !mh->has_no_heap_execution();
+
+        std::vector<std::string> hard_errors;
+        if (exec_stack) {
+            hard_errors.emplace_back("MH_ALLOW_STACK_EXECUTION (0x00020000) is set");
+        }
+
+        for (const MachOSegmentCommand& seg : image.macho_segments()) {
+            const bool init_wx = seg.init_is_wx();
+            const bool max_wx = seg.max_is_wx();
+            if (init_wx || max_wx) {
+                if (f.file_offset == hdr_off && seg.file_offset != 0u) {
+                    f.file_offset = seg.file_offset;
+                    f.virtual_address = seg.virtual_address;
+                }
+                hard_errors.push_back(std::format(
+                    "segment '{}' [0x{:X}, 0x{:X}) violates W^X (initprot=0x{:X}, maxprot=0x{:X})",
+                    seg.name.empty() ? "<unnamed>" : seg.name,
+                    seg.virtual_address,
+                    seg.virtual_address + seg.virtual_size,
+                    seg.initprot,
+                    seg.maxprot));
+            }
+        }
+
+        for (const MachOSection& sec : image.macho_sections()) {
+            if (sec.writable && sec.executable) {
+                hard_errors.push_back(std::format(
+                    "section '{},{}' @ 0x{:X} combines write and execute permissions",
+                    sec.segment_name,
+                    sec.section_name,
+                    sec.virtual_address));
+            }
+        }
+
+        if (!hard_errors.empty()) {
+            f.severity = SecuritySeverity::Error;
+            std::string joined;
+            for (std::size_t i = 0u; i < hard_errors.size(); ++i) {
+                if (i > 0u) {
+                    joined += "; ";
+                }
+                joined += hard_errors[i];
+            }
+            f.summary = "Mach-O image permits executable stack or writable+executable (RWX) memory mappings.";
+            f.evidence = std::format(
+                "flags=0x{:08X}, MH_ALLOW_STACK_EXECUTION={}, MH_NO_HEAP_EXECUTION={}, violations=[{}]",
+                mh->flags,
+                exec_stack ? 1 : 0,
+                mh->has_no_heap_execution() ? 1 : 0,
+                joined);
+        } else if (missing_32bit_heap_nx) {
+            f.severity = SecuritySeverity::Warning;
+            f.summary = "32-bit Mach-O executable does not set MH_NO_HEAP_EXECUTION.";
+            f.evidence = std::format(
+                "bits=32, filetype=MH_EXECUTE, flags=0x{:08X} (MH_NO_HEAP_EXECUTION=0, RWX_segments=0)",
+                mh->flags);
+        } else {
+            f.severity = SecuritySeverity::Pass;
+            f.summary = "Mach-O segments/sections enforce W^X (initprot & maxprot) with non-executable stack/heap posture.";
+            f.evidence = std::format(
+                "bits={}, flags=0x{:08X}, MH_ALLOW_STACK_EXECUTION=0, MH_NO_HEAP_EXECUTION={}, segments={}, RWX=0",
+                mh->is_64bit ? 64 : 32,
+                mh->flags,
+                mh->has_no_heap_execution() ? 1 : 0,
+                image.macho_segments().size());
+        }
+        tally_finding(report, std::move(f));
+    }
+
+    // MACHO4003: EnableStackProtectorAndArcIndicators
+    {
+        SecurityFinding f;
+        f.rule_id = "MACHO4003";
+        f.rule_name = "EnableStackProtectorAndArcIndicators";
+        f.domain = SecurityRuleDomain::MachO;
+        f.subject = "SymbolTable / Imports / ObjC Metadata";
+        f.virtual_address = base_va;
+        f.file_offset = hdr_off;
+        f.remediation = "Compile C/C++/ObjC code with -fstack-protector-strong and Objective-C targets with -fobjc-arc.";
+
+        bool has_canary = false;
+        std::string canary_sym;
+        bool has_arc = false;
+        std::string arc_sym;
+
+        for (const ImportEntry& imp : image.imports()) {
+            if (!has_canary && is_macho_stack_canary_symbol(imp.name)) {
+                has_canary = true;
+                canary_sym = imp.name;
+            }
+            if (!has_arc && is_macho_objc_arc_symbol(imp.name)) {
+                has_arc = true;
+                arc_sym = imp.name;
+            }
+        }
+        for (const Symbol& sym : image.symbols()) {
+            if (!has_canary && is_macho_stack_canary_symbol(sym.name)) {
+                has_canary = true;
+                canary_sym = sym.name;
+            }
+            if (!has_arc && is_macho_objc_arc_symbol(sym.name)) {
+                has_arc = true;
+                arc_sym = sym.name;
+            }
+        }
+
+        bool has_objc_metadata = false;
+        std::string first_objc_section;
+        for (const MachOSection& sec : image.macho_sections()) {
+            if (is_macho_objc_metadata_section(sec)) {
+                has_objc_metadata = true;
+                if (first_objc_section.empty()) {
+                    first_objc_section = std::format("{},{}", sec.segment_name, sec.section_name);
+                }
+            }
+        }
+
+        const bool symbols_stripped = image.symbols().empty() && image.imports().empty();
+        if (symbols_stripped) {
+            f.severity = SecuritySeverity::Note;
+            f.summary = "Symbol and import tables are empty or stripped; stack-canary and ObjC ARC indicators cannot be verified statically.";
+            f.evidence = std::format(
+                "symbols=0, imports=0, objc_metadata={}",
+                has_objc_metadata ? first_objc_section : "absent");
+        } else if (has_canary && (!has_objc_metadata || has_arc)) {
+            f.severity = SecuritySeverity::Pass;
+            f.summary = has_objc_metadata
+                            ? "Stack-canary check and Objective-C ARC symbols are present."
+                            : "Stack-canary check symbol is present (no Objective-C metadata sections detected).";
+            f.evidence = std::format(
+                "stack_canary='{}', objc_metadata={}, objc_arc={}",
+                canary_sym,
+                has_objc_metadata ? first_objc_section : "absent",
+                has_arc ? arc_sym : "n/a");
+        } else {
+            f.severity = SecuritySeverity::Warning;
+            std::vector<std::string> gaps;
+            if (!has_canary) {
+                gaps.emplace_back("missing ___stack_chk_fail / ___stack_chk_guard");
+            }
+            if (has_objc_metadata && !has_arc) {
+                gaps.push_back(std::format(
+                    "Objective-C metadata ({}) present without _objc_release / ARC runtime symbols",
+                    first_objc_section));
+            }
+            std::string joined;
+            for (std::size_t i = 0u; i < gaps.size(); ++i) {
+                if (i > 0u) {
+                    joined += "; ";
+                }
+                joined += gaps[i];
+            }
+            f.summary = std::format("Mach-O hardening indicator gap: {}.", joined);
+            f.evidence = std::format(
+                "stack_canary={}, objc_metadata={}, objc_arc={}, symbols={}, imports={}",
+                has_canary ? canary_sym : "absent",
+                has_objc_metadata ? first_objc_section : "absent",
+                has_arc ? arc_sym : "absent",
+                image.symbols().size(),
+                image.imports().size());
+        }
+        tally_finding(report, std::move(f));
+    }
+
+    // MACHO4004: CodeSignatureAndHardenedRuntime
+    // Strictly separates structural LC_CODE_SIGNATURE presence from cryptographic trust!
+    {
+        SecurityFinding f;
+        f.rule_id = "MACHO4004";
+        f.rule_name = "CodeSignatureAndHardenedRuntime";
+        f.domain = SecurityRuleDomain::MachO;
+        f.subject = "LC_CODE_SIGNATURE";
+        f.virtual_address = base_va;
+        f.file_offset = hdr_off;
+        f.remediation = "Sign Mach-O deliverables with codesign --options runtime using a valid Developer ID or platform identity and verify cryptographic trust on macOS.";
+
+        const MachOCodeSignatureInfo* cs = image.macho_code_signature();
+        if (cs == nullptr || !cs->present) {
+            if (mh->file_type == macho::kMhObject || mh->file_type == macho::kMhDsym) {
+                f.severity = SecuritySeverity::Note;
+                f.summary = "Non-executable Mach-O object/dSYM container has no LC_CODE_SIGNATURE.";
+            } else {
+                f.severity = SecuritySeverity::Warning;
+                f.summary = "Mach-O binary is unsigned (no LC_CODE_SIGNATURE load command present).";
+            }
+            f.evidence = std::format(
+                "lc_code_signature=absent, cryptographically_verified=false, trust_provenance=absent, filetype={}",
+                macho_audit_filetype_name(mh->file_type));
+        } else {
+            f.file_offset = cs->container_offset != 0u ? cs->container_offset : hdr_off;
+            if (!cs->superblob_valid || !cs->has_code_directory) {
+                f.severity = SecuritySeverity::Error;
+                f.summary = "LC_CODE_SIGNATURE payload is truncated, malformed, or missing a CodeDirectory blob.";
+                f.evidence = std::format(
+                    "lc_code_signature=corrupt_structure, superblob_valid={}, has_code_directory={}, dataoff=0x{:X}, datasize={}, cryptographically_verified=false",
+                    cs->superblob_valid ? 1 : 0,
+                    cs->has_code_directory ? 1 : 0,
+                    cs->slice_offset,
+                    cs->data_size);
+            } else {
+                const bool adhoc = cs->is_adhoc();
+                const bool runtime = cs->has_hardened_runtime();
+                const bool cms_nonempty = cs->has_nonempty_cms_signature;
+                const bool needs_runtime = (mh->file_type == macho::kMhExecute);
+
+                if ((needs_runtime && !runtime) || adhoc || !cms_nonempty) {
+                    f.severity = SecuritySeverity::Warning;
+                    std::vector<std::string> reasons;
+                    if (adhoc) {
+                        reasons.emplace_back("ad-hoc signature (CS_ADHOC) lacks publisher certificate identity");
+                    }
+                    if (needs_runtime && !runtime) {
+                        reasons.emplace_back("Hardened Runtime (CS_RUNTIME) is not enabled");
+                    }
+                    if (!adhoc && !cms_nonempty) {
+                        reasons.emplace_back("CMS signature blob is empty");
+                    }
+                    std::string joined;
+                    for (std::size_t i = 0u; i < reasons.size(); ++i) {
+                        if (i > 0u) {
+                            joined += "; ";
+                        }
+                        joined += reasons[i];
+                    }
+                    f.summary = std::format(
+                        "LC_CODE_SIGNATURE structurally present ({}); cryptographic Apple signature/notarization trust is unverified offline.",
+                        joined);
+                } else if (cs->cryptographically_verified) {
+                    f.severity = SecuritySeverity::Pass;
+                    f.summary = "LC_CODE_SIGNATURE verified with Hardened Runtime (CS_RUNTIME) and trusted cryptographic signature.";
+                } else {
+                    f.severity = SecuritySeverity::Note;
+                    f.summary =
+                        "Structurally valid LC_CODE_SIGNATURE with Hardened Runtime (CS_RUNTIME) and CMS blob present; "
+                        "cryptographic Apple signature/notarization trust is unverified (not checked in offline/cross-OS static analysis).";
+                }
+                f.evidence = std::format(
+                    "lc_code_signature=present_structural, cs_flags=0x{:08X}, cs_adhoc={}, cs_runtime={}, cms_blob={}, identifier='{}', team_id='{}', cryptographically_verified={}, trust_provenance={}",
+                    cs->cd_flags,
+                    adhoc ? 1 : 0,
+                    runtime ? 1 : 0,
+                    cms_nonempty ? "nonempty" : (cs->has_cms_blob ? "empty" : "absent"),
+                    cs->identifier.empty() ? "<none>" : cs->identifier,
+                    cs->team_id.empty() ? "<none>" : cs->team_id,
+                    cs->cryptographically_verified ? "true" : "false",
+                    cs->cryptographically_verified ? "os_verified" : "unverified_offline_structural_only");
+            }
+        }
+        tally_finding(report, std::move(f));
+    }
+
+    // MACHO4005: SafeDylibRpathAndDyldHardening
+    {
+        SecurityFinding f;
+        f.rule_id = "MACHO4005";
+        f.rule_name = "SafeDylibRpathAndDyldHardening";
+        f.domain = SecurityRuleDomain::MachO;
+        f.subject = "LC_RPATH / LC_LOAD_*_DYLIB / Dyld Namespace";
+        f.virtual_address = base_va;
+        f.file_offset = hdr_off;
+        f.remediation = "Use @executable_path, @loader_path, or @rpath without '..' or /tmp entries, keep MH_TWOLEVEL, and add -Wl,-sectcreate,__RESTRICT,__restrict,/dev/null for privileged binaries.";
+
+        std::vector<std::string> path_errors;
+        for (const MachORpathEntry& rp : image.macho_rpaths()) {
+            if (const auto bad = classify_unsafe_macho_loader_path(rp.path, true); bad.has_value()) {
+                if (f.file_offset == hdr_off && rp.container_offset != 0u) {
+                    f.file_offset = rp.container_offset;
+                }
+                path_errors.push_back(std::format("LC_RPATH: {}", *bad));
+            }
+        }
+        for (const MachODylibDependency& dy : image.macho_dylibs()) {
+            if (dy.ordinal == 0u && mh->file_type != macho::kMhDylib) {
+                continue;
+            }
+            if (const auto bad = classify_unsafe_macho_loader_path(dy.name, false); bad.has_value()) {
+                path_errors.push_back(std::format("{}: {}", macho_audit_load_cmd_name(dy.cmd), *bad));
+            }
+        }
+
+        bool has_restrict = false;
+        for (const MachOSegmentCommand& seg : image.macho_segments()) {
+            if (seg.name == "__RESTRICT") {
+                has_restrict = true;
+                break;
+            }
+        }
+        if (!has_restrict) {
+            for (const MachOSection& sec : image.macho_sections()) {
+                if (sec.segment_name == "__RESTRICT" && sec.section_name == "__restrict") {
+                    has_restrict = true;
+                    break;
+                }
+            }
+        }
+        const MachOCodeSignatureInfo* cs = image.macho_code_signature();
+        const bool cs_restrict = (cs != nullptr && cs->has_code_directory && (cs->cd_flags & macho::kCsRestrict) != 0u);
+
+        const bool dynamic_img = ((mh->flags & macho::kMhDyldLink) != 0u) || !image.macho_dylibs().empty();
+        const bool forces_flat = (mh->flags & macho::kMhForceFlat) != 0u;
+        const bool flat_ns = forces_flat ||
+                             (dynamic_img && mh->file_type != macho::kMhObject && !mh->has_twolevel_namespace());
+
+        if (!path_errors.empty()) {
+            f.severity = SecuritySeverity::Error;
+            std::string joined;
+            for (std::size_t i = 0u; i < path_errors.size(); ++i) {
+                if (i > 0u) {
+                    joined += "; ";
+                }
+                joined += path_errors[i];
+            }
+            f.summary = "Mach-O image contains unsafe LC_RPATH or dylib install-name paths susceptible to dylib hijacking.";
+            f.evidence = std::format(
+                "rpaths={}, dylibs={}, MH_TWOLEVEL={}, MH_FORCE_FLAT={}, restrict={}, unsafe=[{}]",
+                image.macho_rpaths().size(),
+                image.macho_dylibs().size(),
+                mh->has_twolevel_namespace() ? 1 : 0,
+                forces_flat ? 1 : 0,
+                (has_restrict || cs_restrict) ? 1 : 0,
+                joined);
+        } else if (flat_ns) {
+            f.severity = SecuritySeverity::Warning;
+            f.summary = "Mach-O dynamic image uses flat symbol namespace (missing MH_TWOLEVEL or sets MH_FORCE_FLAT).";
+            f.evidence = std::format(
+                "flags=0x{:08X}, MH_TWOLEVEL={}, MH_FORCE_FLAT={}, restrict={}",
+                mh->flags,
+                mh->has_twolevel_namespace() ? 1 : 0,
+                forces_flat ? 1 : 0,
+                (has_restrict || cs_restrict) ? 1 : 0);
+        } else {
+            f.severity = SecuritySeverity::Pass;
+            f.summary = "Mach-O dylib install names and LC_RPATH entries use safe anchored paths with two-level namespace isolation.";
+            f.evidence = std::format(
+                "rpaths={}, dylibs={}, MH_TWOLEVEL={}, __RESTRICT={}, CS_RESTRICT={}",
+                image.macho_rpaths().size(),
+                image.macho_dylibs().size(),
+                mh->has_twolevel_namespace() ? 1 : 0,
+                has_restrict ? 1 : 0,
+                cs_restrict ? 1 : 0);
+        }
+        tally_finding(report, std::move(f));
+    }
+
+    // MACHO4006: PointerAuthAndSegmentEncryption
+    {
+        SecurityFinding f;
+        f.rule_id = "MACHO4006";
+        f.rule_name = "PointerAuthAndSegmentEncryption";
+        f.domain = SecurityRuleDomain::MachO;
+        f.subject = "CPU Subtype (PAC) / LC_ENCRYPTION_INFO";
+        f.virtual_address = base_va;
+        f.file_offset = hdr_off;
+        f.remediation = "Build security-critical Apple Silicon targets for arm64e where supported, and decrypt FairPlay/encrypted slices (cryptid != 0) in an authorized environment before static audit.";
+
+        const MachOEncryptionInfo* enc = image.macho_encryption_info();
+        const bool encrypted = (enc != nullptr && enc->is_encrypted());
+        if (encrypted) {
+            f.severity = SecuritySeverity::Warning;
+            if (enc->container_cryptoff != 0u) {
+                f.file_offset = enc->container_cryptoff;
+            }
+            f.summary = "Mach-O LC_ENCRYPTION_INFO payload is encrypted (cryptid != 0); static disassembly, strings, and symbol analysis are degraded.";
+            f.evidence = std::format(
+                "cryptid={}, cryptoff=0x{:X}, cryptsize=0x{:X}, arch={}, arm64e={}",
+                enc->cryptid,
+                enc->cryptoff,
+                enc->cryptsize,
+                to_string(image.architecture()),
+                mh->is_arm64e ? 1 : 0);
+        } else if (image.architecture() == Architecture::ARM64) {
+            if (mh->is_arm64e) {
+                f.severity = SecuritySeverity::Pass;
+                f.summary = "ARM64 Mach-O slice enables arm64e pointer authentication (PAC) and has unencrypted segments (cryptid == 0).";
+                f.evidence = std::format(
+                    "arch=ARM64, arm64e=1, ptrauth_abi={}, ptrauth_version={}, cryptid=0",
+                    mh->ptrauth_abi,
+                    mh->ptrauth_version);
+            } else {
+                f.severity = SecuritySeverity::Note;
+                f.summary = "ARM64 Mach-O slice uses baseline arm64 ABI without arm64e pointer authentication (PAC); payload is unencrypted (cryptid == 0).";
+                f.evidence = std::format(
+                    "arch=ARM64, arm64e=0, cpu_subtype=0x{:08X}, cryptid=0",
+                    mh->cpu_subtype);
+            }
+        } else {
+            f.severity = SecuritySeverity::Pass;
+            f.summary = "Mach-O slice is unencrypted (cryptid == 0); arm64e PAC is not applicable to this architecture.";
+            f.evidence = std::format(
+                "arch={}, cpu_type=0x{:08X}, cryptid=0",
+                to_string(image.architecture()),
+                mh->cpu_type);
+        }
+        tally_finding(report, std::move(f));
+    }
+
+    report.status = SubsystemStatus::available(
+        "security_audit",
+        std::format("Evaluated 6 Mach-O security rules: {} error(s), {} warning(s), {} note(s), {} pass",
+                    report.error_count,
+                    report.warning_count,
+                    report.note_count,
+                    report.pass_count));
+}
+
+// ---------------------------------------------------------------------------
 // JSON Escaping & Atomic File Write Helpers
 // ---------------------------------------------------------------------------
+
+[[nodiscard]] Result<BinaryOpenOptions> build_headless_open_options(
+    const std::optional<std::string>& slice_selector) {
+    BinaryOpenOptions open_opts{};
+    if (!slice_selector.has_value()) {
+        return open_opts;
+    }
+    const std::string_view sel = *slice_selector;
+    if (sel.empty()) {
+        return make_error("--slice selector must not be empty");
+    }
+    bool all_digits = true;
+    for (const char ch : sel) {
+        if (ch < '0' || ch > '9') {
+            all_digits = false;
+            break;
+        }
+    }
+    if (all_digits) {
+        std::size_t idx = 0u;
+        const auto [ptr, ec] = std::from_chars(sel.data(), sel.data() + sel.size(), idx);
+        if (ec != std::errc{} || ptr != sel.data() + sel.size()) {
+            return make_error(std::format("Invalid numeric --slice index '{}'", sel));
+        }
+        open_opts.selected_slice_index = idx;
+    } else {
+        open_opts.preferred_arch_name = std::string(sel);
+    }
+    return open_opts;
+}
 
 void append_json_escaped(std::string& out, std::string_view text) {
     out.push_back('"');
@@ -1545,6 +2278,8 @@ SecurityAuditReport audit_security(
         evaluate_pe_rules(image, raw_bytes, report);
     } else if (image.format() == Format::ELF) {
         evaluate_elf_rules(image, report);
+    } else if (image.format() == Format::MachO) {
+        evaluate_macho_rules(image, report);
     } else {
         report.status = SubsystemStatus::unavailable("security_audit", "Unsupported binary format");
     }
@@ -1814,7 +2549,16 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         return report;
     }
 
-    auto parsed = parse_image(raw_bytes);
+    auto open_opts = build_headless_open_options(options.slice_selector);
+    if (!open_opts.has_value()) {
+        return std::unexpected(open_opts.error());
+    }
+
+    if (auto cinfo = inspect_binary_container(raw_bytes); cinfo.has_value()) {
+        report.container_info = std::move(*cinfo);
+    }
+
+    auto parsed = open_binary_image(raw_bytes, *open_opts);
     if (!parsed.has_value()) {
         return make_error(std::format("Failed to parse '{}': {}",
                                       options.binary_path.string(),
@@ -1822,6 +2566,13 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
     }
 
     report.image = std::move(*parsed);
+    report.selected_slice_index = report.image->container_slice_index();
+    if (report.selected_slice_index < report.container_info.slices.size()) {
+        report.selected_slice_arch =
+            report.container_info.slices[report.selected_slice_index].arch_name;
+    } else {
+        report.selected_slice_arch = std::string(to_string(report.image->architecture()));
+    }
     report.primary_provenance = ProvenanceTag::DiskFile;
     report.target_profile = derive_target_profile(
         report.image.get(),
@@ -1868,6 +2619,11 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         BinaryDiffOptions diff_opts;
         diff_opts.lhs_label = options.binary_path.filename().string();
         diff_opts.rhs_label = options.compare_path->filename().string();
+        if (open_opts->selected_slice_index.has_value()) {
+            diff_opts.lhs_slice_index = *open_opts->selected_slice_index;
+        } else if (!open_opts->preferred_arch_name.empty()) {
+            diff_opts.lhs_arch_name = open_opts->preferred_arch_name;
+        }
         auto cmp = compare_binary_files(options.binary_path, *options.compare_path, diff_opts);
         if (!cmp.has_value()) {
             return std::unexpected(cmp.error());
@@ -1919,7 +2675,16 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
         out += std::format("    \"bits\": {},\n", img->is_64bit() ? 64 : 32);
         out += "    "; key("endianness"); append_json_escaped(out, to_string(img->endianness())); out += ",\n";
         out += std::format("    \"entry_point\": {},\n", img->entry_point());
-        out += std::format("    \"image_base\": {}\n", img->image_base());
+        out += std::format("    \"image_base\": {},\n", img->image_base());
+        out += std::format("    \"universal_container\": {},\n",
+                           report.container_info.is_universal_container ? "true" : "false");
+        out += std::format("    \"slice_count\": {},\n",
+                           std::max<std::size_t>(report.container_info.slices.size(), 1u));
+        out += std::format("    \"selected_slice_index\": {},\n", report.selected_slice_index);
+        out += "    "; key("selected_slice_arch"); append_json_escaped(out, report.selected_slice_arch); out += ",\n";
+        out += std::format("    \"selected_slice_offset\": {},\n", img->container_slice_offset());
+        out += std::format("    \"selected_slice_size\": {}\n",
+                           img->container_slice_size() != 0u ? img->container_slice_size() : report.file_size);
     }
     out += "  },\n";
 
@@ -2039,6 +2804,7 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
     out += std::format("    \"transitive_dependencies\": {},\n", ds.transitive_dependencies);
     out += std::format("    \"resolved_count\": {},\n", ds.resolved_count);
     out += std::format("    \"virtual_api_sets\": {},\n", ds.virtual_api_sets);
+    out += std::format("    \"system_shared_cache\": {},\n", ds.system_shared_cache);
     out += std::format("    \"missing_libraries\": {},\n", ds.missing_libraries);
     out += std::format("    \"architecture_mismatches\": {},\n", ds.architecture_mismatches);
     out += std::format("    \"cycle_edges\": {},\n", ds.cycle_edges);
@@ -2403,6 +3169,11 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
 
     // Optional properties block carrying dependency & comparison summary for CI tooling
     out += ",\n      \"properties\": {\n";
+    out += std::format("        \"universalContainer\": {},\n",
+                       report.container_info.is_universal_container ? "true" : "false");
+    out += std::format("        \"selectedSliceIndex\": {},\n", report.selected_slice_index);
+    out += "        "; key("selectedSliceArch"); append_json_escaped(out, report.selected_slice_arch); out += ",\n";
+    out += std::format("        \"systemSharedCacheLibraries\": {},\n", report.dependencies.summary.system_shared_cache);
     out += std::format("        \"missingLibraries\": {},\n", report.dependencies.summary.missing_libraries);
     out += std::format("        \"architectureMismatches\": {},\n", report.dependencies.summary.architecture_mismatches);
     out += std::format("        \"unresolvedSymbols\": {}", report.dependencies.summary.unresolved_symbols);
@@ -2471,6 +3242,7 @@ std::optional<int> try_run_headless_or_help_cli(
             << "  peelf_viewer --headless                       Smoke check without loading GUI (exits 0)\n"
             << "  peelf_viewer --headless <binary> [options]    Run headless static & security inspection\n"
             << "\nHeadless Options:\n"
+            << "  --slice <index|arch>         Select Universal Mach-O slice by 0-based index or arch name\n"
             << "  --compare <other_binary>     Include static binary & relocation-tolerant function diff\n"
             << "  --format <json|sarif>        Output format (default: json; sarif emits SARIF 2.1.0)\n"
             << "  --output <path>              Write report atomically to <path> (default: stdout)\n"
@@ -2518,6 +3290,14 @@ std::optional<int> try_run_headless_or_help_cli(
             auto val = require_next(a);
             if (!val) return 1;
             opts.compare_path = std::filesystem::path(*val);
+        } else if (a == "--slice") {
+            auto val = require_next(a);
+            if (!val) return 1;
+            if (val->empty()) {
+                stderr_stream << "Error: --slice requires a slice index or architecture name\n";
+                return 1;
+            }
+            opts.slice_selector = std::string(*val);
         } else if (a == "--format") {
             auto val = require_next(a);
             if (!val) return 1;

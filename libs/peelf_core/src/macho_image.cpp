@@ -528,11 +528,21 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse(
         chosen_index = *options.selected_slice_index;
     } else if (!options.preferred_arch_name.empty()) {
         bool found = false;
+        const std::string req_exact = to_lower_ascii(options.preferred_arch_name);
         for (std::size_t i = 0u; i < container->slices.size(); ++i) {
-            if (matches_arch_alias(container->slices[i], options.preferred_arch_name)) {
+            if (to_lower_ascii(container->slices[i].arch_name) == req_exact) {
                 chosen_index = i;
                 found = true;
                 break;
+            }
+        }
+        if (!found) {
+            for (std::size_t i = 0u; i < container->slices.size(); ++i) {
+                if (matches_arch_alias(container->slices[i], options.preferred_arch_name)) {
+                    chosen_index = i;
+                    found = true;
+                    break;
+                }
             }
         }
         if (!found) {

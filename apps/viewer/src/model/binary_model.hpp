@@ -177,6 +177,13 @@ namespace viewer {
         [[nodiscard]] peelf::TargetLayout target_layout() const noexcept;
 
         [[nodiscard]] const FileInfo& file_info() const { return file_info_; }
+        [[nodiscard]] const peelf::BinaryContainerInfo& container_info() const noexcept { return container_info_; }
+        [[nodiscard]] std::size_t active_slice_index() const noexcept { return active_slice_index_; }
+        [[nodiscard]] bool is_universal_container() const noexcept {
+            return !is_live_process() && container_info_.is_universal_container &&
+                   container_info_.slices.size() > 1u;
+        }
+        [[nodiscard]] bool select_container_slice(std::size_t slice_index);
         [[nodiscard]] const std::vector<std::uint8_t>& bytes() const { return bytes_; }
         [[nodiscard]] std::span<const std::uint8_t> analysis_image_bytes() const noexcept;
         [[nodiscard]] std::uint64_t analysis_image_size() const noexcept;
@@ -448,6 +455,8 @@ namespace viewer {
         peelf::Endianness endianness_ = peelf::Endianness::Little;
 
         FileInfo file_info_;
+        peelf::BinaryContainerInfo container_info_{};
+        std::size_t active_slice_index_{0};
         std::vector<std::uint8_t> bytes_;
         std::vector<std::uint8_t> live_backing_file_bytes_;
         std::vector<std::uint8_t> live_module_snapshot_bytes_;

@@ -204,7 +204,112 @@ struct ElfDeclaredSettings {
 };
 
 // ---------------------------------------------------------------------------
-// Unified 3-Section Executable & Settings Overview (`WU-22` + `WU-23`)
+// Mach-O Static Declared Metadata (`mach_header[_64]`, Load Commands, Signing)
+// ---------------------------------------------------------------------------
+
+struct MachODylibSetting {
+    std::string install_name;
+    std::uint32_t cmd{0};
+    std::string cmd_name;
+    std::string current_version;
+    std::string compatibility_version;
+    bool is_id{false};
+    bool is_weak{false};
+    bool is_reexport{false};
+    bool is_lazy{false};
+    bool is_upward{false};
+
+    auto operator<=>(const MachODylibSetting&) const = default;
+};
+
+struct MachOBuildPlatformSetting {
+    std::uint32_t platform{0};
+    std::string platform_name;
+    std::string minos;
+    std::string sdk;
+    std::uint32_t source_cmd{0};
+    std::string source_cmd_name;
+
+    auto operator<=>(const MachOBuildPlatformSetting&) const = default;
+};
+
+struct MachOCodeSignatureSetting {
+    bool present{false};
+    bool parsed_ok{false};
+    bool is_adhoc{false};
+    bool is_linker_signed{false};
+    bool hardened_runtime{false};
+    bool restrict_flag{false};
+    bool kill_flag{false};
+    bool library_validation{false};
+    bool has_entitlements{false};
+    bool has_der_entitlements{false};
+    bool has_cms_signature{false};
+    bool cryptographically_verified{false};
+    std::string trust_provenance;
+    std::uint32_t flags{0};
+    std::vector<std::string> decoded_flags;
+    std::string identifier;
+    std::string team_id;
+    std::string hash_type_name;
+    std::uint64_t container_offset{0};
+    std::uint32_t data_size{0};
+    std::uint32_t cms_blob_size{0};
+};
+
+struct MachOEncryptionSetting {
+    bool present{false};
+    bool is_encrypted{false};
+    std::uint32_t cryptoff{0};
+    std::uint32_t cryptsize{0};
+    std::uint32_t cryptid{0};
+
+    auto operator<=>(const MachOEncryptionSetting&) const = default;
+};
+
+struct MachODeclaredSettings {
+    std::uint32_t magic{0};
+    std::uint32_t cpu_type{0};
+    std::uint32_t cpu_subtype{0};
+    std::string arch_name;
+    std::uint32_t file_type{0};
+    std::string file_type_name;
+    std::uint32_t header_flags{0};
+    std::vector<std::string> decoded_header_flags;
+    bool is_universal_slice{false};
+    std::size_t slice_index{0};
+    std::uint64_t slice_file_offset{0};
+    std::uint64_t slice_file_size{0};
+
+    bool is_pie{false};
+    bool has_pagezero{false};
+    std::uint64_t pagezero_size{0};
+    bool two_level_namespace{false};
+    bool allow_stack_execution{false};
+    bool no_heap_execution{false};
+    bool app_extension_safe{false};
+    bool has_restrict_section{false};
+    bool is_arm64e_pac{false};
+    std::uint8_t ptrauth_version{0};
+
+    std::optional<std::string> uuid_hex;
+    std::optional<std::string> dylinker;
+    std::optional<std::string> entry_source;
+    std::optional<std::uint64_t> entry_offset;
+    std::optional<std::uint64_t> initial_stack_size;
+    std::optional<std::string> source_version;
+    std::optional<std::string> dylib_id;
+
+    std::vector<MachOBuildPlatformSetting> build_platforms;
+    std::vector<std::string> rpaths;
+    std::vector<MachODylibSetting> dylibs;
+    MachOCodeSignatureSetting code_signature;
+    MachOEncryptionSetting encryption;
+    std::vector<std::string> warnings;
+};
+
+// ---------------------------------------------------------------------------
+// Unified 3-Section Executable & Settings Overview (`WU-22` + `WU-23` + `WU-26b`)
 // ---------------------------------------------------------------------------
 
 struct DeclaredSettings {
@@ -238,6 +343,10 @@ struct DeclaredSettings {
     // ELF declared metadata block
     MetadataFieldState elf_settings_state{MetadataFieldState::UnsupportedFormat};
     Observed<ElfDeclaredSettings> elf_settings;
+
+    // Mach-O declared metadata block
+    MetadataFieldState macho_settings_state{MetadataFieldState::UnsupportedFormat};
+    Observed<MachODeclaredSettings> macho_settings;
 };
 
 /// Environment redaction policy (`WU-23`: redacted by default unless explicitly opted in).

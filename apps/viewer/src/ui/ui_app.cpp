@@ -336,6 +336,9 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     file_panel_.set_refresh_requested_callback(on_refresh_map);
     file_panel_.set_detach_requested_callback(on_detach_proc);
     file_panel_.set_pause_toggle_callback(on_toggle_pause);
+    file_panel_.set_slice_selected_callback([this](std::size_t slice_index) {
+        pending_slice_selection_ = slice_index;
+    });
 
     memory_map_panel_.set_attach_requested_callback([this]() {
         open_attach_process_modal();
@@ -780,6 +783,20 @@ void UiApp::render() {
         ImGui::ShowDemoWindow(&show_demo_window_);
     apply_structure_selection_navigation();
     drain_pending_navigations();
+    if (pending_slice_selection_.has_value()) {
+        const std::size_t requested_slice = *pending_slice_selection_;
+        pending_slice_selection_.reset();
+        if (model_.select_container_slice(requested_slice)) {
+            on_file_loaded();
+            Log().info("Selected Universal Mach-O slice #{} ({})",
+                       model_.active_slice_index(),
+                       model_.file_info().arch_str);
+        } else {
+            Log().error("Failed to select Universal Mach-O slice #{}: {}",
+                        requested_slice,
+                        model_.last_diagnostic());
+        }
+    }
     if (focus_listing_) { activate_panel("Disassembly"); focus_listing_ = false; }
     navigation_history_.visit(current_selection_);
     if (focus_workspace_) {
@@ -1020,6 +1037,7 @@ void UiApp::process_deferred_gpu_work() {
 
     // Called after a file (PE or ELF) is loaded into the model, or after detaching.
     void UiApp::on_file_loaded() {
+        pending_slice_selection_.reset();
         pending_navigations_.clear();
         patch_set_panel_.reset_preview();
         binary_diff_panel_.invalidate();

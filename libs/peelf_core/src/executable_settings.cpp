@@ -1,6 +1,7 @@
 #include <peelf/executable_settings.hpp>
 
 #include <peelf/endian_reader.hpp>
+#include <peelf/macho_image.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1853,6 +1854,390 @@ void extract_elf_declared(
 }
 
 // ---------------------------------------------------------------------------
+// Mach-O `MachODeclaredSettings` Extractor (`WU-26b`)
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::string macho_filetype_to_string(std::uint32_t ftype) {
+    switch (ftype) {
+        case macho::kMhObject:     return "MH_OBJECT";
+        case macho::kMhExecute:    return "MH_EXECUTE";
+        case macho::kMhFvmlib:     return "MH_FVMLIB";
+        case macho::kMhCore:       return "MH_CORE";
+        case macho::kMhPreload:    return "MH_PRELOAD";
+        case macho::kMhDylib:      return "MH_DYLIB";
+        case macho::kMhDylinker:   return "MH_DYLINKER";
+        case macho::kMhBundle:     return "MH_BUNDLE";
+        case macho::kMhDylibStub:  return "MH_DYLIB_STUB";
+        case macho::kMhDsym:       return "MH_DSYM";
+        case macho::kMhKextBundle: return "MH_KEXT_BUNDLE";
+        case macho::kMhFileset:    return "MH_FILESET";
+        default:                   return std::format("0x{:X}", ftype);
+    }
+}
+
+[[nodiscard]] std::string macho_load_cmd_to_string(std::uint32_t cmd) {
+    switch (cmd) {
+        case macho::kLcIdDylib:            return "LC_ID_DYLIB";
+        case macho::kLcLoadDylib:          return "LC_LOAD_DYLIB";
+        case macho::kLcLoadWeakDylib:      return "LC_LOAD_WEAK_DYLIB";
+        case macho::kLcReexportDylib:      return "LC_REEXPORT_DYLIB";
+        case macho::kLcLazyLoadDylib:      return "LC_LAZY_LOAD_DYLIB";
+        case macho::kLcLoadUpwardDylib:    return "LC_LOAD_UPWARD_DYLIB";
+        case macho::kLcBuildVersion:       return "LC_BUILD_VERSION";
+        case macho::kLcVersionMinMacosx:   return "LC_VERSION_MIN_MACOSX";
+        case macho::kLcVersionMinIphoneos: return "LC_VERSION_MIN_IPHONEOS";
+        case macho::kLcVersionMinTvos:     return "LC_VERSION_MIN_TVOS";
+        case macho::kLcVersionMinWatchos:  return "LC_VERSION_MIN_WATCHOS";
+        case macho::kLcMain:               return "LC_MAIN";
+        case macho::kLcUnixThread:         return "LC_UNIXTHREAD";
+        default:                           return std::format("0x{:08X}", cmd);
+    }
+}
+
+[[nodiscard]] std::string macho_arch_label(const MachOHeader& hdr, Architecture arch) {
+    const std::uint32_t sub = hdr.cpu_subtype & ~macho::kCpuSubtypeMask;
+    if (hdr.cpu_type == macho::kCpuTypeArm64) {
+        return hdr.is_arm64e ? "arm64e" : "arm64";
+    }
+    if (hdr.cpu_type == macho::kCpuTypeArm64_32) {
+        return "arm64_32";
+    }
+    if (hdr.cpu_type == macho::kCpuTypeX86_64) {
+        return sub == macho::kCpuSubtypeX86_64H ? "x86_64h" : "x86_64";
+    }
+    if (hdr.cpu_type == macho::kCpuTypeX86) {
+        return "i386";
+    }
+    if (hdr.cpu_type == macho::kCpuTypeArm) {
+        return "armv7";
+    }
+    if (hdr.cpu_type == macho::kCpuTypePowerPC) {
+        return "ppc";
+    }
+    if (hdr.cpu_type == macho::kCpuTypePowerPC64) {
+        return "ppc64";
+    }
+    return std::string(to_string(arch));
+}
+
+[[nodiscard]] std::vector<std::string> decode_macho_header_flags(std::uint32_t flags) {
+    std::vector<std::string> out;
+    if ((flags & macho::kMhNoUndefs) != 0u)            out.emplace_back("MH_NOUNDEFS");
+    if ((flags & macho::kMhDyldLink) != 0u)            out.emplace_back("MH_DYLDLINK");
+    if ((flags & macho::kMhTwoLevel) != 0u)            out.emplace_back("MH_TWOLEVEL");
+    if ((flags & macho::kMhForceFlat) != 0u)           out.emplace_back("MH_FORCE_FLAT");
+    if ((flags & macho::kMhWeakDefines) != 0u)         out.emplace_back("MH_WEAK_DEFINES");
+    if ((flags & macho::kMhBindsToWeak) != 0u)         out.emplace_back("MH_BINDS_TO_WEAK");
+    if ((flags & macho::kMhAllowStackExecution) != 0u) out.emplace_back("MH_ALLOW_STACK_EXECUTION");
+    if ((flags & macho::kMhRootSafe) != 0u)            out.emplace_back("MH_ROOT_SAFE");
+    if ((flags & macho::kMhSetuidSafe) != 0u)          out.emplace_back("MH_SETUID_SAFE");
+    if ((flags & macho::kMhPie) != 0u)                 out.emplace_back("MH_PIE");
+    if ((flags & macho::kMhHasTlvDescriptors) != 0u)   out.emplace_back("MH_HAS_TLV_DESCRIPTORS");
+    if ((flags & macho::kMhNoHeapExecution) != 0u)     out.emplace_back("MH_NO_HEAP_EXECUTION");
+    if ((flags & macho::kMhAppExtensionSafe) != 0u)    out.emplace_back("MH_APP_EXTENSION_SAFE");
+    return out;
+}
+
+[[nodiscard]] std::vector<std::string> decode_macho_cs_flags(std::uint32_t flags) {
+    std::vector<std::string> out;
+    if ((flags & macho::kCsAdhoc) != 0u)        out.emplace_back("CS_ADHOC");
+    if ((flags & macho::kCsHard) != 0u)         out.emplace_back("CS_HARD");
+    if ((flags & macho::kCsKill) != 0u)         out.emplace_back("CS_KILL");
+    if ((flags & macho::kCsRestrict) != 0u)     out.emplace_back("CS_RESTRICT");
+    if ((flags & macho::kCsEnforcement) != 0u)  out.emplace_back("CS_ENFORCEMENT");
+    if ((flags & macho::kCsRequireLv) != 0u)    out.emplace_back("CS_REQUIRE_LV");
+    if ((flags & macho::kCsRuntime) != 0u)      out.emplace_back("CS_RUNTIME");
+    if ((flags & macho::kCsLinkerSigned) != 0u) out.emplace_back("CS_LINKER_SIGNED");
+    return out;
+}
+
+[[nodiscard]] std::string macho_cs_hash_type_name(std::uint8_t hash_type) {
+    switch (hash_type) {
+        case 1u: return "SHA-1";
+        case 2u: return "SHA-256";
+        case 3u: return "SHA-256 (truncated)";
+        case 4u: return "SHA-384";
+        case 5u: return "SHA-512";
+        default: return hash_type == 0u ? std::string("None") : std::format("HashType({})", hash_type);
+    }
+}
+
+[[nodiscard]] std::string format_macho_source_version(std::uint64_t packed) {
+    const std::uint64_t a = (packed >> 40u) & 0xFFFFFFull;
+    const std::uint64_t b = (packed >> 30u) & 0x3FFull;
+    const std::uint64_t c = (packed >> 20u) & 0x3FFull;
+    const std::uint64_t d = (packed >> 10u) & 0x3FFull;
+    const std::uint64_t e = packed & 0x3FFull;
+    if (e != 0u) return std::format("{}.{}.{}.{}.{}", a, b, c, d, e);
+    if (d != 0u) return std::format("{}.{}.{}.{}", a, b, c, d);
+    if (c != 0u) return std::format("{}.{}.{}", a, b, c);
+    return std::format("{}.{}", a, b);
+}
+
+void extract_macho_declared(
+    const IBinaryImage& image,
+    std::span<const std::uint8_t> raw_bytes,
+    const CaptureStamp& stamp,
+    ProvenanceTag prov_tag,
+    MetadataFieldState& state_out,
+    Observed<MachODeclaredSettings>& out) {
+    const MachOHeader* hdr = image.macho_header();
+    if (hdr == nullptr) {
+        state_out = MetadataFieldState::Malformed;
+        out = Observed<MachODeclaredSettings>::unavailable(
+            prov_tag,
+            "Mach-O image is missing mach_header metadata",
+            stamp);
+        return;
+    }
+
+    MachODeclaredSettings m;
+    std::vector<Evidence> evidence;
+    bool truncated = false;
+    bool malformed = false;
+
+    for (const std::string& w : image.parse_warnings()) {
+        m.warnings.push_back(w);
+        if (w.find("truncated") != std::string::npos ||
+            w.find("out of bounds") != std::string::npos ||
+            w.find("exceeds") != std::string::npos) {
+            truncated = true;
+        } else {
+            malformed = true;
+        }
+    }
+
+    m.magic = hdr->magic;
+    m.cpu_type = hdr->cpu_type;
+    m.cpu_subtype = hdr->cpu_subtype;
+    m.arch_name = macho_arch_label(*hdr, image.architecture());
+    m.file_type = hdr->file_type;
+    m.file_type_name = macho_filetype_to_string(hdr->file_type);
+    m.header_flags = hdr->flags;
+    m.decoded_header_flags = decode_macho_header_flags(hdr->flags);
+    m.is_universal_slice = image.is_universal_slice();
+    m.slice_index = image.container_slice_index();
+    m.slice_file_offset = image.container_slice_offset();
+    m.slice_file_size = image.container_slice_size();
+
+    m.is_pie = hdr->has_pie() ||
+               hdr->file_type == macho::kMhDylib ||
+               hdr->file_type == macho::kMhBundle ||
+               hdr->file_type == macho::kMhDylinker;
+    m.two_level_namespace = hdr->has_twolevel_namespace() && ((hdr->flags & macho::kMhForceFlat) == 0u);
+    m.allow_stack_execution = hdr->allows_stack_execution();
+    m.no_heap_execution = hdr->has_no_heap_execution();
+    m.app_extension_safe = hdr->is_app_extension_safe();
+    m.is_arm64e_pac = hdr->is_arm64e;
+    m.ptrauth_version = hdr->ptrauth_version;
+
+    for (const MachOSegmentCommand& seg : image.macho_segments()) {
+        if (seg.is_pagezero() && seg.virtual_address == 0u && seg.virtual_size >= 4096u &&
+            seg.initprot == 0u && seg.maxprot == 0u) {
+            m.has_pagezero = true;
+            m.pagezero_size = seg.virtual_size;
+        }
+        if (ascii_lower(seg.name) == "__restrict") {
+            m.has_restrict_section = true;
+        }
+        for (const MachOSection& sec : seg.sections) {
+            if (ascii_lower(sec.segment_name) == "__restrict" &&
+                ascii_lower(sec.section_name) == "__restrict") {
+                m.has_restrict_section = true;
+            }
+        }
+    }
+
+    evidence.push_back(Evidence{
+        .tag = prov_tag,
+        .source = "macho_header",
+        .detail = std::format("{} {} flags=0x{:08X}", m.file_type_name, m.arch_name, m.header_flags),
+        .file_offset = m.slice_file_offset,
+    });
+
+    if (!image.macho_uuid_string().empty()) {
+        m.uuid_hex = std::string(image.macho_uuid_string());
+        evidence.push_back(Evidence{
+            .tag = prov_tag,
+            .source = "macho_lc_uuid",
+            .detail = std::format("LC_UUID {}", *m.uuid_hex),
+        });
+    }
+
+    if (!image.macho_dylinker().empty()) {
+        m.dylinker = std::string(image.macho_dylinker());
+    }
+
+    if (const auto sv = image.macho_source_version(); sv.has_value()) {
+        m.source_version = format_macho_source_version(*sv);
+    }
+
+    // Entry point load command (`LC_MAIN` vs `LC_UNIXTHREAD`)
+    const TargetLayout layout = TargetLayout::from_image(image);
+    for (const MachOLoadCommandInfo& lc : image.macho_load_commands()) {
+        if (lc.cmd == macho::kLcMain) {
+            m.entry_source = "LC_MAIN";
+            if (!raw_bytes.empty() && lc.cmdsize >= 24u &&
+                fits_range(lc.container_offset, lc.cmdsize, raw_bytes.size())) {
+                const EndianReader lr(
+                    raw_bytes.subspan(static_cast<std::size_t>(lc.container_offset), lc.cmdsize),
+                    layout);
+                if (const auto eoff = lr.read_u64(8u)) {
+                    m.entry_offset = *eoff;
+                }
+                if (const auto stk = lr.read_u64(16u); stk.has_value() && *stk > 0u) {
+                    m.initial_stack_size = *stk;
+                }
+            } else if (image.entry_point() >= image.image_base()) {
+                m.entry_offset = image.entry_point() - image.image_base();
+            }
+            break;
+        }
+        if (lc.cmd == macho::kLcUnixThread && !m.entry_source.has_value()) {
+            m.entry_source = "LC_UNIXTHREAD";
+            if (image.entry_point() >= image.image_base()) {
+                m.entry_offset = image.entry_point() - image.image_base();
+            }
+        }
+    }
+
+    // Build / minimum OS target versions (`LC_BUILD_VERSION` / `LC_VERSION_MIN_*`)
+    for (const MachOBuildVersion& bv : image.macho_build_versions()) {
+        MachOBuildPlatformSetting p;
+        p.platform = bv.platform;
+        p.platform_name = std::string(macho::platform_to_string(bv.platform));
+        p.minos = macho::format_packed_version(bv.minos);
+        p.sdk = bv.sdk != 0u ? macho::format_packed_version(bv.sdk) : std::string{};
+        p.source_cmd = bv.cmd;
+        p.source_cmd_name = macho_load_cmd_to_string(bv.cmd);
+        m.build_platforms.push_back(std::move(p));
+    }
+
+    // `LC_RPATH`
+    for (const MachORpathEntry& rp : image.macho_rpaths()) {
+        if (!rp.path.empty()) {
+            m.rpaths.push_back(rp.path);
+        }
+    }
+
+    // `LC_ID_DYLIB` + `LC_LOAD_*_DYLIB`
+    if (const MachODylibDependency* id_dl = image.macho_id_dylib(); id_dl != nullptr) {
+        m.dylib_id = id_dl->name;
+        MachODylibSetting ds;
+        ds.install_name = id_dl->name;
+        ds.cmd = id_dl->cmd;
+        ds.cmd_name = macho_load_cmd_to_string(id_dl->cmd);
+        ds.current_version = macho::format_packed_version(id_dl->current_version);
+        ds.compatibility_version = macho::format_packed_version(id_dl->compatibility_version);
+        ds.is_id = true;
+        m.dylibs.push_back(std::move(ds));
+    }
+    for (const MachODylibDependency& dl : image.macho_dylibs()) {
+        MachODylibSetting ds;
+        ds.install_name = dl.name;
+        ds.cmd = dl.cmd;
+        ds.cmd_name = macho_load_cmd_to_string(dl.cmd);
+        ds.current_version = macho::format_packed_version(dl.current_version);
+        ds.compatibility_version = macho::format_packed_version(dl.compatibility_version);
+        ds.is_id = (dl.cmd == macho::kLcIdDylib);
+        ds.is_weak = dl.weak;
+        ds.is_reexport = dl.reexport;
+        ds.is_lazy = dl.lazy;
+        ds.is_upward = dl.upward;
+        m.dylibs.push_back(std::move(ds));
+    }
+
+    // `LC_CODE_SIGNATURE` — strictly separate structural presence from cryptographic trust!
+    if (const MachOCodeSignatureInfo* cs = image.macho_code_signature();
+        cs != nullptr && cs->present) {
+        m.code_signature.present = true;
+        m.code_signature.parsed_ok = cs->superblob_valid && cs->has_code_directory;
+        m.code_signature.is_adhoc = cs->is_adhoc();
+        m.code_signature.is_linker_signed = cs->is_linker_signed();
+        m.code_signature.hardened_runtime = cs->has_hardened_runtime();
+        m.code_signature.restrict_flag = (cs->cd_flags & macho::kCsRestrict) != 0u;
+        m.code_signature.kill_flag = (cs->cd_flags & macho::kCsKill) != 0u;
+        m.code_signature.library_validation = (cs->cd_flags & macho::kCsRequireLv) != 0u;
+        m.code_signature.has_entitlements = cs->has_entitlements_blob;
+        m.code_signature.has_der_entitlements = cs->has_der_entitlements_blob;
+        m.code_signature.has_cms_signature = cs->has_nonempty_cms_signature;
+        m.code_signature.cryptographically_verified = cs->cryptographically_verified;
+        m.code_signature.trust_provenance = cs->cryptographically_verified
+            ? "cryptographically_verified"
+            : "unverified_offline_structural_only";
+        m.code_signature.flags = cs->cd_flags;
+        m.code_signature.decoded_flags = decode_macho_cs_flags(cs->cd_flags);
+        m.code_signature.identifier = cs->identifier;
+        m.code_signature.team_id = cs->team_id;
+        m.code_signature.hash_type_name = macho_cs_hash_type_name(cs->hash_type);
+        m.code_signature.container_offset = cs->container_offset;
+        m.code_signature.data_size = cs->data_size;
+        m.code_signature.cms_blob_size = cs->cms_blob_size;
+
+        if (!m.code_signature.parsed_ok) {
+            malformed = true;
+            m.warnings.emplace_back(
+                "LC_CODE_SIGNATURE SuperBlob is malformed, truncated, or missing a CodeDirectory slot");
+        }
+        evidence.push_back(Evidence{
+            .tag = prov_tag,
+            .source = "macho_lc_code_signature",
+            .detail = std::format(
+                "LC_CODE_SIGNATURE id='{}' adhoc={} hardened_runtime={} cms={} trust={}",
+                cs->identifier,
+                cs->is_adhoc(),
+                cs->has_hardened_runtime(),
+                cs->has_nonempty_cms_signature,
+                m.code_signature.trust_provenance),
+            .file_offset = cs->container_offset,
+        });
+    } else {
+        m.code_signature.present = false;
+        m.code_signature.cryptographically_verified = false;
+        m.code_signature.trust_provenance = "unsigned_no_lc_code_signature";
+    }
+
+    // `LC_ENCRYPTION_INFO(_64)`
+    if (const MachOEncryptionInfo* enc = image.macho_encryption_info(); enc != nullptr) {
+        m.encryption.present = true;
+        m.encryption.is_encrypted = enc->is_encrypted();
+        m.encryption.cryptoff = enc->cryptoff;
+        m.encryption.cryptsize = enc->cryptsize;
+        m.encryption.cryptid = enc->cryptid;
+        evidence.push_back(Evidence{
+            .tag = prov_tag,
+            .source = "macho_lc_encryption_info",
+            .detail = std::format("cryptid={} cryptoff=0x{:X} cryptsize=0x{:X}",
+                                  enc->cryptid,
+                                  enc->cryptoff,
+                                  enc->cryptsize),
+            .file_offset = enc->container_cryptoff,
+        });
+    }
+
+    if (truncated) {
+        state_out = MetadataFieldState::Truncated;
+        const std::string note =
+            m.warnings.empty() ? "Truncated Mach-O declared metadata" : m.warnings.front();
+        out = Observed<MachODeclaredSettings>::partial(
+            std::move(m), prov_tag, note, stamp, std::move(evidence));
+        return;
+    }
+    if (malformed) {
+        state_out = MetadataFieldState::Malformed;
+        const std::string note =
+            m.warnings.empty() ? "Malformed Mach-O declared metadata" : m.warnings.front();
+        out = Observed<MachODeclaredSettings>::partial(
+            std::move(m), prov_tag, note, stamp, std::move(evidence));
+        return;
+    }
+
+    state_out = MetadataFieldState::Present;
+    out = Observed<MachODeclaredSettings>::complete(
+        std::move(m), prov_tag, stamp, std::move(evidence));
+}
+
+// ---------------------------------------------------------------------------
 // JSON Escaping Helpers
 // ---------------------------------------------------------------------------
 
@@ -2111,6 +2496,9 @@ ExecutableSettingsReport extract_executable_settings(
         decl.elf_settings_state = MetadataFieldState::UnsupportedFormat;
         decl.elf_settings = Observed<ElfDeclaredSettings>::unavailable(
             prov, "Target format is PE (ELF dynamic/note metadata not applicable)", eff_stamp);
+        decl.macho_settings_state = MetadataFieldState::UnsupportedFormat;
+        decl.macho_settings = Observed<MachODeclaredSettings>::unavailable(
+            prov, "Target format is PE (Mach-O load commands/code signature not applicable)", eff_stamp);
     } else if (image.format() == Format::ELF) {
         extract_elf_declared(
             image, raw_bytes, eff_stamp, prov, decl.elf_settings_state, decl.elf_settings);
@@ -2132,6 +2520,34 @@ ExecutableSettingsReport extract_executable_settings(
         decl.pe_clr_state = MetadataFieldState::UnsupportedFormat;
         decl.pe_clr = Observed<PeClrSummary>::unavailable(
             prov, "Target format is ELF (PE CLR header not applicable)", eff_stamp);
+        decl.macho_settings_state = MetadataFieldState::UnsupportedFormat;
+        decl.macho_settings = Observed<MachODeclaredSettings>::unavailable(
+            prov, "Target format is ELF (Mach-O load commands/code signature not applicable)", eff_stamp);
+    } else if (image.format() == Format::MachO) {
+        extract_macho_declared(
+            image, raw_bytes, eff_stamp, prov, decl.macho_settings_state, decl.macho_settings);
+        if (decl.macho_settings.has_value()) {
+            for (const MachODylibSetting& dl : decl.macho_settings.value->dylibs) {
+                if (!dl.is_id && !dl.install_name.empty() &&
+                    std::ranges::find(decl.declared_dependencies, dl.install_name) ==
+                        decl.declared_dependencies.end()) {
+                    decl.declared_dependencies.push_back(dl.install_name);
+                }
+            }
+        }
+
+        decl.pe_manifest_state = MetadataFieldState::UnsupportedFormat;
+        decl.pe_manifest = Observed<PeManifestInfo>::unavailable(
+            prov, "Target format is Mach-O (PE RT_MANIFEST not applicable)", eff_stamp);
+        decl.pe_version_state = MetadataFieldState::UnsupportedFormat;
+        decl.pe_version = Observed<PeVersionInfo>::unavailable(
+            prov, "Target format is Mach-O (PE RT_VERSION not applicable)", eff_stamp);
+        decl.pe_clr_state = MetadataFieldState::UnsupportedFormat;
+        decl.pe_clr = Observed<PeClrSummary>::unavailable(
+            prov, "Target format is Mach-O (PE CLR header not applicable)", eff_stamp);
+        decl.elf_settings_state = MetadataFieldState::UnsupportedFormat;
+        decl.elf_settings = Observed<ElfDeclaredSettings>::unavailable(
+            prov, "Target format is Mach-O (ELF dynamic/note metadata not applicable)", eff_stamp);
     }
 
     const bool any_partial_decl =
@@ -2142,7 +2558,9 @@ ExecutableSettingsReport extract_executable_settings(
         decl.pe_clr_state == MetadataFieldState::Malformed ||
         decl.pe_clr_state == MetadataFieldState::Truncated ||
         decl.elf_settings_state == MetadataFieldState::Malformed ||
-        decl.elf_settings_state == MetadataFieldState::Truncated;
+        decl.elf_settings_state == MetadataFieldState::Truncated ||
+        decl.macho_settings_state == MetadataFieldState::Malformed ||
+        decl.macho_settings_state == MetadataFieldState::Truncated;
 
     std::vector<Evidence> decl_ev = {
         Evidence{
@@ -2258,6 +2676,36 @@ namespace {
     return false;
 }
 
+[[nodiscard]] std::string_view strip_dylib_version_stem(std::string_view base) noexcept {
+    if (!base.ends_with(".dylib")) {
+        return base;
+    }
+    base.remove_suffix(6u); // ".dylib"
+    // Strip trailing ".A" / ".B" / ".1.2.3" compatibility suffix when present (e.g. libSystem.B.dylib -> libSystem).
+    const std::size_t dot = base.find('.');
+    return dot == std::string_view::npos ? base : base.substr(0u, dot);
+}
+
+[[nodiscard]] bool macho_declared_matches_loaded(
+    std::string_view declared_install_name,
+    std::string_view loaded_basename) noexcept {
+    if (declared_install_name.empty() || loaded_basename.empty()) {
+        return false;
+    }
+    const std::size_t d_slash = declared_install_name.find_last_of("/\\");
+    const std::string_view d_base =
+        (d_slash == std::string_view::npos)
+            ? declared_install_name
+            : declared_install_name.substr(d_slash + 1u);
+    if (d_base == loaded_basename) {
+        return true;
+    }
+    if (d_base.ends_with(".dylib") && loaded_basename.ends_with(".dylib")) {
+        return strip_dylib_version_stem(d_base) == strip_dylib_version_stem(loaded_basename);
+    }
+    return false;
+}
+
 [[nodiscard]] bool is_main_executable_module(
     const ModuleInfo& mod,
     std::size_t mod_index,
@@ -2339,6 +2787,7 @@ Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
     const DeclaredSettings& decl = *declared_in_file.value;
     const auto& mods = *loaded_modules.value;
     const bool is_pe = (decl.format == Format::PE);
+    const bool is_macho = (decl.format == Format::MachO);
 
     std::vector<std::string> declared_libs = decl.declared_dependencies;
     const auto push_unique_decl = [&](std::string_view lib) {
@@ -2358,6 +2807,13 @@ Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
             push_unique_decl(needed);
         }
     }
+    if (is_macho && decl.macho_settings.has_value()) {
+        for (const MachODylibSetting& dl : decl.macho_settings.value->dylibs) {
+            if (!dl.is_id) {
+                push_unique_decl(dl.install_name);
+            }
+        }
+    }
 
     std::optional<std::string> elf_interp_base{};
     std::optional<std::string> elf_soname{};
@@ -2367,6 +2823,17 @@ Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
         }
         if (decl.elf_settings.value->soname.has_value()) {
             elf_soname = *decl.elf_settings.value->soname;
+        }
+    }
+
+    std::optional<std::string> macho_dylinker_base{};
+    std::optional<std::string> macho_dylib_id{};
+    if (is_macho && decl.macho_settings.has_value()) {
+        if (decl.macho_settings.value->dylinker.has_value()) {
+            macho_dylinker_base = extract_filename_component(*decl.macho_settings.value->dylinker);
+        }
+        if (decl.macho_settings.value->dylib_id.has_value()) {
+            macho_dylib_id = *decl.macho_settings.value->dylib_id;
         }
     }
 
@@ -2395,15 +2862,26 @@ Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
             mod_accounted[mi] = 1u;
             continue;
         }
+        if (macho_dylinker_base.has_value() &&
+            macho_declared_matches_loaded(*macho_dylinker_base, mod_basenames[mi])) {
+            mod_accounted[mi] = 1u;
+            continue;
+        }
+        if (macho_dylib_id.has_value() &&
+            macho_declared_matches_loaded(*macho_dylib_id, mod_basenames[mi])) {
+            mod_accounted[mi] = 1u;
+            continue;
+        }
     }
 
     DeclaredVsLoadedModuleComparison cmp{};
     for (const std::string& decl_lib : declared_libs) {
         bool matched_any = false;
         for (std::size_t mi = 0u; mi < mods.size(); ++mi) {
-            const bool matches = is_pe
-                                     ? pe_declared_matches_loaded(decl_lib, mod_basenames[mi])
-                                     : elf_declared_matches_loaded(decl_lib, mod_basenames[mi]);
+            const bool matches =
+                is_pe ? pe_declared_matches_loaded(decl_lib, mod_basenames[mi])
+                      : (is_macho ? macho_declared_matches_loaded(decl_lib, mod_basenames[mi])
+                                  : elf_declared_matches_loaded(decl_lib, mod_basenames[mi]));
             if (matches) {
                 matched_any = true;
                 mod_accounted[mi] = 1u;
@@ -3132,6 +3610,136 @@ std::string format_executable_settings_json(
             append_indent(out, base_indent + 6u);
             out += "\"warnings\": ";
             append_string_array_json(out, e.warnings);
+        }
+        out += "\n";
+        line(4u, "},");
+
+        // Mach-O Settings
+        append_indent(out, base_indent + 4u);
+        out += "\"macho_settings\": {\n";
+        line(6u, std::format("\"state\": \"{}\",", to_string(d.macho_settings_state)));
+        line(6u, std::format("\"availability\": \"{}\",", to_string(d.macho_settings.availability)));
+        append_indent(out, base_indent + 6u);
+        out += "\"note\": ";
+        append_json_string(out, d.macho_settings.note);
+        if (d.macho_settings.has_value()) {
+            const MachODeclaredSettings& m = *d.macho_settings.value;
+            out += ",\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"arch_name\": ";
+            append_json_string(out, m.arch_name);
+            out += ",\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"file_type\": ";
+            append_json_string(out, m.file_type_name);
+            out += ",\n";
+            line(6u, std::format("\"header_flags\": {},", m.header_flags));
+            append_indent(out, base_indent + 6u);
+            out += "\"decoded_header_flags\": ";
+            append_string_array_json(out, m.decoded_header_flags);
+            out += ",\n";
+            line(6u, std::format("\"is_universal_slice\": {},", m.is_universal_slice ? "true" : "false"));
+            line(6u, std::format("\"slice_index\": {},", m.slice_index));
+            line(6u, std::format("\"slice_file_offset\": {},", m.slice_file_offset));
+            line(6u, std::format("\"slice_file_size\": {},", m.slice_file_size));
+            line(6u, std::format("\"is_pie\": {},", m.is_pie ? "true" : "false"));
+            line(6u, std::format("\"has_pagezero\": {},", m.has_pagezero ? "true" : "false"));
+            line(6u, std::format("\"pagezero_size\": {},", m.pagezero_size));
+            line(6u, std::format("\"two_level_namespace\": {},", m.two_level_namespace ? "true" : "false"));
+            line(6u, std::format("\"has_restrict_section\": {},", m.has_restrict_section ? "true" : "false"));
+            line(6u, std::format("\"is_arm64e_pac\": {},", m.is_arm64e_pac ? "true" : "false"));
+            append_indent(out, base_indent + 6u);
+            out += "\"uuid\": ";
+            if (m.uuid_hex.has_value()) {
+                append_json_string(out, *m.uuid_hex);
+            } else {
+                out += "null";
+            }
+            out += ",\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"dylinker\": ";
+            if (m.dylinker.has_value()) {
+                append_json_string(out, *m.dylinker);
+            } else {
+                out += "null";
+            }
+            out += ",\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"entry_source\": ";
+            if (m.entry_source.has_value()) {
+                append_json_string(out, *m.entry_source);
+            } else {
+                out += "null";
+            }
+            out += ",\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"rpaths\": ";
+            append_string_array_json(out, m.rpaths);
+            out += ",\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"build_platforms\": [";
+            for (std::size_t i = 0u; i < m.build_platforms.size(); ++i) {
+                if (i > 0u) out += ", ";
+                out += "{\"platform\": ";
+                append_json_string(out, m.build_platforms[i].platform_name);
+                out += ", \"minos\": ";
+                append_json_string(out, m.build_platforms[i].minos);
+                out += ", \"sdk\": ";
+                append_json_string(out, m.build_platforms[i].sdk);
+                out += ", \"source_cmd\": ";
+                append_json_string(out, m.build_platforms[i].source_cmd_name);
+                out += "}";
+            }
+            out += "],\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"dylibs\": [";
+            for (std::size_t i = 0u; i < m.dylibs.size(); ++i) {
+                if (i > 0u) out += ", ";
+                const MachODylibSetting& dl = m.dylibs[i];
+                out += "{\"install_name\": ";
+                append_json_string(out, dl.install_name);
+                out += ", \"cmd\": ";
+                append_json_string(out, dl.cmd_name);
+                out += ", \"current_version\": ";
+                append_json_string(out, dl.current_version);
+                out += ", \"compatibility_version\": ";
+                append_json_string(out, dl.compatibility_version);
+                out += std::format(", \"is_id\": {}, \"weak\": {}, \"reexport\": {}, \"lazy\": {}}}",
+                                   dl.is_id ? "true" : "false",
+                                   dl.is_weak ? "true" : "false",
+                                   dl.is_reexport ? "true" : "false",
+                                   dl.is_lazy ? "true" : "false");
+            }
+            out += "],\n";
+            append_indent(out, base_indent + 6u);
+            out += "\"code_signature\": {\"present\": ";
+            out += m.code_signature.present ? "true" : "false";
+            out += std::format(
+                ", \"parsed_ok\": {}, \"adhoc\": {}, \"hardened_runtime\": {}, \"has_cms_signature\": {}, \"cryptographically_verified\": {}, \"trust_provenance\": ",
+                m.code_signature.parsed_ok ? "true" : "false",
+                m.code_signature.is_adhoc ? "true" : "false",
+                m.code_signature.hardened_runtime ? "true" : "false",
+                m.code_signature.has_cms_signature ? "true" : "false",
+                m.code_signature.cryptographically_verified ? "true" : "false");
+            append_json_string(out, m.code_signature.trust_provenance);
+            out += ", \"identifier\": ";
+            append_json_string(out, m.code_signature.identifier);
+            out += ", \"team_id\": ";
+            append_json_string(out, m.code_signature.team_id);
+            out += ", \"flags\": ";
+            append_string_array_json(out, m.code_signature.decoded_flags);
+            out += "},\n";
+            append_indent(out, base_indent + 6u);
+            out += std::format(
+                "\"encryption\": {{\"present\": {}, \"is_encrypted\": {}, \"cryptid\": {}, \"cryptoff\": {}, \"cryptsize\": {}}},\n",
+                m.encryption.present ? "true" : "false",
+                m.encryption.is_encrypted ? "true" : "false",
+                m.encryption.cryptid,
+                m.encryption.cryptoff,
+                m.encryption.cryptsize);
+            append_indent(out, base_indent + 6u);
+            out += "\"warnings\": ";
+            append_string_array_json(out, m.warnings);
         }
         out += "\n";
         line(4u, "}");

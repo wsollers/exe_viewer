@@ -45,6 +45,8 @@ namespace {
             return ImVec4(0.35f, 0.95f, 0.85f, 1.0f);
         case peelf::DependencyResolutionStatus::VirtualApiSet:
             return ImVec4(0.75f, 0.78f, 0.92f, 1.0f);
+        case peelf::DependencyResolutionStatus::SystemSharedCache:
+            return ImVec4(0.58f, 0.84f, 0.96f, 1.0f);
         case peelf::DependencyResolutionStatus::ArchitectureMismatch:
             return ImVec4(1.0f, 0.55f, 0.25f, 1.0f);
         case peelf::DependencyResolutionStatus::Unresolved:
@@ -67,6 +69,8 @@ namespace {
             return ImVec4(1.0f, 0.38f, 0.38f, 1.0f);
         case peelf::ImportedSymbolStatus::UncheckedVirtualApiSet:
             return ImVec4(0.75f, 0.78f, 0.92f, 1.0f);
+        case peelf::ImportedSymbolStatus::UncheckedSystemSharedCache:
+            return ImVec4(0.58f, 0.84f, 0.96f, 1.0f);
         case peelf::ImportedSymbolStatus::UncheckedTargetUnavailable:
             return ImVec4(0.95f, 0.75f, 0.35f, 1.0f);
     }
@@ -144,7 +148,8 @@ bool DependenciesPanel::subtree_matches_filter(const peelf::DependencyTreeItem& 
                         icontains_dep(item.requested_name, query) ||
                         icontains_dep(node.display_name, query) ||
                         icontains_dep(node.resolved_path.generic_string(), query) ||
-                        icontains_dep(node.soname, query);
+                        icontains_dep(node.soname, query) ||
+                        icontains_dep(node.macho_install_name, query);
     if (!self_text_ok && item.edge_index.has_value() && *item.edge_index < graph_->edges.size()) {
         for (const auto& sb : graph_->edges[*item.edge_index].symbol_bindings) {
             if (icontains_dep(sb.name, query)) {
@@ -208,6 +213,16 @@ void DependenciesPanel::draw_tree_item(const peelf::DependencyTreeItem& item,
         label += " [forwarder]";
     } else if (item.edge_kind == peelf::DependencyEdgeKind::DynamicLinkerInterp) {
         label += " [PT_INTERP]";
+    } else if (item.edge_kind == peelf::DependencyEdgeKind::WeakDylib) {
+        label += " [weak]";
+    } else if (item.edge_kind == peelf::DependencyEdgeKind::ReexportDylib) {
+        label += " [re-export]";
+    } else if (item.edge_kind == peelf::DependencyEdgeKind::LazyDylib) {
+        label += " [lazy]";
+    } else if (item.edge_kind == peelf::DependencyEdgeKind::UpwardDylib) {
+        label += " [upward]";
+    } else if (item.edge_kind == peelf::DependencyEdgeKind::DyldLinker) {
+        label += " [dyld]";
     }
     if (item.is_cycle) {
         label += " [cycle]";
@@ -350,6 +365,20 @@ void DependenciesPanel::draw_selected_details() {
     if (!node.elf_interpreter.empty()) {
         ImGui::Text("PT_INTERP: %s", node.elf_interpreter.c_str());
     }
+    if (!node.macho_install_name.empty()) {
+        ImGui::Text("LC_ID_DYLIB: %s", node.macho_install_name.c_str());
+    }
+    if (!node.macho_dylinker.empty()) {
+        ImGui::Text("LC_LOAD_DYLINKER: %s", node.macho_dylinker.c_str());
+    }
+    if (!node.macho_rpaths.empty()) {
+        std::string rpaths_joined;
+        for (std::size_t i = 0u; i < node.macho_rpaths.size(); ++i) {
+            if (i > 0u) rpaths_joined += " : ";
+            rpaths_joined += node.macho_rpaths[i];
+        }
+        ImGui::TextWrapped("LC_RPATH: %s", rpaths_joined.c_str());
+    }
 
     const std::string& reason = edge ? edge->resolution_reason : node.resolution_reason;
     ImGui::TextWrapped("Provenance: %s", reason.c_str());
@@ -468,15 +497,16 @@ void DependenciesPanel::draw_contents() {
     if (!model_.has_file() || model_.image() == nullptr) {
         graph_.reset();
         cached_target_key_.clear();
-        ImGui::TextDisabled("Open a PE/ELF binary or attach to a live process to inspect dependencies.");
+        ImGui::TextDisabled("Open a PE/ELF/Mach-O binary or attach to a live process to inspect dependencies.");
         return;
     }
 
     const std::string cur_key = std::format(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         model_.file_info().path,
         model_.is_live_process() ? 1 : 0,
-        model_.active_module() ? model_.active_module()->base_address : 0ull);
+        model_.active_module() ? model_.active_module()->base_address : 0ull,
+        model_.image()->container_slice_index());
     if (!graph_.has_value() || cur_key != cached_target_key_) {
         cached_target_key_ = cur_key;
         rescan();
@@ -485,11 +515,11 @@ void DependenciesPanel::draw_contents() {
     // Summary KPI strip
     if (graph_.has_value()) {
         const auto& s = graph_->summary;
-        ImGui::Text("Direct: %zu  |  Transitive: %zu  |  Resolved: %zu  |  Virtual API-Sets: %zu",
+        ImGui::Text("Direct: %zu  |  Transitive: %zu  |  Resolved: %zu  |  Virtual/Cache: %zu",
                     s.direct_dependencies,
                     s.transitive_dependencies,
                     s.resolved_count,
-                    s.virtual_api_sets);
+                    s.virtual_api_sets + s.system_shared_cache);
         ImGui::SameLine();
         ImGui::TextColored(s.missing_libraries > 0 ? ImVec4(1.0f, 0.38f, 0.38f, 1.0f)
                                                    : ImVec4(0.6f, 0.8f, 0.6f, 1.0f),

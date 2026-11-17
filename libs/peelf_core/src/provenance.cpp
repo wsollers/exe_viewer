@@ -192,6 +192,9 @@ std::string BackingImageIdentity::primary_identifier() const {
     if (!elf_build_id_hex.empty()) {
         return std::format("build-id:{}", elf_build_id_hex);
     }
+    if (!macho_uuid_hex.empty()) {
+        return std::format("uuid:{}", macho_uuid_hex);
+    }
     if (!codeview_guid_hex.empty()) {
         return std::format("rsds:{}:{}", codeview_guid_hex, codeview_age.value_or(0u));
     }
@@ -243,6 +246,10 @@ BackingImageIdentity extract_backing_image_identity(
         }
         if (const GnuDebugLink* dlink = image.gnu_debuglink(); dlink != nullptr) {
             id.elf_gnu_debuglink_crc32 = dlink->crc32;
+        }
+    } else if (image.format() == Format::MachO) {
+        if (const auto uuid = image.macho_uuid(); uuid.has_value()) {
+            id.macho_uuid_hex = bytes_to_lower_hex(*uuid);
         }
     }
 

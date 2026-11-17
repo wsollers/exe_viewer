@@ -23,7 +23,7 @@ Related documentation:
 10. [Read-Only Live Process Inspection, VMMap Visual RAM Explorer, Memory Search & Process Internals](#10-read-only-live-process-inspection-vmmap-visual-ram-explorer-memory-search--process-internals)
 11. [Offline Crash Dump Triage (Windows `.dmp` Minidumps & Linux ELF `ET_CORE`)](#11-offline-crash-dump-triage-windows-dmp-minidumps--linux-elf-et_core)
 12. [Opt-In `IDebugSession` Debugger (Stepping, Software/Hardware Breakpoints & Watchpoints)](#12-opt-in-idebugsession-debugger-stepping-softwarehardware-breakpoints--watchpoints)
-13. [Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`)](#13-formalized-binskim--checksec-security-audit-pe1001pe1008-elf2001elf2008-live3001live3003)
+13. [Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`, `MACHO4001..MACHO4006`)](#13-formalized-binskim--checksec-security-audit-pe1001pe1008-elf2001elf2008-live3001live3003)
 14. [Headless CLI & CI/CD Automation (`--headless`, JSON, SARIF 2.1.0 & GitHub Actions)](#14-headless-cli--cicd-automation---headless-json-sarif-210--github-actions)
 15. [Troubleshooting & Best Practices](#15-troubleshooting--best-practices)
 
@@ -437,7 +437,7 @@ Active debugging mutates target execution state and is therefore **strictly opt-
 
 ## 13. Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`)
 
-Every loaded binary or attached process is evaluated against 19 deterministic security hardening rules (`peelf/security_audit.hpp`), viewable in the **File** security summary and exported via `--headless`:
+Every loaded binary or attached process is evaluated against 25 deterministic security hardening rules (`peelf/security_audit.hpp`), viewable in the **File** security summary and exported via `--headless`:
 
 ### 13.1 Windows PE Rules (`PE1001 .. PE1008`)
 
@@ -473,6 +473,17 @@ Every loaded binary or attached process is evaluated against 19 deterministic se
 | **`LIVE3002`** | `InspectUnbackedExecutableMemory` | `Warning` | Flags anonymous/private executable pages not backed by an on-disk image (JIT / shellcode / unpacker stubs) |
 | **`LIVE3003`** | `VerifyProcessRuntimeMitigations` | `Warning` | Checks OS-level runtime ASLR, DEP, Seccomp, `NoNewPrivs`, and process mitigation policy state |
 
+### 13.4 macOS / Apple Mach-O Rules (`MACHO4001 .. MACHO4006`)
+
+| Rule ID | Rule Name | Default Fail Level | What It Verifies & Compiler/Linker Remediation |
+|---|---|---|---|
+| **`MACHO4001`** | `EnablePieAndZeroPage` | `Error` | `MH_PIE` on `MH_EXECUTE` and an unmapped `__PAGEZERO` guard segment (`vmaddr == 0`, `vmsize >= 4096`, `initprot == 0`, `maxprot == 0`) |
+| **`MACHO4002`** | `EnableMemoryProtectionAndWxorX` | `Error` / `Warning` | Absence of `MH_ALLOW_STACK_EXECUTION`, `MH_NO_HEAP_EXECUTION` on 32-bit executables, and zero `RWX` segments/sections across `initprot` & `maxprot` |
+| **`MACHO4003`** | `EnableStackProtectorAndArcIndicators` | `Warning` | Stack-canary symbol (`___stack_chk_fail` / `___stack_chk_guard`) and Objective-C ARC indicator (`_objc_release`) when `__OBJC` / `__objc_*` metadata exists (`Note` when stripped) |
+| **`MACHO4004`** | `CodeSignatureAndHardenedRuntime` | `Error` / `Warning` / `Note` | Inspects `LC_CODE_SIGNATURE` (`CS_ADHOC`, `CS_RUNTIME`, identifier/team ID, CMS blob) while strictly separating structural presence (`Note` when unverified offline/cross-OS) from cryptographic Apple trust |
+| **`MACHO4005`** | `SafeDylibRpathAndDyldHardening` | `Error` / `Warning` | Rejects world-writable (`/tmp`, `/var/tmp`), unanchored relative, or escaping `..` `LC_RPATH` / `LC_LOAD_*_DYLIB` paths; checks `MH_TWOLEVEL` and `__RESTRICT,__restrict` |
+| **`MACHO4006`** | `PointerAuthAndSegmentEncryption` | `Warning` / `Note` | Reports `arm64e` Pointer Authentication (`PAC`) posture on `arm64` slices and warns when `LC_ENCRYPTION_INFO(_64)` has `cryptid != 0` |
+
 ---
 
 ## 14. Headless CLI & CI/CD Automation (`--headless`, JSON, SARIF 2.1.0 & GitHub Actions)
@@ -499,7 +510,8 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | Option | Description |
 |---|---|
 | `--headless` | Run in Vulkan-free CLI mode (passing `--headless` alone with no path performs a fast readiness check and exits `0`) |
-| `<binary_or_dump>` | Path to a PE, ELF, Windows `.dmp` Minidump, or Linux ELF `ET_CORE` file |
+| `<binary_or_dump>` | Path to a PE, ELF, Mach-O / Universal fat binary, Windows `.dmp` Minidump, or Linux ELF `ET_CORE` file |
+| `--slice <index\|arch>` | Select a specific Universal Mach-O slice by 0-based index (e.g. `0`, `1`) or architecture name (e.g. `arm64`, `arm64e`, `x86_64`) |
 | `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only) |
 | `--format <json\|sarif>` | Output format: structured `json` (default) or **OASIS SARIF 2.1.0** (`sarif`) |
 | `--output <path>` | Write report to `<path>` instead of `stdout` |

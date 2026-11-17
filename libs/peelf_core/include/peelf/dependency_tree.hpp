@@ -20,6 +20,7 @@ enum class DependencyResolutionStatus : std::uint8_t {
     ResolvedOnDisk,
     ResolvedInLiveProcess,
     VirtualApiSet,
+    SystemSharedCache,
     ArchitectureMismatch,
     Unresolved,
     CycleSkipped,
@@ -31,6 +32,7 @@ enum class DependencyResolutionStatus : std::uint8_t {
         case DependencyResolutionStatus::ResolvedOnDisk:        return "Resolved (Disk)";
         case DependencyResolutionStatus::ResolvedInLiveProcess: return "Resolved (Live RAM)";
         case DependencyResolutionStatus::VirtualApiSet:         return "Virtual API-Set";
+        case DependencyResolutionStatus::SystemSharedCache:     return "System Shared Cache";
         case DependencyResolutionStatus::ArchitectureMismatch:  return "Arch Mismatch";
         case DependencyResolutionStatus::Unresolved:            return "Unresolved";
         case DependencyResolutionStatus::CycleSkipped:          return "Cycle Skipped";
@@ -43,6 +45,11 @@ enum class DependencyEdgeKind : std::uint8_t {
     DelayLoadImport,
     ForwardedExport,
     DynamicLinkerInterp,
+    WeakDylib,
+    ReexportDylib,
+    LazyDylib,
+    UpwardDylib,
+    DyldLinker,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(DependencyEdgeKind kind) noexcept {
@@ -51,6 +58,11 @@ enum class DependencyEdgeKind : std::uint8_t {
         case DependencyEdgeKind::DelayLoadImport:     return "Delay-Load";
         case DependencyEdgeKind::ForwardedExport:     return "Forwarded Export";
         case DependencyEdgeKind::DynamicLinkerInterp: return "PT_INTERP Linker";
+        case DependencyEdgeKind::WeakDylib:           return "Weak Dylib";
+        case DependencyEdgeKind::ReexportDylib:       return "Re-Export Dylib";
+        case DependencyEdgeKind::LazyDylib:           return "Lazy Dylib";
+        case DependencyEdgeKind::UpwardDylib:         return "Upward Dylib";
+        case DependencyEdgeKind::DyldLinker:          return "LC_LOAD_DYLINKER";
     }
     return "Import";
 }
@@ -61,6 +73,7 @@ enum class ImportedSymbolStatus : std::uint8_t {
     BoundWeakOptional,
     UnboundMissingExport,
     UncheckedVirtualApiSet,
+    UncheckedSystemSharedCache,
     UncheckedTargetUnavailable,
 };
 
@@ -71,6 +84,7 @@ enum class ImportedSymbolStatus : std::uint8_t {
         case ImportedSymbolStatus::BoundWeakOptional:          return "Weak (Optional)";
         case ImportedSymbolStatus::UnboundMissingExport:       return "Missing Export";
         case ImportedSymbolStatus::UncheckedVirtualApiSet:     return "API-Set Contract";
+        case ImportedSymbolStatus::UncheckedSystemSharedCache: return "dyld Shared Cache";
         case ImportedSymbolStatus::UncheckedTargetUnavailable: return "Target Missing";
     }
     return "Target Missing";
@@ -110,6 +124,9 @@ struct DependencyNode {
     std::vector<std::string> elf_rpaths{};
     std::vector<std::string> elf_runpaths{};
     std::string elf_interpreter{};
+    std::vector<std::string> macho_rpaths{};
+    std::string macho_install_name{};
+    std::string macho_dylinker{};
     std::vector<ImportedSymbolBinding> unresolved_symbols{};
 };
 
@@ -145,6 +162,7 @@ struct DependencySummary {
     std::size_t resolved_count{0};
     std::size_t resolved_live_count{0};
     std::size_t virtual_api_sets{0};
+    std::size_t system_shared_cache{0};
     std::size_t missing_libraries{0};
     std::size_t architecture_mismatches{0};
     std::size_t cycle_edges{0};
@@ -182,6 +200,19 @@ struct DependencyResolveOptions {
     const std::filesystem::path& origin_dir,
     std::string_view lib_token,
     std::string_view platform_token,
+    std::vector<std::string>* assumptions_out = nullptr);
+
+/// Returns true if `install_name` names a macOS / Darwin dyld shared-cache system path
+/// (e.g. `/usr/lib/...`, `/System/Library/...`, `/System/iOSSupport/...`) that resides in
+/// Apple's dyld shared cache rather than standalone files on modern macOS or non-Apple hosts.
+[[nodiscard]] bool is_macos_dyld_shared_cache_path(std::string_view install_name) noexcept;
+
+/// Expands Mach-O `@executable_path` and `@loader_path` prefixes in a dylib install name
+/// or `LC_RPATH` entry and appends any fallback assumptions used to `assumptions_out`.
+[[nodiscard]] std::string expand_macho_loader_tokens(
+    std::string_view raw_path,
+    const std::filesystem::path& executable_dir,
+    const std::filesystem::path& loader_dir,
     std::vector<std::string>* assumptions_out = nullptr);
 
 /// Splits a `:` or `;` separated search-root string into non-empty filesystem paths.

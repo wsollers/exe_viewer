@@ -36,6 +36,7 @@ private:
     void draw_pe_version_block(const peelf::DeclaredSettings& decl);
     void draw_pe_clr_block(const peelf::DeclaredSettings& decl);
     void draw_elf_settings_block(const peelf::DeclaredSettings& decl);
+    void draw_macho_settings_block(const peelf::DeclaredSettings& decl);
     void draw_launch_environment_section(
         const peelf::ExecutableSettingsReport& report,
         std::optional<peelf::EnvironmentRedactionPolicy>& pending_policy);

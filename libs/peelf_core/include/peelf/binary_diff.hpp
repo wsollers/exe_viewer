@@ -188,6 +188,10 @@ struct FunctionDiffEntry {
 struct BinaryDiffOptions {
     std::string lhs_label{"Primary"};
     std::string rhs_label{"Comparison"};
+    std::optional<std::size_t> lhs_slice_index{};
+    std::string lhs_arch_name{};
+    std::optional<std::size_t> rhs_slice_index{};
+    std::string rhs_arch_name{};
     std::uint64_t coalesce_gap_bytes{4};
     std::size_t max_byte_hunks{4096};
     std::size_t sample_bytes_per_hunk{24};
@@ -195,6 +199,20 @@ struct BinaryDiffOptions {
     std::stop_token stop_token{};
     std::function<void(std::size_t completed, std::size_t total, std::string_view stage)> progress_callback{};
 };
+
+struct ResolvedDiffImagePair {
+    std::unique_ptr<IBinaryImage> lhs_image{};
+    std::unique_ptr<IBinaryImage> rhs_image{};
+    BinaryContainerInfo lhs_container{};
+    BinaryContainerInfo rhs_container{};
+};
+
+/// Opens `lhs_bytes` and `rhs_bytes` for binary diffing, automatically matching
+/// architecture slices when one or both inputs are Universal Mach-O containers.
+[[nodiscard]] Result<ResolvedDiffImagePair> open_matched_diff_images(
+    std::span<const std::uint8_t> lhs_bytes,
+    std::span<const std::uint8_t> rhs_bytes,
+    const BinaryDiffOptions& options = {});
 
 struct BinaryDiffReport {
     HeaderDiffSummary header{};

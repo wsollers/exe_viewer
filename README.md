@@ -42,9 +42,9 @@ Original captures are stored in [`docs/screenshots`](docs/screenshots).
 
 The executable is a small launcher. It loads the optional `peelf_gui` module only
 for interactive use. `peelf_viewer --headless` with no arguments exits `0` without
-loading graphics dependencies, while `peelf_viewer --headless <binary|dump> [--format json|sarif] [--compare <other>] [--fail-on none|error|warning]`
+loading graphics dependencies, while `peelf_viewer --headless <binary|dump> [--slice <index|arch>] [--format json|sarif] [--compare <other>] [--fail-on none|error|warning]`
 exports structured metadata, dependencies, symbols, security findings (`PE1001..PE1008`,
-`ELF2001..ELF2008`), crash-dump summaries, and binary diffs for CI pipelines.
+`ELF2001..ELF2008`, `MACHO4001..MACHO4006`), crash-dump summaries, and binary diffs for CI pipelines.
 Configure with `-DPEELF_BUILD_GUI=OFF` to build the launcher without Vulkan, GLFW,
 ImGui, or native file dialogs.
 
@@ -310,9 +310,9 @@ conflict previews, or summarized via **File > Export Patch Report...**.
 
 Additional workspaces cover:
 - **Structure View** & **Data Structures**: Overlay built-in PE, ELF, Win32 (`PEB`/`TEB`), and Linux (`r_debug`/`link_map`) schemas or loaded PDB/DWARF/Ghidra `DataTypeRecord` structs onto any static offset or live VA with array counts, endian/pointer overrides, click-to-follow pointers, and `.peproj` v2 pinned bindings.
-- **Dependencies** (**View > Dependencies**): Inspect static PE imports/delay-load/bound imports/forwarders/`api-ms-win-*` contracts and ELF `DT_NEEDED`/`PT_INTERP`/`DT_RPATH`/`DT_RUNPATH` (`$ORIGIN` expansion) or live loaded module DAGs, highlighting missing libraries, architecture mismatches, and unresolved symbols.
-- **Binary Diff** (**File > Compare With Binary...** & **File > Compare Active Live Module vs. Disk**): Cancellable background `AsyncBinaryDiffController` diffing headers, sections, imports, exports, byte hunks, and 3-tier relocation-tolerant function matches (`ExactName`, `NormalizedFingerprint`, n-gram `Similarity`), plus live RAM vs. on-disk module integrity checks separating `.text` inline detours from IAT/GOT pointer hooks alongside synced Hex/Disassembly panes.
-- **Security Audit** (**PEB / TEB & Flags > Security Audit (BinSkim)** & `--headless`): Evaluates 19 formalized rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`). `PE1005` explicitly distinguishes structural `WIN_CERTIFICATE` Authenticode presence (`Note` when unverified off-Windows) from cryptographic `WinVerifyTrust` signature and publisher trust verification on Windows.
+- **Dependencies** (**View > Dependencies**): Inspect static PE imports/delay-load/bound imports/forwarders/`api-ms-win-*` contracts, ELF `DT_NEEDED`/`PT_INTERP`/`DT_RPATH`/`DT_RUNPATH` (`$ORIGIN` expansion), and Mach-O `LC_LOAD_*_DYLIB`/`LC_REEXPORT_DYLIB`/`@rpath`/`@loader_path`/`@executable_path` (with honest macOS dyld shared-cache classification) or live loaded module DAGs, highlighting missing libraries, architecture mismatches, and unresolved symbols.
+- **Binary Diff** (**File > Compare With Binary...** & **File > Compare Active Live Module vs. Disk**): Cancellable background `AsyncBinaryDiffController` diffing headers, sections, imports, exports, byte hunks, and 3-tier relocation-tolerant function matches (`ExactName`, `NormalizedFingerprint`, n-gram `Similarity`) across PE, ELF, and thin/Universal Mach-O slices, plus live RAM vs. on-disk module integrity checks separating `.text` inline detours from IAT/GOT pointer hooks alongside synced Hex/Disassembly panes.
+- **Security Audit** (**PEB / TEB & Flags > Security Audit (BinSkim)** & `--headless`): Evaluates 25 formalized rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`, `MACHO4001..MACHO4006`). `PE1005` and `MACHO4004` explicitly distinguish structural `WIN_CERTIFICATE` / `LC_CODE_SIGNATURE` presence (`Note` when unverified offline/cross-OS) from cryptographic signature and publisher trust verification.
 - **Live Process, Crash Dumps & Opt-In Debugger**: VMMap-style `Memory Map` (`/proc/<pid>/smaps` PSS/RSS/Swap & `QueryWorkingSetEx` proportional bars), `Process Internals` (handles/FDs, sockets, tokens/capabilities/Seccomp, thread CPU%), offline `.dmp` & `ET_CORE` crash triage, and explicit opt-in `IDebugSession` debugging (**Inspect > Start / Attach Debugger (Opt-in)...** with `F5`/`F9`/`F10`/`F11`/`Shift+F11`, software + `DR0..DR7` hardware breakpoints/watchpoints, shadow-filtered memory reads, and clean detach).
 
 Press **`F5`** outside an active paused debugger session (**Navigate > Decompile selection**) to open the **Decompile** panel. **Ghidra** is the primary external provider when configured, falling back automatically to the built-in zero-dependency **Structured Pseudo-C** decompiler (`RetDec`, `Binary Ninja`, and `Annotated assembly` are also selectable).

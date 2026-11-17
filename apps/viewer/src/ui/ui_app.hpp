@@ -156,6 +156,7 @@ namespace viewer {
         std::optional<ViewerSelection> last_navigation_selection_;
         NavigationHistory navigation_history_;
         NavigationRequestQueue pending_navigations_;
+        std::optional<std::size_t> pending_slice_selection_{};
         void navigate_history(bool forward);
         void switch_analysis_view(bool graph);
         [[nodiscard]] std::optional<SymbolRecord> navigation_graph_root(std::uint64_t address) const;
