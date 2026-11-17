@@ -34,6 +34,7 @@
 #include <peelf/process_snapshot.hpp>
 #include <peelf/provenance.hpp>
 #include <peelf/runtime_structures.hpp>
+#include <peelf/scripting.hpp>
 #include <peelf/security_audit.hpp>
 #include <peelf/stack_tls.hpp>
 
@@ -91,9 +92,43 @@ namespace viewer {
         bool backing_identity_verified{true};
     };
 
+    enum class AsyncScriptStatus : std::uint8_t {
+        Succeeded = 0,
+        Cancelled = 1,
+        Failed = 2,
+        StaleDiscarded = 3,
+    };
+
+    struct ScriptExecutionStamp {
+        std::uint64_t content_generation{0};
+        std::uint64_t edit_revision{0};
+
+        auto operator<=>(const ScriptExecutionStamp&) const = default;
+    };
+
+    struct ScriptMutationEligibility {
+        bool can_mutate_target{false};
+        std::string reason{};
+    };
+
+    struct AsyncScriptOutcome {
+        AsyncScriptStatus status{AsyncScriptStatus::Failed};
+        ScriptExecutionStamp expected_stamp{};
+        bool allow_mutations_effective{false};
+        bool mutations_applied_to_model{false};
+        std::string apply_diagnostic{};
+        peelf::ScriptExecutionResult script_result{};
+        peelf::ProjectWorkspace committed_workspace{};
+    };
+
     class BinaryModel {
     public:
         BinaryModel();
+        ~BinaryModel() noexcept;
+        BinaryModel(const BinaryModel&) = delete;
+        BinaryModel& operator=(const BinaryModel&) = delete;
+        BinaryModel(BinaryModel&&) noexcept;
+        BinaryModel& operator=(BinaryModel&&) noexcept;
 
         bool load_file(const std::string& path);
 
@@ -444,7 +479,31 @@ namespace viewer {
         [[nodiscard]] peelf::Result<std::size_t> record_timeline_snapshot_delta(
             bool pause_during_capture = false);
 
+        // Sandboxed Lua 5.4 async script execution & UI-thread transactional harvest (WU-28b).
+        [[nodiscard]] ScriptMutationEligibility script_mutation_eligibility() const;
+        [[nodiscard]] ScriptExecutionStamp current_script_stamp() const noexcept {
+            return ScriptExecutionStamp{
+                .content_generation = content_generation_,
+                .edit_revision = edit_revision_,
+            };
+        }
+        [[nodiscard]] peelf::Result<void> start_script_execution(
+            std::string script_source,
+            peelf::ScriptLimits limits = {},
+            bool request_allow_mutations = false,
+            peelf::ProjectWorkspace initial_workspace = {},
+            std::string chunk_name = "=panel_script");
+        void cancel_script_execution() noexcept;
+        [[nodiscard]] bool is_script_running() const noexcept;
+        void wait_for_script_idle() noexcept;
+        [[nodiscard]] std::optional<AsyncScriptOutcome> harvest_script_execution();
+        [[nodiscard]] const std::optional<AsyncScriptOutcome>& last_script_outcome() const noexcept {
+            return last_script_outcome_;
+        }
+        void clear_last_script_outcome() noexcept { last_script_outcome_.reset(); }
+
     private:
+        class AsyncScriptRunner;
         void sync_live_executable_settings();
         BinarySourceKind source_kind_ = BinarySourceKind::None;
         LiveViewTargetKind live_target_kind_ = LiveViewTargetKind::None;
@@ -543,6 +602,8 @@ namespace viewer {
         peelf::CaptureStamp process_internals_stamp_{};
         peelf::ExecutionTimeline execution_timeline_{};
         std::shared_ptr<peelf::DebugSessionTimelineSource> debug_timeline_source_{};
+        std::unique_ptr<AsyncScriptRunner> script_runner_{};
+        std::optional<AsyncScriptOutcome> last_script_outcome_{};
 
         mutable std::string last_diagnostic_;
         mutable std::string cached_content_sha256_;

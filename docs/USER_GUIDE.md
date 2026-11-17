@@ -12,19 +12,19 @@ Related documentation:
 ## Table of Contents
 
 1. [Quick Start, Supported Platforms, Build Presets & External Tool Setup](#1-quick-start-supported-platforms-build-presets--external-tool-setup)
-2. [Workspace Navigation, Jump Bar, Synchronized Views, Bookmarks & `.peproj` v2 Sessions](#2-workspace-navigation-jump-bar-synchronized-views-bookmarks--peproj-v2-sessions)
+2. [Workspace Presets, Context Menus, Capabilities, Settings Overview & `.peproj` v2 Sessions](#2-workspace-presets-context-menus-capabilities-settings-overview--peproj-v2-sessions)
 3. [Symbols, Demangling, Windows PDB/DIA & ELF DWARF v2–v5 Sidecars](#3-symbols-demangling-windows-pdbdia--elf-dwarf-v2v5-sidecars)
 4. [Background Cross-References (`ReferenceIndex`), Jump Tables & `Strings` Browser](#4-background-cross-references-referenceindex-jump-tables--strings-browser)
 5. [Interactive Call Graph, Function CFG Canvas & Decompilation](#5-interactive-call-graph-function-cfg-canvas--decompilation)
 6. [Static & Live `Structure View` (Built-In Schemas, C Structs, Arrays & Pointers)](#6-static--live-structure-view-built-in-schemas-c-structs-arrays--pointers)
 7. [Static & Live `Dependencies` Explorer](#7-static--live-dependencies-explorer)
-8. [Binary Patching, Interactive Assembly Preview & `.pepatch.json` Bundles](#8-binary-patching-interactive-assembly-preview--pepatchjson-bundles)
+8. [Binary Patching, Interactive Assembly Preview, `.pepatch.json` Bundles & Sandboxed Lua 5.4 Scripting](#8-binary-patching-interactive-assembly-preview-pepatchjson-bundles--sandboxed-lua-54-scripting)
 9. [Binary Comparison (`Binary Diff`) & Disk-vs-Live-RAM Hook Detection](#9-binary-comparison-binary-diff--disk-vs-live-ram-hook-detection)
-10. [Read-Only Live Process Inspection, VMMap Visual RAM Explorer, Memory Search & Process Internals](#10-read-only-live-process-inspection-vmmap-visual-ram-explorer-memory-search--process-internals)
+10. [Read-Only Live Process Inspection, VMMap Explorer, `ProcessStateSnapshot` Diffs & `Execution Timeline`](#10-read-only-live-process-inspection-vmmap-explorer-processstatesnapshot-diffs--execution-timeline)
 11. [Offline Crash Dump Triage (Windows `.dmp` Minidumps & Linux ELF `ET_CORE`)](#11-offline-crash-dump-triage-windows-dmp-minidumps--linux-elf-et_core)
-12. [Opt-In `IDebugSession` Debugger (Stepping, Software/Hardware Breakpoints & Watchpoints)](#12-opt-in-idebugsession-debugger-stepping-softwarehardware-breakpoints--watchpoints)
-13. [Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`, `MACHO4001..MACHO4006`)](#13-formalized-binskim--checksec-security-audit-pe1001pe1008-elf2001elf2008-live3001live3003)
-14. [Headless CLI & CI/CD Automation (`--headless`, JSON, SARIF 2.1.0 & GitHub Actions)](#14-headless-cli--cicd-automation---headless-json-sarif-210--github-actions)
+12. [Opt-In `IDebugSession` Debugger & `GDB Remote / QEMU RSP` Inspection](#12-opt-in-idebugsession-debugger--gdb-remote--qemu-rsp-inspection)
+13. [Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`, `MACHO4001..MACHO4006`)](#13-formalized-binskim--checksec-security-audit-pe1001pe1008-elf2001elf2008-live3001live3003-macho4001macho4006)
+14. [Headless CLI & CI/CD Automation (`--headless`, `--slice`, `--script`, JSON & SARIF 2.1.0)](#14-headless-cli--cicd-automation---headless---slice---script-json--sarif-210)
 15. [Troubleshooting & Best Practices](#15-troubleshooting--best-practices)
 
 ---
@@ -36,9 +36,10 @@ Related documentation:
 | Dimension | Supported Coverage |
 |---|---|
 | **Host OS** | Windows 10/11 x64 (MSVC 2022) and Linux / WSL2 Ubuntu 22.04+ (Clang 18) |
-| **Static Binary Formats** | **PE32 / PE32+** (`.exe`, `.dll`, `.sys`, `.ocx`, delay-load/bound/forwarded/ordinal tables, `.pdata`, CLR, Authenticode) and **ELF32 / ELF64** little- & big-endian (`ET_EXEC`, `ET_DYN`, `ET_REL`, `SHN_XINDEX`/`PN_XNUM`, sectionless `PT_DYNAMIC`-only ELFs) |
+| **Static Binary Formats** | **PE32 / PE32+** (`.exe`, `.dll`, `.sys`, `.ocx`, delay-load/bound/forwarded/ordinal tables, `.pdata`, manifest/version/CLR, Authenticode), **ELF32 / ELF64** little- & big-endian (`ET_EXEC`, `ET_DYN`, `ET_REL`, `SHN_XINDEX`/`PN_XNUM`, sectionless `PT_DYNAMIC`-only ELFs), and **Mach-O / Universal FAT** (`MH_MAGIC`/`MH_MAGIC_64`/`MH_CIGAM`/`MH_CIGAM_64`, `FAT_MAGIC`/`FAT_CIGAM_64`, `LC_DYLD_EXPORTS_TRIE`, `LC_DYLD_CHAINED_FIXUPS`, structural `LC_CODE_SIGNATURE`) |
+| **Live & Remote Targets** | Local read-only live processes (Win32 / Linux `/proc`), **GDB Remote / QEMU RSP** stubs (`GdbRemoteBackend` read-only & opt-in debug), and opt-in local `ptrace` / Win32 debugging |
 | **Offline Crash Dumps** | Windows Minidumps (`.dmp` `MDMP`) and Linux ELF Core Dumps (`ET_CORE`, 32/64-bit LE/BE) |
-| **Target Architectures** | `x86` (32-bit), `x86_64`, `ARM` (ARM32 + Thumb-2), `ARM64` (`AArch64`), `RISC-V` (`RV32`/`RV64`), `MIPS` (`MIPS32`/`MIPS64` LE/BE), `PowerPC` (`PPC32`/`PPC64` LE/BE) |
+| **Target Architectures** | `x86` (32-bit), `x86_64`, `ARM` (ARM32 + Thumb-2), `ARM64` (`AArch64` / `arm64e`), `RISC-V` (`RV32`/`RV64`), `MIPS` (`MIPS32`/`MIPS64` LE/BE), `PowerPC` (`PPC32`/`PPC64` LE/BE) |
 
 > **WSL2 Filesystem Performance & Hygiene**: When working on WSL2, always keep your repository checkout, CMake `out/build/*` trees, `.peproj` journals, and Ghidra caches inside native Linux ext4 paths (for example `/home/<user>/projects/exe_viewer`), **never** on `/mnt/c`.
 
@@ -48,7 +49,7 @@ Third-party libraries (Dear ImGui docking, GLFW, Capstone, AsmJit/AsmTK, nativef
 
 #### Linux / WSL2 (Clang 18 + Ninja)
 ```bash
-# 1. Debug build + full 326-test verification
+# 1. Debug build + full 449-test verification
 cmake --preset clang18-debug
 cmake --build --preset clang18-debug
 ctest --preset clang18-debug
@@ -109,27 +110,35 @@ PE / ELF Explorer works out of the box with zero external runtime tools (built-i
 
 ---
 
-## 2. Workspace Navigation, Jump Bar, Synchronized Views, Bookmarks & `.peproj` v2 Sessions
+## 2. Workspace Presets, Context Menus, Capabilities, Settings Overview & `.peproj` v2 Sessions
 
 ```mermaid
 flowchart LR
     open["File > Open / Recent / CLI"] --> model["BinaryModel + IBinaryImage"]
     proj["File > Open Analysis Project<br/>(.peproj v2 + SHA-256 check)"] --> model
-    model --> nav["ViewerSelection + Jump Bar"]
+    model --> nav["ViewerSelection + NavigationRequestQueue"]
     nav --> hex["Hex View<br/>(Synced Offsets & Patches)"]
     nav --> dis["Disassembly & Flow Graph"]
     nav --> str["Structure & Details"]
     bmk["Bookmarks (Ctrl+B) &<br/>Comments / Renames"] --> save["Atomic .peproj v2 Save +<br/>Off-/mnt/c Recovery Journal"]
 ```
 
-### 2.1 Opening Files & Navigating the Workspace
-- **Open a Binary**: Press **`Ctrl+O`** (**File > Open...**), pick an entry under **File > Recent Binaries**, or pass a file path on the command line.
-- **Structure Tree & Details**: The left **Structure** panel presents a unified hierarchy (`File/Image -> Headers -> Sections -> Segments -> Imports -> Exports -> Symbols -> Relocations / Notes / Dynamic / Debug`). Clicking any node populates **Details** and synchronizes **Hex View** and **Disassembly** when the item maps to bytes or code.
-- **Address / Offset Jump Bar**: At the top of the workspace, enter a hexadecimal virtual address (e.g. `0x401000` or `140001000`) in the **Jump** input box and click **Jump** (or press `Enter`). Use **Hex View**'s own address/offset box to jump directly by raw file offset or live virtual address.
-- **Synchronized Hex & Disassembly Views**:
-  - Selecting an instruction in **Disassembly** highlights its exact encoded byte span in **Hex View**.
-  - Clicking a byte in **Hex View** updates `ViewerSelection` and disassembles from that mapped address when inside an executable section/region.
-  - Toggle **View > Interface scale** (`100%`, `125%`, `150%`, `200%`) or **View > Reset Layout** at any time.
+### 2.1 Opening Files, Universal Mach-O Slices & Navigating the Workspace
+- **Open a Binary**: Press **`Ctrl+O`** (**File > Open...**), pick an entry under **File > Recent Binaries**, or pass a file path on the command line (PE, ELF, or thin/Universal Mach-O).
+- **Universal Mach-O Slice Selector (`WU-26`)**: When a multi-architecture Universal (`FAT_MAGIC` / `FAT_CIGAM_64`) Mach-O container is loaded, use the top **Universal Slice** combo (e.g. `arm64`, `arm64e`, `x86_64`) to switch active slices safely between frames; all container-absolute file offsets, load commands, exports tries, chained fixups, security findings, and patches rebind to the chosen slice.
+- **Workspaces & Layout Presets (`View > Workspaces`, `WU-27`)**: Switch instantaneously across 5 curated `DockNodeSpec` layouts (*Static Reverse Engineering*, *Live Process / VMMap*, *Debugger*, *Binary Diff*, and *Minimal*) or choose **View > Workspaces > Reset Current Workspace Layout** (`kWorkspaceLayoutSchemaVersion = 9` across all 36 dockable panels).
+- **Universal Capability-Aware Entity Context Menus (`WU-27`)**: Right-click any row or address across **File**, **Sections**, **Imports**, **Exports**, **Symbols**, **Disassembly**, **Memory Map**, or **Security Audit** to invoke:
+  - **Copy**: `Copy Virtual Address`, `Copy File Offset`, `Copy Label`, or `Copy JSON Summary` (deterministic RFC 8259 snippet with provenance).
+  - **Navigate & Act**: `Follow in Hex`, `Follow in Disassembly`, `Follow in Decompiler`, `Follow in Structure View`, `Add Bookmark`, or `Toggle Software Breakpoint` (unavailable actions remain visible-disabled with explicit `TargetCapabilityMatrix` explanations rather than failing silently).
+- **`Target Capabilities` & `Observed<T>` Provenance (`WU-21`)**: Open **View > Target Capabilities** to inspect the target's `TargetProfile`, `ProviderFacts`, `BackingImageIdentity` verification, and per-domain `SupportState` (`SupportedValidated`, `SupportedExperimental`, `Partial`, `Unsupported` — defaulting strictly to `Unsupported` without validation evidence). Every runtime and static datum carries `Observed<T>` provenance (`ProvenanceTag`, `CaptureAvailability`, and `CaptureStamp` with `TargetInstanceId` + `snapshot_revision`).
+- **`Executable & Settings` Static & Runtime Overview (`WU-22`)**: Open **View > Executable & Settings** to inspect declared static metadata side-by-side with observed runtime state:
+  - **PE**: Bounded `RT_MANIFEST` XML (requested execution level, DPI awareness, Windows compatibility GUIDs), `RT_VERSION` (`VS_FIXEDFILEINFO` + multi-locale `StringFileInfo`), and CLR `.NET` `BSJB` metadata summary.
+  - **ELF**: `PT_INTERP`, `.note.ABI-tag`, `.note.gnu.build-id`, `DT_SONAME`/`DT_RPATH`/`DT_RUNPATH`, and `DT_FLAGS`/`DF_1_*`.
+  - **Mach-O**: File type, `LC_BUILD_VERSION` / `LC_VERSION_MIN_*` platform & SDK versions, `LC_MAIN` / `LC_UNIXTHREAD` entry point, `LC_ID_DYLIB` / `LC_RPATH`, `LC_UUID`, and `LC_CODE_SIGNATURE` flags/entitlements summary.
+  - **Observed Runtime Settings**: Live command line, working directory, security posture, and environment variables (**sensitive secret values are redacted by default** unless explicitly revealed).
+- **Structure Tree, Jump Bar & Synchronized Views**:
+  - The left **Structure** panel presents a unified hierarchy (`File/Image -> Headers -> Sections -> Segments -> Imports -> Exports -> Symbols -> Relocations / Notes / Dynamic / Debug`).
+  - Enter any hex VA in the top **Jump** bar and press `Enter`; **Disassembly** and **Hex View** synchronize byte spans and mapped offsets automatically.
 
 ### 2.2 Keyboard Shortcuts & Menu Reference
 
@@ -286,6 +295,8 @@ Open **Dependencies** (**View > Dependencies**) to audit transitive shared-libra
 - **ELF Dependency Resolution**:
   - Parses `PT_INTERP` dynamic loader path, `DT_NEEDED` libraries, `DT_SONAME`, `DT_RPATH`, and `DT_RUNPATH` (recovering dynamic dependencies even on stripped sectionless `PT_DYNAMIC`-only ELFs).
   - Expands `$ORIGIN` / `${ORIGIN}`, `$LIB`, and `$PLATFORM` tokens accurately relative to each importing binary's directory, plus custom `--search-root` sysroots and optional `LD_LIBRARY_PATH`.
+- **Mach-O Dependency Resolution (`WU-26`)**:
+  - Parses `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB`, `LC_LOAD_UPWARD_DYLIB`, and `LC_RPATH`, expanding `@executable_path`, `@loader_path`, and `@rpath` chains across configured `--search-root` sysroots while honestly classifying Apple system paths (`/usr/lib/...`, `/System/Library/Frameworks/...`) as **`DyldSharedCacheExpected`** rather than false missing-file errors when no extracted shared cache is mounted.
 - **Triage Filters & Symbol Binding Status**:
   - Adjust **Max Depth** (`1..16`), add semicolon/colon-separated **Extra Search Roots** (ideal for cross-compiled embedded rootfs directories or app bundles), and toggle **`Issues Only`** to immediately isolate:
     - `Unresolved` (red — missing `.dll`/`.so`),
@@ -295,7 +306,7 @@ Open **Dependencies** (**View > Dependencies**) to audit transitive shared-libra
 
 ---
 
-## 8. Binary Patching, Interactive Assembly Preview & `.pepatch.json` Bundles
+## 8. Binary Patching, Interactive Assembly Preview, `.pepatch.json` Bundles & Sandboxed Lua 5.4 Scripting
 
 ```mermaid
 flowchart LR
@@ -330,6 +341,33 @@ Share deterministic patches with teammates without redistributing proprietary bi
 - **Export**: In **Patch Set**, specify a bundle path (`<binary>.pepatch.json`), description, and click **Export Bundle**. Each hunk records `file_offset`, `virtual_address`, `original_bytes_hex`, `patched_bytes_hex`, optional `asm_source`, plus target `expected_sha256` and `expected_size`.
 - **Import & Pre-Apply Conflict Verification**: Load a `.pepatch.json` bundle to inspect a per-hunk conflict preview (`Ready`, `AlreadyApplied`, `OriginalBytesMismatch`, `OutOfBounds`, or whole-file `SHA-256` mismatch). Applying stages **all** hunks as a single atomic, undoable `PatchTransaction`—if any hunk conflicts, zero bytes are mutated.
 
+### 8.3 Sandboxed Lua 5.4 Transactional `Scripting` Console (`WU-28`)
+Open **Scripting** (**View > Scripting** or **Edit > Scripting console**) to automate analysis, pattern scanning, workspace labeling, and multi-hunk patching inside a deterministic, sandboxed **Lua 5.4.7** VM:
+1. **Hardened Execution Sandbox & Quotas (`ScriptLimits`)**:
+   - Standard host-escape libraries (`io`, `os`, `debug`, `package`, `dofile`, `loadfile`) are **never loaded**, and precompiled Lua bytecode chunks are rejected (`"t"` text-only loader).
+   - Configure **Max Instructions** (default `2,000,000`), **Max Memory (MiB)** (default `32 MiB` via custom `lua_Alloc`), and **Timeout (ms)** (default `5,000 ms`). Scripts run asynchronously on `BinaryModel::AsyncScriptRunner` with an instant **Cancel** button (`std::stop_source`) and never block or race UI rendering.
+2. **Dry-Run Staging by Default vs. Opt-In `Allow Target Mutations`**:
+   - **Starter Templates**: Pick from built-in templates via the **Template** combo (*Inspect Target & Sections*, *Scan High-Entropy / RWX Sections*, *Auto-Label Entry & Exports (Dry-Run)*, *Stage NOP Patch + Commit*).
+   - **Read-Your-Writes Staging**: Byte writes and annotations (`set_label`, `set_comment`, `add_bookmark`) operate on an isolated staging clone. If `peelf.commit()` is omitted, **Allow Target Mutations** is unchecked, or an error/quota failure occurs, all staged changes remain a harmless **Dry-Run** preview.
+   - **Capability Protection**: On read-only live processes, offline crash dumps, and remote GDB RSP targets, **Allow Target Mutations** is automatically disabled with an explicit capability explanation. When enabled on a static binary and `peelf.commit()` succeeds, the UI thread atomically harvests patches into `PagedBinaryImage` (fully undoable via **Edit > Undo patch**) and annotations into `ProjectWorkspace`.
+   - **Click-to-Navigate Summary**: Every staged/committed label, comment, bookmark, and byte patch is listed in the **Mutations Summary** table—click any row to jump **Hex View** / **Disassembly** directly to its VA or file offset.
+3. **`peelf.*` Lua API Reference**:
+
+| Lua Function | Behavior |
+|---|---|
+| `peelf.target_info()` | Returns `{ format, arch, endianness, is_64bit, pointer_size, entry_va, image_base, file_size, sha256, is_live, is_read_only, allow_mutations }` |
+| `peelf.capabilities()` | Returns capability support states (`"SupportedValidated"`, `"SupportedExperimental"`, `"Partial"`, `"Unsupported"`) |
+| `peelf.sections()` / `peelf.symbols()` / `peelf.imports()` / `peelf.exports()` / `peelf.security_findings()` | Returns 1-indexed arrays of parsed sections (with `entropy`), symbols, imports, exports, or BinSkim/checksec findings |
+| `peelf.va_to_offset(va)` / `peelf.offset_to_va(off)` | Translates between virtual addresses and container-aware file offsets (`nil` if unmapped) |
+| `peelf.read_bytes(va_or_off, len [, "va"\|"offset"])` | Reads staged/effective bytes as a Lua binary string (reflects uncommitted `write_bytes` in the same run) |
+| `peelf.find_bytes(hex_pattern [, section_name])` | Scans for hex bytes + `??` wildcards (e.g. `"48 89 ?? 24"`), returning `{ { offset, va }, ... }` |
+| `peelf.disassemble(va, count)` | Disassembles `count` instructions via Capstone, returning `{ { address, size, mnemonic, operands, bytes }, ... }` |
+| `peelf.assemble(asm_text, base_va)` | Encodes assembly via `AsmTK` (x86/x64) or `llvm-mc` (multi-arch), returning raw assembled byte string |
+| `peelf.write_bytes(offset, raw_or_hex [, is_hex])` | Stages byte modifications at `offset` (requires `allow_mutations`; throws Lua error on read-only targets) |
+| `peelf.set_label(va, name)` / `peelf.set_comment(va, text)` / `peelf.add_bookmark(va, label [, note])` | Stages workspace symbol renames, comments, and bookmarks |
+| `peelf.commit()` / `peelf.rollback()` | Marks staged mutations for atomic commit on completion, or discards all staged changes immediately |
+| `peelf.log(msg)` / `print(...)` | Appends formatted diagnostic lines to the **Scripting** output console (and `--headless --script` stdout/JSON) |
+
 ---
 
 ## 9. Binary Comparison (`Binary Diff`) & Disk-vs-Live-RAM Hook Detection
@@ -352,7 +390,7 @@ Open **Binary Diff** via **File > Compare With Binary...** (static A vs. static 
 
 ---
 
-## 10. Read-Only Live Process Inspection, VMMap Visual RAM Explorer, Memory Search & Process Internals
+## 10. Read-Only Live Process Inspection, VMMap Explorer, `ProcessStateSnapshot` Diffs & `Execution Timeline`
 
 ```mermaid
 flowchart TD
@@ -391,6 +429,15 @@ Open **Memory Search** (**Edit > Memory Search** or **Navigate > Memory Search**
 - **Threads & Stack** (**Navigate > Threads & Stack**): Enumerates threads with state, wait reason, start address + symbol, user/kernel **CPU% delta**, general-purpose registers, and unwound stack frames distinguishing concrete frame-pointer chains from heuristic stack-scan candidates.
 - **Thread Locals**, **PEB / TEB & Flags**, and **Handlers**: Inspect TLS slots (`PT_TLS`/DTV & `.tls`/TEB), `PEB`/`TEB` or Linux `auxv`/`r_debug`, and registered VEH/SEH/signal/`atexit` handlers.
 
+### 10.5 Timestamped `ProcessStateSnapshot`, `SnapshotDiff` & Multi-Thread `Execution Timeline` (`WU-23`, `WU-24`)
+Track how a live or debugged process evolves over time without losing uncertainty or sampling boundaries:
+1. **Point-in-Time `ProcessStateSnapshot` & `SnapshotDiff` (`WU-23`)**:
+   - Capture timestamped snapshots from **Executable & Settings** / **Process Internals** (`Capture Snapshot`) and compare any two revisions sharing the same `TargetInstanceId` (PID reuse across distinct process instances is rejected automatically).
+   - `SnapshotDiff` surfaces loaded/unloaded modules, added/removed/split/merged virtual memory regions and **new `RWX` protection transitions**, created/exited threads + stack-pointer shifts, opened/closed handles & FDs (**detecting FD number reuse** when kernel object identity changes), and socket state transitions—propagating partial-capture uncertainty honestly rather than reporting false removals.
+2. **Multi-Thread `Execution Timeline` Swimlanes (`WU-24`)**:
+   - Open **Execution Timeline** (**View > Execution Timeline**) to inspect a chronological + per-thread swimlane view merging `IDebugSession` stop/breakpoint/watchpoint/signal/module events with `SnapshotDiff` deltas.
+   - **Honest Loss & Gap Markers**: Intervals between polled snapshots render explicit **`SamplingGap`** bands, and ring-buffer overflows render **`DroppedEvents`** markers so analysts never mistake unrecorded intervals for target inactivity. Click any event marker to jump **Disassembly**, **Hex View**, or **Threads & Stack** to its thread and instruction address.
+
 ---
 
 ## 11. Offline Crash Dump Triage (Windows `.dmp` Minidumps & Linux ELF `ET_CORE`)
@@ -409,7 +456,7 @@ Analyze post-mortem production crashes on **any** host OS (for example, open a W
 
 ---
 
-## 12. Opt-In `IDebugSession` Debugger (Stepping, Software/Hardware Breakpoints & Watchpoints)
+## 12. Opt-In `IDebugSession` Debugger & `GDB Remote / QEMU RSP` Inspection
 
 Active debugging mutates target execution state and is therefore **strictly opt-in**, isolated from read-only live inspection:
 
@@ -432,10 +479,14 @@ Active debugging mutates target execution state and is therefore **strictly opt-
    - The **Registers** tab compares register values before and after each step/stop, highlighting changed registers in gold/amber and allowing inline hex edits when paused.
    - The **Debug Events** log records thread creations, DLL/`.so` loads, signals/exceptions, and breakpoint hits.
    - Click **Detach Cleanly** (**Inspect > Detach Debugger Cleanly**) to strip all software trap bytes from target RAM, clear `DR7` hardware debug registers, and release the process safely without terminating it.
+6. **`GDB Remote / QEMU RSP` Read-Only Inspection & Opt-In Debugging (`WU-25`)**:
+   - Connect to `qemu-user` / `qemu-system` (`-gdb tcp::1234 -S`), `gdbserver`, OpenOCD, or JTAG/microVM stubs across `x86`, `x86_64`, `ARM`, `ARM64`, `RISC-V`, `MIPS`, and big-endian `PowerPC` via a clean-room BSD-2-Clause GDB Remote Serial Protocol client:
+   - **Read-Only RSP Attach (`Inspect > Connect GDB Remote / QEMU (Read-Only)...`)**: Opens `GdbRemoteBackend::open_read_only` (`IProcessSession`), negotiating `qSupported` / `QStartNoAckMode` and reading bounded XXE-free `qXfer:features:read:target.xml`, `qXfer:memory-map:read`, and `qXfer:libraries-svr4:read` (`libraries` fallback) plus `xx`-preserving partial register packets without sending `M`/`G`/`P`/`Z*`/`vKill`. Non-loopback endpoints require explicit remote-endpoint acknowledgement (`allow_remote_endpoint`).
+   - **Opt-In RSP Debugging (`Inspect > Connect GDB Remote Debugger (Opt-in)...`)**: Requires `ExplicitDebugConsent`, enabling `vCont` (`Hc` + `c`/`s` fallback and `0x03` async interrupt), `Z0`/`z0` software breakpoints with shadowed memory reads, `Z1`–`Z4`/`z1`–`z4` hardware breakpoints & watchpoints (degrading `TargetCapabilityMatrix` honestly when a stub replies `""`), target-endian `P`/`G` register writes, `M` memory writes, stepping, `Execution Timeline` stop-reply decoding (`Sxx`/`Txx`/`Wxx`/`Xxx`/`O`), and truthful `detach()` (retaining session state if `z*` cleanup or `D` fails).
 
 ---
 
-## 13. Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`)
+## 13. Formalized BinSkim / checksec Security Audit (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`, `MACHO4001..MACHO4006`)
 
 Every loaded binary or attached process is evaluated against 25 deterministic security hardening rules (`peelf/security_audit.hpp`), viewable in the **File** security summary and exported via `--headless`:
 
@@ -486,7 +537,7 @@ Every loaded binary or attached process is evaluated against 25 deterministic se
 
 ---
 
-## 14. Headless CLI & CI/CD Automation (`--headless`, JSON, SARIF 2.1.0 & GitHub Actions)
+## 14. Headless CLI & CI/CD Automation (`--headless`, `--slice`, `--script`, JSON & SARIF 2.1.0)
 
 ```mermaid
 flowchart LR
@@ -512,9 +563,15 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | `--headless` | Run in Vulkan-free CLI mode (passing `--headless` alone with no path performs a fast readiness check and exits `0`) |
 | `<binary_or_dump>` | Path to a PE, ELF, Mach-O / Universal fat binary, Windows `.dmp` Minidump, or Linux ELF `ET_CORE` file |
 | `--slice <index\|arch>` | Select a specific Universal Mach-O slice by 0-based index (e.g. `0`, `1`) or architecture name (e.g. `arm64`, `arm64e`, `x86_64`) |
-| `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only) |
-| `--format <json\|sarif>` | Output format: structured `json` (default) or **OASIS SARIF 2.1.0** (`sarif`) |
-| `--output <path>` | Write report to `<path>` instead of `stdout` |
+| `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only; matches Universal Mach-O slices automatically or via `--slice`) |
+| `--format <json\|sarif\|text>` | Output format: structured `json` (default for audits), **OASIS SARIF 2.1.0** (`sarif`), or human-readable `text` (default when `--script` is used without `--format`) |
+| `--output <path>` | Write report or script output to `<path>` instead of `stdout` |
+| `--script <file.lua>` | Execute a sandboxed Lua 5.4 script (`peelf.*` API) against `<binary_or_dump>` in **read-only dry-run mode by default** |
+| `--script-allow-mutations` | Explicitly permit `--script` to stage and `peelf.commit()` byte patches and workspace annotations on static binaries |
+| `--output-binary <path>` | Write committed `--script` byte patches to `<path>` (requires `--script-allow-mutations` and `peelf.commit()`; never overwrites input by default) |
+| `--project <workspace.peproj>` | Load existing `.peproj` v2 annotations before `--script` runs and persist committed labels/comments/bookmarks + patch metadata on success |
+| `--script-max-instructions <N>` | Override `ScriptLimits::max_instructions` quota for `--script` (default `2000000`) |
+| `--script-timeout-ms <ms>` | Override wall-clock execution timeout in milliseconds for `--script` (default `5000`) |
 | `--search-root <dir>` | Repeatable sysroot / staging directory prefix for resolving `DT_NEEDED` / DLL dependencies |
 | `--include-strings` | Extract and embed printable ASCII/UTF-8/UTF-16 strings in the JSON report |
 | `--min-string-len <N>` | Minimum character length for `--include-strings` (default `4`) |
@@ -522,8 +579,8 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | `-h`, `--help` | Print CLI usage and exit `0` |
 
 **Exit Codes**:
-- **`0`** — Analysis succeeded and `--fail-on` policy passed.
-- **`1`** — Invalid CLI arguments, unreadable file, or malformed/unrecognized input.
+- **`0`** — Analysis or `--script` succeeded and `--fail-on` policy passed.
+- **`1`** — Invalid CLI arguments, unreadable/malformed input, or Lua `--script` syntax/runtime/quota/mutation-permission failure.
 - **`2`** — Analysis succeeded, but one or more findings violated `--fail-on error` or `--fail-on warning`.
 
 ### 14.2 Common Headless Recipes
@@ -534,17 +591,25 @@ peelf_viewer --headless ./build/my_service \
   --search-root /opt/my_service/lib \
   --format json --output audit.json --fail-on error
 
-# 2. Generate OASIS SARIF 2.1.0 for GitHub Code Scanning security tab
-peelf_viewer --headless ./build/my_service \
-  --format sarif --output results.sarif --fail-on error
+# 2. Audit a specific Universal Mach-O slice & emit OASIS SARIF 2.1.0 for GitHub Code Scanning
+peelf_viewer --headless ./macos/MyApp.app/Contents/MacOS/MyApp \
+  --slice arm64 --format sarif --output results.sarif --fail-on error
 
 # 3. Automated release-vs-previous binary comparison in CI
 peelf_viewer --headless ./release/v1.1/app.exe \
   --compare ./release/v1.0/app.exe \
   --format json --output diff_v1.0_v1.1.json
 
-# 4. Headless post-mortem crash-dump summary (JSON threads, faulting IP, modules)
-peelf_viewer --headless ./crashes/service.core --format json
+# 4. Read-only batch Lua 5.4 inspection script emitting structured JSON
+peelf_viewer --headless ./build/my_service \
+  --script ./scripts/audit_rwx_and_exports.lua --format json
+
+# 5. Transactional headless Lua patching + .peproj annotation update
+peelf_viewer --headless ./firmware.elf \
+  --script ./scripts/patch_and_label.lua \
+  --script-allow-mutations \
+  --output-binary ./firmware.patched.elf \
+  --project ./firmware.peproj --format json
 ```
 
 ### 14.3 GitHub Actions Workflow Example (Upload SARIF to GitHub Security)

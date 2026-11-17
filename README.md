@@ -1,11 +1,11 @@
 # PE / ELF Explorer (C++23)
 
 A cross-platform executable, shared-library, crash-dump, and live-process analysis suite:
-- **Core parsing & runtime library (`peelf_core`)**: Unified `IBinaryImage` spine (`viewer::PeParser` retired in `473ee3f`) covering PE32/PE32+ (ordinals, forwarders, delay-load/bound imports, `.pdata`/`.xdata` unwind, MSF 7.00 RSDS GUID+Age PDB verification, Authenticode `WinVerifyTrust` & structural checks, LoadConfig/GuardCF, TLS, resources, CLR) and ELF32/ELF64 LE/BE across 10 CPU variants (including `SHN_XINDEX`/`PN_XNUM` extended numbering and static sectionless `PT_DYNAMIC` recovery), DWARF v2–v5 + `.gnu_debuglink`/`.note.gnu.build-id` sidecars, Itanium/Rust/MSVC demangling, dependency DAG resolution, relocation-tolerant binary & disk-vs-live-RAM diffing, formalized BinSkim/checksec security rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`), offline Windows `.dmp` Minidump & Linux `ET_CORE` crash dumps, strictly read-only `IProcessSession` (`/proc/<pid>/smaps` & `QueryWorkingSetEx`), and opt-in BSD-2-Clause `IDebugSession` (`ptrace` & Win32 Debug API)
-- **Vulkan-free CLI launcher & dynamically loaded GUI (`peelf_viewer` + `peelf_gui`)**: `peelf_viewer` links only `peelf_core` for zero-GUI `--headless` JSON/SARIF 2.1.0 CI automation and dynamically loads `peelf_gui` (Vulkan 2-frames-in-flight `VulkanManager` + GLFW + Dear ImGui docking) for interactive reverse engineering across `Structure`, `Details`, `Hex View`, `Disassembly`, `Flow Graph`, `Decompile`, `References & Notes`, `Strings`, `Structure View`, `Dependencies`, `Binary Diff`, VMMap `Memory Map`, `Process Internals`, `Threads & Stack`, `Thread Locals`, `Memory Search`, `PEB / TEB & Flags`, `Handlers`, and opt-in `Debugger`
-- **Analysis & patching integrations**: Capstone multi-arch disassembly, resumable background `ReferenceIndex` & jump-table/indirect-branch recovery, Graphviz CFG/call-graph layout, `AsmTK` (in-process x86/x86_64) + `llvm-mc` (multi-arch) assembly-to-bytes providers, transactional `PagedBinaryImage` & `.pepatch.json` patch bundles, `.peproj` v2 `SHA-256` sessions with crash-recovery journals, and `DecompileCache` + persistent LRU-reusable headless Ghidra / Structured Pseudo-C / RetDec / Binary Ninja decompilation
+- **Core parsing & runtime library (`peelf_core`)**: Unified `IBinaryImage` spine (`viewer::PeParser` retired in `473ee3f`) covering PE32/PE32+ (ordinals, forwarders, delay-load/bound imports, `.pdata`/`.xdata` unwind, MSF 7.00 RSDS GUID+Age PDB verification, Authenticode `WinVerifyTrust` & structural checks, LoadConfig/GuardCF, TLS, resources/manifest/version, CLR), ELF32/ELF64 LE/BE across 10 CPU variants (including `SHN_XINDEX`/`PN_XNUM` extended numbering and static sectionless `PT_DYNAMIC` recovery), and cross-endian **Mach-O** (`MH_MAGIC`/`MH_MAGIC_64`/`MH_CIGAM`/`MH_CIGAM_64` + Universal `FAT_MAGIC`/`FAT_CIGAM_64`, `LC_DYLD_EXPORTS_TRIE`, `LC_DYLD_CHAINED_FIXUPS`, structural `LC_CODE_SIGNATURE`, `@executable_path`/`@loader_path`/`@rpath` & dyld shared-cache resolution); first-class `TargetCapabilityMatrix` & `Observed<T>` provenance (`WU-21`); static & observed runtime `ExecutableSettings` (`WU-22`); timestamped `ProcessStateSnapshot`, `SnapshotDiff`, and multi-thread `ExecutionTimeline` (`WU-23`, `WU-24`); DWARF v2–v5 + `.gnu_debuglink`/`.note.gnu.build-id` sidecars; Itanium/Rust/MSVC demangling; relocation-tolerant binary & disk-vs-live-RAM diffing; formalized BinSkim/checksec security rules (`PE1001..PE1008`, `ELF2001..ELF2008`, `LIVE3001..LIVE3003`, `MACHO4001..MACHO4006`); offline Windows `.dmp` Minidump & Linux `ET_CORE` crash dumps; strictly read-only `IProcessSession` (`/proc/<pid>/smaps`, `QueryWorkingSetEx`, and **GDB Remote / QEMU RSP** `GdbRemoteBackend::open_read_only`); opt-in BSD-2-Clause `IDebugSession` (`ptrace`, Win32 Debug API, and `GdbRemoteBackend::open_debug`); and embedded MIT **Lua 5.4** transactional scripting (`LuaScriptingEngine`)
+- **Vulkan-free CLI launcher & dynamically loaded GUI (`peelf_viewer` + `peelf_gui`)**: `peelf_viewer` links only `peelf_core` for zero-GUI `--headless` JSON/SARIF 2.1.0 CI automation and `--headless --script <file.lua>` batch scripting, and dynamically loads `peelf_gui` (Vulkan 2-frames-in-flight `VulkanManager` + GLFW + Dear ImGui docking with 5 `DockNodeSpec` `View > Workspaces` presets and universal capability-aware entity context menus) across 36 dockable panels including `Structure`, `Details`, `Hex View`, `Disassembly`, `Flow Graph`, `Decompile`, `References & Notes`, `Strings`, `Structure View`, `Dependencies`, `Executable & Settings`, `Target Capabilities`, `Binary Diff`, `Scripting`, VMMap `Memory Map`, `Process Internals`, `Threads & Stack`, `Execution Timeline`, `Thread Locals`, `Memory Search`, `PEB / TEB & Flags`, `Handlers`, and opt-in `Debugger`
+- **Analysis & patching integrations**: Capstone multi-arch disassembly, resumable background `ReferenceIndex` & jump-table/indirect-branch recovery, Graphviz CFG/call-graph layout, `AsmTK` (in-process x86/x86_64) + `llvm-mc` (multi-arch) assembly-to-bytes providers, transactional `PagedBinaryImage` & `.pepatch.json` patch bundles, sandboxed Lua 5.4 `peelf.*` scripting with `ScriptLimits` quotas and explicit `peelf.commit()` / dry-run rollback, `.peproj` v2 `SHA-256` sessions with crash-recovery journals, and `DecompileCache` + persistent LRU-reusable headless Ghidra / Structured Pseudo-C / RetDec / Binary Ninja decompilation
 
-> **Status**: Phase 0 (`P0-1..P0-10`) and Work Units `WU-01..WU-18` are complete with **326/326 CTests passing** under `-Werror` (Clang 18 Debug/Release + `clang18-asan-ubsan` AddressSanitizer/UBSan + `malformed_inputs_matrix_test`) and `/W4 /WX /FS` (MSVC 2022 Debug/Release), gated continuously by [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+> **Status**: Phase 0 (`P0-1..P0-10`), Wave 1 (`WU-19a..WU-19d`), and Next-Gen Work Units `WU-01..WU-28` are complete with **449/449 CTests passing** under `-Werror` (Clang 18 Debug/Release + `clang18-asan-ubsan` AddressSanitizer/UBSan + `malformed_inputs_matrix_test`) and `/W4 /WX /FS` (MSVC 2022 Debug/Release), gated continuously by [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
 ## Documentation
 
@@ -42,9 +42,12 @@ Original captures are stored in [`docs/screenshots`](docs/screenshots).
 
 The executable is a small launcher. It loads the optional `peelf_gui` module only
 for interactive use. `peelf_viewer --headless` with no arguments exits `0` without
-loading graphics dependencies, while `peelf_viewer --headless <binary|dump> [--slice <index|arch>] [--format json|sarif] [--compare <other>] [--fail-on none|error|warning]`
-exports structured metadata, dependencies, symbols, security findings (`PE1001..PE1008`,
-`ELF2001..ELF2008`, `MACHO4001..MACHO4006`), crash-dump summaries, and binary diffs for CI pipelines.
+loading graphics dependencies, while `peelf_viewer --headless <binary|dump> [--slice <index|arch>] [--format json|sarif|text] [--compare <other>] [--fail-on none|error|warning]`
+exports structured metadata, `TargetCapabilityMatrix` & `Observed<T>` provenance, `ExecutableSettings`,
+dependencies, symbols, security findings (`PE1001..PE1008`, `ELF2001..ELF2008`, `MACHO4001..MACHO4006`),
+crash-dump summaries, and binary diffs for CI pipelines. Passing `--script <file.lua>` runs sandboxed
+Lua 5.4 scripts headlessly (read-only dry-run by default; opt-in writes to `--output-binary <out>` and/or
+`--project <workspace.peproj>` when `--script-allow-mutations` is specified and `peelf.commit()` is called).
 Configure with `-DPEELF_BUILD_GUI=OFF` to build the launcher without Vulkan, GLFW,
 ImGui, or native file dialogs.
 
@@ -116,6 +119,7 @@ the following the first time you configure:
 | Dear ImGui | `docking` branch |
 | nativefiledialog-extended | 1.2.1 |
 | Capstone | 5.0.6 |
+| Lua | 5.4.7 (MIT, embedded C VM without `io`/`os`/`debug`/`package`) |
 | AsmJit + AsmTK | pinned commits, optional assembly provider dependency |
 | Graphviz | 13.0.0, optional source fetch |
 
@@ -152,7 +156,7 @@ To run the viewer directly:
 ### Linux: Clang 18 + Ninja (Debug, Release, & ASan+UBSan)
 
 ```bash
-# Debug (326/326 CTests)
+# Debug (449/449 CTests)
 cmake --preset clang18-debug
 cmake --build --preset clang18-debug
 ctest --test-dir out/build/clang18-debug --output-on-failure

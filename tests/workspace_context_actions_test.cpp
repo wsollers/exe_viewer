@@ -61,7 +61,9 @@ TEST(WorkspaceLayoutTest, AllFivePresetsPassStructuralValidationAndCopyMoveClean
     }
 }
 
-TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll35Panels) {
+TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll36Panels) {
+    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 9u);
+    EXPECT_EQ(kWorkspacePanelCount, 36u);
     const std::span<const WorkspacePanelId> panels = all_workspace_panels();
     EXPECT_EQ(panels.size(), kWorkspacePanelCount);
 
@@ -88,6 +90,7 @@ TEST(WorkspaceLayoutTest, PresetsCoverExpectedDomainPanels) {
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::HexView));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::StructureView));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::TargetCapabilities));
+        EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::Scripting));
     }
     {
         const WorkspacePresetSpec live =

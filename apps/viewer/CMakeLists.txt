@@ -13,7 +13,12 @@ if(TARGET vulkan)
   message(STATUS "vulkan exists")
 endif()
 
-add_executable(peelf_viewer src/launcher.cpp)
+add_executable(peelf_viewer
+  src/launcher.cpp
+  src/headless_cli.hpp
+  src/headless_cli.cpp
+)
+target_include_directories(peelf_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(WIN32)
   enable_language(RC)
   target_sources(peelf_viewer PRIVATE resources/branding.rc)
@@ -97,6 +102,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_settings_overview.cpp
         src/ui/ui_panels_timeline.hpp
         src/ui/ui_panels_timeline.cpp
+        src/ui/ui_panels_scripting.hpp
+        src/ui/ui_panels_scripting.cpp
         src/analysis/async_binary_diff.hpp
         src/analysis/async_binary_diff.cpp
         src/analysis/function_index.hpp

@@ -27,6 +27,7 @@
 #include "ui_panels_capabilities.hpp"
 #include "ui_panels_settings_overview.hpp"
 #include "ui_panels_timeline.hpp"
+#include "ui_panels_scripting.hpp"
 #include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
@@ -202,6 +203,7 @@ namespace viewer {
         CapabilityMatrixPanel capabilities_panel_;
         ExecutableSettingsPanel executable_settings_panel_;
         ExecutionTimelinePanel timeline_panel_;
+        ScriptingPanel  scripting_panel_;
         LogPanel        log_panel_;
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;

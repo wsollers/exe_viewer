@@ -14,7 +14,7 @@
 
 namespace viewer {
 
-inline constexpr std::uint32_t kWorkspaceLayoutSchemaVersion = 8u;
+inline constexpr std::uint32_t kWorkspaceLayoutSchemaVersion = 9u;
 inline constexpr float kMinDockSplitRatio = 0.05f;
 inline constexpr float kMaxDockSplitRatio = 0.95f;
 
@@ -69,6 +69,7 @@ enum class WorkspacePanelId : std::uint8_t {
     HexView,
     PatchSet,
     Shellcode,
+    Scripting,
     Imports,
     Exports,
     Symbols,
@@ -98,7 +99,7 @@ enum class WorkspacePanelId : std::uint8_t {
     Log,
 };
 
-inline constexpr std::size_t kWorkspacePanelCount = 35u;
+inline constexpr std::size_t kWorkspacePanelCount = 36u;
 
 [[nodiscard]] std::span<const WorkspacePanelId> all_workspace_panels() noexcept;
 [[nodiscard]] std::string_view workspace_panel_window_name(WorkspacePanelId panel) noexcept;

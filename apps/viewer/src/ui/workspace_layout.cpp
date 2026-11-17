@@ -20,6 +20,7 @@ constexpr std::array<WorkspacePanelId, kWorkspacePanelCount> kAllPanels{{
     WorkspacePanelId::HexView,
     WorkspacePanelId::PatchSet,
     WorkspacePanelId::Shellcode,
+    WorkspacePanelId::Scripting,
     WorkspacePanelId::Imports,
     WorkspacePanelId::Exports,
     WorkspacePanelId::Symbols,
@@ -189,6 +190,7 @@ std::string_view workspace_panel_window_name(WorkspacePanelId panel) noexcept {
         case WorkspacePanelId::HexView:            return "Hex View";
         case WorkspacePanelId::PatchSet:           return "Patch Set";
         case WorkspacePanelId::Shellcode:          return "Shellcode";
+        case WorkspacePanelId::Scripting:          return "Scripting";
         case WorkspacePanelId::Imports:            return "Imports";
         case WorkspacePanelId::Exports:            return "Exports";
         case WorkspacePanelId::Symbols:            return "Functions & Names";
@@ -290,7 +292,7 @@ WorkspacePresetSpec build_workspace_preset(WorkspacePreset preset) {
                 {P::Disassembly, P::FlowGraph, P::Decompiler},
                 P::Disassembly);
             auto center_bottom = DockNodeSpec::make_leaf(
-                {P::HexView, P::ReferencesAndNotes, P::Strings, P::PatchSet, P::Shellcode, P::MemorySearch},
+                {P::HexView, P::ReferencesAndNotes, P::Strings, P::PatchSet, P::Shellcode, P::Scripting, P::MemorySearch},
                 P::HexView);
             auto right = DockNodeSpec::make_leaf(
                 {P::Details, P::FileInfo, P::ExecutableSettings, P::TargetCapabilities,

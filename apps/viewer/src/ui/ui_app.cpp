@@ -118,6 +118,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
                   }
               });
           })
+    , scripting_panel_(model, annotations_, pending_navigations_)
     , log_panel_()
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
@@ -132,6 +133,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     capabilities_panel_.set_visible(false);
     executable_settings_panel_.set_visible(false);
     timeline_panel_.set_visible(false);
+    scripting_panel_.set_visible(false);
     dependencies_panel_.set_visible(false);
     initialize_decompiler();
     recent_binaries_path_ = decompiler_directory_ / "recent_binaries.ini";
@@ -586,6 +588,48 @@ UiApp::~UiApp() {
 }
 
 void UiApp::render() {
+    if (const auto harvested = model_.harvest_script_execution(); harvested.has_value()) {
+        if (harvested->status == AsyncScriptStatus::Succeeded &&
+            harvested->script_result.ok &&
+            harvested->script_result.committed &&
+            harvested->mutations_applied_to_model) {
+            const auto& staged = harvested->script_result.staged_summary;
+            bool notes_updated = false;
+            for (const auto& [va, maybe_label] : staged.staged_labels) {
+                const Annotation* existing = annotations_.find(va);
+                std::string comment = existing != nullptr ? existing->comment : std::string{};
+                annotations_.set(va, maybe_label.value_or(std::string{}), std::move(comment));
+                notes_updated = true;
+            }
+            for (const auto& [va, maybe_comment] : staged.staged_comments) {
+                const Annotation* existing = annotations_.find(va);
+                std::string name = existing != nullptr ? existing->name : std::string{};
+                annotations_.set(va, std::move(name), maybe_comment.value_or(std::string{}));
+                notes_updated = true;
+            }
+            if (notes_updated) {
+                ++symbol_revision_;
+            }
+            if (!staged.staged_patches.empty()) {
+                strings_dirty_ = true;
+                references_dirty_ = true;
+                refresh_disassembly();
+            }
+            Log().info("Lua script committed ({} patch(es), {} label(s), {} comment(s), {} bookmark(s))",
+                       staged.staged_patches.size(),
+                       staged.staged_labels.size(),
+                       staged.staged_comments.size(),
+                       staged.staged_bookmarks.size());
+        } else if (harvested->status == AsyncScriptStatus::StaleDiscarded) {
+            Log().warn("Lua script result discarded: {}", harvested->apply_diagnostic);
+        } else if (harvested->status == AsyncScriptStatus::Failed) {
+            Log().error("Lua script failed [{}]: {}",
+                        peelf::to_string(harvested->script_result.error_kind),
+                        !harvested->apply_diagnostic.empty()
+                            ? harvested->apply_diagnostic
+                            : harvested->script_result.error_message);
+        }
+    }
     if (const auto stop_ip = model_.sync_debugger_stop_state(); stop_ip.has_value()) {
         sync_live_process_view(false);
         navigate_to_address(*stop_ip, PreferredView::Disassembly);
@@ -763,6 +807,7 @@ void UiApp::render() {
     capabilities_panel_.draw();
     executable_settings_panel_.draw();
     timeline_panel_.draw();
+    scripting_panel_.draw();
     if (show_decompiler_) render_decompiler();
     if (focus_references_) {
         activate_panel(references_panel_.name().c_str());

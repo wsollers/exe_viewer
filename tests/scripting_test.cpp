@@ -1,10 +1,14 @@
 #include "peelf/scripting.hpp"
 
+#include "analysis/project.hpp"
+#include "headless_cli.hpp"
+#include "model/binary_model.hpp"
 #include "peelf/binary_image.hpp"
 #include "peelf/capability_matrix.hpp"
 #include "peelf/macho_image.hpp"
 #include "peelf/patching.hpp"
 #include "peelf/process.hpp"
+#include "peelf/subprocess.hpp"
 
 #include <gtest/gtest.h>
 
@@ -909,3 +913,486 @@ TEST(ScriptingTest, RejectsMutationsOnReadOnlyTargetsAndUnmappedAddresses) {
         EXPECT_FALSE(fixture.paged.dirty());
     }
 }
+
+namespace {
+
+class TempDirGuard {
+public:
+    TempDirGuard() {
+        static std::atomic<std::uint64_t> seq{0u};
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        const std::string test_name = info != nullptr ? info->name() : "wu28b";
+        const auto nonce = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        dir_ = std::filesystem::temp_directory_path() /
+               std::filesystem::path(std::format(
+                   "peelf_wu28b_{}_{}_{}",
+                   test_name,
+                   nonce,
+                   seq.fetch_add(1u, std::memory_order_relaxed)));
+        std::filesystem::create_directories(dir_);
+    }
+
+    TempDirGuard(const TempDirGuard&) = delete;
+    TempDirGuard& operator=(const TempDirGuard&) = delete;
+    TempDirGuard(TempDirGuard&&) = delete;
+    TempDirGuard& operator=(TempDirGuard&&) = delete;
+
+    ~TempDirGuard() noexcept {
+        std::error_code ec{};
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return dir_; }
+
+    [[nodiscard]] std::filesystem::path write_text(std::string_view filename,
+                                                   std::string_view contents) const {
+        const std::filesystem::path p = dir_ / filename;
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+        return p;
+    }
+
+    [[nodiscard]] std::filesystem::path write_bytes(std::string_view filename,
+                                                    std::span<const std::uint8_t> bytes) const {
+        const std::filesystem::path p = dir_ / filename;
+        std::ofstream out(p, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+        return p;
+    }
+
+private:
+    std::filesystem::path dir_{};
+};
+
+[[nodiscard]] std::vector<std::uint8_t> make_synthetic_arm64_macho() {
+    using namespace peelf::macho;
+    MachOByteWriter w;
+
+    // mach_header_64 (32 bytes)
+    w.u32(kMhMagic64);
+    w.u32(kCpuTypeArm64);
+    w.u32(kCpuSubtypeArm64All);
+    w.u32(kMhExecute);
+    w.u32(2u);
+    w.u32(72u + 80u + 24u);
+    w.u32(kMhPie | kMhTwoLevel);
+    w.u32(0u);
+
+    // 1. LC_SEGMENT_64 __TEXT with __text @ 0x100000400 (file offset 0x400)
+    w.u32(kLcSegment64);
+    w.u32(72u + 80u);
+    w.fixed_str16("__TEXT");
+    w.u64(0x100000000ULL);
+    w.u64(0x1000ULL);
+    w.u64(0u);
+    w.u64(0x800ULL);
+    w.u32(kVmProtRead | kVmProtExecute);
+    w.u32(kVmProtRead | kVmProtExecute);
+    w.u32(1u);
+    w.u32(0u);
+
+    w.fixed_str16("__text");
+    w.fixed_str16("__TEXT");
+    w.u64(0x100000400ULL);
+    w.u64(8u);
+    w.u32(0x400u);
+    w.u32(2u);
+    w.u32(0u);
+    w.u32(0u);
+    w.u32(kSAttrPureInstructions | kSRegular);
+    w.u32(0u);
+    w.u32(0u);
+    w.u32(0u);
+
+    // 2. LC_MAIN -> entryoff 0x400
+    w.u32(kLcMain);
+    w.u32(24u);
+    w.u64(0x400ULL);
+    w.u64(0ULL);
+
+    w.pad_to(0x400u);
+    // ARM64: mov w0, #7; ret (0x528000E0, 0xD65F03C0)
+    const std::array<std::uint8_t, 8> code{
+        0xE0u, 0x00u, 0x80u, 0x52u, 0xC0u, 0x03u, 0x5Fu, 0xD6u};
+    w.raw(code);
+    w.pad_to(0x800u);
+    return w.bytes();
+}
+
+[[nodiscard]] std::vector<std::uint8_t> make_synthetic_universal_macho() {
+    const std::vector<std::uint8_t> slice0_x86 = make_synthetic_x86_64_macho();
+    const std::vector<std::uint8_t> slice1_arm = make_synthetic_arm64_macho();
+
+    auto append_be32 = [](std::vector<std::uint8_t>& out, std::uint32_t v) {
+        out.push_back(static_cast<std::uint8_t>((v >> 24u) & 0xFFu));
+        out.push_back(static_cast<std::uint8_t>((v >> 16u) & 0xFFu));
+        out.push_back(static_cast<std::uint8_t>((v >> 8u) & 0xFFu));
+        out.push_back(static_cast<std::uint8_t>(v & 0xFFu));
+    };
+
+    std::vector<std::uint8_t> fat{};
+    append_be32(fat, peelf::macho::kFatMagic);
+    append_be32(fat, 2u);
+
+    // Slice 0: x86_64 @ 0x1000
+    append_be32(fat, peelf::macho::kCpuTypeX86_64);
+    append_be32(fat, peelf::macho::kCpuSubtypeX86_64All);
+    append_be32(fat, 0x1000u);
+    append_be32(fat, static_cast<std::uint32_t>(slice0_x86.size()));
+    append_be32(fat, 12u);
+
+    // Slice 1: arm64 @ 0x4000
+    append_be32(fat, peelf::macho::kCpuTypeArm64);
+    append_be32(fat, peelf::macho::kCpuSubtypeArm64All);
+    append_be32(fat, 0x4000u);
+    append_be32(fat, static_cast<std::uint32_t>(slice1_arm.size()));
+    append_be32(fat, 12u);
+
+    fat.resize(0x1000u, 0u);
+    fat.insert(fat.end(), slice0_x86.begin(), slice0_x86.end());
+    fat.resize(0x4000u, 0u);
+    fat.insert(fat.end(), slice1_arm.begin(), slice1_arm.end());
+    return fat;
+}
+
+[[nodiscard]] std::optional<viewer::AsyncScriptOutcome> wait_for_script_harvest(
+    viewer::BinaryModel& model,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds{4000}) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (auto harvested = model.harvest_script_execution(); harvested.has_value()) {
+            return harvested;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    return std::nullopt;
+}
+
+#if defined(PEELF_VIEWER_EXECUTABLE_PATH)
+[[nodiscard]] peelf::SubprocessResult run_viewer_cli_subprocess(
+    std::span<const std::string> args) {
+    return peelf::run_subprocess_bounded(
+        std::filesystem::path{PEELF_VIEWER_EXECUTABLE_PATH}, args);
+}
+#endif
+
+} // namespace
+
+TEST(ScriptingTest, BinaryModelAsyncScriptHarvestsCommittedMutationsAndHonorsDryRun) {
+    const TempDirGuard tmp{};
+    const std::filesystem::path bin_path =
+        tmp.write_bytes("target.macho", make_synthetic_x86_64_macho());
+
+    viewer::BinaryModel model{};
+    ASSERT_TRUE(model.load_file(bin_path.string()));
+    const auto eligibility = model.script_mutation_eligibility();
+    EXPECT_TRUE(eligibility.can_mutate_target) << eligibility.reason;
+
+    // 1. Dry-run script stages mutations without calling peelf.commit(): UI model stays clean.
+    {
+        peelf::ProjectWorkspace seed_ws{};
+        seed_ws.set_label(0x100000C00ULL, "seed_entry");
+
+        constexpr std::string_view kDryRun = R"lua(
+            local entry = peelf.target_info().entry_point
+            assert(peelf.get_label(entry) == "seed_entry")
+            peelf.stage_patch(entry, "\x90\x90\xc3")
+            peelf.set_label(entry, "dry_run_label")
+            peelf.add_bookmark(entry, "DryRunBM")
+            print("dry-run complete")
+        )lua";
+
+        auto started = model.start_script_execution(
+            std::string{kDryRun}, peelf::ScriptLimits{}, /*request_allow_mutations=*/true, std::move(seed_ws));
+        ASSERT_TRUE(started.has_value()) << started.error().message;
+
+        const auto outcome = wait_for_script_harvest(model);
+        ASSERT_TRUE(outcome.has_value());
+        EXPECT_EQ(outcome->status, viewer::AsyncScriptStatus::Succeeded);
+        EXPECT_TRUE(outcome->script_result.ok) << outcome->script_result.error_message;
+        EXPECT_FALSE(outcome->script_result.committed);
+        EXPECT_FALSE(outcome->mutations_applied_to_model);
+        EXPECT_TRUE(model.changed_intervals().empty());
+        EXPECT_TRUE(model.bookmarks().empty());
+    }
+
+    // 2. Explicit peelf.commit() safely harvests patches & bookmarks onto BinaryModel on UI thread.
+    {
+        constexpr std::string_view kCommit = R"lua(
+            local entry = peelf.target_info().entry_point
+            peelf.stage_patch(entry, "\x31\xc0\xc3")
+            peelf.set_label(entry, "ui_committed_entry")
+            peelf.set_comment(entry, "patched from async worker")
+            peelf.add_bookmark(entry, "AsyncScriptBookmark")
+            assert(peelf.commit() == true)
+            print("committed ok")
+        )lua";
+
+        auto started = model.start_script_execution(
+            std::string{kCommit}, peelf::ScriptLimits{}, /*request_allow_mutations=*/true);
+        ASSERT_TRUE(started.has_value()) << started.error().message;
+
+        const auto outcome = wait_for_script_harvest(model);
+        ASSERT_TRUE(outcome.has_value());
+        EXPECT_EQ(outcome->status, viewer::AsyncScriptStatus::Succeeded);
+        EXPECT_TRUE(outcome->script_result.ok) << outcome->script_result.error_message;
+        EXPECT_TRUE(outcome->script_result.committed);
+        EXPECT_TRUE(outcome->mutations_applied_to_model) << outcome->apply_diagnostic;
+
+        EXPECT_EQ(model.changed_intervals().size(), 1u);
+        const auto patched_bytes = model.read_effective_bytes(0xC00u, 3u);
+        ASSERT_TRUE(patched_bytes.has_value());
+        EXPECT_EQ(*patched_bytes, (std::vector<std::uint8_t>{0x31u, 0xC0u, 0xC3u}));
+
+        ASSERT_EQ(model.bookmarks().size(), 1u);
+        EXPECT_EQ(model.bookmarks()[0].address, 0x100000C00ULL);
+        EXPECT_EQ(model.bookmarks()[0].label, "AsyncScriptBookmark");
+
+        // Undo reverts the harvested Lua commit cleanly in one step.
+        ASSERT_TRUE(model.undo_patch().has_value());
+        EXPECT_TRUE(model.changed_intervals().empty());
+    }
+}
+
+TEST(ScriptingTest, BinaryModelAsyncScriptSupportsCancellationAndReloadCleanup) {
+    const TempDirGuard tmp{};
+    const std::filesystem::path bin_path =
+        tmp.write_bytes("target.macho", make_synthetic_x86_64_macho());
+    const std::filesystem::path bin_path_2 =
+        tmp.write_bytes("target2.macho", make_synthetic_arm64_macho());
+
+    viewer::BinaryModel model{};
+    ASSERT_TRUE(model.load_file(bin_path.string()));
+
+    peelf::ScriptLimits generous_limits{};
+    generous_limits.max_instructions = 500'000'000ULL;
+    generous_limits.wall_clock_timeout = std::chrono::milliseconds{10000};
+
+    auto started = model.start_script_execution(
+        "local n = 0; while true do n = n + 1 end",
+        generous_limits,
+        /*request_allow_mutations=*/false);
+    ASSERT_TRUE(started.has_value()) << started.error().message;
+
+    // Give worker a moment to enter Lua VM, then cooperatively cancel via stop_source.
+    std::this_thread::sleep_for(std::chrono::milliseconds{15});
+    model.cancel_script_execution();
+
+    const auto cancelled = wait_for_script_harvest(model);
+    ASSERT_TRUE(cancelled.has_value());
+    EXPECT_EQ(cancelled->status, viewer::AsyncScriptStatus::Cancelled);
+    EXPECT_FALSE(cancelled->script_result.ok);
+    EXPECT_EQ(cancelled->script_result.error_kind, peelf::ScriptErrorKind::Cancelled);
+
+    // Concurrent UI edit while script is running invalidates expected_stamp -> StaleDiscarded.
+    {
+        ASSERT_TRUE(model.start_script_execution(
+                        "local entry = peelf.target_info().entry_point\n"
+                        "peelf.stage_patch(entry, '\\x90\\x90')\n"
+                        "peelf.commit()\n",
+                        generous_limits,
+                        /*request_allow_mutations=*/true)
+                        .has_value());
+        const std::array<std::uint8_t, 1> manual_patch{0xCCu};
+        ASSERT_TRUE(model.apply_patch_bytes(0xC04u, manual_patch, "Concurrent UI edit").has_value());
+
+        const auto stale = wait_for_script_harvest(model);
+        ASSERT_TRUE(stale.has_value());
+        EXPECT_EQ(stale->status, viewer::AsyncScriptStatus::StaleDiscarded);
+        EXPECT_FALSE(stale->mutations_applied_to_model);
+        // Only the manual UI edit at 0xC04 remains; script's 0xC00 patch was discarded.
+        ASSERT_EQ(model.changed_intervals().size(), 1u);
+        EXPECT_EQ(model.changed_intervals()[0].offset, 0xC04u);
+    }
+
+    // Reloading a new target while another script is running cleanly stops & resets state.
+    ASSERT_TRUE(model.start_script_execution(
+                    "local n = 0; while true do n = n + 1 end",
+                    generous_limits,
+                    /*request_allow_mutations=*/false)
+                    .has_value());
+    ASSERT_TRUE(model.load_file(bin_path_2.string()));
+    EXPECT_FALSE(model.is_script_running());
+    EXPECT_FALSE(model.harvest_script_execution().has_value());
+}
+
+#if defined(PEELF_VIEWER_EXECUTABLE_PATH)
+TEST(ScriptingTest, HeadlessCliScriptSupportsTextJsonSlicesAndQuotaExitCodes) {
+    const std::filesystem::path viewer_exe{PEELF_VIEWER_EXECUTABLE_PATH};
+    ASSERT_TRUE(std::filesystem::exists(viewer_exe))
+        << "Expected built peelf_viewer at " << viewer_exe.string();
+
+    const TempDirGuard tmp{};
+    const std::filesystem::path macho_bin =
+        tmp.write_bytes("sample.macho", make_synthetic_x86_64_macho());
+    const std::filesystem::path fat_bin =
+        tmp.write_bytes("universal.macho", make_synthetic_universal_macho());
+
+    const std::filesystem::path inspect_lua = tmp.write_text(
+        "inspect.lua",
+        R"lua(
+            local info = peelf.target_info()
+            print(string.format("ARCH=%s ENTRY=0x%X RO=%s",
+                info.arch, info.entry_point, tostring(info.is_read_only)))
+        )lua");
+
+    // 1. Default text output is read-only and exits 0.
+    {
+        const std::array<std::string, 4> args{
+            "--headless", macho_bin.string(), "--script", inspect_lua.string()};
+        const auto res = run_viewer_cli_subprocess(args);
+        ASSERT_TRUE(res.launched) << res.launch_error;
+        EXPECT_FALSE(res.timed_out);
+        EXPECT_EQ(res.exit_code, 0) << res.stderr_text;
+        EXPECT_NE(res.stdout_text.find("ARCH=x86-64 ENTRY=0x100000C00 RO=true"), std::string::npos);
+        EXPECT_NE(res.stdout_text.find("status=OK mode=read-only"), std::string::npos);
+    }
+
+    // 2. JSON output + Universal Mach-O `--slice arm64` selects slice 1 (ARM64).
+    {
+        const std::array<std::string, 8> args{
+            "--headless", fat_bin.string(),
+            "--slice", "arm64",
+            "--script", inspect_lua.string(),
+            "--format", "json"};
+        const auto res = run_viewer_cli_subprocess(args);
+        ASSERT_TRUE(res.launched) << res.launch_error;
+        EXPECT_FALSE(res.timed_out);
+        EXPECT_EQ(res.exit_code, 0) << res.stderr_text;
+        EXPECT_NE(res.stdout_text.find("\"selected_slice_index\": 1"), std::string::npos);
+        EXPECT_NE(res.stdout_text.find("ARCH=ARM64 ENTRY=0x100000400 RO=true"), std::string::npos);
+        EXPECT_NE(res.stdout_text.find("\"allow_mutations\": false"), std::string::npos);
+    }
+
+    // 3. Attempting mutation without `--script-allow-mutations` fails deterministically (exit 1).
+    {
+        const std::filesystem::path mut_lua = tmp.write_text(
+            "disallow_mut.lua", "peelf.stage_patch(0x100000C00, '\\x90')\n");
+        const std::array<std::string, 6> args{
+            "--headless", macho_bin.string(), "--script", mut_lua.string(), "--format", "json"};
+        const auto res = run_viewer_cli_subprocess(args);
+        ASSERT_TRUE(res.launched) << res.launch_error;
+        EXPECT_EQ(res.exit_code, 1);
+        EXPECT_NE(res.stdout_text.find("\"error_kind\": \"RuntimeError\""), std::string::npos);
+    }
+
+    // 4. Syntax error and instruction quota limit return deterministic non-zero exit code (1).
+    {
+        const std::filesystem::path bad_lua = tmp.write_text("syntax_err.lua", "function broken(\n");
+        const std::array<std::string, 6> bad_args{
+            "--headless", macho_bin.string(), "--script", bad_lua.string(), "--format", "json"};
+        const auto bad_res = run_viewer_cli_subprocess(bad_args);
+        ASSERT_TRUE(bad_res.launched) << bad_res.launch_error;
+        EXPECT_EQ(bad_res.exit_code, 1);
+        EXPECT_NE(bad_res.stdout_text.find("\"error_kind\": \"SyntaxOrLoadError\""),
+                  std::string::npos);
+
+        const std::filesystem::path loop_lua =
+            tmp.write_text("loop.lua", "local x = 0; while true do x = x + 1 end\n");
+        const std::array<std::string, 8> quota_args{
+            "--headless", macho_bin.string(),
+            "--script", loop_lua.string(),
+            "--script-max-instructions", "200",
+            "--format", "json"};
+        const auto quota_res = run_viewer_cli_subprocess(quota_args);
+        ASSERT_TRUE(quota_res.launched) << quota_res.launch_error;
+        EXPECT_FALSE(quota_res.timed_out);
+        EXPECT_EQ(quota_res.exit_code, 1);
+        EXPECT_NE(quota_res.stdout_text.find("\"error_kind\": \"InstructionLimitExceeded\""),
+                  std::string::npos);
+    }
+}
+
+TEST(ScriptingTest, HeadlessCliScriptTransactionalCommitVsDryRunWritesOutputAndProject) {
+    const std::vector<std::uint8_t> orig_bytes = make_synthetic_x86_64_macho();
+    const TempDirGuard tmp{};
+    const std::filesystem::path macho_bin = tmp.write_bytes("orig.macho", orig_bytes);
+    const std::filesystem::path dry_out_bin = tmp.path() / "dry_out.macho";
+    const std::filesystem::path dry_proj = tmp.path() / "dry.peproj";
+
+    // 1. Dry-run with `--script-allow-mutations` (no peelf.commit()) does NOT write outputs.
+    {
+        const std::filesystem::path dry_lua = tmp.write_text(
+            "dry.lua",
+            R"lua(
+                local entry = peelf.target_info().entry_point
+                peelf.stage_patch(entry, "\x90\x90\xc3")
+                peelf.set_label(entry, "dry_label")
+                peelf.add_bookmark(entry, "DryBM")
+            )lua");
+        const std::array<std::string, 11> args{
+            "--headless", macho_bin.string(),
+            "--script", dry_lua.string(),
+            "--script-allow-mutations",
+            "--output-binary", dry_out_bin.string(),
+            "--project", dry_proj.string(),
+            "--format", "json"};
+        const auto res = run_viewer_cli_subprocess(args);
+        ASSERT_TRUE(res.launched) << res.launch_error;
+        EXPECT_EQ(res.exit_code, 0) << res.stderr_text;
+        EXPECT_NE(res.stdout_text.find("\"committed\": false"), std::string::npos);
+        EXPECT_NE(res.stdout_text.find("\"output_binary_written\": false"), std::string::npos);
+        EXPECT_FALSE(std::filesystem::exists(dry_out_bin));
+        EXPECT_FALSE(std::filesystem::exists(dry_proj));
+        EXPECT_EQ(read_all_bytes(macho_bin), orig_bytes);
+    }
+
+    // 2. Transactional commit writes patched binary + PEELF_PROJECT v2 workspace atomically.
+    const std::filesystem::path committed_bin = tmp.path() / "patched.macho";
+    const std::filesystem::path committed_proj = tmp.path() / "workspace.peproj";
+    {
+        const std::filesystem::path commit_lua = tmp.write_text(
+            "commit.lua",
+            R"lua(
+                local entry = peelf.target_info().entry_point
+                peelf.stage_patch(entry, "\x31\xc0\xc3")
+                peelf.set_label(entry, "cli_fast_entry")
+                peelf.set_comment(entry, "committed via headless --script")
+                peelf.add_bookmark(entry, "HeadlessCommitBM")
+                assert(peelf.commit() == true)
+            )lua");
+        const std::array<std::string, 11> args{
+            "--headless", macho_bin.string(),
+            "--script", commit_lua.string(),
+            "--script-allow-mutations",
+            "--output-binary", committed_bin.string(),
+            "--project", committed_proj.string(),
+            "--format", "json"};
+        const auto res = run_viewer_cli_subprocess(args);
+        ASSERT_TRUE(res.launched) << res.launch_error;
+        EXPECT_EQ(res.exit_code, 0) << res.stderr_text;
+        EXPECT_NE(res.stdout_text.find("\"committed\": true"), std::string::npos);
+        EXPECT_NE(res.stdout_text.find("\"output_binary_written\": true"), std::string::npos);
+        EXPECT_NE(res.stdout_text.find("\"project_written\": true"), std::string::npos);
+
+        // Input binary remains untouched; `--output-binary` carries the 3-byte patch @ 0xC00.
+        EXPECT_EQ(read_all_bytes(macho_bin), orig_bytes);
+        const std::vector<std::uint8_t> out_bytes = read_all_bytes(committed_bin);
+        ASSERT_EQ(out_bytes.size(), orig_bytes.size());
+        EXPECT_EQ(out_bytes[0xC00u], 0x31u);
+        EXPECT_EQ(out_bytes[0xC01u], 0xC0u);
+        EXPECT_EQ(out_bytes[0xC02u], 0xC3u);
+
+        // Saved `.peproj` round-trips cleanly through `viewer::decode_project`.
+        const auto proj_text = viewer::read_project_file(committed_proj);
+        ASSERT_TRUE(proj_text.has_value()) << proj_text.error().message;
+        const auto decoded = viewer::decode_project(*proj_text);
+        ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+        ASSERT_EQ(decoded->patches.size(), 1u);
+        EXPECT_EQ(decoded->patches[0].offset, 0xC00u);
+        EXPECT_EQ(decoded->patches[0].patched, (std::vector<std::uint8_t>{0x31u, 0xC0u, 0xC3u}));
+
+        const auto note_it = decoded->annotations.find(0x100000C00ULL);
+        ASSERT_NE(note_it, decoded->annotations.end());
+        EXPECT_EQ(note_it->second.name, "cli_fast_entry");
+        EXPECT_EQ(note_it->second.comment, "committed via headless --script");
+
+        ASSERT_EQ(decoded->bookmarks.size(), 1u);
+        EXPECT_EQ(decoded->bookmarks[0].address, 0x100000C00ULL);
+        EXPECT_EQ(decoded->bookmarks[0].label, "HeadlessCommitBM");
+    }
+}
+#endif
+

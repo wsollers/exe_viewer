@@ -171,6 +171,7 @@ void UiApp::set_workspace_panel_visible(WorkspacePanelId panel, bool visible) no
         case WorkspacePanelId::HexView:            hex_panel_.set_visible(visible); break;
         case WorkspacePanelId::PatchSet:           patch_set_panel_.set_visible(visible); break;
         case WorkspacePanelId::Shellcode:          shellcode_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Scripting:          scripting_panel_.set_visible(visible); break;
         case WorkspacePanelId::Imports:            imports_panel_.set_visible(visible); break;
         case WorkspacePanelId::Exports:            exports_panel_.set_visible(visible); break;
         case WorkspacePanelId::Symbols:            symbols_panel_.set_visible(visible); break;
@@ -211,6 +212,7 @@ bool UiApp::is_workspace_panel_visible(WorkspacePanelId panel) const noexcept {
         case WorkspacePanelId::HexView:            return hex_panel_.visible();
         case WorkspacePanelId::PatchSet:           return patch_set_panel_.visible();
         case WorkspacePanelId::Shellcode:          return shellcode_panel_.visible();
+        case WorkspacePanelId::Scripting:          return scripting_panel_.visible();
         case WorkspacePanelId::Imports:            return imports_panel_.visible();
         case WorkspacePanelId::Exports:            return exports_panel_.visible();
         case WorkspacePanelId::Symbols:            return symbols_panel_.visible();
@@ -401,6 +403,10 @@ void UiApp::render_main_menu() {
         }
         if (ImGui::MenuItem("Patch workspace", nullptr, false, !model_.is_live_process())) patch_set_panel_.set_visible(true);
         if (ImGui::MenuItem("Byte input workspace", nullptr, false, !model_.is_live_process())) shellcode_panel_.set_visible(true);
+        if (ImGui::MenuItem("Scripting console")) {
+            scripting_panel_.set_visible(true);
+            activate_panel(scripting_panel_.name().c_str());
+        }
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Navigate")) {
@@ -622,6 +628,7 @@ void UiApp::render_main_menu() {
         for (UiPanel* extra : {static_cast<UiPanel*>(&capabilities_panel_),
                                static_cast<UiPanel*>(&executable_settings_panel_),
                                static_cast<UiPanel*>(&timeline_panel_),
+                               static_cast<UiPanel*>(&scripting_panel_),
                                static_cast<UiPanel*>(&debugger_panel_),
                                static_cast<UiPanel*>(&binary_diff_panel_),
                                static_cast<UiPanel*>(&dependencies_panel_),
@@ -726,7 +733,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV8");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV9");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     const bool missing_dockspace = (ImGui::DockBuilderGetNode(dockspace_id) == nullptr);

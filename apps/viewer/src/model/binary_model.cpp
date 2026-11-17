@@ -8,10 +8,15 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <exception>
 #include <format>
 #include <fstream>
 #include <limits>
+#include <mutex>
+#include <new>
+#include <thread>
 #include <utility>
 
 namespace viewer {
@@ -38,9 +43,311 @@ using detail::utf8_path;
 
 } // namespace
 
-    BinaryModel::BinaryModel() {
+    class BinaryModel::AsyncScriptRunner {
+    public:
+        struct WorkerLaunchInput {
+            ScriptExecutionStamp expected_stamp{};
+            bool live_target{false};
+            bool remote_gdb_rsp{false};
+            bool allow_mutations_effective{false};
+            std::size_t slice_index{0};
+            std::filesystem::path backing_path{};
+            std::vector<peelf::PatchInterval> prior_patches{};
+            std::vector<std::uint8_t> image_bytes{};
+            std::shared_ptr<peelf::IProcessSession> live_session{};
+            peelf::TargetCapabilityMatrix capabilities{};
+            peelf::ProjectWorkspace workspace{};
+            std::string script_source{};
+            peelf::ScriptLimits limits{};
+            std::string chunk_name{};
+        };
+
+        AsyncScriptRunner() = default;
+        ~AsyncScriptRunner() noexcept {
+            cancel();
+            wait_for_idle();
+        }
+        AsyncScriptRunner(const AsyncScriptRunner&) = delete;
+        AsyncScriptRunner& operator=(const AsyncScriptRunner&) = delete;
+        AsyncScriptRunner(AsyncScriptRunner&&) = delete;
+        AsyncScriptRunner& operator=(AsyncScriptRunner&&) = delete;
+
+        void start(WorkerLaunchInput input) {
+            reset_for_launch(input.expected_stamp, input.allow_mutations_effective);
+
+            struct LaunchRollbackGuard {
+                AsyncScriptRunner* self{nullptr};
+                bool committed{false};
+                explicit LaunchRollbackGuard(AsyncScriptRunner* s) noexcept : self(s) {}
+                LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
+                LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
+                LaunchRollbackGuard(LaunchRollbackGuard&&) = delete;
+                LaunchRollbackGuard& operator=(LaunchRollbackGuard&&) = delete;
+                ~LaunchRollbackGuard() noexcept {
+                    if (!committed && self != nullptr) {
+                        self->rollback_failed_launch();
+                    }
+                }
+            } launch_guard{this};
+
+            worker_ = std::jthread(
+                [this, job = std::move(input)](std::stop_token stop_token) mutable noexcept {
+                    const ScriptExecutionStamp expected_stamp = job.expected_stamp;
+                    const bool allow_mutations_effective = job.allow_mutations_effective;
+                    try {
+                        AsyncScriptOutcome out{};
+                        out.expected_stamp = expected_stamp;
+                        out.allow_mutations_effective = allow_mutations_effective;
+
+                        if (stop_token.stop_requested()) {
+                            out.status = AsyncScriptStatus::Cancelled;
+                            out.script_result.error_kind = peelf::ScriptErrorKind::Cancelled;
+                            out.script_result.error_message = "Lua script execution cancelled";
+                            publish_outcome(std::move(out));
+                            return;
+                        }
+
+                        std::unique_ptr<peelf::IBinaryImage> worker_image{};
+                        if (!job.image_bytes.empty()) {
+                            peelf::BinaryOpenOptions open_opts{};
+                            open_opts.selected_slice_index = job.slice_index;
+                            auto parsed = peelf::open_binary_image(job.image_bytes, open_opts);
+                            if (parsed.has_value()) {
+                                worker_image = std::move(*parsed);
+                            } else if (!job.live_target) {
+                                out.status = AsyncScriptStatus::Failed;
+                                out.script_result.error_kind =
+                                    peelf::ScriptErrorKind::InvalidConfiguration;
+                                out.script_result.error_message = parsed.error().message;
+                                publish_outcome(std::move(out));
+                                return;
+                            }
+                        }
+
+                        std::optional<peelf::PagedBinaryImage> worker_paged_image{};
+                        if (!job.live_target && job.allow_mutations_effective &&
+                            !job.backing_path.empty()) {
+                            auto opened = peelf::PagedBinaryImage::open(job.backing_path);
+                            if (!opened.has_value()) {
+                                out.status = AsyncScriptStatus::Failed;
+                                out.script_result.error_kind =
+                                    peelf::ScriptErrorKind::InvalidConfiguration;
+                                out.script_result.error_message = opened.error().message;
+                                publish_outcome(std::move(out));
+                                return;
+                            }
+                            worker_paged_image = std::move(*opened);
+                            if (!job.prior_patches.empty()) {
+                                auto tx = worker_paged_image->begin_transaction("Seed prior patches");
+                                for (const peelf::PatchInterval& p : job.prior_patches) {
+                                    if (auto wr = tx.write(p.offset, p.patched); !wr.has_value()) {
+                                        out.status = AsyncScriptStatus::Failed;
+                                        out.script_result.error_kind =
+                                            peelf::ScriptErrorKind::InvalidConfiguration;
+                                        out.script_result.error_message = wr.error().message;
+                                        publish_outcome(std::move(out));
+                                        return;
+                                    }
+                                }
+                                if (auto cm = tx.commit(); !cm.has_value()) {
+                                    out.status = AsyncScriptStatus::Failed;
+                                    out.script_result.error_kind =
+                                        peelf::ScriptErrorKind::InvalidConfiguration;
+                                    out.script_result.error_message = cm.error().message;
+                                    publish_outcome(std::move(out));
+                                    return;
+                                }
+                            }
+                        }
+
+                        peelf::ScriptContext ctx{};
+                        ctx.image = worker_image.get();
+                        ctx.raw_bytes = worker_image != nullptr
+                                            ? std::span<const std::uint8_t>(job.image_bytes)
+                                            : std::span<const std::uint8_t>{};
+                        ctx.live_session = job.live_session.get();
+                        ctx.crash_dump = dynamic_cast<peelf::ICrashDumpSession*>(
+                            job.live_session.get());
+                        ctx.paged_image =
+                            worker_paged_image.has_value() ? &*worker_paged_image : nullptr;
+                        ctx.workspace = &job.workspace;
+                        ctx.capabilities = job.capabilities;
+                        ctx.allow_mutations = job.allow_mutations_effective;
+                        ctx.is_read_only = !job.allow_mutations_effective;
+                        ctx.remote_gdb_rsp = job.remote_gdb_rsp;
+
+                        peelf::ScriptExecutionResult exec_res = peelf::execute_lua_script(
+                            job.script_source,
+                            ctx,
+                            job.limits,
+                            stop_token,
+                            job.chunk_name);
+
+                        out.committed_workspace = std::move(job.workspace);
+                        if (exec_res.ok) {
+                            out.status = AsyncScriptStatus::Succeeded;
+                        } else if (exec_res.error_kind == peelf::ScriptErrorKind::Cancelled ||
+                                   stop_token.stop_requested()) {
+                            out.status = AsyncScriptStatus::Cancelled;
+                        } else {
+                            out.status = AsyncScriptStatus::Failed;
+                        }
+                        out.script_result = std::move(exec_res);
+                        publish_outcome(std::move(out));
+                    } catch (const std::bad_alloc&) {
+                        publish_preallocated_failure(/*is_oom=*/true, stop_token.stop_requested());
+                    } catch (const std::exception& e) {
+                        publish_exception_failure(expected_stamp,
+                                                  allow_mutations_effective,
+                                                  e.what(),
+                                                  stop_token.stop_requested());
+                    } catch (...) {
+                        publish_preallocated_failure(/*is_oom=*/false, stop_token.stop_requested());
+                    }
+                });
+            launch_guard.committed = true;
+        }
+
+        void cancel() noexcept {
+            if (worker_.joinable()) {
+                (void)worker_.request_stop();
+            }
+        }
+
+        [[nodiscard]] bool is_running() const noexcept {
+            return running_.load(std::memory_order_acquire);
+        }
+
+        void wait_for_idle() noexcept {
+            if (worker_.joinable()) {
+                worker_.join();
+            }
+        }
+
+        void clear_pending() noexcept {
+            std::scoped_lock lock(mutex_);
+            pending_outcome_.reset();
+        }
+
+        [[nodiscard]] std::optional<AsyncScriptOutcome> poll_completed(
+            ScriptExecutionStamp current_stamp) {
+            if (running_.load(std::memory_order_acquire)) {
+                return std::nullopt;
+            }
+            std::optional<AsyncScriptOutcome> harvested{};
+            {
+                std::scoped_lock lock(mutex_);
+                if (!pending_outcome_.has_value()) {
+                    return std::nullopt;
+                }
+                harvested = std::move(pending_outcome_);
+                pending_outcome_.reset();
+            }
+            if (worker_.joinable()) {
+                worker_.join();
+            }
+            if (harvested->expected_stamp != current_stamp) {
+                harvested->status = AsyncScriptStatus::StaleDiscarded;
+                harvested->mutations_applied_to_model = false;
+                harvested->apply_diagnostic =
+                    "Target binary or patch state changed while script was executing; staged mutations discarded.";
+            }
+            return harvested;
+        }
+
+    private:
+        void reset_for_launch(ScriptExecutionStamp expected_stamp, bool allow_mutations_effective) {
+            cancel();
+            wait_for_idle();
+
+            AsyncScriptOutcome pre_oom{};
+            pre_oom.status = AsyncScriptStatus::Failed;
+            pre_oom.expected_stamp = expected_stamp;
+            pre_oom.allow_mutations_effective = allow_mutations_effective;
+            pre_oom.script_result.error_kind = peelf::ScriptErrorKind::MemoryLimitExceeded;
+            pre_oom.script_result.error_message =
+                "Out of memory in background Lua script worker";
+
+            AsyncScriptOutcome pre_unknown{};
+            pre_unknown.status = AsyncScriptStatus::Failed;
+            pre_unknown.expected_stamp = expected_stamp;
+            pre_unknown.allow_mutations_effective = allow_mutations_effective;
+            pre_unknown.script_result.error_kind = peelf::ScriptErrorKind::RuntimeError;
+            pre_unknown.script_result.error_message =
+                "Unhandled exception in background Lua script worker";
+
+            std::scoped_lock lock(mutex_);
+            pending_outcome_.reset();
+            oom_outcome_ = std::move(pre_oom);
+            unknown_exception_outcome_ = std::move(pre_unknown);
+            running_.store(true, std::memory_order_release);
+        }
+
+        void rollback_failed_launch() noexcept {
+            {
+                std::scoped_lock lock(mutex_);
+                pending_outcome_.reset();
+            }
+            running_.store(false, std::memory_order_release);
+        }
+
+        void publish_outcome(AsyncScriptOutcome outcome) noexcept {
+            {
+                std::scoped_lock lock(mutex_);
+                pending_outcome_ = std::move(outcome);
+            }
+            running_.store(false, std::memory_order_release);
+        }
+
+        void publish_preallocated_failure(bool is_oom, bool stop_requested) noexcept {
+            {
+                std::scoped_lock lock(mutex_);
+                AsyncScriptOutcome& fallback = is_oom ? oom_outcome_ : unknown_exception_outcome_;
+                if (stop_requested && !is_oom) {
+                    fallback.status = AsyncScriptStatus::Cancelled;
+                    fallback.script_result.error_kind = peelf::ScriptErrorKind::Cancelled;
+                }
+                pending_outcome_ = std::move(fallback);
+            }
+            running_.store(false, std::memory_order_release);
+        }
+
+        void publish_exception_failure(ScriptExecutionStamp expected_stamp,
+                                       bool allow_mutations_effective,
+                                       const char* what_msg,
+                                       bool stop_requested) noexcept {
+            try {
+                AsyncScriptOutcome out{};
+                out.status = AsyncScriptStatus::Failed;
+                out.expected_stamp = expected_stamp;
+                out.allow_mutations_effective = allow_mutations_effective;
+                out.script_result.error_kind = peelf::ScriptErrorKind::RuntimeError;
+                out.script_result.error_message =
+                    (what_msg != nullptr && *what_msg != '\0')
+                        ? std::string(what_msg)
+                        : std::string("Unhandled std::exception in background Lua script worker");
+                publish_outcome(std::move(out));
+            } catch (...) {
+                publish_preallocated_failure(/*is_oom=*/true, stop_requested);
+            }
+        }
+
+        mutable std::mutex mutex_{};
+        std::atomic<bool> running_{false};
+        std::optional<AsyncScriptOutcome> pending_outcome_{};
+        AsyncScriptOutcome oom_outcome_{};
+        AsyncScriptOutcome unknown_exception_outcome_{};
+        std::jthread worker_{};
+    };
+
+    BinaryModel::BinaryModel()
+        : script_runner_(std::make_unique<AsyncScriptRunner>()) {
         reset_timeline_sources();
     }
+
+    BinaryModel::~BinaryModel() noexcept = default;
+    BinaryModel::BinaryModel(BinaryModel&&) noexcept = default;
+    BinaryModel& BinaryModel::operator=(BinaryModel&&) noexcept = default;
 
     void BinaryModel::reset_timeline_sources() {
         debug_timeline_source_.reset();
@@ -51,6 +358,12 @@ using detail::utf8_path;
     }
 
     void BinaryModel::reset_all() {
+        if (script_runner_ != nullptr) {
+            script_runner_->cancel();
+            script_runner_->wait_for_idle();
+            script_runner_->clear_pending();
+        }
+        last_script_outcome_.reset();
         ++content_generation_;
         cached_content_sha256_.clear();
         cached_sha256_generation_ = std::numeric_limits<std::uint64_t>::max();
@@ -1640,6 +1953,215 @@ using detail::utf8_path;
         }
         cached_content_sha256_ = hasher.finalize_hex();
         return cached_content_sha256_;
+    }
+
+    ScriptMutationEligibility BinaryModel::script_mutation_eligibility() const {
+        if (!has_file()) {
+            return ScriptMutationEligibility{
+                .can_mutate_target = false,
+                .reason = "Open a static binary image to stage or commit scripted mutations.",
+            };
+        }
+        if (is_live_process()) {
+            if (is_crash_dump()) {
+                return ScriptMutationEligibility{
+                    .can_mutate_target = false,
+                    .reason =
+                        "Crash dump and core targets are strictly read-only; scripted target mutations are disabled.",
+                };
+            }
+            const peelf::IProcessSession* underlying_session =
+                debug_session_ != nullptr ? &debug_session_->session() : session_.get();
+            if (dynamic_cast<const peelf::IGdbRemoteSession*>(underlying_session) != nullptr ||
+                dynamic_cast<const peelf::IGdbRemoteDebugSession*>(debug_session_.get()) != nullptr) {
+                return ScriptMutationEligibility{
+                    .can_mutate_target = false,
+                    .reason =
+                        "GDB Remote / QEMU RSP targets are read-only for scripting; scripted target mutations are disabled.",
+                };
+            }
+            return ScriptMutationEligibility{
+                .can_mutate_target = false,
+                .reason =
+                    "Live process inspection is strictly read-only; scripted target mutations are disabled.",
+            };
+        }
+        if (!editable_image_.has_value()) {
+            return ScriptMutationEligibility{
+                .can_mutate_target = false,
+                .reason = "Target binary has no editable backing image; read-only script execution only.",
+            };
+        }
+        const peelf::Capability& patch_cap =
+            capability_matrix_.get(peelf::Operation::StaticPatching);
+        if (!patch_cap.can_execute()) {
+            return ScriptMutationEligibility{
+                .can_mutate_target = false,
+                .reason = patch_cap.reason.empty()
+                              ? std::string{"StaticPatching capability is unavailable for this target."}
+                              : patch_cap.reason,
+            };
+        }
+        return ScriptMutationEligibility{
+            .can_mutate_target = true,
+            .reason =
+                "Editable static binary: opt-in transactional labels, comments, bookmarks, and byte patches are available.",
+        };
+    }
+
+    peelf::Result<void> BinaryModel::start_script_execution(
+        std::string script_source,
+        peelf::ScriptLimits limits,
+        bool request_allow_mutations,
+        peelf::ProjectWorkspace initial_workspace,
+        std::string chunk_name) {
+        if (!has_file()) {
+            return peelf::make_error("No binary image or live process target is loaded");
+        }
+        if (script_runner_ == nullptr) {
+            script_runner_ = std::make_unique<AsyncScriptRunner>();
+        }
+        if (script_runner_->is_running()) {
+            return peelf::make_error("A Lua script is already executing in the background");
+        }
+
+        const ScriptMutationEligibility elig = script_mutation_eligibility();
+        const bool allow_mutations_effective = request_allow_mutations && elig.can_mutate_target;
+
+        if (initial_workspace.bookmarks().empty() && !bookmarks_.empty()) {
+            for (const Bookmark& bm : bookmarks_) {
+                if (!bm.is_file_offset) {
+                    initial_workspace.add_bookmark(bm.address, bm.label);
+                }
+            }
+        }
+
+        AsyncScriptRunner::WorkerLaunchInput job{};
+        job.expected_stamp = current_script_stamp();
+        job.live_target = is_live_process();
+        job.remote_gdb_rsp =
+            (capability_matrix_.profile().backend == peelf::BackendKind::RemoteGdbRsp) ||
+            (dynamic_cast<const peelf::IGdbRemoteSession*>(session_.get()) != nullptr);
+        job.allow_mutations_effective = allow_mutations_effective;
+        job.slice_index = active_slice_index_;
+        job.capabilities = capability_matrix_;
+        job.workspace = std::move(initial_workspace);
+        job.script_source = std::move(script_source);
+        job.limits = limits;
+        job.chunk_name = std::move(chunk_name);
+
+        if (job.live_target) {
+            job.live_session = session_;
+            if (image_ != nullptr) {
+                const std::span<const std::uint8_t> analysis_span = analysis_image_bytes();
+                job.image_bytes.assign(analysis_span.begin(), analysis_span.end());
+            }
+        } else {
+            job.backing_path = utf8_path(file_info_.path);
+            job.prior_patches = changed_intervals();
+            if (job.prior_patches.empty()) {
+                job.image_bytes = bytes_;
+            } else {
+                auto eff = read_effective_bytes(0u, bytes_.size());
+                if (!eff.has_value()) {
+                    return std::unexpected(eff.error());
+                }
+                job.image_bytes = std::move(*eff);
+            }
+        }
+
+        script_runner_->start(std::move(job));
+        return {};
+    }
+
+    void BinaryModel::cancel_script_execution() noexcept {
+        if (script_runner_ != nullptr) {
+            script_runner_->cancel();
+        }
+    }
+
+    bool BinaryModel::is_script_running() const noexcept {
+        return script_runner_ != nullptr && script_runner_->is_running();
+    }
+
+    void BinaryModel::wait_for_script_idle() noexcept {
+        if (script_runner_ != nullptr) {
+            script_runner_->wait_for_idle();
+        }
+    }
+
+    std::optional<AsyncScriptOutcome> BinaryModel::harvest_script_execution() {
+        if (script_runner_ == nullptr) {
+            return std::nullopt;
+        }
+        auto polled = script_runner_->poll_completed(current_script_stamp());
+        if (!polled.has_value()) {
+            return std::nullopt;
+        }
+
+        AsyncScriptOutcome outcome = std::move(*polled);
+        if (outcome.status == AsyncScriptStatus::Succeeded &&
+            outcome.script_result.ok &&
+            outcome.script_result.committed &&
+            outcome.allow_mutations_effective) {
+            const auto& staged_patches = outcome.script_result.staged_summary.staged_patches;
+            bool patch_ok = true;
+            if (!staged_patches.empty()) {
+                if (!editable_image_.has_value() || is_live_process()) {
+                    patch_ok = false;
+                    outcome.apply_diagnostic =
+                        "Target binary no longer has an editable static backing image.";
+                } else {
+                    auto tx = editable_image_->begin_transaction("Lua script commit");
+                    for (const peelf::StagedBytePatch& sp : staged_patches) {
+                        if (auto wr = tx.write(sp.file_offset, sp.patched_bytes); !wr.has_value()) {
+                            patch_ok = false;
+                            outcome.apply_diagnostic = wr.error().message;
+                            break;
+                        }
+                    }
+                    if (patch_ok) {
+                        if (auto cm = tx.commit(); !cm.has_value()) {
+                            patch_ok = false;
+                            outcome.apply_diagnostic = cm.error().message;
+                        } else {
+                            for (const peelf::StagedBytePatch& sp : staged_patches) {
+                                patch_metadata_by_offset_[sp.file_offset] = PatchEntryMetadata{
+                                    .label = "Lua script commit",
+                                    .asm_source = std::nullopt,
+                                };
+                            }
+                            ++edit_revision_;
+                        }
+                    }
+                }
+            }
+
+            if (patch_ok) {
+                if (outcome.script_result.staged_summary.bookmarks_modified) {
+                    std::erase_if(bookmarks_, [](const Bookmark& b) {
+                        return !b.is_file_offset;
+                    });
+                    for (const peelf::ScriptBookmark& wbm :
+                         outcome.committed_workspace.bookmarks()) {
+                        add_or_update_bookmark(Bookmark{
+                            .address = wbm.virtual_address,
+                            .is_file_offset = false,
+                            .label = wbm.label,
+                            .category = "Script",
+                            .note = {},
+                        });
+                    }
+                    ++bookmark_revision_;
+                }
+                outcome.mutations_applied_to_model = true;
+            } else {
+                outcome.status = AsyncScriptStatus::Failed;
+            }
+        }
+
+        last_script_outcome_ = outcome;
+        return outcome;
     }
 
 } // namespace viewer

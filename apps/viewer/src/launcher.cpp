@@ -1,4 +1,4 @@
-#include <peelf/security_audit.hpp>
+#include "headless_cli.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -20,7 +20,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (const auto cli_exit = peelf::try_run_headless_or_help_cli(args, std::cout, std::cerr);
+    if (const auto cli_exit = viewer::try_run_headless_or_help_cli(args, std::cout, std::cerr);
         cli_exit.has_value()) {
         return *cli_exit;
     }
