@@ -145,7 +145,7 @@ enum class IsaTier : std::uint8_t {
 }
 
 [[nodiscard]] constexpr bool is_known_format(Format fmt) noexcept {
-    return fmt == Format::PE || fmt == Format::ELF || fmt == Format::Unknown;
+    return fmt == Format::PE || fmt == Format::ELF || fmt == Format::MachO || fmt == Format::Unknown;
 }
 
 [[nodiscard]] constexpr bool is_known_endianness(Endianness endian) noexcept {

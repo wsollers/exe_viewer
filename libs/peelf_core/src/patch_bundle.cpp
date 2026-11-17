@@ -33,6 +33,7 @@ namespace {
     switch (fmt) {
         case Format::PE:      return "PE";
         case Format::ELF:     return "ELF";
+        case Format::MachO:   return "MachO";
         case Format::Unknown: return "Unknown";
     }
     return "Unknown";
@@ -42,6 +43,7 @@ namespace {
     const std::string low = to_lower_ascii(s);
     if (low == "pe") return Format::PE;
     if (low == "elf") return Format::ELF;
+    if (low == "macho" || low == "mach-o") return Format::MachO;
     return Format::Unknown;
 }
 

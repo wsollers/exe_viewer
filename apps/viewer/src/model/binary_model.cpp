@@ -503,9 +503,12 @@ using detail::utf8_path;
             return loaded;
         }
 
-        // ELF -> identity from the unified image.
-        if (image_ && image_->format() == peelf::Format::ELF) {
-            const bool loaded = load_elf(path);
+        // ELF / Mach-O -> identity from the unified image.
+        if (image_ && (image_->format() == peelf::Format::ELF ||
+                       image_->format() == peelf::Format::MachO)) {
+            const bool loaded = image_->format() == peelf::Format::ELF
+                ? load_elf(path)
+                : load_macho(path);
             if (loaded) {
                 ++content_generation_;
                 source_kind_ = BinarySourceKind::StaticFile;
@@ -1060,6 +1063,41 @@ using detail::utf8_path;
         }
 
         format_ = BinaryFormat::ELF;
+
+        file_info_.path = path;
+        file_info_.format_str = std::string(peelf::to_string(image_->format()));
+        file_info_.arch_str = std::string(peelf::to_string(image_->architecture()));
+        file_info_.size_bytes = bytes_.size();
+        file_info_.entry_point = image_->entry_point();
+
+        file_info_.flags.clear();
+        file_info_.flags.push_back(std::string(peelf::to_string(image_->kind())));
+        file_info_.flags.push_back(image_->is_64bit() ? "64-bit" : "32-bit");
+        file_info_.flags.push_back(std::string(peelf::to_string(image_->endianness())));
+
+        sections_.clear();
+        for (const auto& s : image_->sections()) {
+            std::uint32_t flags = 0;
+            if (s.readable)   flags |= 0x4;
+            if (s.writable)   flags |= 0x2;
+            if (s.executable) flags |= 0x1;
+            sections_.push_back(SectionInfo{
+                .name = s.name,
+                .address = s.virtual_address,
+                .size = s.virtual_size,
+                .flags = flags
+            });
+        }
+
+        return true;
+    }
+
+    bool BinaryModel::load_macho(const std::string& path) {
+        if (!image_ || image_->format() != peelf::Format::MachO) {
+            return false;
+        }
+
+        format_ = BinaryFormat::MachO;
 
         file_info_.path = path;
         file_info_.format_str = std::string(peelf::to_string(image_->format()));

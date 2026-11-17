@@ -2377,6 +2377,38 @@ HeaderFlagsReport harvest_header_flags(const IBinaryImage& image) {
         case Format::ELF:
             harvest_elf_header_flags(image, report);
             break;
+        case Format::MachO:
+            if (const MachOHeader* mh = image.macho_header(); mh != nullptr) {
+                report.status = SubsystemStatus::available("macho_header");
+                report.raw_masks.push_back(DecodedField{
+                    .name = "mach_header.flags",
+                    .offset = image.container_slice_offset() + 24u,
+                    .raw_value = mh->flags,
+                    .formatted_value = hex_u64(mh->flags, 8u),
+                    .description = "Mach-O mach_header(_64).flags bitmask",
+                });
+                static constexpr std::array<BitFlagSpec, 7> kMachOFlagSpecs = {{
+                    {0x00000080u, "MH_TWOLEVEL", "Two-level symbol namespace"},
+                    {0x00020000u, "MH_ALLOW_STACK_EXECUTION", "Allow executable stack"},
+                    {0x00040000u, "MH_ROOT_SAFE", "Safe for root execution"},
+                    {0x00080000u, "MH_SETUID_SAFE", "Safe for setuid execution"},
+                    {0x00200000u, "MH_PIE", "Position-independent executable (ASLR)"},
+                    {0x01000000u, "MH_NO_HEAP_EXECUTION", "Non-executable heap"},
+                    {0x02000000u, "MH_APP_EXTENSION_SAFE", "Safe for app extensions"},
+                }};
+                append_mask_flags(report.flags, "mach_header.flags", mh->flags, kMachOFlagSpecs);
+                report.security_summary.push_back(DecodedField{
+                    .name = "PIE / ASLR",
+                    .offset = std::nullopt,
+                    .raw_value = mh->has_pie() ? 1u : 0u,
+                    .formatted_value = mh->has_pie() ? "Enabled" : "Disabled",
+                    .description = "Position-Independent Executable (MH_PIE)",
+                });
+            } else {
+                report.status =
+                    SubsystemStatus::unavailable("macho_header", "Missing Mach-O header metadata");
+            }
+            break;
         case Format::Unknown:
             report.status =
                 SubsystemStatus::unavailable("binary_image", "Unknown binary container format");

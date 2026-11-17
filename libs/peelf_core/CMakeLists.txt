@@ -23,6 +23,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/image_mapping.cpp
   src/pe_image.cpp
   src/elf_image.cpp
+  src/macho_image.cpp
   src/binary_image.cpp
   src/binary_diff.cpp
   src/dependency_tree.cpp
@@ -72,6 +73,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/gdb_remote.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
+  include/peelf/macho_image.hpp
   include/peelf/binary_diff.hpp
   include/peelf/dependency_tree.hpp
   include/peelf/demangle.hpp

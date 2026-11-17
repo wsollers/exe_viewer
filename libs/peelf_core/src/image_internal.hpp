@@ -137,31 +137,9 @@ public:
     [[nodiscard]] const GnuDebugLink* gnu_debuglink() const noexcept override {
         return gnu_debuglink_.has_value() ? &*gnu_debuglink_ : nullptr;
     }
-    [[nodiscard]] const std::vector<PeDataDirectory>& pe_data_directories() const noexcept override;
-    [[nodiscard]] const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept override;
-    [[nodiscard]] const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept override;
-    [[nodiscard]] const PeTlsDirectory* pe_tls_directory() const noexcept override { return nullptr; }
-    [[nodiscard]] const std::vector<PeCertificate>& pe_certificates() const noexcept override;
-    [[nodiscard]] const PeLoadConfigDirectory* pe_load_config_directory() const noexcept override {
-        return nullptr;
+    [[nodiscard]] std::uint64_t container_slice_size() const noexcept override {
+        return raw_bytes_.size();
     }
-    [[nodiscard]] const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept override;
-    [[nodiscard]] const std::vector<PeBoundImport>& pe_bound_imports() const noexcept override;
-    [[nodiscard]] const PeResourceDirectory* pe_resource_directory() const noexcept override {
-        return nullptr;
-    }
-    [[nodiscard]] const std::vector<PeResourceDataEntry>& pe_resource_data_entries() const noexcept override;
-    [[nodiscard]] const PeClrHeader* pe_clr_header() const noexcept override { return nullptr; }
-    [[nodiscard]] const ElfHeader* elf_header() const noexcept override { return nullptr; }
-    [[nodiscard]] const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept override;
-    [[nodiscard]] const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept override;
-    [[nodiscard]] const std::vector<ElfSymbol>& elf_symbols() const noexcept override;
-    [[nodiscard]] const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept override;
-    [[nodiscard]] const std::vector<ElfRelocation>& elf_relocations() const noexcept override;
-    [[nodiscard]] const std::vector<ElfNote>& elf_notes() const noexcept override;
-    [[nodiscard]] const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept override;
-    [[nodiscard]] const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept override;
-    [[nodiscard]] std::string_view elf_interpreter() const noexcept override { return {}; }
     [[nodiscard]] std::span<const std::string> parse_warnings() const noexcept override {
         return parse_warnings_;
     }
@@ -171,6 +149,16 @@ public:
         std::uint64_t file_offset) const noexcept override;
     [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(
         std::uint64_t virtual_address) const noexcept override;
+    [[nodiscard]] Result<std::vector<std::uint8_t>> read_bytes_at_offset(
+        std::uint64_t file_offset,
+        std::size_t size) const override;
+    [[nodiscard]] Result<std::vector<std::uint8_t>> read_bytes_at_va(
+        std::uint64_t virtual_address,
+        std::size_t size) const override;
+
+    void attach_raw_bytes(std::span<const std::uint8_t> bytes) {
+        raw_bytes_.assign(bytes.begin(), bytes.end());
+    }
 
     virtual void rebase_to_live_base(std::uint64_t live_base) = 0;
 
@@ -191,6 +179,7 @@ protected:
     std::vector<ExportEntry> exports_;
     std::vector<std::string> parse_warnings_;
     std::optional<GnuDebugLink> gnu_debuglink_;
+    std::vector<std::uint8_t> raw_bytes_;
 
     void add_warning(std::string warning) {
         if (!warning.empty()) {

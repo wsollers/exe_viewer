@@ -45,6 +45,7 @@ add_executable(peelf_tests
   sha256_test.cpp
   parsers_test.cpp
   binary_image_test.cpp
+  macho_image_test.cpp
   disassembler_test.cpp
   viewer_navigation_test.cpp
   patch_navigation_test.cpp

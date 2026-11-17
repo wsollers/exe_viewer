@@ -1,8 +1,13 @@
 #include "image_internal.hpp"
 
+#include <peelf/macho_image.hpp>
+
+#include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -11,23 +16,201 @@ namespace peelf {
 
 namespace {
 
-[[nodiscard]] Result<std::unique_ptr<detail::ImageBase>> parse_image_base(
-    std::span<const std::uint8_t> bytes) {
-    switch (detect_format(bytes)) {
-        case Format::ELF: return detail::parse_elf_image_impl(bytes);
-        case Format::PE:  return detail::parse_pe_image_impl(bytes);
-        default:          return make_error("Unknown or unsupported binary format");
+[[nodiscard]] bool iequals_ascii(std::string_view lhs, std::string_view rhs) noexcept {
+    if (lhs.size() != rhs.size()) {
+        return false;
     }
+    for (std::size_t i = 0; i < lhs.size(); ++i) {
+        const auto ca = static_cast<unsigned char>(lhs[i]);
+        const auto cb = static_cast<unsigned char>(rhs[i]);
+        if (std::tolower(ca) != std::tolower(cb)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[nodiscard]] Result<std::unique_ptr<detail::ImageBase>> parse_pe_or_elf_base(
+    Format fmt,
+    std::span<const std::uint8_t> bytes) {
+    Result<std::unique_ptr<detail::ImageBase>> parsed =
+        make_error("Unknown or unsupported binary format");
+    switch (fmt) {
+        case Format::ELF:
+            parsed = detail::parse_elf_image_impl(bytes);
+            break;
+        case Format::PE:
+            parsed = detail::parse_pe_image_impl(bytes);
+            break;
+        case Format::MachO:
+        case Format::Unknown:
+            return make_error("Unknown or unsupported binary format");
+    }
+    if (!parsed) {
+        return std::unexpected(parsed.error());
+    }
+    (*parsed)->attach_raw_bytes(bytes);
+    return parsed;
 }
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// IBinaryImage non-pure format defaults & container offset helpers
+// ---------------------------------------------------------------------------
+std::optional<std::uint64_t> IBinaryImage::slice_relative_offset(
+    std::uint64_t container_file_offset) const noexcept {
+    const std::uint64_t base = container_slice_offset();
+    if (container_file_offset < base) {
+        return std::nullopt;
+    }
+    const std::uint64_t rel = container_file_offset - base;
+    const std::uint64_t sz = container_slice_size();
+    if (sz != 0u && rel >= sz) {
+        return std::nullopt;
+    }
+    return rel;
+}
+
+std::optional<std::uint64_t> IBinaryImage::container_file_offset(
+    std::uint64_t slice_rel_offset) const noexcept {
+    const std::uint64_t sz = container_slice_size();
+    if (sz != 0u && slice_rel_offset >= sz) {
+        return std::nullopt;
+    }
+    return detail::checked_add_u64(container_slice_offset(), slice_rel_offset);
+}
+
+const std::vector<PeDataDirectory>& IBinaryImage::pe_data_directories() const noexcept {
+    static const std::vector<PeDataDirectory> empty;
+    return empty;
+}
+
+const std::vector<PeBaseRelocationBlock>& IBinaryImage::pe_base_relocations() const noexcept {
+    static const std::vector<PeBaseRelocationBlock> empty;
+    return empty;
+}
+
+const std::vector<PeDebugDirectory>& IBinaryImage::pe_debug_directories() const noexcept {
+    static const std::vector<PeDebugDirectory> empty;
+    return empty;
+}
+
+const std::vector<PeCertificate>& IBinaryImage::pe_certificates() const noexcept {
+    static const std::vector<PeCertificate> empty;
+    return empty;
+}
+
+const std::vector<PeRuntimeFunction>& IBinaryImage::pe_runtime_functions() const noexcept {
+    static const std::vector<PeRuntimeFunction> empty;
+    return empty;
+}
+
+const std::vector<PeBoundImport>& IBinaryImage::pe_bound_imports() const noexcept {
+    static const std::vector<PeBoundImport> empty;
+    return empty;
+}
+
+const std::vector<PeResourceDataEntry>& IBinaryImage::pe_resource_data_entries() const noexcept {
+    static const std::vector<PeResourceDataEntry> empty;
+    return empty;
+}
+
+const std::vector<ElfProgramHeader>& IBinaryImage::elf_program_headers() const noexcept {
+    static const std::vector<ElfProgramHeader> empty;
+    return empty;
+}
+
+const std::vector<ElfSectionHeader>& IBinaryImage::elf_section_headers() const noexcept {
+    static const std::vector<ElfSectionHeader> empty;
+    return empty;
+}
+
+const std::vector<ElfSymbol>& IBinaryImage::elf_symbols() const noexcept {
+    static const std::vector<ElfSymbol> empty;
+    return empty;
+}
+
+const std::vector<ElfDynamicEntry>& IBinaryImage::elf_dynamic_entries() const noexcept {
+    static const std::vector<ElfDynamicEntry> empty;
+    return empty;
+}
+
+const std::vector<ElfRelocation>& IBinaryImage::elf_relocations() const noexcept {
+    static const std::vector<ElfRelocation> empty;
+    return empty;
+}
+
+const std::vector<ElfNote>& IBinaryImage::elf_notes() const noexcept {
+    static const std::vector<ElfNote> empty;
+    return empty;
+}
+
+const std::vector<ElfSysvHashTable>& IBinaryImage::elf_sysv_hash_tables() const noexcept {
+    static const std::vector<ElfSysvHashTable> empty;
+    return empty;
+}
+
+const std::vector<ElfGnuHashTable>& IBinaryImage::elf_gnu_hash_tables() const noexcept {
+    static const std::vector<ElfGnuHashTable> empty;
+    return empty;
+}
+
+const std::vector<MachOLoadCommandInfo>& IBinaryImage::macho_load_commands() const noexcept {
+    static const std::vector<MachOLoadCommandInfo> empty;
+    return empty;
+}
+
+const std::vector<MachOSegmentCommand>& IBinaryImage::macho_segments() const noexcept {
+    static const std::vector<MachOSegmentCommand> empty;
+    return empty;
+}
+
+const std::vector<MachOSection>& IBinaryImage::macho_sections() const noexcept {
+    static const std::vector<MachOSection> empty;
+    return empty;
+}
+
+const std::vector<MachOSymbol>& IBinaryImage::macho_symbols() const noexcept {
+    static const std::vector<MachOSymbol> empty;
+    return empty;
+}
+
+const std::vector<MachODylibDependency>& IBinaryImage::macho_dylibs() const noexcept {
+    static const std::vector<MachODylibDependency> empty;
+    return empty;
+}
+
+const std::vector<MachORpathEntry>& IBinaryImage::macho_rpaths() const noexcept {
+    static const std::vector<MachORpathEntry> empty;
+    return empty;
+}
+
+const std::vector<MachOBuildVersion>& IBinaryImage::macho_build_versions() const noexcept {
+    static const std::vector<MachOBuildVersion> empty;
+    return empty;
+}
+
+Result<std::vector<std::uint8_t>> IBinaryImage::read_bytes_at_offset(
+    std::uint64_t /*file_offset*/,
+    std::size_t /*size*/) const {
+    return make_error("Raw image bytes are not retained by this binary image instance");
+}
+
+Result<std::vector<std::uint8_t>> IBinaryImage::read_bytes_at_va(
+    std::uint64_t /*virtual_address*/,
+    std::size_t /*size*/) const {
+    return make_error("Raw image bytes are not retained by this binary image instance");
+}
+
 std::string_view to_string(Format f) noexcept {
     switch (f) {
-        case Format::PE:  return "PE";
-        case Format::ELF: return "ELF";
-        default:          return "Unknown";
+        case Format::PE:      return "PE";
+        case Format::ELF:     return "ELF";
+        case Format::MachO:   return "Mach-O";
+        case Format::Unknown: return "Unknown";
     }
+    return "Unknown";
 }
 
 std::string_view to_string(ImageKind k) noexcept {
@@ -36,8 +219,9 @@ std::string_view to_string(ImageKind k) noexcept {
         case ImageKind::SharedLibrary: return "Shared library";
         case ImageKind::Object:        return "Object";
         case ImageKind::Core:          return "Core dump";
-        default:                       return "Unknown";
+        case ImageKind::Unknown:       return "Unknown";
     }
+    return "Unknown";
 }
 
 std::string_view to_string(Architecture a) noexcept {
@@ -52,8 +236,9 @@ std::string_view to_string(Architecture a) noexcept {
         case Architecture::PowerPC64: return "PowerPC64";
         case Architecture::MIPS32:    return "MIPS32";
         case Architecture::MIPS64:    return "MIPS64";
-        default:                      return "Unknown";
+        case Architecture::Unknown:   return "Unknown";
     }
+    return "Unknown";
 }
 
 std::string_view to_string(Endianness e) noexcept {
@@ -67,21 +252,100 @@ Format detect_format(std::span<const std::uint8_t> b) noexcept {
     if (b.size() >= 2 && b[0] == 'M' && b[1] == 'Z') {
         return Format::PE;
     }
+    if (macho::is_valid_macho_or_universal(b)) {
+        return Format::MachO;
+    }
     return Format::Unknown;
 }
 
-Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> bytes) {
-    auto parsed = parse_image_base(bytes);
-    if (!parsed) {
-        return std::unexpected(parsed.error());
+Result<BinaryContainerInfo> inspect_binary_container(std::span<const std::uint8_t> bytes) {
+    if (macho::has_macho_or_fat_magic_prefix(bytes)) {
+        return MachOImage::inspect_container(bytes);
     }
-    return std::unique_ptr<IBinaryImage>(std::move(*parsed));
+    const Format fmt = detect_format(bytes);
+    if (fmt == Format::MachO) {
+        return MachOImage::inspect_container(bytes);
+    }
+    if (fmt == Format::PE || fmt == Format::ELF) {
+        auto parsed = parse_pe_or_elf_base(fmt, bytes);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        const IBinaryImage& img = **parsed;
+        BinaryContainerInfo info;
+        info.format = fmt;
+        info.is_universal_container = false;
+        BinarySliceDescriptor slice;
+        slice.slice_index = 0;
+        slice.arch = img.architecture();
+        slice.bitness = img.is_64bit() ? 64u : 32u;
+        slice.endianness = img.endianness();
+        slice.arch_name = std::string(to_string(img.architecture()));
+        slice.container_offset = 0;
+        slice.slice_size = static_cast<std::uint64_t>(bytes.size());
+        slice.align_log2 = 0;
+        info.slices.push_back(std::move(slice));
+        return info;
+    }
+    return make_error("Unknown or unsupported binary format");
+}
+
+Result<std::unique_ptr<IBinaryImage>> open_binary_image(
+    std::span<const std::uint8_t> bytes,
+    const BinaryOpenOptions& options) {
+    if (macho::has_macho_or_fat_magic_prefix(bytes)) {
+        auto parsed = MachOImage::parse(bytes, options);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        return std::unique_ptr<IBinaryImage>(std::move(*parsed));
+    }
+    const Format fmt = detect_format(bytes);
+    if (fmt == Format::MachO) {
+        auto parsed = MachOImage::parse(bytes, options);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        return std::unique_ptr<IBinaryImage>(std::move(*parsed));
+    }
+    if (fmt == Format::PE || fmt == Format::ELF) {
+        if (options.selected_slice_index.has_value() && *options.selected_slice_index != 0u) {
+            return make_error("Selected slice index is out of range for non-Universal binary");
+        }
+        auto parsed = parse_pe_or_elf_base(fmt, bytes);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        if (options.preferred_architecture.has_value() &&
+            (*parsed)->architecture() != *options.preferred_architecture) {
+            return make_error("Binary does not match requested architecture");
+        }
+        if (!options.preferred_arch_name.empty() &&
+            !iequals_ascii(to_string((*parsed)->architecture()), options.preferred_arch_name)) {
+            return make_error("Binary does not match requested architecture name");
+        }
+        return std::unique_ptr<IBinaryImage>(std::move(*parsed));
+    }
+    return make_error("Unknown or unsupported binary format");
+}
+
+Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> bytes) {
+    return open_binary_image(bytes, BinaryOpenOptions{});
 }
 
 Result<std::unique_ptr<IBinaryImage>> parse_rebased_image(
     std::span<const std::uint8_t> file_bytes,
     std::uint64_t live_base) {
-    auto parsed = parse_image_base(file_bytes);
+    const Format fmt = detect_format(file_bytes);
+    if (fmt == Format::MachO) {
+        auto parsed = MachOImage::parse(file_bytes);
+        if (!parsed) {
+            return std::unexpected(parsed.error());
+        }
+        (*parsed)->rebase_to_live_base(live_base);
+        return std::unique_ptr<IBinaryImage>(std::move(*parsed));
+    }
+    auto parsed = parse_pe_or_elf_base(fmt, file_bytes);
     if (!parsed) {
         return std::unexpected(parsed.error());
     }
@@ -102,12 +366,22 @@ Result<std::unique_ptr<IBinaryImage>> parse_mapped_image(
             if (!parsed) {
                 return std::unexpected(parsed.error());
             }
+            (*parsed)->attach_raw_bytes(norm);
             (*parsed)->rebase_to_live_base(live_base);
             return std::unique_ptr<IBinaryImage>(std::move(*parsed));
         }
-        default:
+        case Format::MachO: {
+            auto parsed = MachOImage::parse(mapped_bytes);
+            if (!parsed) {
+                return std::unexpected(parsed.error());
+            }
+            (*parsed)->rebase_to_live_base(live_base);
+            return std::unique_ptr<IBinaryImage>(std::move(*parsed));
+        }
+        case Format::Unknown:
             return make_error("Unknown or unsupported mapped binary format");
     }
+    return make_error("Unknown or unsupported mapped binary format");
 }
 
 } // namespace peelf

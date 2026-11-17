@@ -761,7 +761,10 @@ private:
         auto loaded = peelf::load_live_module_image(*session_, mod, regions_);
         if (loaded) {
             image_ = std::move(*loaded);
-            format_ = image_->format() == peelf::Format::PE ? BinaryFormat::PE : BinaryFormat::ELF;
+            format_ = image_->format() == peelf::Format::PE      ? BinaryFormat::PE
+                    : image_->format() == peelf::Format::ELF     ? BinaryFormat::ELF
+                    : image_->format() == peelf::Format::MachO   ? BinaryFormat::MachO
+                                                                 : BinaryFormat::None;
             architecture_ = image_->architecture();
             endianness_ = image_->endianness();
             live_window_base_ = mod.base_address;
@@ -923,8 +926,10 @@ private:
                 if (looks_pe_or_elf) {
                     if (auto mapped = peelf::parse_mapped_image(sample.bytes, reg.start_address)) {
                         image_ = std::move(*mapped);
-                        format_ = image_->format() == peelf::Format::PE ? BinaryFormat::PE
-                                                                        : BinaryFormat::ELF;
+                        format_ = image_->format() == peelf::Format::PE      ? BinaryFormat::PE
+                                : image_->format() == peelf::Format::ELF     ? BinaryFormat::ELF
+                                : image_->format() == peelf::Format::MachO   ? BinaryFormat::MachO
+                                                                             : BinaryFormat::None;
                         architecture_ = image_->architecture();
                         endianness_ = image_->endianness();
                         rebuild_symbol_index();

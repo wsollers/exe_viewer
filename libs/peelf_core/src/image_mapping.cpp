@@ -45,81 +45,6 @@ std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& s
     return std::nullopt;
 }
 
-const std::vector<PeDataDirectory>& ImageBase::pe_data_directories() const noexcept {
-    static const std::vector<PeDataDirectory> empty;
-    return empty;
-}
-
-const std::vector<PeBaseRelocationBlock>& ImageBase::pe_base_relocations() const noexcept {
-    static const std::vector<PeBaseRelocationBlock> empty;
-    return empty;
-}
-
-const std::vector<PeDebugDirectory>& ImageBase::pe_debug_directories() const noexcept {
-    static const std::vector<PeDebugDirectory> empty;
-    return empty;
-}
-
-const std::vector<PeCertificate>& ImageBase::pe_certificates() const noexcept {
-    static const std::vector<PeCertificate> empty;
-    return empty;
-}
-
-const std::vector<PeRuntimeFunction>& ImageBase::pe_runtime_functions() const noexcept {
-    static const std::vector<PeRuntimeFunction> empty;
-    return empty;
-}
-
-const std::vector<PeBoundImport>& ImageBase::pe_bound_imports() const noexcept {
-    static const std::vector<PeBoundImport> empty;
-    return empty;
-}
-
-const std::vector<PeResourceDataEntry>& ImageBase::pe_resource_data_entries() const noexcept {
-    static const std::vector<PeResourceDataEntry> empty;
-    return empty;
-}
-
-const std::vector<ElfProgramHeader>& ImageBase::elf_program_headers() const noexcept {
-    static const std::vector<ElfProgramHeader> empty;
-    return empty;
-}
-
-const std::vector<ElfSectionHeader>& ImageBase::elf_section_headers() const noexcept {
-    static const std::vector<ElfSectionHeader> empty;
-    return empty;
-}
-
-const std::vector<ElfSymbol>& ImageBase::elf_symbols() const noexcept {
-    static const std::vector<ElfSymbol> empty;
-    return empty;
-}
-
-const std::vector<ElfDynamicEntry>& ImageBase::elf_dynamic_entries() const noexcept {
-    static const std::vector<ElfDynamicEntry> empty;
-    return empty;
-}
-
-const std::vector<ElfRelocation>& ImageBase::elf_relocations() const noexcept {
-    static const std::vector<ElfRelocation> empty;
-    return empty;
-}
-
-const std::vector<ElfNote>& ImageBase::elf_notes() const noexcept {
-    static const std::vector<ElfNote> empty;
-    return empty;
-}
-
-const std::vector<ElfSysvHashTable>& ImageBase::elf_sysv_hash_tables() const noexcept {
-    static const std::vector<ElfSysvHashTable> empty;
-    return empty;
-}
-
-const std::vector<ElfGnuHashTable>& ImageBase::elf_gnu_hash_tables() const noexcept {
-    static const std::vector<ElfGnuHashTable> empty;
-    return empty;
-}
-
 bool ImageBase::has_elf_pt_load() const noexcept {
     for (const auto& segment : segments_) {
         if (segment.type == 1) {
@@ -199,6 +124,134 @@ std::optional<std::uint64_t> ImageBase::virtual_address_to_file_offset(
         return virtual_address - image_base_;
     }
     return std::nullopt;
+}
+
+Result<std::vector<std::uint8_t>> ImageBase::read_bytes_at_offset(
+    std::uint64_t file_offset,
+    std::size_t size) const {
+    if (raw_bytes_.empty()) {
+        return make_error("Raw image bytes are not available");
+    }
+    if (!fits_range(file_offset, static_cast<std::uint64_t>(size),
+                    static_cast<std::uint64_t>(raw_bytes_.size()))) {
+        return make_error("Requested file offset range exceeds image size");
+    }
+    if (size == 0u) {
+        return std::vector<std::uint8_t>{};
+    }
+    const auto begin_idx = static_cast<std::size_t>(file_offset);
+    return std::vector<std::uint8_t>(raw_bytes_.begin() + static_cast<std::ptrdiff_t>(begin_idx),
+                                     raw_bytes_.begin() + static_cast<std::ptrdiff_t>(begin_idx + size));
+}
+
+Result<std::vector<std::uint8_t>> ImageBase::read_bytes_at_va(
+    std::uint64_t virtual_address,
+    std::size_t size) const {
+    constexpr std::size_t kMaxVaReadBytes = 64u * 1024u * 1024u;
+    if (size > kMaxVaReadBytes) {
+        return make_error("Requested virtual-address read exceeds maximum single-read size");
+    }
+    if (raw_bytes_.empty()) {
+        return make_error("Raw image bytes are not available");
+    }
+    const auto end_va = checked_add_u64(virtual_address, static_cast<std::uint64_t>(size));
+    if (!end_va.has_value()) {
+        return make_error("Virtual-address range overflows 64-bit address space");
+    }
+    if (size == 0u) {
+        if (virtual_address_to_file_offset(virtual_address).has_value()) {
+            return std::vector<std::uint8_t>{};
+        }
+        return make_error("Virtual address is not mapped");
+    }
+
+    std::vector<std::uint8_t> out(size, 0u);
+    std::size_t written = 0u;
+    while (written < size) {
+        const std::uint64_t cur_va = virtual_address + static_cast<std::uint64_t>(written);
+        const std::uint64_t remaining = static_cast<std::uint64_t>(size - written);
+        bool advanced = false;
+
+        if (format_ == Format::ELF && has_elf_pt_load()) {
+            for (const Segment& seg : segments_) {
+                if (seg.type != 1u || cur_va < seg.virtual_address) {
+                    continue;
+                }
+                const std::uint64_t delta = cur_va - seg.virtual_address;
+                if (delta >= seg.virtual_size) {
+                    continue;
+                }
+                if (delta < seg.file_size) {
+                    const std::uint64_t chunk = std::min(remaining, seg.file_size - delta);
+                    const auto off = checked_add_u64(seg.file_offset, delta);
+                    if (!off.has_value() ||
+                        !fits_range(*off, chunk, static_cast<std::uint64_t>(raw_bytes_.size()))) {
+                        return make_error("Segment file backing exceeds image size");
+                    }
+                    const auto src_idx = static_cast<std::size_t>(*off);
+                    const auto n = static_cast<std::size_t>(chunk);
+                    std::copy_n(raw_bytes_.data() + src_idx, n, out.data() + written);
+                    written += n;
+                } else {
+                    const std::uint64_t chunk = std::min(remaining, seg.virtual_size - delta);
+                    written += static_cast<std::size_t>(chunk);
+                }
+                advanced = true;
+                break;
+            }
+        } else {
+            for (const Section& sec : sections_) {
+                if (format_ == Format::ELF && !sec.readable && !sec.writable && !sec.executable) {
+                    continue;
+                }
+                const std::uint64_t mapped_size =
+                    sec.virtual_size != 0u ? sec.virtual_size : sec.file_size;
+                if (mapped_size == 0u || cur_va < sec.virtual_address) {
+                    continue;
+                }
+                const std::uint64_t delta = cur_va - sec.virtual_address;
+                if (delta >= mapped_size) {
+                    continue;
+                }
+                if (delta < sec.file_size) {
+                    const std::uint64_t chunk = std::min(remaining, sec.file_size - delta);
+                    const auto off = checked_add_u64(sec.file_offset, delta);
+                    if (!off.has_value() ||
+                        !fits_range(*off, chunk, static_cast<std::uint64_t>(raw_bytes_.size()))) {
+                        return make_error("Section file backing exceeds image size");
+                    }
+                    const auto src_idx = static_cast<std::size_t>(*off);
+                    const auto n = static_cast<std::size_t>(chunk);
+                    std::copy_n(raw_bytes_.data() + src_idx, n, out.data() + written);
+                    written += n;
+                } else {
+                    const std::uint64_t chunk = std::min(remaining, mapped_size - delta);
+                    written += static_cast<std::size_t>(chunk);
+                }
+                advanced = true;
+                break;
+            }
+        }
+
+        if (!advanced && is_live_mapped_ && cur_va >= image_base_ &&
+            (cur_va - image_base_) < mapped_span_size_) {
+            const std::uint64_t delta = cur_va - image_base_;
+            const std::uint64_t chunk = std::min(remaining, mapped_span_size_ - delta);
+            if (!fits_range(delta, chunk, static_cast<std::uint64_t>(raw_bytes_.size()))) {
+                return make_error("Mapped image span is truncated");
+            }
+            const auto src_idx = static_cast<std::size_t>(delta);
+            const auto n = static_cast<std::size_t>(chunk);
+            std::copy_n(raw_bytes_.data() + src_idx, n, out.data() + written);
+            written += n;
+            advanced = true;
+        }
+
+        if (!advanced) {
+            return make_error("Virtual address range is not mapped");
+        }
+    }
+    return out;
 }
 
 void ImageBase::parse_gnu_debuglink_section(std::span<const std::uint8_t> b, bool big) {

@@ -10,6 +10,8 @@
 // entry point). Sections are filled in Phase 2 (P2-1); symbols/imports/exports
 // arrive in Phase 3, at which point this interface grows.
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -22,7 +24,8 @@
 
 namespace peelf {
 
-enum class Format { Unknown, PE, ELF };
+enum class Format { Unknown, PE, ELF, MachO };
+using BinaryFormat = Format;
 enum class ImageKind { Unknown, Executable, SharedLibrary, Object, Core };
 enum class Architecture {
     Unknown,
@@ -77,6 +80,37 @@ struct Symbol {
     std::uint8_t  type            = 0;
     std::uint16_t section_index   = 0;
     bool          dynamic         = false;
+};
+
+using SectionInfo = Section;
+using SegmentInfo = Segment;
+using SymbolInfo  = Symbol;
+
+struct BinarySliceDescriptor {
+    std::size_t   slice_index      = 0;
+    std::uint32_t cpu_type         = 0;
+    std::uint32_t cpu_subtype      = 0;
+    Architecture  arch             = Architecture::Unknown;
+    std::uint8_t  bitness          = 0;
+    Endianness    endianness       = Endianness::Little;
+    std::string   arch_name{};
+    std::uint64_t container_offset = 0;
+    std::uint64_t slice_size       = 0;
+    std::uint32_t align_log2       = 0;
+};
+
+struct BinaryContainerInfo {
+    Format format = Format::Unknown;
+    bool is_universal_container = false;
+    std::vector<BinarySliceDescriptor> slices{};
+};
+
+using UniversalBinaryInfo = BinaryContainerInfo;
+
+struct BinaryOpenOptions {
+    std::optional<std::size_t> selected_slice_index{};
+    std::string preferred_arch_name{};
+    std::optional<Architecture> preferred_architecture{};
 };
 
 struct ImportEntry {
@@ -386,8 +420,270 @@ struct GnuDebugLink {
     std::uint32_t crc32 = 0;
 };
 
-// Format-agnostic interface over a parsed binary. Concrete PE/ELF types are
-// internal to binary_image.cpp; callers obtain one via parse_image().
+struct MachOHeader {
+    std::uint32_t magic       = 0;
+    std::uint32_t cpu_type    = 0;
+    std::uint32_t cpu_subtype = 0;
+    std::uint32_t file_type   = 0;
+    std::uint32_t ncmds       = 0;
+    std::uint32_t sizeofcmds  = 0;
+    std::uint32_t flags       = 0;
+    std::uint32_t reserved    = 0;
+    bool          is_64bit    = false;
+    bool          is_arm64e   = false;
+    bool          ptrauth_abi = false;
+    std::uint8_t  ptrauth_version = 0;
+
+    [[nodiscard]] constexpr bool has_pie() const noexcept {
+        return (flags & 0x00200000u) != 0u; // MH_PIE
+    }
+    [[nodiscard]] constexpr bool allows_stack_execution() const noexcept {
+        return (flags & 0x00020000u) != 0u; // MH_ALLOW_STACK_EXECUTION
+    }
+    [[nodiscard]] constexpr bool has_no_heap_execution() const noexcept {
+        return (flags & 0x01000000u) != 0u; // MH_NO_HEAP_EXECUTION
+    }
+    [[nodiscard]] constexpr bool has_twolevel_namespace() const noexcept {
+        return (flags & 0x00000080u) != 0u; // MH_TWOLEVEL
+    }
+    [[nodiscard]] constexpr bool is_root_safe() const noexcept {
+        return (flags & 0x00040000u) != 0u; // MH_ROOT_SAFE
+    }
+    [[nodiscard]] constexpr bool is_setuid_safe() const noexcept {
+        return (flags & 0x00080000u) != 0u; // MH_SETUID_SAFE
+    }
+    [[nodiscard]] constexpr bool is_app_extension_safe() const noexcept {
+        return (flags & 0x02000000u) != 0u; // MH_APP_EXTENSION_SAFE
+    }
+};
+
+struct MachOLoadCommandInfo {
+    std::uint32_t cmd              = 0;
+    std::uint32_t cmdsize          = 0;
+    std::uint64_t slice_offset     = 0;
+    std::uint64_t container_offset = 0;
+};
+
+struct MachOSection {
+    std::string   section_name;
+    std::string   segment_name;
+    std::string   full_name;
+    std::uint64_t virtual_address   = 0;
+    std::uint64_t virtual_size      = 0;
+    std::uint64_t file_offset       = 0; // Container-absolute (0 for zero-fill)
+    std::uint64_t slice_file_offset = 0; // Raw section offset inside slice
+    std::uint64_t file_size         = 0; // 0 for S_ZEROFILL / S_GB_ZEROFILL / S_THREAD_LOCAL_ZEROFILL
+    std::uint32_t align_log2        = 0;
+    std::uint32_t reloff            = 0;
+    std::uint32_t nreloc            = 0;
+    std::uint32_t flags             = 0;
+    std::uint32_t reserved1         = 0;
+    std::uint32_t reserved2         = 0;
+    std::uint32_t reserved3         = 0;
+    bool          readable          = false;
+    bool          writable          = false;
+    bool          executable        = false;
+    bool          is_zerofill       = false;
+
+    [[nodiscard]] constexpr std::uint8_t section_type() const noexcept {
+        return static_cast<std::uint8_t>(flags & 0xFFu);
+    }
+    [[nodiscard]] constexpr std::uint32_t section_attributes() const noexcept {
+        return flags & 0xFFFFFF00u;
+    }
+};
+
+struct MachOSegmentCommand {
+    std::string   name;
+    std::uint64_t virtual_address   = 0;
+    std::uint64_t virtual_size      = 0;
+    std::uint64_t file_offset       = 0; // Container-absolute
+    std::uint64_t slice_file_offset = 0; // Raw segment fileoff inside slice
+    std::uint64_t file_size         = 0;
+    std::uint32_t maxprot           = 0;
+    std::uint32_t initprot          = 0;
+    std::uint32_t nsects            = 0;
+    std::uint32_t flags             = 0;
+    std::vector<MachOSection> sections{};
+
+    [[nodiscard]] constexpr bool readable() const noexcept { return (initprot & 0x1u) != 0u; }
+    [[nodiscard]] constexpr bool writable() const noexcept { return (initprot & 0x2u) != 0u; }
+    [[nodiscard]] constexpr bool executable() const noexcept { return (initprot & 0x4u) != 0u; }
+    [[nodiscard]] constexpr bool init_is_wx() const noexcept {
+        return (initprot & 0x6u) == 0x6u;
+    }
+    [[nodiscard]] constexpr bool max_is_wx() const noexcept {
+        return (maxprot & 0x6u) == 0x6u;
+    }
+    [[nodiscard]] bool is_pagezero() const noexcept {
+        return name == "__PAGEZERO";
+    }
+};
+
+struct MachODylibDependency {
+    std::uint32_t cmd                   = 0;
+    std::uint16_t ordinal               = 0; // 1-based ordinal for imported dylibs; 0 for LC_ID_DYLIB
+    std::string   name;
+    std::uint32_t timestamp             = 0;
+    std::uint32_t current_version       = 0;
+    std::uint32_t compatibility_version = 0;
+    bool          weak                  = false;
+    bool          reexport              = false;
+    bool          lazy                  = false;
+    bool          upward                = false;
+};
+
+struct MachORpathEntry {
+    std::string   path;
+    std::uint64_t slice_offset     = 0;
+    std::uint64_t container_offset = 0;
+};
+
+struct MachOSymbol {
+    std::string   name;
+    std::uint32_t string_offset       = 0;
+    std::uint8_t  n_type              = 0;
+    std::uint8_t  n_sect              = 0;
+    std::uint16_t n_desc              = 0;
+    std::uint64_t value               = 0;
+    std::uint8_t  library_ordinal     = 0;
+    std::string   library_name;
+    bool          is_stab             = false;
+    bool          is_external         = false;
+    bool          is_private_external = false;
+    bool          is_undefined        = false;
+    bool          is_weak_def         = false;
+    bool          is_weak_ref         = false;
+    bool          is_thumb            = false;
+};
+
+struct MachOSymtabInfo {
+    bool          present          = false;
+    std::uint32_t symoff           = 0;
+    std::uint64_t container_symoff = 0;
+    std::uint32_t nsyms            = 0;
+    std::uint32_t stroff           = 0;
+    std::uint64_t container_stroff = 0;
+    std::uint32_t strsize          = 0;
+};
+
+struct MachODysymtabInfo {
+    bool          present                  = false;
+    std::uint32_t ilocalsym                = 0;
+    std::uint32_t nlocalsym                = 0;
+    std::uint32_t iextdefsym               = 0;
+    std::uint32_t nextdefsym               = 0;
+    std::uint32_t iundefsym                = 0;
+    std::uint32_t nundefsym                = 0;
+    std::uint32_t indirectsymoff           = 0;
+    std::uint64_t container_indirectsymoff = 0;
+    std::uint32_t nindirectsyms            = 0;
+};
+
+struct MachOBuildToolVersion {
+    std::uint32_t tool    = 0;
+    std::uint32_t version = 0;
+};
+
+struct MachOBuildVersion {
+    std::uint32_t cmd                      = 0;
+    std::uint32_t platform                 = 0;
+    std::uint32_t minos                    = 0;
+    std::uint32_t sdk                      = 0;
+    bool          from_version_min_command = false;
+    std::vector<MachOBuildToolVersion> tools{};
+};
+
+struct MachOEncryptionInfo {
+    bool          is_64bit           = false;
+    std::uint32_t cryptoff           = 0;
+    std::uint64_t container_cryptoff = 0;
+    std::uint32_t cryptsize          = 0;
+    std::uint32_t cryptid            = 0;
+    std::uint32_t pad                = 0;
+
+    [[nodiscard]] constexpr bool is_encrypted() const noexcept { return cryptid != 0u; }
+};
+
+struct MachOLinkeditRange {
+    bool          present          = false;
+    std::uint32_t cmd              = 0;
+    std::uint32_t slice_offset     = 0;
+    std::uint64_t container_offset = 0;
+    std::uint32_t size             = 0;
+};
+
+struct MachODyldInfoRanges {
+    bool               has_dyld_info           = false;
+    bool               dyld_info_only          = false;
+    std::uint32_t      rebase_off              = 0;
+    std::uint64_t      container_rebase_off    = 0;
+    std::uint32_t      rebase_size             = 0;
+    std::uint32_t      bind_off                = 0;
+    std::uint64_t      container_bind_off      = 0;
+    std::uint32_t      bind_size               = 0;
+    std::uint32_t      weak_bind_off           = 0;
+    std::uint64_t      container_weak_bind_off = 0;
+    std::uint32_t      weak_bind_size          = 0;
+    std::uint32_t      lazy_bind_off           = 0;
+    std::uint64_t      container_lazy_bind_off = 0;
+    std::uint32_t      lazy_bind_size          = 0;
+    std::uint32_t      export_off              = 0;
+    std::uint64_t      container_export_off    = 0;
+    std::uint32_t      export_size             = 0;
+    MachOLinkeditRange exports_trie{};
+    MachOLinkeditRange chained_fixups{};
+    MachOLinkeditRange function_starts{};
+    MachOLinkeditRange data_in_code{};
+};
+
+// Structural summary of an embedded `LC_CODE_SIGNATURE` SuperBlob / CodeDirectory.
+// Explicitly separates structural blob presence (`superblob_valid` / `has_code_directory` /
+// `has_cms_blob`) from OS cryptographic trust-chain verification (`cryptographically_verified`).
+struct MachOCodeSignatureInfo {
+    bool          present                     = false;
+    std::uint32_t slice_offset                = 0;
+    std::uint64_t container_offset            = 0;
+    std::uint32_t data_size                   = 0;
+    bool          superblob_valid             = false;
+    std::uint32_t superblob_magic             = 0;
+    std::uint32_t superblob_length            = 0;
+    std::uint32_t blob_count                  = 0;
+    bool          has_code_directory          = false;
+    std::uint32_t cd_version                  = 0;
+    std::uint32_t cd_flags                    = 0;
+    std::uint32_t n_special_slots             = 0;
+    std::uint32_t n_code_slots                = 0;
+    std::uint32_t code_limit                  = 0;
+    std::uint8_t  hash_size                   = 0;
+    std::uint8_t  hash_type                   = 0;
+    std::uint8_t  platform                    = 0;
+    std::uint8_t  page_size_log2              = 0;
+    std::string   identifier{};
+    std::string   team_id{};
+    bool          has_requirements_blob       = false;
+    bool          has_entitlements_blob       = false;
+    bool          has_der_entitlements_blob   = false;
+    bool          has_cms_blob                = false;
+    std::uint32_t cms_blob_size               = 0;
+    std::uint32_t cms_payload_size            = 0;
+    bool          has_nonempty_cms_signature  = false;
+    bool          cryptographically_verified  = false;
+
+    [[nodiscard]] constexpr bool is_adhoc() const noexcept {
+        return (cd_flags & 0x00000002u) != 0u; // CS_ADHOC
+    }
+    [[nodiscard]] constexpr bool has_hardened_runtime() const noexcept {
+        return (cd_flags & 0x00010000u) != 0u; // CS_RUNTIME
+    }
+    [[nodiscard]] constexpr bool is_linker_signed() const noexcept {
+        return (cd_flags & 0x00020000u) != 0u; // CS_LINKER_SIGNED
+    }
+};
+
+// Format-agnostic interface over a parsed binary. Concrete PE/ELF/Mach-O types
+// sit behind this interface; format-specific accessors carry safe empty defaults
+// so subclasses and test mocks need not implement unrelated formats.
 class IBinaryImage {
 public:
     virtual ~IBinaryImage() = default;
@@ -398,36 +694,82 @@ public:
     [[nodiscard]] virtual Endianness    endianness()   const noexcept = 0;
     [[nodiscard]] virtual bool          is_64bit()     const noexcept = 0;
     [[nodiscard]] virtual std::uint64_t image_base()   const noexcept = 0;
-    // Entry-point virtual address (ELF e_entry; PE ImageBase + AddressOfEntryPoint).
+    // Entry-point virtual address (ELF e_entry; PE ImageBase + AddressOfEntryPoint; Mach-O LC_MAIN/LC_UNIXTHREAD).
     [[nodiscard]] virtual std::uint64_t entry_point()  const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Section>& sections() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Segment>& segments() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<Symbol>& symbols() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ImportEntry>& imports() const noexcept = 0;
     [[nodiscard]] virtual const std::vector<ExportEntry>& exports() const noexcept = 0;
+
+    // Container / Universal slice provenance (container-absolute offset discipline).
+    [[nodiscard]] virtual bool          is_universal_slice()     const noexcept { return false; }
+    [[nodiscard]] virtual std::size_t   container_slice_index()  const noexcept { return 0; }
+    [[nodiscard]] virtual std::uint64_t container_slice_offset() const noexcept { return 0; }
+    [[nodiscard]] virtual std::uint64_t container_slice_size()   const noexcept { return 0; }
+    [[nodiscard]] virtual std::optional<std::uint64_t> slice_relative_offset(
+        std::uint64_t container_file_offset) const noexcept;
+    [[nodiscard]] virtual std::optional<std::uint64_t> container_file_offset(
+        std::uint64_t slice_rel_offset) const noexcept;
+
     [[nodiscard]] virtual const GnuDebugLink* gnu_debuglink() const noexcept { return nullptr; }
+
+    // PE metadata accessors (safe empty defaults for non-PE images).
     [[nodiscard]] virtual const PeHeader* pe_header() const noexcept { return nullptr; }
-    [[nodiscard]] virtual const std::vector<PeDataDirectory>& pe_data_directories() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept = 0;
-    [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<PeCertificate>& pe_certificates() const noexcept = 0;
-    [[nodiscard]] virtual const PeLoadConfigDirectory* pe_load_config_directory() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<PeBoundImport>& pe_bound_imports() const noexcept = 0;
-    [[nodiscard]] virtual const PeResourceDirectory* pe_resource_directory() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<PeResourceDataEntry>& pe_resource_data_entries() const noexcept = 0;
-    [[nodiscard]] virtual const PeClrHeader* pe_clr_header() const noexcept = 0;
-    [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfSymbol>& elf_symbols() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfRelocation>& elf_relocations() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfNote>& elf_notes() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept = 0;
-    [[nodiscard]] virtual const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept = 0;
-    [[nodiscard]] virtual std::string_view elf_interpreter() const noexcept = 0;
+    [[nodiscard]] virtual const std::vector<PeDataDirectory>& pe_data_directories() const noexcept;
+    [[nodiscard]] virtual const std::vector<PeBaseRelocationBlock>& pe_base_relocations() const noexcept;
+    [[nodiscard]] virtual const std::vector<PeDebugDirectory>& pe_debug_directories() const noexcept;
+    [[nodiscard]] virtual const PeTlsDirectory* pe_tls_directory() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<PeCertificate>& pe_certificates() const noexcept;
+    [[nodiscard]] virtual const PeLoadConfigDirectory* pe_load_config_directory() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<PeRuntimeFunction>& pe_runtime_functions() const noexcept;
+    [[nodiscard]] virtual const std::vector<PeBoundImport>& pe_bound_imports() const noexcept;
+    [[nodiscard]] virtual const PeResourceDirectory* pe_resource_directory() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<PeResourceDataEntry>& pe_resource_data_entries() const noexcept;
+    [[nodiscard]] virtual const PeClrHeader* pe_clr_header() const noexcept { return nullptr; }
+
+    // ELF metadata accessors (safe empty defaults for non-ELF images).
+    [[nodiscard]] virtual const ElfHeader* elf_header() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<ElfProgramHeader>& elf_program_headers() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfSectionHeader>& elf_section_headers() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfSymbol>& elf_symbols() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfDynamicEntry>& elf_dynamic_entries() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfRelocation>& elf_relocations() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfNote>& elf_notes() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept;
+    [[nodiscard]] virtual const std::vector<ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept;
+    [[nodiscard]] virtual std::string_view elf_interpreter() const noexcept { return {}; }
+
+    // Mach-O metadata accessors (safe empty defaults for non-Mach-O images).
+    [[nodiscard]] virtual const MachOHeader* macho_header() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<MachOLoadCommandInfo>& macho_load_commands() const noexcept;
+    [[nodiscard]] virtual const std::vector<MachOSegmentCommand>& macho_segments() const noexcept;
+    [[nodiscard]] virtual const std::vector<MachOSection>& macho_sections() const noexcept;
+    [[nodiscard]] virtual const std::vector<MachOSymbol>& macho_symbols() const noexcept;
+    [[nodiscard]] virtual const MachOSymtabInfo* macho_symtab() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const MachODysymtabInfo* macho_dysymtab() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<MachODylibDependency>& macho_dylibs() const noexcept;
+    [[nodiscard]] virtual const MachODylibDependency* macho_id_dylib() const noexcept { return nullptr; }
+    [[nodiscard]] virtual const std::vector<MachORpathEntry>& macho_rpaths() const noexcept;
+    [[nodiscard]] virtual std::string_view macho_dylinker() const noexcept { return {}; }
+    [[nodiscard]] virtual std::optional<std::array<std::uint8_t, 16>> macho_uuid() const noexcept {
+        return std::nullopt;
+    }
+    [[nodiscard]] virtual std::string_view macho_uuid_string() const noexcept { return {}; }
+    [[nodiscard]] virtual std::optional<std::uint64_t> macho_source_version() const noexcept {
+        return std::nullopt;
+    }
+    [[nodiscard]] virtual const std::vector<MachOBuildVersion>& macho_build_versions() const noexcept;
+    [[nodiscard]] virtual const MachOEncryptionInfo* macho_encryption_info() const noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] virtual const MachODyldInfoRanges* macho_dyld_info() const noexcept {
+        return nullptr;
+    }
+    [[nodiscard]] virtual const MachOCodeSignatureInfo* macho_code_signature() const noexcept {
+        return nullptr;
+    }
+
     [[nodiscard]] virtual std::span<const std::string> parse_warnings() const noexcept {
         return {};
     }
@@ -435,12 +777,38 @@ public:
         std::uint64_t file_offset) const noexcept = 0;
     [[nodiscard]] virtual std::optional<std::uint64_t> virtual_address_to_file_offset(
         std::uint64_t virtual_address) const noexcept = 0;
+
+    [[nodiscard]] std::optional<std::uint64_t> file_offset_to_va(
+        std::uint64_t file_offset) const noexcept {
+        return file_offset_to_virtual_address(file_offset);
+    }
+    [[nodiscard]] std::optional<std::uint64_t> va_to_file_offset(
+        std::uint64_t virtual_address) const noexcept {
+        return virtual_address_to_file_offset(virtual_address);
+    }
+
+    [[nodiscard]] virtual Result<std::vector<std::uint8_t>> read_bytes_at_offset(
+        std::uint64_t file_offset,
+        std::size_t size) const;
+    [[nodiscard]] virtual Result<std::vector<std::uint8_t>> read_bytes_at_va(
+        std::uint64_t virtual_address,
+        std::size_t size) const;
 };
 
-// Detect the container format from the leading magic bytes.
+// Detect the container format from the leading magic bytes (disambiguating Universal
+// Mach-O 0xCAFEBABE containers from Java .class files).
 [[nodiscard]] Format detect_format(std::span<const std::uint8_t> bytes) noexcept;
 
-// Parse bytes into a concrete PE/ELF image behind the IBinaryImage interface.
+// Inspect a thin binary or Universal Mach-O container and enumerate available slices.
+[[nodiscard]] Result<BinaryContainerInfo> inspect_binary_container(
+    std::span<const std::uint8_t> bytes);
+
+// Open a thin binary or selected Universal Mach-O slice behind IBinaryImage.
+[[nodiscard]] Result<std::unique_ptr<IBinaryImage>> open_binary_image(
+    std::span<const std::uint8_t> bytes,
+    const BinaryOpenOptions& options = {});
+
+// Parse bytes into a concrete PE/ELF/Mach-O image behind the IBinaryImage interface.
 [[nodiscard]] Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> bytes);
 
 // Parse an on-disk PE/ELF file and rebase all virtual addresses and mapped section offsets

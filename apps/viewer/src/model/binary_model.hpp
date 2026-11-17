@@ -42,7 +42,8 @@ namespace viewer {
     enum class BinaryFormat {
         None,
         PE,
-        ELF
+        ELF,
+        MachO
     };
 
     enum class BinarySourceKind : std::uint8_t {
@@ -552,6 +553,7 @@ namespace viewer {
         void load_live_module_backing_bytes(const peelf::ModuleInfo& module);
         bool load_pe(const std::string& path);
         bool load_elf(const std::string& path);
+        bool load_macho(const std::string& path);
     };
 
 } // namespace viewer
