@@ -512,7 +512,7 @@ TEST(BinaryDiffTest, RelocationTolerantFunctionMatchingAcrossShiftedVirtualAddre
             .code = {
                 0x53u,                               // push rbx
                 0x48u, 0x31u, 0xDBu,                 // xor rbx, rbx
-                0xE8u, 0x30u, 0x00u, 0x00u, 0x00u,   // call external
+                0xE8u, 0x00u, 0x01u, 0x00u, 0x00u,   // call 0x401189 (next IP = 0x401089)
                 0x48u, 0x89u, 0xD8u,                 // mov rax, rbx
                 0x5Bu, 0xC3u,
             },
@@ -524,11 +524,11 @@ TEST(BinaryDiffTest, RelocationTolerantFunctionMatchingAcrossShiftedVirtualAddre
         },
     };
 
-    // Build B shifts every function forward by +0x60 bytes AND changes RIP-relative & CALL rel32 displacements!
-    // - `compute_hash` moved to 0x401060 with updated RIP disp32 (`0x1FB0`) and call disp32 (`0x80`) -> MUST be `IdenticalRelocated`!
+    // Build B shifts functions forward AND changes RIP-relative & CALL rel32 displacements!
+    // - `compute_hash` moved to 0x401060 with updated RIP disp32 (`0x1FB0`) and call disp32 (`0x80` -> 0x4010F0) -> MUST be `IdenticalRelocated`!
     // - `validate_token` moved to 0x4010A0 AND changed immediate (`add eax, 0x2A` instead of `7`) -> MUST be `Modified`!
-    // - `renamed_v2_helper` moved to 0x4010E0 with updated call disp32 (`0x90`) -> matched by Pass 2 `NormalizedFingerprint` as `IdenticalRelocated`!
-    // - `brand_new_func` added at 0x401120 -> `Added`, plus an extra `.note.build` section!
+    // - `renamed_v2_helper` moved to 0x4010F0 with updated call disp32 (`0x90` -> 0x401189) -> matched by Pass 2 `NormalizedFingerprint` as `IdenticalRelocated`!
+    // - `brand_new_func` added at 0x401130 -> `Added`, plus an extra `.note.build` section!
     const std::vector<ElfFuncDef> funcs_b{
         ElfFuncDef{
             .name = "_Z12compute_hashPKvm",
@@ -537,7 +537,7 @@ TEST(BinaryDiffTest, RelocationTolerantFunctionMatchingAcrossShiftedVirtualAddre
                 0x55u,
                 0x48u, 0x89u, 0xE5u,
                 0x48u, 0x8Du, 0x0Du, 0xB0u, 0x1Fu, 0x00u, 0x00u, // shifted RIP disp32!
-                0xE8u, 0x80u, 0x00u, 0x00u, 0x00u,               // shifted CALL rel32!
+                0xE8u, 0x80u, 0x00u, 0x00u, 0x00u,               // shifted CALL rel32 -> 0x4010F0!
                 0x5Du,
                 0xC3u,
             },
@@ -554,18 +554,18 @@ TEST(BinaryDiffTest, RelocationTolerantFunctionMatchingAcrossShiftedVirtualAddre
         },
         ElfFuncDef{
             .name = "renamed_v2_helper",
-            .va = 0x4010E0ull,
+            .va = 0x4010F0ull,
             .code = {
                 0x53u,
                 0x48u, 0x31u, 0xDBu,
-                0xE8u, 0x90u, 0x00u, 0x00u, 0x00u, // shifted CALL rel32!
+                0xE8u, 0x90u, 0x00u, 0x00u, 0x00u, // shifted CALL rel32 -> 0x401189!
                 0x48u, 0x89u, 0xD8u,
                 0x5Bu, 0xC3u,
             },
         },
         ElfFuncDef{
             .name = "brand_new_func",
-            .va = 0x401120ull,
+            .va = 0x401130ull,
             .code = {0xB8u, 0x01u, 0x00u, 0x00u, 0x00u, 0xC3u},
         },
     };
@@ -993,3 +993,175 @@ TEST(BinaryDiffTest, AdversarialNearUint64MaxRelocAndSecurityCookieRvasDoNotOver
     const auto norm = peelf::normalize_function_bytes_for_diff(near_max_code, 0xFFFF'FFFF'FFFF'FFFCull, adv);
     EXPECT_EQ(norm.size(), near_max_code.size());
 }
+
+TEST(BinaryDiffTest, UnrelocatedX86CallTargetChangeReportsModifiedAndMergesOverlappingRelocs) {
+    // 1. Two x86_64 binaries where `dispatch_request` differs ONLY in its un-relocated
+    //    `E8 rel32` displacement (`call fn_a` at 0x401040 vs `call fn_b` at 0x401080) MUST
+    //    be classified as `Modified` (NOT `IdenticalRelocated`)!
+    const std::vector<ElfFuncDef> funcs_lhs{
+        ElfFuncDef{
+            .name = "dispatch_request",
+            .va = 0x401000ull,
+            .code = {
+                0x55u,                              // push rbp
+                0x48u, 0x89u, 0xE5u,                // mov rbp, rsp
+                0xE8u, 0x37u, 0x00u, 0x00u, 0x00u,  // call 0x401040 (`fn_a`, next IP = 0x401009)
+                0x5Du,                              // pop rbp
+                0xC3u,                              // ret
+            },
+        },
+        ElfFuncDef{
+            .name = "fn_a",
+            .va = 0x401040ull,
+            .code = {0xB8u, 0x01u, 0x00u, 0x00u, 0x00u, 0xC3u}, // mov eax, 1; ret
+        },
+        ElfFuncDef{
+            .name = "fn_b",
+            .va = 0x401080ull,
+            .code = {0xB8u, 0x02u, 0x00u, 0x00u, 0x00u, 0xC3u}, // mov eax, 2; ret
+        },
+    };
+
+    std::vector<ElfFuncDef> funcs_rhs = funcs_lhs;
+    // Switch `dispatch_request` from `call fn_a` (0x401040) to `call fn_b` (0x401080):
+    funcs_rhs[0].code[5] = 0x77u; // 0x401009 + 0x77 = 0x401080 (`fn_b`)
+
+    const auto elf_lhs = build_elf64_with_functions(0x401000ull, funcs_lhs);
+    const auto elf_rhs = build_elf64_with_functions(0x401000ull, funcs_rhs);
+
+    const auto diff_res = peelf::compare_binaries(elf_lhs, elf_rhs);
+    ASSERT_TRUE(diff_res.has_value()) << diff_res.error().message;
+
+    const auto dispatch_it = std::ranges::find_if(
+        diff_res->functions,
+        [](const peelf::FunctionDiffEntry& f) { return f.display_name == "dispatch_request"; });
+    ASSERT_NE(dispatch_it, diff_res->functions.end());
+    EXPECT_EQ(dispatch_it->status, peelf::FunctionMatchKind::Modified);
+    EXPECT_LT(dispatch_it->similarity, 1.0);
+    EXPECT_EQ(diff_res->functions_modified, 1u);
+    EXPECT_EQ(diff_res->functions_relocated, 0u);
+
+    auto parsed_lhs = peelf::parse_image(elf_lhs);
+    auto parsed_rhs = peelf::parse_image(elf_rhs);
+    ASSERT_TRUE(parsed_lhs.has_value());
+    ASSERT_TRUE(parsed_rhs.has_value());
+    const auto norm_lhs = peelf::normalize_function_bytes_for_diff(
+        funcs_lhs[0].code, 0x401000ull, **parsed_lhs);
+    const auto norm_rhs = peelf::normalize_function_bytes_for_diff(
+        funcs_rhs[0].code, 0x401000ull, **parsed_rhs);
+    EXPECT_NE(norm_lhs, norm_rhs);
+
+    // 2. Overlapping relocation intervals: a wide earlier interval [0x401002, 0x40100A)
+    //    overlapping a narrower slightly-later interval [0x401003, 0x401007) MUST be merged
+    //    so `std::upper_bound` recognizes that rel32 at [0x401005, 0x401009) is covered!
+    class OverlappingRelocImage final : public peelf::IBinaryImage {
+    public:
+        explicit OverlappingRelocImage(const peelf::IBinaryImage& base) : base_(base) {
+            elf_relocs_ = {
+                peelf::ElfRelocation{
+                    .section_name = ".rela.text",
+                    .offset = 0x401003ull,
+                    .info = 2u,
+                    .symbol_index = 1u,
+                    .type = 2u, // 4-byte R_X86_64_PC32 -> [0x401003, 0x401007)
+                    .addend = -4,
+                    .has_addend = true,
+                    .symbol_name = {},
+                },
+                peelf::ElfRelocation{
+                    .section_name = ".rela.text",
+                    .offset = 0x401002ull,
+                    .info = 1u,
+                    .symbol_index = 1u,
+                    .type = 1u, // 8-byte R_X86_64_64 -> [0x401002, 0x40100A)
+                    .addend = 0,
+                    .has_addend = true,
+                    .symbol_name = {},
+                },
+            };
+        }
+        [[nodiscard]] peelf::Format format() const noexcept override { return base_.format(); }
+        [[nodiscard]] peelf::ImageKind kind() const noexcept override { return base_.kind(); }
+        [[nodiscard]] peelf::Architecture architecture() const noexcept override { return base_.architecture(); }
+        [[nodiscard]] peelf::Endianness endianness() const noexcept override { return base_.endianness(); }
+        [[nodiscard]] bool is_64bit() const noexcept override { return base_.is_64bit(); }
+        [[nodiscard]] std::uint64_t image_base() const noexcept override { return base_.image_base(); }
+        [[nodiscard]] std::uint64_t entry_point() const noexcept override { return base_.entry_point(); }
+        [[nodiscard]] const std::vector<peelf::Section>& sections() const noexcept override { return base_.sections(); }
+        [[nodiscard]] const std::vector<peelf::Segment>& segments() const noexcept override { return base_.segments(); }
+        [[nodiscard]] const std::vector<peelf::Symbol>& symbols() const noexcept override { return base_.symbols(); }
+        [[nodiscard]] const std::vector<peelf::ImportEntry>& imports() const noexcept override { return base_.imports(); }
+        [[nodiscard]] const std::vector<peelf::ExportEntry>& exports() const noexcept override { return base_.exports(); }
+        [[nodiscard]] const peelf::PeHeader* pe_header() const noexcept override { return base_.pe_header(); }
+        [[nodiscard]] const std::vector<peelf::PeDataDirectory>& pe_data_directories() const noexcept override { return base_.pe_data_directories(); }
+        [[nodiscard]] const std::vector<peelf::PeBaseRelocationBlock>& pe_base_relocations() const noexcept override { return base_.pe_base_relocations(); }
+        [[nodiscard]] const std::vector<peelf::PeDebugDirectory>& pe_debug_directories() const noexcept override { return base_.pe_debug_directories(); }
+        [[nodiscard]] const peelf::PeTlsDirectory* pe_tls_directory() const noexcept override { return base_.pe_tls_directory(); }
+        [[nodiscard]] const std::vector<peelf::PeCertificate>& pe_certificates() const noexcept override { return base_.pe_certificates(); }
+        [[nodiscard]] const peelf::PeLoadConfigDirectory* pe_load_config_directory() const noexcept override { return base_.pe_load_config_directory(); }
+        [[nodiscard]] const std::vector<peelf::PeRuntimeFunction>& pe_runtime_functions() const noexcept override { return base_.pe_runtime_functions(); }
+        [[nodiscard]] const std::vector<peelf::PeBoundImport>& pe_bound_imports() const noexcept override { return base_.pe_bound_imports(); }
+        [[nodiscard]] const peelf::PeResourceDirectory* pe_resource_directory() const noexcept override { return base_.pe_resource_directory(); }
+        [[nodiscard]] const std::vector<peelf::PeResourceDataEntry>& pe_resource_data_entries() const noexcept override { return base_.pe_resource_data_entries(); }
+        [[nodiscard]] const peelf::PeClrHeader* pe_clr_header() const noexcept override { return base_.pe_clr_header(); }
+        [[nodiscard]] const peelf::ElfHeader* elf_header() const noexcept override { return base_.elf_header(); }
+        [[nodiscard]] const std::vector<peelf::ElfProgramHeader>& elf_program_headers() const noexcept override { return base_.elf_program_headers(); }
+        [[nodiscard]] const std::vector<peelf::ElfSectionHeader>& elf_section_headers() const noexcept override { return base_.elf_section_headers(); }
+        [[nodiscard]] const std::vector<peelf::ElfSymbol>& elf_symbols() const noexcept override { return base_.elf_symbols(); }
+        [[nodiscard]] const std::vector<peelf::ElfDynamicEntry>& elf_dynamic_entries() const noexcept override { return base_.elf_dynamic_entries(); }
+        [[nodiscard]] const std::vector<peelf::ElfRelocation>& elf_relocations() const noexcept override { return elf_relocs_; }
+        [[nodiscard]] const std::vector<peelf::ElfNote>& elf_notes() const noexcept override { return base_.elf_notes(); }
+        [[nodiscard]] const std::vector<peelf::ElfSysvHashTable>& elf_sysv_hash_tables() const noexcept override { return base_.elf_sysv_hash_tables(); }
+        [[nodiscard]] const std::vector<peelf::ElfGnuHashTable>& elf_gnu_hash_tables() const noexcept override { return base_.elf_gnu_hash_tables(); }
+        [[nodiscard]] std::string_view elf_interpreter() const noexcept override { return base_.elf_interpreter(); }
+        [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(std::uint64_t o) const noexcept override {
+            return base_.file_offset_to_virtual_address(o);
+        }
+        [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(std::uint64_t v) const noexcept override {
+            return base_.virtual_address_to_file_offset(v);
+        }
+
+    private:
+        const peelf::IBinaryImage& base_;
+        std::vector<peelf::ElfRelocation> elf_relocs_{};
+    };
+
+    const OverlappingRelocImage overlap_lhs(**parsed_lhs);
+    const OverlappingRelocImage overlap_rhs(**parsed_rhs);
+    const auto reloc_norm_lhs = peelf::normalize_function_bytes_for_diff(
+        funcs_lhs[0].code, 0x401000ull, overlap_lhs);
+    const auto reloc_norm_rhs = peelf::normalize_function_bytes_for_diff(
+        funcs_rhs[0].code, 0x401000ull, overlap_rhs);
+    EXPECT_EQ(reloc_norm_lhs, reloc_norm_rhs);
+    EXPECT_EQ(reloc_norm_lhs[5], 0u);
+    EXPECT_EQ(reloc_norm_lhs[8], 0u);
+
+    // 3. Bogus explicit `st_size` exceeding `.text` bounds is clamped cleanly, and pre-triggered
+    //    `stop_token` cancels cleanly.
+    std::vector<std::uint8_t> inflated_sym_elf = elf_lhs;
+    // Patch first STT_FUNC symbol's 64-bit `st_size` in `.symtab` (search for `st_value == 0x401000` + `st_size == 11`)
+    bool patched_st_size = false;
+    for (std::size_t off = 0x200u; off + 16u <= inflated_sym_elf.size(); ++off) {
+        if (inflated_sym_elf[off] == 0x00u && inflated_sym_elf[off + 1u] == 0x10u &&
+            inflated_sym_elf[off + 2u] == 0x40u && inflated_sym_elf[off + 3u] == 0x00u &&
+            inflated_sym_elf[off + 8u] == 11u && inflated_sym_elf[off + 9u] == 0u) {
+            put64(inflated_sym_elf, off + 8u, 0x0FFF'FFFFull);
+            patched_st_size = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(patched_st_size);
+    const auto clamped_diff = peelf::compare_binaries(inflated_sym_elf, elf_lhs);
+    ASSERT_TRUE(clamped_diff.has_value()) << clamped_diff.error().message;
+    for (const auto& fn : clamped_diff->functions) {
+        EXPECT_LE(fn.lhs_size, 0x200u);
+    }
+
+    std::stop_source stop_src;
+    stop_src.request_stop();
+    peelf::BinaryDiffOptions cancel_opts;
+    cancel_opts.stop_token = stop_src.get_token();
+    const auto cancelled = peelf::compare_binaries(elf_lhs, elf_rhs, cancel_opts);
+    EXPECT_FALSE(cancelled.has_value());
+}
+

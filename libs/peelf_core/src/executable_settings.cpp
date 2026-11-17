@@ -2442,9 +2442,12 @@ ExecutableSettingsReport extract_executable_settings(
 
     CaptureStamp eff_stamp = static_stamp;
     if (eff_stamp.snapshot_revision == 0u && eff_stamp.captured_at_utc.empty()) {
-        TargetInstanceId tid;
-        tid.backend = BackendKind::StaticFile;
-        eff_stamp = CaptureStamp::capture_now(tid, 1u, true, CaptureAvailability::Complete);
+        TargetInstanceId tid = static_stamp.target_id;
+        const CaptureAvailability default_avail =
+            (static_stamp.availability == CaptureAvailability::Unavailable)
+                ? CaptureAvailability::Complete
+                : static_stamp.availability;
+        eff_stamp = CaptureStamp::capture_now(tid, 1u, true, default_avail);
     }
 
     const ProvenanceTag prov =
@@ -2573,13 +2576,37 @@ ExecutableSettingsReport extract_executable_settings(
             .file_offset = 0u,
         }};
 
-    if (any_partial_decl) {
+    if (eff_stamp.availability == CaptureAvailability::Unavailable) {
+        report.declared_in_file = Observed<DeclaredSettings>::unavailable(
+            prov,
+            "Static declared settings marked unavailable by caller provenance stamp",
+            eff_stamp);
+    } else if (any_partial_decl || eff_stamp.availability == CaptureAvailability::Partial) {
+        eff_stamp.availability = CaptureAvailability::Partial;
         report.declared_in_file = Observed<DeclaredSettings>::partial(
             std::move(decl),
             prov,
-            "One or more static metadata blocks are malformed or truncated",
+            any_partial_decl
+                ? "One or more static metadata blocks are malformed or truncated"
+                : "Static declared settings partially captured",
             eff_stamp,
             std::move(decl_ev));
+    } else if (eff_stamp.availability == CaptureAvailability::Redacted) {
+        report.declared_in_file = Observed<DeclaredSettings>::redacted(
+            std::move(decl),
+            prov,
+            "Static declared settings marked redacted by caller provenance stamp",
+            eff_stamp);
+        report.declared_in_file.evidence = std::move(decl_ev);
+    } else if (eff_stamp.availability == CaptureAvailability::Stale) {
+        report.declared_in_file = Observed<DeclaredSettings>{
+            .value = std::move(decl),
+            .provenance = prov,
+            .availability = CaptureAvailability::Stale,
+            .stamp = eff_stamp,
+            .evidence = std::move(decl_ev),
+            .note = "Static declared settings capture is stale",
+        };
     } else {
         report.declared_in_file = Observed<DeclaredSettings>::complete(
             std::move(decl),
@@ -2606,6 +2633,123 @@ ExecutableSettingsReport extract_executable_settings(
 }
 
 namespace {
+
+[[nodiscard]] constexpr CaptureAvailability combine_section_availabilities(
+    std::initializer_list<CaptureAvailability> states) noexcept {
+    bool any_non_unavail = false;
+    bool any_partial_or_unavail = false;
+    bool any_redacted = false;
+    bool any_stale = false;
+    for (const CaptureAvailability st : states) {
+        if (st != CaptureAvailability::Unavailable) {
+            any_non_unavail = true;
+        }
+        switch (st) {
+            case CaptureAvailability::Unavailable:
+            case CaptureAvailability::Partial:
+                any_partial_or_unavail = true;
+                break;
+            case CaptureAvailability::Redacted:
+                any_redacted = true;
+                break;
+            case CaptureAvailability::Stale:
+                any_stale = true;
+                break;
+            case CaptureAvailability::Complete:
+                break;
+        }
+    }
+    if (!any_non_unavail) {
+        return CaptureAvailability::Unavailable;
+    }
+    if (any_partial_or_unavail) {
+        return CaptureAvailability::Partial;
+    }
+    if (any_redacted) {
+        return CaptureAvailability::Redacted;
+    }
+    if (any_stale) {
+        return CaptureAvailability::Stale;
+    }
+    return CaptureAvailability::Complete;
+}
+
+template <typename T>
+[[nodiscard]] Observed<T> make_observed_preserving_availability(
+    T val,
+    ProvenanceTag prov,
+    CaptureStamp stamp,
+    std::string_view note_if_non_complete,
+    std::vector<Evidence> ev = {}) {
+    switch (stamp.availability) {
+        case CaptureAvailability::Unavailable:
+            return Observed<T>::unavailable(
+                prov,
+                note_if_non_complete.empty() ? "Observation unavailable." : note_if_non_complete,
+                std::move(stamp));
+        case CaptureAvailability::Partial:
+            return Observed<T>::partial(
+                std::move(val),
+                prov,
+                note_if_non_complete.empty() ? "Observation partially captured." : note_if_non_complete,
+                std::move(stamp),
+                std::move(ev));
+        case CaptureAvailability::Redacted: {
+            auto obs = Observed<T>::redacted(
+                std::move(val),
+                prov,
+                note_if_non_complete.empty() ? "Observation redacted." : note_if_non_complete,
+                std::move(stamp));
+            if (!ev.empty()) {
+                obs.evidence = std::move(ev);
+            }
+            return obs;
+        }
+        case CaptureAvailability::Stale: {
+            const std::string resolved_note(
+                note_if_non_complete.empty() ? "Observation capture is stale." : note_if_non_complete);
+            if (ev.empty()) {
+                ev.push_back(Evidence{
+                    .tag = prov,
+                    .source = std::string(to_string(prov)),
+                    .detail = resolved_note,
+                });
+            }
+            return Observed<T>{
+                .value = std::move(val),
+                .provenance = prov,
+                .availability = CaptureAvailability::Stale,
+                .stamp = std::move(stamp),
+                .evidence = std::move(ev),
+                .note = resolved_note,
+            };
+        }
+        case CaptureAvailability::Complete:
+            return Observed<T>::complete(std::move(val), prov, std::move(stamp), std::move(ev));
+    }
+    return Observed<T>::complete(std::move(val), prov, std::move(stamp), std::move(ev));
+}
+
+template <typename T>
+[[nodiscard]] Observed<T> from_forgiving_preserving_stamp(
+    const ForgivingValue<T>& fv,
+    ProvenanceTag prov,
+    CaptureStamp stamp) {
+    const CaptureAvailability stamp_avail = stamp.availability;
+    Observed<T> obs = Observed<T>::from_forgiving(fv, prov, std::move(stamp));
+    if (obs.availability == CaptureAvailability::Complete &&
+        (stamp_avail == CaptureAvailability::Stale ||
+         stamp_avail == CaptureAvailability::Redacted)) {
+        obs.availability = stamp_avail;
+        obs.stamp.availability = stamp_avail;
+        if (obs.note.empty()) {
+            obs.note = (stamp_avail == CaptureAvailability::Stale)
+                           ? "Observation capture is stale."
+                           : "Observation redacted.";
+        }
+    }
+    return obs;
+}
 
 [[nodiscard]] constexpr std::string_view strip_deleted_view(std::string_view sv) noexcept {
     constexpr std::string_view kDeletedSuffix = " (deleted)";
@@ -2916,11 +3060,11 @@ Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
     }
 
     cmp.runtime_load_proven_by_timeline = any_timeline_proven;
-    const bool partial_inputs =
-        (loaded_modules.availability != CaptureAvailability::Complete) ||
-        (declared_in_file.availability != CaptureAvailability::Complete);
+    const CaptureAvailability cmp_avail = combine_section_availabilities(
+        {loaded_modules.availability, declared_in_file.availability});
 
-    if (partial_inputs) {
+    if (cmp_avail == CaptureAvailability::Partial ||
+        cmp_avail == CaptureAvailability::Unavailable) {
         cmp.summary = std::format(
             "Partial reconciliation: {}/{} root declared dependencies observed loaded ({} not observed in partial capture), {} unmatched loaded module(s).",
             cmp.matched_declared.size(),
@@ -2945,13 +3089,21 @@ Observed<DeclaredVsLoadedModuleComparison> reconcile_declared_vs_loaded_modules(
         any_timeline_proven ? " (includes timeline-proven runtime load)" : "");
 
     CaptureStamp s = loaded_modules.stamp;
-    s.availability = CaptureAvailability::Complete;
+    s.availability = cmp_avail;
     std::vector<Evidence> ev = {
         Evidence{.tag = declared_in_file.provenance, .source = "declared_dependencies"},
         Evidence{.tag = loaded_modules.provenance, .source = "loaded_modules"},
     };
-    return Observed<DeclaredVsLoadedModuleComparison>::complete(
-        std::move(cmp), prov, std::move(s), std::move(ev));
+    return make_observed_preserving_availability(
+        std::move(cmp),
+        prov,
+        std::move(s),
+        cmp_avail == CaptureAvailability::Stale
+            ? "Declared vs loaded module reconciliation uses stale capture data."
+            : (cmp_avail == CaptureAvailability::Redacted
+                   ? "Declared vs loaded module reconciliation uses redacted capture data."
+                   : std::string_view{}),
+        std::move(ev));
 }
 
 Observed<LaunchEnvironmentSettings> extract_launch_environment_settings(
@@ -3110,26 +3262,23 @@ Observed<LaunchEnvironmentSettings> extract_launch_environment_settings(
             prov, "Process launch/current environment fields are all unavailable.", unavail_stamp);
     }
 
-    const bool all_complete =
-        le.argv.availability == CaptureAvailability::Complete &&
-        le.cwd.availability == CaptureAvailability::Complete &&
-        le.environment.availability == CaptureAvailability::Complete &&
-        le.security_profile.availability == CaptureAvailability::Complete;
+    const CaptureAvailability overall_env_avail = combine_section_availabilities({
+        le.argv.availability,
+        le.cwd.availability,
+        le.environment.availability,
+        le.security_profile.availability,
+    });
 
     const CaptureStamp overall_stamp = CaptureStamp::capture_now(
         target_id,
         snapshot_revision,
         paused,
-        all_complete ? CaptureAvailability::Complete : CaptureAvailability::Partial);
+        overall_env_avail);
 
-    if (all_complete) {
-        auto obs = Observed<LaunchEnvironmentSettings>::complete(
-            std::move(le), prov, overall_stamp);
-        obs.note = origin_note;
-        return obs;
-    }
-    return Observed<LaunchEnvironmentSettings>::partial(
-        std::move(le), prov, origin_note, overall_stamp);
+    auto obs = make_observed_preserving_availability(
+        std::move(le), prov, overall_stamp, origin_note);
+    obs.note = origin_note;
+    return obs;
 }
 
 void populate_runtime_executable_settings(
@@ -3160,19 +3309,24 @@ void populate_runtime_executable_settings(
 
     if (internals_ptr != nullptr) {
         const auto make_stamp = [&](Availability avail) {
+            const CaptureAvailability field_avail = to_capture_availability(avail);
             if (cached_internals_stamp != nullptr) {
                 CaptureStamp s = *cached_internals_stamp;
-                s.availability = to_capture_availability(avail);
+                if (field_avail != CaptureAvailability::Complete ||
+                    (s.availability != CaptureAvailability::Stale &&
+                     s.availability != CaptureAvailability::Redacted)) {
+                    s.availability = field_avail;
+                }
                 return s;
             }
             return CaptureStamp::capture_now(
-                target_id, snapshot_revision, paused, to_capture_availability(avail));
+                target_id, snapshot_revision, paused, field_avail);
         };
-        sec_obs = Observed<ProcessSecurityProfile>::from_forgiving(
+        sec_obs = from_forgiving_preserving_stamp(
             internals_ptr->security, prov, make_stamp(internals_ptr->security.status.availability));
-        handles_obs = Observed<std::vector<ProcessHandleEntry>>::from_forgiving(
+        handles_obs = from_forgiving_preserving_stamp(
             internals_ptr->handles, prov, make_stamp(internals_ptr->handles.status.availability));
-        sockets_obs = Observed<std::vector<ProcessSocketEntry>>::from_forgiving(
+        sockets_obs = from_forgiving_preserving_stamp(
             internals_ptr->sockets, prov, make_stamp(internals_ptr->sockets.status.availability));
     } else {
         const CaptureStamp unavail_stamp = CaptureStamp::capture_now(
@@ -3197,23 +3351,29 @@ void populate_runtime_executable_settings(
     if (cached_modules_stamp != nullptr) {
         std::vector<ModuleInfo> mods_copy(cached_modules.begin(), cached_modules.end());
         CaptureStamp mod_stamp = *cached_modules_stamp;
-        if (mod_stamp.availability == CaptureAvailability::Unavailable) {
-            modules_obs = Observed<std::vector<ModuleInfo>>::unavailable(
-                prov, "Module list unavailable.", mod_stamp);
-        } else if (mod_stamp.availability == CaptureAvailability::Partial) {
-            modules_obs = Observed<std::vector<ModuleInfo>>::partial(
-                std::move(mods_copy), prov, "Module list partially captured.", mod_stamp);
-        } else {
-            mod_stamp.availability = CaptureAvailability::Complete;
-            modules_obs = Observed<std::vector<ModuleInfo>>::complete(
-                std::move(mods_copy), prov, mod_stamp);
-        }
+        const std::string_view mod_note =
+            mod_stamp.availability == CaptureAvailability::Unavailable
+                ? "Module list unavailable."
+                : (mod_stamp.availability == CaptureAvailability::Partial
+                       ? "Module list partially captured."
+                       : (mod_stamp.availability == CaptureAvailability::Stale
+                              ? "Module list capture is stale."
+                              : (mod_stamp.availability == CaptureAvailability::Redacted
+                                     ? "Module list redacted."
+                                     : std::string_view{})));
+        modules_obs = make_observed_preserving_availability(
+            std::move(mods_copy), prov, std::move(mod_stamp), mod_note);
     } else if (session.is_alive()) {
         if (auto mods_res = session.modules(); mods_res.has_value()) {
+            const CaptureAvailability sess_mod_avail =
+                to_capture_availability(session.modules_status().availability);
             const CaptureStamp mod_stamp = CaptureStamp::capture_now(
-                target_id, snapshot_revision, paused, CaptureAvailability::Complete);
-            modules_obs = Observed<std::vector<ModuleInfo>>::complete(
-                std::move(*mods_res), prov, mod_stamp);
+                target_id, snapshot_revision, paused, sess_mod_avail);
+            modules_obs = make_observed_preserving_availability(
+                std::move(*mods_res),
+                prov,
+                mod_stamp,
+                session.modules_status().detail);
         } else {
             const CaptureStamp mod_stamp = CaptureStamp::capture_now(
                 target_id, snapshot_revision, paused, CaptureAvailability::Unavailable);
@@ -3257,27 +3417,28 @@ void populate_runtime_executable_settings(
         return;
     }
 
-    const bool all_complete =
-        runtime.loaded_modules.availability == CaptureAvailability::Complete &&
-        runtime.open_handles.availability == CaptureAvailability::Complete &&
-        runtime.sockets.availability == CaptureAvailability::Complete;
+    const CaptureAvailability rt_avail = combine_section_availabilities({
+        runtime.loaded_modules.availability,
+        runtime.open_handles.availability,
+        runtime.sockets.availability,
+    });
 
     const CaptureStamp rt_stamp = CaptureStamp::capture_now(
         target_id,
         snapshot_revision,
         paused,
-        all_complete ? CaptureAvailability::Complete : CaptureAvailability::Partial);
+        rt_avail);
 
-    if (all_complete) {
-        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::complete(
-            std::move(runtime), prov, rt_stamp);
-    } else {
-        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::partial(
-            std::move(runtime),
-            prov,
-            "One or more runtime collections (modules, handles, sockets) are partial or unavailable.",
-            rt_stamp);
-    }
+    const std::string_view rt_note =
+        rt_avail == CaptureAvailability::Partial
+            ? "One or more runtime collections (modules, handles, sockets) are partial or unavailable."
+            : (rt_avail == CaptureAvailability::Stale
+                   ? "Observed runtime configuration uses stale capture data."
+                   : (rt_avail == CaptureAvailability::Redacted
+                          ? "Observed runtime configuration uses redacted capture data."
+                          : std::string_view{}));
+    report.observed_runtime = make_observed_preserving_availability(
+        std::move(runtime), prov, rt_stamp, rt_note);
 }
 
 ExecutableSettingsReport extract_executable_settings_for_session(

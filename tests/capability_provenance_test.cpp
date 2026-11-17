@@ -396,6 +396,10 @@ public:
                      std::chrono::steady_clock::now().time_since_epoch().count()));
         std::filesystem::create_directories(path_);
     }
+    ScopedTempDir(const ScopedTempDir&) = delete;
+    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+    ScopedTempDir(ScopedTempDir&&) = delete;
+    ScopedTempDir& operator=(ScopedTempDir&&) = delete;
     ~ScopedTempDir() {
         std::error_code ec;
         std::filesystem::remove_all(path_, ec);
@@ -771,3 +775,113 @@ TEST(CapabilityProvenanceTest, HeadlessReportAndBinaryModelHaveExactCapabilityPa
     EXPECT_NE(json.find("\"SupportedValidated\""), std::string::npos);
     EXPECT_NE(json.find("\"DiskFile\""), std::string::npos);
 }
+
+TEST(CapabilityProvenanceTest, MachOUuidSliceEndiannessAndEmptyIdentityNonceHardening) {
+    // 1. Truthful noexcept on allocating factory `CaptureStamp::unavailable_for` (CppCoreGuidelines E.12)
+    static_assert(!noexcept(peelf::CaptureStamp::unavailable_for(peelf::TargetInstanceId{})));
+
+    // 2. Empty hashes/build-IDs/paths MUST NOT compare identical when `dump_nonce == 0` / `session_nonce == 0`
+    peelf::BackingImageIdentity empty_a{};
+    empty_a.format = peelf::Format::ELF;
+    empty_a.architecture = peelf::Architecture::X86_64;
+    peelf::BackingImageIdentity empty_b = empty_a;
+    EXPECT_FALSE(empty_a.same_identity(empty_b));
+
+    empty_a.dump_nonce = 77u;
+    empty_b.dump_nonce = 77u;
+    EXPECT_TRUE(empty_a.same_identity(empty_b));
+    empty_b.dump_nonce = 78u;
+    EXPECT_FALSE(empty_a.same_identity(empty_b));
+
+    peelf::TargetInstanceId dump_id_a{};
+    dump_id_a.backend = peelf::BackendKind::CrashDumpElfCore;
+    peelf::TargetInstanceId dump_id_b = dump_id_a;
+    EXPECT_FALSE(dump_id_a.same_instance(dump_id_b));
+    dump_id_a.session_nonce = 101u;
+    dump_id_b.session_nonce = 101u;
+    EXPECT_TRUE(dump_id_a.same_instance(dump_id_b));
+
+    // 3. Mach-O `LC_UUID` (`macho_uuid_hex`), CPU slice (`cputype`/`cpusubtype`), and endianness
+    const auto make_macho64_with_uuid = [](std::uint32_t cputype,
+                                           std::uint32_t cpusubtype,
+                                           std::array<std::uint8_t, 16> uuid) {
+        std::vector<std::uint8_t> m(0x200u, 0u);
+        // mach_header_64 (32 bytes): MH_MAGIC_64 = 0xFEEDFACF, MH_EXECUTE = 2, ncmds = 2, sizeofcmds = 96
+        write_u32_le(m, 0u, 0xFEEDFACFu);
+        write_u32_le(m, 4u, cputype);
+        write_u32_le(m, 8u, cpusubtype);
+        write_u32_le(m, 12u, 2u);  // MH_EXECUTE
+        write_u32_le(m, 16u, 2u);  // ncmds = 2 (LC_SEGMENT_64 + LC_UUID)
+        write_u32_le(m, 20u, 96u); // sizeofcmds = 72 + 24
+
+        // LC_SEGMENT_64 (cmd = 0x19, cmdsize = 72)
+        const std::size_t seg = 32u;
+        write_u32_le(m, seg + 0u, 0x19u);
+        write_u32_le(m, seg + 4u, 72u);
+        std::memcpy(m.data() + seg + 8u, "__TEXT", 6u);
+        write_u64_le(m, seg + 24u, 0x100000000ULL); // vmaddr
+        write_u64_le(m, seg + 32u, 0x200ULL);       // vmsize
+        write_u64_le(m, seg + 40u, 0ULL);           // fileoff
+        write_u64_le(m, seg + 48u, 0x200ULL);       // filesize
+        write_u32_le(m, seg + 56u, 5u);             // maxprot
+        write_u32_le(m, seg + 60u, 5u);             // initprot
+
+        // LC_UUID (cmd = 0x1B, cmdsize = 24)
+        const std::size_t lc_uuid = seg + 72u;
+        write_u32_le(m, lc_uuid + 0u, 0x1Bu);
+        write_u32_le(m, lc_uuid + 4u, 24u);
+        std::memcpy(m.data() + lc_uuid + 8u, uuid.data(), uuid.size());
+        return m;
+    };
+
+    constexpr std::uint32_t kCpuArchAbi64 = 0x01000000u;
+    constexpr std::uint32_t kCpuTypeX86_64 = 7u | kCpuArchAbi64;
+    constexpr std::uint32_t kCpuTypeArm64 = 12u | kCpuArchAbi64;
+    const std::array<std::uint8_t, 16> uuid_1 = {
+        0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u,
+        0x99u, 0xAAu, 0xBBu, 0xCCu, 0xDDu, 0xEEu, 0xFFu, 0x01u};
+    const std::array<std::uint8_t, 16> uuid_2 = {
+        0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u, 0x88u,
+        0x99u, 0xAAu, 0xBBu, 0xCCu, 0xDDu, 0xEEu, 0xFFu, 0x02u};
+
+    const auto arm64_v1 = make_macho64_with_uuid(kCpuTypeArm64, 0u, uuid_1);
+    const auto arm64_v2 = make_macho64_with_uuid(kCpuTypeArm64, 0u, uuid_2);
+    const auto arm64e_v1 = make_macho64_with_uuid(kCpuTypeArm64, 2u /*arm64e*/, uuid_1);
+    const auto x86_64_v1 = make_macho64_with_uuid(kCpuTypeX86_64, 3u, uuid_1);
+
+    auto img_arm64_v1 = peelf::parse_image(arm64_v1);
+    auto img_arm64_v2 = peelf::parse_image(arm64_v2);
+    auto img_arm64e_v1 = peelf::parse_image(arm64e_v1);
+    auto img_x86_64_v1 = peelf::parse_image(x86_64_v1);
+    ASSERT_TRUE(img_arm64_v1.has_value()) << img_arm64_v1.error().message;
+    ASSERT_TRUE(img_arm64_v2.has_value()) << img_arm64_v2.error().message;
+    ASSERT_TRUE(img_arm64e_v1.has_value()) << img_arm64e_v1.error().message;
+    ASSERT_TRUE(img_x86_64_v1.has_value()) << img_x86_64_v1.error().message;
+
+    const auto id_arm64_v1 = peelf::extract_backing_image_identity(**img_arm64_v1, arm64_v1);
+    const auto id_arm64_v2 = peelf::extract_backing_image_identity(**img_arm64_v2, arm64_v2);
+    const auto id_arm64e_v1 = peelf::extract_backing_image_identity(**img_arm64e_v1, arm64e_v1);
+    const auto id_x86_64_v1 = peelf::extract_backing_image_identity(**img_x86_64_v1, x86_64_v1);
+
+    // Same Mach-O slice + UUID matches
+    const auto same_ver = peelf::verify_backing_image_identity(id_arm64_v1, id_arm64_v1);
+    EXPECT_TRUE(same_ver.matches);
+
+    // Distinct Mach-O LC_UUID MUST fail verification
+    const auto uuid_mismatch = peelf::verify_backing_image_identity(id_arm64_v1, id_arm64_v2);
+    EXPECT_FALSE(uuid_mismatch.matches);
+    ASSERT_FALSE(uuid_mismatch.mismatches.empty());
+    EXPECT_NE(uuid_mismatch.mismatches.front().find("UUID"), std::string::npos);
+
+    // Distinct Universal Mach-O slices (`ARM64` vs `X86_64`, and `arm64` vs `arm64e` subtype) MUST fail
+    const auto arch_slice_mismatch = peelf::verify_backing_image_identity(id_arm64_v1, id_x86_64_v1);
+    EXPECT_FALSE(arch_slice_mismatch.matches);
+    const auto subtype_slice_mismatch = peelf::verify_backing_image_identity(id_arm64_v1, id_arm64e_v1);
+    EXPECT_FALSE(subtype_slice_mismatch.matches);
+
+    // Distinct endianness MUST fail verification
+    peelf::BackingImageIdentity flipped_endian = id_arm64_v1;
+    flipped_endian.endianness = peelf::Endianness::Big;
+    EXPECT_FALSE(peelf::verify_backing_image_identity(id_arm64_v1, flipped_endian).matches);
+}
+

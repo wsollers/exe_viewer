@@ -1,6 +1,7 @@
 #include <peelf/process_snapshot.hpp>
 
 #include <peelf/capability_matrix.hpp>
+#include <peelf/crash_dump.hpp>
 #include <peelf/gdb_remote.hpp>
 
 #include <algorithm>
@@ -1369,22 +1370,37 @@ ProcessStateSnapshot capture_process_snapshot(
     }
 
     // 1. Regions
+    bool any_core_stream_degraded = false;
     if (auto regs_res = session.memory_regions(); regs_res.has_value()) {
+        const SubsystemStatus reg_st = session.memory_regions_status();
+        const bool session_reg_partial =
+            reg_st.availability == Availability::Partial ||
+            reg_st.availability == Availability::Unavailable;
+        if (session_reg_partial) {
+            any_core_stream_degraded = true;
+        }
         const CaptureAvailability reg_avail =
-            regs_res->empty() ? CaptureAvailability::Partial : CaptureAvailability::Complete;
+            (regs_res->empty() || session_reg_partial)
+                ? CaptureAvailability::Partial
+                : CaptureAvailability::Complete;
         const CaptureStamp reg_stamp = CaptureStamp::capture_now(
             snapshot.target_id, snapshot.snapshot_revision, paused, reg_avail);
         if (reg_avail == CaptureAvailability::Complete) {
             snapshot.regions = Observed<std::vector<MemoryRegion>>::complete(
                 std::move(*regs_res), os_prov, reg_stamp);
         } else {
+            const std::string detail =
+                (session_reg_partial && !reg_st.detail.empty())
+                    ? reg_st.detail
+                    : std::string("Memory region query succeeded but returned zero regions.");
             snapshot.regions = Observed<std::vector<MemoryRegion>>::partial(
                 std::move(*regs_res),
                 os_prov,
-                "Memory region query succeeded but returned zero regions.",
+                detail,
                 reg_stamp);
         }
     } else {
+        any_core_stream_degraded = true;
         const CaptureStamp reg_stamp = CaptureStamp::capture_now(
             snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
         snapshot.regions = Observed<std::vector<MemoryRegion>>::unavailable(
@@ -1398,6 +1414,13 @@ ProcessStateSnapshot capture_process_snapshot(
 
     // 2. Modules (+ optional bounded header identity probe)
     if (auto mods_res = session.modules(); mods_res.has_value()) {
+        const SubsystemStatus mod_st = session.modules_status();
+        const bool session_mod_partial =
+            mod_st.availability == Availability::Partial ||
+            mod_st.availability == Availability::Unavailable;
+        if (session_mod_partial) {
+            any_core_stream_degraded = true;
+        }
         bool has_image_regions = false;
         for (const MemoryRegion& reg : regions_span) {
             if (reg.kind == MemoryRegionKind::Image) {
@@ -1406,7 +1429,7 @@ ProcessStateSnapshot capture_process_snapshot(
             }
         }
         const CaptureAvailability mod_avail =
-            (mods_res->empty() && has_image_regions)
+            ((mods_res->empty() && has_image_regions) || session_mod_partial)
                 ? CaptureAvailability::Partial
                 : CaptureAvailability::Complete;
         const CaptureStamp mod_stamp = CaptureStamp::capture_now(
@@ -1415,10 +1438,14 @@ ProcessStateSnapshot capture_process_snapshot(
             snapshot.modules = Observed<std::vector<ModuleInfo>>::complete(
                 std::move(*mods_res), os_prov, mod_stamp);
         } else {
+            const std::string detail =
+                (session_mod_partial && !mod_st.detail.empty())
+                    ? mod_st.detail
+                    : std::string("Module query returned empty despite mapped image regions.");
             snapshot.modules = Observed<std::vector<ModuleInfo>>::partial(
                 std::move(*mods_res),
                 os_prov,
-                "Module query returned empty despite mapped image regions.",
+                detail,
                 mod_stamp);
         }
 
@@ -1548,21 +1575,35 @@ ProcessStateSnapshot capture_process_snapshot(
             thread_snaps.push_back(std::move(ts));
         }
 
+        const SubsystemStatus th_st = session.threads_status();
+        const bool session_th_partial =
+            th_st.availability == Availability::Partial ||
+            th_st.availability == Availability::Unavailable;
+        if (session_th_partial) {
+            any_core_stream_degraded = true;
+        }
         const CaptureAvailability th_avail =
-            any_partial_thread_entry ? CaptureAvailability::Partial : CaptureAvailability::Complete;
+            (any_partial_thread_entry || session_th_partial)
+                ? CaptureAvailability::Partial
+                : CaptureAvailability::Complete;
         const CaptureStamp th_stamp = CaptureStamp::capture_now(
             snapshot.target_id, snapshot.snapshot_revision, paused, th_avail);
         if (th_avail == CaptureAvailability::Complete) {
             snapshot.threads = Observed<std::vector<ThreadSnapshot>>::complete(
                 std::move(thread_snaps), os_prov, th_stamp);
         } else {
+            const std::string detail =
+                (session_th_partial && !th_st.detail.empty())
+                    ? th_st.detail
+                    : std::string("One or more thread entries reported partial metadata.");
             snapshot.threads = Observed<std::vector<ThreadSnapshot>>::partial(
                 std::move(thread_snaps),
                 os_prov,
-                "One or more thread entries reported partial metadata.",
+                detail,
                 th_stamp);
         }
     } else {
+        any_core_stream_degraded = true;
         const CaptureStamp th_stamp = CaptureStamp::capture_now(
             snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
         snapshot.threads = Observed<std::vector<ThreadSnapshot>>::unavailable(
@@ -1636,6 +1677,15 @@ ProcessStateSnapshot capture_process_snapshot(
             os_prov, "Environment capture disabled by CaptureOptions.", env_stamp);
     }
 
+    if (const auto* dump_session = dynamic_cast<const ICrashDumpSession*>(&session);
+        dump_session != nullptr &&
+        dump_session->crash_summary().status.availability != Availability::Available) {
+        any_core_stream_degraded = true;
+    }
+    if (any_core_stream_degraded) {
+        snapshot.snapshot_stamp.availability = CaptureAvailability::Partial;
+    }
+
     (void)mem_prov;
     return snapshot;
 }
@@ -1675,24 +1725,52 @@ void populate_runtime_settings_from_snapshot(
         return;
     }
 
-    const bool all_complete =
-        runtime.loaded_modules.availability == CaptureAvailability::Complete &&
-        runtime.open_handles.availability == CaptureAvailability::Complete &&
-        runtime.sockets.availability == CaptureAvailability::Complete;
+    const CaptureAvailability snap_stamp_avail = snapshot.snapshot_stamp.availability;
+    const auto has_state = [&](CaptureAvailability target) noexcept {
+        return runtime.loaded_modules.availability == target ||
+               runtime.open_handles.availability == target ||
+               runtime.sockets.availability == target ||
+               ((target == CaptureAvailability::Stale ||
+                 target == CaptureAvailability::Redacted) &&
+                snap_stamp_avail == target);
+    };
+    const bool any_partial_or_unavail =
+        has_state(CaptureAvailability::Partial) ||
+        has_state(CaptureAvailability::Unavailable);
 
     CaptureStamp rt_stamp = snapshot.snapshot_stamp;
-    rt_stamp.availability =
-        all_complete ? CaptureAvailability::Complete : CaptureAvailability::Partial;
-
-    if (all_complete) {
-        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::complete(
-            std::move(runtime), prov, std::move(rt_stamp));
-    } else {
+    if (any_partial_or_unavail) {
+        rt_stamp.availability = CaptureAvailability::Partial;
         report.observed_runtime = Observed<ObservedRuntimeConfiguration>::partial(
             std::move(runtime),
             prov,
             "One or more observed runtime collections are partial or unavailable.",
             std::move(rt_stamp));
+    } else if (has_state(CaptureAvailability::Redacted)) {
+        rt_stamp.availability = CaptureAvailability::Redacted;
+        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::redacted(
+            std::move(runtime),
+            prov,
+            "Observed runtime configuration uses redacted snapshot data.",
+            std::move(rt_stamp));
+    } else if (has_state(CaptureAvailability::Stale)) {
+        rt_stamp.availability = CaptureAvailability::Stale;
+        report.observed_runtime = Observed<ObservedRuntimeConfiguration>{
+            .value = std::move(runtime),
+            .provenance = prov,
+            .availability = CaptureAvailability::Stale,
+            .stamp = std::move(rt_stamp),
+            .evidence = {Evidence{
+                .tag = prov,
+                .source = std::string(to_string(prov)),
+                .detail = "Observed runtime configuration uses stale snapshot data.",
+            }},
+            .note = "Observed runtime configuration uses stale snapshot data.",
+        };
+    } else {
+        rt_stamp.availability = CaptureAvailability::Complete;
+        report.observed_runtime = Observed<ObservedRuntimeConfiguration>::complete(
+            std::move(runtime), prov, std::move(rt_stamp));
     }
 }
 

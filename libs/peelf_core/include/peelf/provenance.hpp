@@ -123,21 +123,32 @@ struct TargetInstanceId {
     std::string image_sha256{};
     std::string build_id_or_pdb_guid{};
     std::uint64_t session_nonce{0};
+    std::uint64_t dump_nonce{0};
 
     [[nodiscard]] bool same_instance(const TargetInstanceId& other) const noexcept {
         if (backend != other.backend) {
             return false;
         }
+        const std::uint64_t lhs_nonce = dump_nonce != 0u ? dump_nonce : session_nonce;
+        const std::uint64_t rhs_nonce =
+            other.dump_nonce != 0u ? other.dump_nonce : other.session_nonce;
+
         if (backend == BackendKind::StaticFile ||
             backend == BackendKind::CrashDumpMinidump ||
             backend == BackendKind::CrashDumpElfCore) {
-            if (!image_sha256.empty() && !other.image_sha256.empty()) {
-                return image_sha256 == other.image_sha256;
+            if (!image_sha256.empty() || !other.image_sha256.empty()) {
+                return !image_sha256.empty() && image_sha256 == other.image_sha256;
             }
-            if (pid != 0u || other.pid != 0u) {
-                return pid == other.pid && session_nonce == other.session_nonce;
+            if (!build_id_or_pdb_guid.empty() || !other.build_id_or_pdb_guid.empty()) {
+                if (build_id_or_pdb_guid.empty() ||
+                    build_id_or_pdb_guid != other.build_id_or_pdb_guid) {
+                    return false;
+                }
+                if (backend == BackendKind::StaticFile && lhs_nonce == 0u && rhs_nonce == 0u) {
+                    return pid == other.pid;
+                }
             }
-            return session_nonce != 0u && session_nonce == other.session_nonce;
+            return (pid == other.pid) && (lhs_nonce != 0u) && (lhs_nonce == rhs_nonce);
         }
 
         // Live / debugger / remote process backends: PID must match and creation
@@ -150,7 +161,7 @@ struct TargetInstanceId {
                    other.creation_identity.has_value() &&
                    *creation_identity == *other.creation_identity;
         }
-        return session_nonce != 0u && session_nonce == other.session_nonce;
+        return lhs_nonce != 0u && lhs_nonce == rhs_nonce;
     }
 
     auto operator<=>(const TargetInstanceId&) const = default;
@@ -175,7 +186,7 @@ struct CaptureStamp {
         CaptureAvailability avail = CaptureAvailability::Complete);
 
     [[nodiscard]] static CaptureStamp unavailable_for(
-        const TargetInstanceId& target = {}) noexcept {
+        const TargetInstanceId& target = {}) {
         CaptureStamp st;
         st.target_id = target;
         st.availability = CaptureAvailability::Unavailable;
@@ -412,13 +423,78 @@ struct BackingImageIdentity {
     std::string elf_build_id_hex{};
     std::optional<std::uint32_t> elf_gnu_debuglink_crc32{};
 
-    // Mach-O build identifier (LC_UUID)
+    // Mach-O build identifier (LC_UUID) & slice CPU metadata
     std::string macho_uuid_hex{};
+    std::optional<std::uint32_t> macho_cpu_type{};
+    std::optional<std::uint32_t> macho_cpu_subtype{};
 
-    // Optional whole-file hash when extracted from raw disk bytes
+    // Optional whole-file hash, backing path, or explicit dump nonce
     std::string file_sha256{};
+    std::string backing_path{};
+    std::uint64_t dump_nonce{0};
 
     [[nodiscard]] std::string primary_identifier() const;
+
+    [[nodiscard]] bool same_identity(const BackingImageIdentity& other) const noexcept {
+        if (format == Format::Unknown || other.format == Format::Unknown ||
+            format != other.format || architecture != other.architecture ||
+            address_width != other.address_width || endianness != other.endianness) {
+            return false;
+        }
+        if (macho_cpu_type.has_value() && other.macho_cpu_type.has_value() &&
+            *macho_cpu_type != *other.macho_cpu_type) {
+            return false;
+        }
+        if (macho_cpu_subtype.has_value() && other.macho_cpu_subtype.has_value() &&
+            *macho_cpu_subtype != *other.macho_cpu_subtype) {
+            return false;
+        }
+
+        bool any_explicit_field = false;
+        if (!elf_build_id_hex.empty() || !other.elf_build_id_hex.empty()) {
+            if (elf_build_id_hex != other.elf_build_id_hex) {
+                return false;
+            }
+            any_explicit_field = true;
+        }
+        if (!macho_uuid_hex.empty() || !other.macho_uuid_hex.empty()) {
+            if (macho_uuid_hex != other.macho_uuid_hex) {
+                return false;
+            }
+            any_explicit_field = true;
+        }
+        if (!codeview_guid_hex.empty() || !other.codeview_guid_hex.empty()) {
+            if (codeview_guid_hex != other.codeview_guid_hex ||
+                codeview_age != other.codeview_age) {
+                return false;
+            }
+            any_explicit_field = true;
+        }
+        if (pe_time_date_stamp.has_value() || other.pe_time_date_stamp.has_value()) {
+            if (pe_time_date_stamp != other.pe_time_date_stamp ||
+                pe_size_of_image != other.pe_size_of_image) {
+                return false;
+            }
+            any_explicit_field = true;
+        }
+        if (!file_sha256.empty() || !other.file_sha256.empty()) {
+            if (file_sha256 != other.file_sha256) {
+                return false;
+            }
+            any_explicit_field = true;
+        }
+        if (!backing_path.empty() || !other.backing_path.empty()) {
+            if (backing_path != other.backing_path) {
+                return false;
+            }
+            any_explicit_field = true;
+        }
+
+        if (any_explicit_field) {
+            return dump_nonce == 0u || other.dump_nonce == 0u || dump_nonce == other.dump_nonce;
+        }
+        return dump_nonce != 0u && dump_nonce == other.dump_nonce;
+    }
 };
 
 /// Result of comparing an on-disk backing file's build identity against a live or dump module.

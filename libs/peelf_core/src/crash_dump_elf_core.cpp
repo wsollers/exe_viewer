@@ -1,5 +1,6 @@
 #include "peelf/crash_dump.hpp"
 
+#include "image_internal.hpp"
 #include "peelf/sha256.hpp"
 
 #include <algorithm>
@@ -49,7 +50,11 @@ struct CoreLoadSegment {
     std::uint64_t file_offset{0};
     std::uint32_t flags{0};
 
-    [[nodiscard]] constexpr std::uint64_t vend() const noexcept { return vaddr + memsz; }
+    [[nodiscard]] constexpr std::uint64_t vend() const noexcept {
+        return memsz <= (std::numeric_limits<std::uint64_t>::max() - vaddr)
+                   ? (vaddr + memsz)
+                   : std::numeric_limits<std::uint64_t>::max();
+    }
 };
 
 struct CoreMappedFileEntry {
@@ -59,17 +64,30 @@ struct CoreMappedFileEntry {
     std::string filename{};
 };
 
-[[nodiscard]] constexpr std::size_t align_up_4(std::size_t n) noexcept {
-    return (n + 3u) & ~std::size_t{3u};
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_align4(std::uint64_t n) noexcept {
+    if (n > std::numeric_limits<std::uint64_t>::max() - 3ull ||
+        n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max() - 3u)) {
+        return std::nullopt;
+    }
+    return (n + 3ull) & ~std::uint64_t{3u};
 }
 
 [[nodiscard]] bool checked_span(std::size_t total,
                                 std::uint64_t off,
                                 std::uint64_t len) noexcept {
-    if (off > static_cast<std::uint64_t>(total)) {
-        return false;
+    const auto end = checked_add_u64(off, len);
+    return end.has_value() && *end <= static_cast<std::uint64_t>(total);
+}
+
+[[nodiscard]] std::string join_diagnostics(std::span<const std::string> notes) {
+    std::string out;
+    for (std::size_t i = 0u; i < notes.size(); ++i) {
+        if (i > 0u) {
+            out += "; ";
+        }
+        out += notes[i];
     }
-    return len <= (static_cast<std::uint64_t>(total) - off);
+    return out;
 }
 
 [[nodiscard]] std::string trim_nul_and_spaces(std::span<const std::uint8_t> raw) {
@@ -475,7 +493,10 @@ public:
                    std::vector<ThreadInfo> threads,
                    std::unordered_map<ThreadId, ThreadContext> contexts,
                    std::vector<std::uint8_t> auxv_bytes,
-                   ProcessInternalsSnapshot internals)
+                   ProcessInternalsSnapshot internals,
+                   SubsystemStatus regions_status,
+                   SubsystemStatus modules_status,
+                   SubsystemStatus threads_status)
         : bytes_(std::move(bytes)),
           info_(std::move(info)),
           summary_(std::move(summary)),
@@ -486,13 +507,20 @@ public:
           threads_(std::move(threads)),
           contexts_(std::move(contexts)),
           auxv_bytes_(std::move(auxv_bytes)),
-          internals_(std::move(internals)) {}
+          internals_(std::move(internals)),
+          regions_status_(std::move(regions_status)),
+          modules_status_(std::move(modules_status)),
+          threads_status_(std::move(threads_status)) {}
 
     [[nodiscard]] const ProcessInfo& info() const noexcept override { return info_; }
     [[nodiscard]] const CrashDumpSummary& crash_summary() const noexcept override { return summary_; }
     [[nodiscard]] const ProcessInternalsSnapshot& crash_internals() const noexcept override {
         return internals_;
     }
+
+    [[nodiscard]] SubsystemStatus memory_regions_status() const override { return regions_status_; }
+    [[nodiscard]] SubsystemStatus modules_status() const override { return modules_status_; }
+    [[nodiscard]] SubsystemStatus threads_status() const override { return threads_status_; }
 
     [[nodiscard]] Result<std::vector<MemoryRegion>> memory_regions() override {
         return regions_;
@@ -557,7 +585,11 @@ public:
                     from_disk > 0u) {
                     std::copy_n(disk_scratch_.data(), from_disk, buffer.data() + total_copied);
                     total_copied += from_disk;
-                    cursor += from_disk;
+                    const auto next_cursor = checked_add_u64(cursor, from_disk);
+                    if (!next_cursor.has_value()) {
+                        break;
+                    }
+                    cursor = *next_cursor;
                     continue;
                 }
                 break;
@@ -570,15 +602,19 @@ public:
             if (seg_delta < seg->filesz) {
                 const std::size_t file_chunk = static_cast<std::size_t>(
                     std::min<std::uint64_t>(seg->filesz - seg_delta, want));
-                const std::uint64_t src_off = seg->file_offset + seg_delta;
-                if (!checked_span(bytes_.size(), src_off, file_chunk)) {
+                const auto src_off = checked_add_u64(seg->file_offset, seg_delta);
+                if (!src_off.has_value() || !checked_span(bytes_.size(), *src_off, file_chunk)) {
                     break;
                 }
-                std::copy_n(bytes_.data() + static_cast<std::size_t>(src_off),
+                std::copy_n(bytes_.data() + static_cast<std::size_t>(*src_off),
                             file_chunk,
                             buffer.data() + total_copied);
                 total_copied += file_chunk;
-                cursor += file_chunk;
+                const auto next_cursor = checked_add_u64(cursor, file_chunk);
+                if (!next_cursor.has_value()) {
+                    break;
+                }
+                cursor = *next_cursor;
                 continue;
             }
 
@@ -589,7 +625,11 @@ public:
                 from_disk > 0u) {
                 std::copy_n(disk_scratch_.data(), from_disk, buffer.data() + total_copied);
                 total_copied += from_disk;
-                cursor += from_disk;
+                const auto next_cursor = checked_add_u64(cursor, from_disk);
+                if (!next_cursor.has_value()) {
+                    break;
+                }
+                cursor = *next_cursor;
                 continue;
             }
 
@@ -597,7 +637,11 @@ public:
             if (seg->filesz > 0u) {
                 std::fill_n(buffer.data() + total_copied, want, std::uint8_t{0});
                 total_copied += want;
-                cursor += want;
+                const auto next_cursor = checked_add_u64(cursor, want);
+                if (!next_cursor.has_value()) {
+                    break;
+                }
+                cursor = *next_cursor;
                 continue;
             }
 
@@ -642,19 +686,23 @@ private:
             if (va < mf.start_va || va >= mf.end_va || mf.filename.empty()) {
                 continue;
             }
+            const auto file_off = checked_add_u64(mf.byte_offset, va - mf.start_va);
+            if (!file_off.has_value() ||
+                *file_off > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max())) {
+                return 0u;
+            }
             std::error_code ec;
             const std::filesystem::path p(strip_deleted_proc_suffix(mf.filename));
             if (!std::filesystem::is_regular_file(p, ec) || ec) {
                 return 0u;
             }
-            const std::uint64_t file_off = mf.byte_offset + (va - mf.start_va);
             const std::size_t chunk = static_cast<std::size_t>(
                 std::min<std::uint64_t>(mf.end_va - va, max_len));
             std::ifstream in(p, std::ios::binary);
             if (!in) {
                 return 0u;
             }
-            in.seekg(static_cast<std::streamoff>(file_off), std::ios::beg);
+            in.seekg(static_cast<std::streamoff>(*file_off), std::ios::beg);
             if (!in) {
                 return 0u;
             }
@@ -678,6 +726,9 @@ private:
     std::unordered_map<ThreadId, ThreadContext> contexts_;
     std::vector<std::uint8_t> auxv_bytes_;
     ProcessInternalsSnapshot internals_;
+    SubsystemStatus regions_status_{SubsystemStatus::available("elf_core")};
+    SubsystemStatus modules_status_{SubsystemStatus::available("elf_core")};
+    SubsystemStatus threads_status_{SubsystemStatus::available("elf_core")};
     std::vector<std::uint8_t> disk_scratch_;
 };
 
@@ -761,8 +812,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
     }
 
     const std::size_t min_phent = is_64 ? 56u : 32u;
-    if (phnum > 0u && (e_phentsize < min_phent ||
-                       !checked_span(bytes.size(), e_phoff, static_cast<std::uint64_t>(phnum) * e_phentsize))) {
+    const auto ph_table_bytes =
+        checked_mul_u64(static_cast<std::uint64_t>(phnum), static_cast<std::uint64_t>(e_phentsize));
+    if (phnum > 0u && (e_phentsize < min_phent || !ph_table_bytes.has_value() ||
+                       !checked_span(bytes.size(), e_phoff, *ph_table_bytes))) {
         return make_error("ELF ET_CORE program header table exceeds file bounds");
     }
 
@@ -772,6 +825,9 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
         std::size_t size{0};
     };
     std::vector<NoteSpan> note_spans;
+    std::vector<std::string> reg_warnings;
+    std::vector<std::string> mod_warnings;
+    std::vector<std::string> thread_warnings;
 
     for (std::uint32_t i = 0; i < phnum; ++i) {
         const std::size_t poff = static_cast<std::size_t>(e_phoff) + static_cast<std::size_t>(i) * e_phentsize;
@@ -802,15 +858,19 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
                     "ELF ET_CORE PT_LOAD segment {} (offset 0x{:X}, filesz 0x{:X}) exceeds file bounds",
                     i, p_offset, p_filesz));
             }
-            if (p_memsz <= std::numeric_limits<std::uint64_t>::max() - p_vaddr) {
-                load_segments.push_back(CoreLoadSegment{
-                    .vaddr = p_vaddr,
-                    .memsz = p_memsz,
-                    .filesz = std::min(p_filesz, p_memsz),
-                    .file_offset = p_offset,
-                    .flags = p_flags,
-                });
+            const auto vaddr_end = checked_add_u64(p_vaddr, p_memsz);
+            if (!vaddr_end.has_value()) {
+                return make_error(std::format(
+                    "ELF ET_CORE PT_LOAD segment {} (vaddr 0x{:X}, memsz 0x{:X}) overflows 64-bit address space",
+                    i, p_vaddr, p_memsz));
             }
+            load_segments.push_back(CoreLoadSegment{
+                .vaddr = p_vaddr,
+                .memsz = p_memsz,
+                .filesz = std::min(p_filesz, p_memsz),
+                .file_offset = p_offset,
+                .flags = p_flags,
+            });
         } else if (p_type == kPtNote && p_filesz >= 12u) {
             if (!checked_span(bytes.size(), p_offset, p_filesz)) {
                 return make_error("ELF ET_CORE PT_NOTE segment exceeds file bounds");
@@ -845,20 +905,42 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
 
     for (const NoteSpan& ns : note_spans) {
         std::size_t cur = ns.offset;
-        const std::size_t end = ns.offset + ns.size;
-        while (cur + 12u <= end) {
+        const auto end_u64 = checked_add_u64(ns.offset, ns.size);
+        if (!end_u64.has_value() || *end_u64 > bytes.size()) {
+            return make_error("ELF ET_CORE PT_NOTE span overflows buffer bounds");
+        }
+        const auto end = static_cast<std::size_t>(*end_u64);
+        while (cur <= end && (end - cur) >= 12u) {
             const std::uint32_t namesz = rd.read_u32(cur).value_or(0);
             const std::uint32_t descsz = rd.read_u32(cur + 4u).value_or(0);
             const std::uint32_t ntype  = rd.read_u32(cur + 8u).value_or(0);
             cur += 12u;
-            const std::size_t name_padded = align_up_4(namesz);
-            const std::size_t desc_padded = align_up_4(descsz);
-            if (name_padded > (end - cur) || desc_padded > (end - cur - name_padded)) {
+            if (namesz > std::numeric_limits<std::uint32_t>::max() - 3u ||
+                descsz > std::numeric_limits<std::uint32_t>::max() - 3u) {
+                return make_error(std::format(
+                    "ELF ET_CORE PT_NOTE entry (namesz=0x{:X}, descsz=0x{:X}) overflows 4-byte note alignment",
+                    namesz, descsz));
+            }
+            const auto name_padded = checked_align4(namesz);
+            const auto desc_padded = checked_align4(descsz);
+            const auto note_body = (name_padded.has_value() && desc_padded.has_value())
+                                       ? checked_add_u64(*name_padded, *desc_padded)
+                                       : std::nullopt;
+            if (!note_body.has_value()) {
+                return make_error("ELF ET_CORE PT_NOTE entry alignment overflows 64-bit bounds");
+            }
+            const auto rem = static_cast<std::uint64_t>(end - cur);
+            if (*name_padded > rem || *desc_padded > (rem - *name_padded)) {
+                thread_warnings.push_back(std::format(
+                    "Truncated PT_NOTE entry (type 0x{:X}, namesz 0x{:X}, descsz 0x{:X}) exceeds PT_NOTE bounds",
+                    ntype, namesz, descsz));
                 break;
             }
-            const std::span<const std::uint8_t> desc(bytes.data() + cur + name_padded, descsz);
+            const auto name_pad_sz = static_cast<std::size_t>(*name_padded);
+            const auto desc_pad_sz = static_cast<std::size_t>(*desc_padded);
+            const std::span<const std::uint8_t> desc(bytes.data() + cur + name_pad_sz, descsz);
             const EndianReader drd(desc, layout);
-            cur += name_padded + desc_padded;
+            cur += name_pad_sz + desc_pad_sz;
 
             if (ntype == kNtPrpsinfo && descsz >= 120u) {
                 // Tail-anchored `elf_prpsinfo` decoding (works across 124/128/136-byte 32/64-bit layouts):
@@ -939,11 +1021,21 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
                 const std::size_t word = layout.pointer_size();
                 const std::uint64_t count = drd.read_pointer(0u).value_or(0);
                 const std::uint64_t page_sz = std::max<std::uint64_t>(1u, drd.read_pointer(word).value_or(1u));
-                const std::uint64_t table_bytes = count <= ((descsz - 2u * word) / (3u * word))
-                    ? count * 3u * word
-                    : 0u;
-                if (count > 0u && table_bytes > 0u) {
-                    std::size_t str_cur = 2u * word + static_cast<std::size_t>(table_bytes);
+                const auto entry_stride = checked_mul_u64(3u, static_cast<std::uint64_t>(word));
+                const auto table_bytes = entry_stride.has_value()
+                                             ? checked_mul_u64(count, *entry_stride)
+                                             : std::nullopt;
+                const auto hdr_and_table = table_bytes.has_value()
+                                               ? checked_add_u64(2u * static_cast<std::uint64_t>(word), *table_bytes)
+                                               : std::nullopt;
+                if (count > 0u && (!hdr_and_table.has_value() || *hdr_and_table > desc.size())) {
+                    const std::string msg = std::format(
+                        "Truncated or overflowing NT_FILE table (count={}, desc_size={})",
+                        count, desc.size());
+                    reg_warnings.push_back(msg);
+                    mod_warnings.push_back(msg);
+                } else if (count > 0u && hdr_and_table.has_value() && *table_bytes > 0u) {
+                    std::size_t str_cur = static_cast<std::size_t>(*hdr_and_table);
                     mapped_files.reserve(static_cast<std::size_t>(count));
                     for (std::uint64_t i = 0; i < count; ++i) {
                         const std::size_t roff = 2u * word + static_cast<std::size_t>(i) * 3u * word;
@@ -959,14 +1051,27 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
                             fname.assign(reinterpret_cast<const char*>(desc.data() + str_cur), nul - str_cur);
                             str_cur = (nul < desc.size()) ? (nul + 1u) : desc.size();
                         }
-                        if (f_end > f_start) {
-                            mapped_files.push_back(CoreMappedFileEntry{
-                                .start_va = f_start,
-                                .end_va = f_end,
-                                .byte_offset = f_pgoff * page_sz,
-                                .filename = std::move(fname),
-                            });
+                        if (f_end <= f_start) {
+                            continue;
                         }
+                        const auto byte_offset = checked_mul_u64(f_pgoff, page_sz);
+                        const auto file_end_off = byte_offset.has_value()
+                                                      ? checked_add_u64(*byte_offset, f_end - f_start)
+                                                      : std::nullopt;
+                        if (!file_end_off.has_value()) {
+                            const std::string msg = std::format(
+                                "Skipped NT_FILE entry [0x{:X}..0x{:X}) with overflowing page_offset*page_size",
+                                f_start, f_end);
+                            reg_warnings.push_back(msg);
+                            mod_warnings.push_back(msg);
+                            continue;
+                        }
+                        mapped_files.push_back(CoreMappedFileEntry{
+                            .start_va = f_start,
+                            .end_va = f_end,
+                            .byte_offset = *byte_offset,
+                            .filename = std::move(fname),
+                        });
                     }
                 }
             }
@@ -998,9 +1103,11 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
 
         for (const CoreMappedFileEntry& mf : mapped_files) {
             if (reg.start_address >= mf.start_va && reg.start_address < mf.end_va) {
-                reg.pathname = strip_deleted_proc_suffix(mf.filename);
-                reg.file_offset = mf.byte_offset + (reg.start_address - mf.start_va);
-                reg.kind = MemoryRegionKind::MappedFile;
+                if (const auto reg_foff = checked_add_u64(mf.byte_offset, reg.start_address - mf.start_va)) {
+                    reg.pathname = strip_deleted_proc_suffix(mf.filename);
+                    reg.file_offset = *reg_foff;
+                    reg.kind = MemoryRegionKind::MappedFile;
+                }
                 break;
             }
         }
@@ -1131,6 +1238,21 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
     pinfo.is_64bit = is_64;
     pinfo.access = ProcessAccessStatus::ReadOnly;
 
+    SubsystemStatus regions_status = reg_warnings.empty()
+        ? SubsystemStatus::available("elf_core", "Parsed PT_LOAD and NT_FILE mappings")
+        : SubsystemStatus::partial("elf_core", join_diagnostics(reg_warnings));
+    SubsystemStatus modules_status = mod_warnings.empty()
+        ? SubsystemStatus::available("elf_core", "Derived modules from NT_FILE mappings")
+        : SubsystemStatus::partial("elf_core", join_diagnostics(mod_warnings));
+    SubsystemStatus threads_status = thread_warnings.empty()
+        ? SubsystemStatus::available("elf_core", "Parsed NT_PRSTATUS thread notes")
+        : SubsystemStatus::partial("elf_core", join_diagnostics(thread_warnings));
+
+    std::vector<std::string> all_diags;
+    all_diags.insert(all_diags.end(), reg_warnings.begin(), reg_warnings.end());
+    all_diags.insert(all_diags.end(), mod_warnings.begin(), mod_warnings.end());
+    all_diags.insert(all_diags.end(), thread_warnings.begin(), thread_warnings.end());
+
     CrashDumpSummary summary{};
     summary.kind = CrashDumpKind::ElfCore;
     summary.dump_path = std::move(source_path);
@@ -1147,6 +1269,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
     summary.command_line = cmd_line;
     summary.exception = std::move(crash_exc);
     summary.thread_count = threads.size();
+    summary.diagnostics = all_diags;
+    summary.status = all_diags.empty()
+        ? SubsystemStatus::available("elf_core")
+        : SubsystemStatus::partial("elf_core", join_diagnostics(all_diags));
 
     auto session = std::make_unique<ElfCoreSession>(
         std::move(bytes),
@@ -1159,7 +1285,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_elf_core_bytes(
         std::move(threads),
         std::move(contexts),
         std::move(auxv_bytes),
-        std::move(internals));
+        std::move(internals),
+        std::move(regions_status),
+        std::move(modules_status),
+        std::move(threads_status));
 
     // Derive `ModuleInfo` entries from `NT_FILE`-annotated regions and probe ELF headers in dump memory!
     std::vector<ModuleInfo> modules = derive_modules_from_regions(

@@ -937,4 +937,119 @@ TEST(ExecutableSettingsTest, SharedUtf16DecoderHandlesSurrogatePairsAndLoneSurro
     }
 }
 
+TEST(ExecutableSettingsTest, PreservesStaleAndRedactedCaptureAvailabilityStamps) {
+    const std::vector<std::uint8_t> elf = make_synthetic_elf64_full_declared();
+    auto parsed = peelf::parse_image(elf);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+
+    peelf::TargetInstanceId tid;
+    tid.backend = peelf::BackendKind::LiveNativeReadOnly;
+    tid.pid = 4321u;
+    tid.session_nonce = 99u;
+
+    // 1. Static declared settings preserve explicit `Stale` and `Redacted` caller stamps
+    const peelf::CaptureStamp stale_static = peelf::CaptureStamp::capture_now(
+        tid, 3u, false, peelf::CaptureAvailability::Stale);
+    peelf::ExecutableSettingsReport stale_rep =
+        peelf::extract_executable_settings(**parsed, elf, stale_static);
+    EXPECT_EQ(stale_rep.declared_in_file.availability, peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.declared_in_file.stamp.availability, peelf::CaptureAvailability::Stale);
+    EXPECT_TRUE(stale_rep.declared_in_file.has_value());
+
+    const peelf::CaptureStamp redacted_static = peelf::CaptureStamp::capture_now(
+        tid, 4u, true, peelf::CaptureAvailability::Redacted);
+    peelf::ExecutableSettingsReport redacted_rep =
+        peelf::extract_executable_settings(**parsed, elf, redacted_static);
+    EXPECT_EQ(redacted_rep.declared_in_file.availability, peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.declared_in_file.stamp.availability, peelf::CaptureAvailability::Redacted);
+    EXPECT_TRUE(redacted_rep.declared_in_file.has_value());
+
+    // 2. Runtime settings preserve `Stale` and `Redacted` cached module & internals stamps
+    class MinimalRuntimeSession final : public peelf::IProcessSession {
+    public:
+        explicit MinimalRuntimeSession(peelf::ProcessInfo info) : info_(std::move(info)) {}
+        [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override { return info_; }
+        [[nodiscard]] bool is_alive() const noexcept override { return true; }
+        [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
+            return std::vector<peelf::MemoryRegion>{};
+        }
+        [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
+            return std::vector<peelf::ModuleInfo>{};
+        }
+        [[nodiscard]] peelf::Result<std::size_t> read_memory(
+            std::uint64_t, std::span<std::uint8_t>) override {
+            return peelf::make_error("not mapped");
+        }
+        [[nodiscard]] peelf::ForgivingValue<std::vector<std::string>> environment_variables() override {
+            return {.value = std::vector<std::string>{"PATH=/usr/bin"},
+                    .status = peelf::SubsystemStatus::available("mock")};
+        }
+
+    private:
+        peelf::ProcessInfo info_{};
+    };
+
+    peelf::ProcessInfo pinfo;
+    pinfo.pid = 4321u;
+    pinfo.name = "demo";
+    pinfo.executable_path = "/usr/bin/demo";
+    pinfo.command_line = "/usr/bin/demo";
+    MinimalRuntimeSession session(pinfo);
+    const std::string fallback_cwd = "/tmp";
+
+    peelf::ProcessInternalsSnapshot internals{};
+    internals.security = {
+        .value = peelf::ProcessSecurityProfile{},
+        .status = peelf::SubsystemStatus::available("mock"),
+    };
+    internals.handles = {
+        .value = std::vector<peelf::ProcessHandleEntry>{},
+        .status = peelf::SubsystemStatus::available("mock"),
+    };
+    internals.sockets = {
+        .value = std::vector<peelf::ProcessSocketEntry>{},
+        .status = peelf::SubsystemStatus::available("mock"),
+    };
+    const std::array<peelf::ModuleInfo, 1> cached_mods = {
+        peelf::ModuleInfo{.name = "demo", .path = "/usr/bin/demo", .base_address = 0x400000ULL, .size = 0x2000ULL},
+    };
+
+    peelf::RuntimeSettingsOptions rt_opts{};
+    rt_opts.query_process_internals = false;
+
+    const peelf::CaptureStamp stale_rt_stamp = peelf::CaptureStamp::capture_now(
+        tid, 5u, false, peelf::CaptureAvailability::Stale);
+    peelf::populate_runtime_executable_settings(
+        stale_rep, session, tid, 5u, rt_opts, &internals, &stale_rt_stamp, cached_mods, &stale_rt_stamp, &fallback_cwd);
+    ASSERT_TRUE(stale_rep.observed_runtime.has_value());
+    EXPECT_EQ(stale_rep.observed_runtime.availability, peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.observed_runtime.stamp.availability, peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.observed_runtime.value->loaded_modules.availability,
+              peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.observed_runtime.value->open_handles.availability,
+              peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.observed_runtime.value->sockets.availability,
+              peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.observed_runtime.value->declared_vs_loaded.availability,
+              peelf::CaptureAvailability::Stale);
+    EXPECT_EQ(stale_rep.launch_environment.availability, peelf::CaptureAvailability::Stale);
+
+    const peelf::CaptureStamp redacted_rt_stamp = peelf::CaptureStamp::capture_now(
+        tid, 6u, true, peelf::CaptureAvailability::Redacted);
+    peelf::populate_runtime_executable_settings(
+        redacted_rep, session, tid, 6u, rt_opts, &internals, &redacted_rt_stamp, cached_mods, &redacted_rt_stamp, &fallback_cwd);
+    ASSERT_TRUE(redacted_rep.observed_runtime.has_value());
+    EXPECT_EQ(redacted_rep.observed_runtime.availability, peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.observed_runtime.stamp.availability, peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.observed_runtime.value->loaded_modules.availability,
+              peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.observed_runtime.value->open_handles.availability,
+              peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.observed_runtime.value->sockets.availability,
+              peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.observed_runtime.value->declared_vs_loaded.availability,
+              peelf::CaptureAvailability::Redacted);
+    EXPECT_EQ(redacted_rep.launch_environment.availability, peelf::CaptureAvailability::Redacted);
+}
+
 } // namespace

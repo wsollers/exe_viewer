@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -337,7 +338,9 @@ struct ModuleInfo {
     bool is_main_module{false};
 
     [[nodiscard]] constexpr std::uint64_t end_address() const noexcept {
-        return base_address + size;
+        return size <= (std::numeric_limits<std::uint64_t>::max() - base_address)
+                   ? (base_address + size)
+                   : std::numeric_limits<std::uint64_t>::max();
     }
 
     [[nodiscard]] constexpr bool contains(std::uint64_t address) const noexcept {
@@ -374,6 +377,16 @@ public:
     [[nodiscard]] virtual Result<std::vector<ModuleInfo>> modules() = 0;
     [[nodiscard]] virtual Result<std::size_t> read_memory(std::uint64_t address,
                                                           std::span<std::uint8_t> buffer) = 0;
+
+    [[nodiscard]] virtual SubsystemStatus memory_regions_status() const {
+        return SubsystemStatus::available("session");
+    }
+    [[nodiscard]] virtual SubsystemStatus modules_status() const {
+        return SubsystemStatus::available("session");
+    }
+    [[nodiscard]] virtual SubsystemStatus threads_status() const {
+        return SubsystemStatus::available("session");
+    }
 
     /// Live process inspection is strictly read-only (`is_read_only() == true`).
     /// Retained only as a retired error-returning stub so existing `LiveMemoryPatchSpace`

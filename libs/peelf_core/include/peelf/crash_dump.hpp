@@ -60,6 +60,8 @@ struct CrashDumpSummary {
     std::size_t thread_count{0};
     std::size_t region_count{0};
     std::size_t handle_count{0};
+    SubsystemStatus status{SubsystemStatus::available("crash_dump")};
+    std::vector<std::string> diagnostics{};
 };
 
 /// Strictly read-only `IProcessSession` adapter backed by an offline Windows Minidump (`.dmp`)

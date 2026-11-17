@@ -781,3 +781,93 @@ TEST(DependencyTreeTest, LiveProcessDependencyResolutionMarksLoadedModules) {
     EXPECT_GT(g.summary.resolved_live_count, 0u);
 }
 #endif
+
+TEST(DependencyTreeTest, ShortestDepthBfsDiamondExpansionAndNonThrowingDirectoryProbe) {
+    const fs::path scratch = fs::temp_directory_path() / "peelf-fbf03b-bfs-diamond";
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+
+    const fs::path bin_dir = scratch / "bin";
+    const fs::path lib_dir = scratch / "lib";
+    const fs::path broken_dir = scratch / "search_with_broken_entries";
+    fs::create_directories(broken_dir, ec);
+    // Dangling symlink + restricted subdir inside search root must never throw `filesystem_error`
+    fs::create_symlink(scratch / "nonexistent_target_xyz.so", broken_dir / "dangling.so", ec);
+    const fs::path locked_subdir = broken_dir / "locked_sub";
+    fs::create_directories(locked_subdir, ec);
+    fs::permissions(locked_subdir, fs::perms::none, ec);
+
+    // Graph topology with `max_depth = 2`:
+    //   Branch 0 (deeper):    main (0) -> libdeep.so (1) -> libshared.so (2, truncated at depth 2)
+    //   Branch 1 (shallower): main (0) -> libshared.so (1) -> libleaf.so (2, MUST be expanded!)
+    write_bytes(lib_dir / "libleaf.so", build_synthetic_elf(SynthElfSpec{
+        .soname = "libleaf.so",
+        .dynsyms = {{.name = "leaf_fn", .defined = true, .value = 0x4100}},
+    }));
+    write_bytes(lib_dir / "libshared.so", build_synthetic_elf(SynthElfSpec{
+        .soname = "libshared.so",
+        .runpath = "$ORIGIN",
+        .needed = {"libleaf.so"},
+        .dynsyms = {
+            {.name = "shared_fn", .defined = true, .value = 0x3100},
+            {.name = "leaf_fn", .defined = false},
+        },
+    }));
+    write_bytes(lib_dir / "libdeep.so", build_synthetic_elf(SynthElfSpec{
+        .soname = "libdeep.so",
+        .runpath = "$ORIGIN",
+        .needed = {"libshared.so"},
+        .dynsyms = {
+            {.name = "deep_fn", .defined = true, .value = 0x2100},
+            {.name = "shared_fn", .defined = false},
+        },
+    }));
+    const fs::path main_path = bin_dir / "main.elf";
+    write_bytes(main_path, build_synthetic_elf(SynthElfSpec{
+        .e_type = 2,
+        .runpath = "$ORIGIN/../lib",
+        .needed = {"libdeep.so", "libshared.so", "libmissing_case.dll"},
+        .dynsyms = {
+            {.name = "deep_fn", .defined = false},
+            {.name = "shared_fn", .defined = false},
+        },
+    }));
+
+    peelf::DependencyResolveOptions opts;
+    opts.max_depth = 2u;
+    opts.include_default_system_dirs = false;
+    opts.search_roots = {broken_dir};
+
+    auto graph_res = peelf::build_dependency_graph_from_file(main_path, opts);
+    fs::permissions(locked_subdir, fs::perms::owner_all, ec);
+    fs::remove_all(scratch, ec);
+
+    ASSERT_TRUE(graph_res.has_value()) << graph_res.error().message;
+    const peelf::DependencyGraph& g = *graph_res;
+
+    // `libleaf.so` sits at shortest BFS depth 2 via `main -> libshared -> libleaf`,
+    // so it MUST be discovered even though `libdeep -> libshared` reaches `libshared` at depth 2!
+    const bool found_leaf = std::ranges::any_of(g.nodes, [](const peelf::DependencyNode& n) {
+        return n.display_name == "libleaf.so" &&
+               n.status == peelf::DependencyResolutionStatus::ResolvedOnDisk;
+    });
+    EXPECT_TRUE(found_leaf);
+
+    ASSERT_EQ(g.root_tree.children.size(), 3u);
+    // Branch 0: main -> libdeep (depth 1) -> libshared (depth 2 == max_depth, truncated!)
+    const auto& deep_item = g.root_tree.children[0];
+    EXPECT_EQ(deep_item.depth, 1u);
+    ASSERT_EQ(deep_item.children.size(), 1u);
+    EXPECT_EQ(deep_item.children[0].depth, 2u);
+    EXPECT_TRUE(deep_item.children[0].truncated_by_depth);
+    EXPECT_TRUE(deep_item.children[0].children.empty());
+
+    // Branch 1: main -> libshared (depth 1 < max_depth) -> libleaf (depth 2)
+    const auto& shared_item = g.root_tree.children[1];
+    EXPECT_EQ(shared_item.depth, 1u);
+    EXPECT_FALSE(shared_item.truncated_by_depth);
+    ASSERT_EQ(shared_item.children.size(), 1u);
+    EXPECT_EQ(shared_item.children[0].requested_name, "libleaf.so");
+    EXPECT_EQ(shared_item.children[0].depth, 2u);
+}
+

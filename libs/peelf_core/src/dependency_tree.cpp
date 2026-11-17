@@ -7,6 +7,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <format>
+#include <queue>
+#include <ranges>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -521,17 +523,17 @@ probe_directory_for_file(const std::filesystem::path& dir,
         return std::nullopt;
     }
     const std::string target_lower = to_lower_ascii(filename);
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-        if (ec) {
-            break;
-        }
+    std::filesystem::directory_iterator it(
+        dir, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
         std::error_code f_ec;
-        if (!entry.is_regular_file(f_ec)) {
+        if (!it->is_regular_file(f_ec) || f_ec) {
             continue;
         }
-        const std::string cand_name = entry.path().filename().string();
+        const std::string cand_name = it->path().filename().string();
         if (to_lower_ascii(cand_name) == target_lower) {
-            return entry.path().lexically_normal();
+            return it->path().lexically_normal();
         }
     }
     return std::nullopt;
@@ -602,7 +604,6 @@ public:
         graph_.root_tree.status = DependencyResolutionStatus::RootModule;
         graph_.root_tree.depth = 0;
 
-        std::vector<std::size_t> ancestors{0};
         std::vector<std::pair<std::string, std::filesystem::path>> inherited_rpaths;
         root_origin_ =
             !opts_.root_path.empty() ? opts_.root_path.parent_path() : std::filesystem::path{};
@@ -616,7 +617,10 @@ public:
             }
         }
 
-        expand_node(0, root_image_, root_origin_, inherited_rpaths, 0, ancestors, graph_.root_tree);
+        expand_graph_bfs(inherited_rpaths);
+        std::vector<std::size_t> tree_ancestors{0};
+        seen_in_tree_.insert(0);
+        build_tree_children(0, 0u, tree_ancestors, graph_.root_tree);
         compute_summary();
         return std::move(graph_);
     }
@@ -1531,202 +1535,256 @@ private:
         return new_id;
     }
 
-    void clone_cached_subtree(std::size_t node_id,
-                              std::uint32_t current_depth,
-                              std::vector<std::size_t>& ancestors,
-                              DependencyTreeItem& target_item) {
-        auto cached_it = expanded_subtree_by_node_.find(node_id);
-        if (cached_it == expanded_subtree_by_node_.end()) {
-            return;
-        }
-        if (current_depth >= opts_.max_depth) {
-            if (!cached_it->second.empty()) {
-                target_item.truncated_by_depth = true;
-            }
-            return;
-        }
-        ancestors.push_back(node_id);
-        for (const DependencyTreeItem& tmpl : cached_it->second) {
-            DependencyTreeItem copy = tmpl;
-            copy.depth = current_depth + 1;
-            copy.children.clear();
-            if (std::ranges::find(ancestors, copy.node_id) != ancestors.end()) {
-                copy.is_cycle = true;
-                copy.status = DependencyResolutionStatus::CycleSkipped;
-            } else if (!tmpl.is_cycle) {
-                clone_cached_subtree(copy.node_id, current_depth + 1, ancestors, copy);
-            }
-            target_item.children.push_back(std::move(copy));
-        }
-        ancestors.pop_back();
-    }
+    struct PendingChild {
+        std::size_t edge_idx{0};
+        std::size_t child_id{0};
+        const IBinaryImage* child_img{nullptr};
+        DependencyEdgeKind kind{DependencyEdgeKind::StandardImport};
+        DependencyResolutionStatus status{DependencyResolutionStatus::Unresolved};
+        bool is_bfs_cycle{false};
+    };
 
-    void expand_node(std::size_t parent_id,
-                     const IBinaryImage& parent_img,
-                     const std::filesystem::path& parent_origin,
-                     const std::vector<std::pair<std::string, std::filesystem::path>>& inherited_rpaths,
-                     std::uint32_t depth,
-                     std::vector<std::size_t>& ancestors,
-                     DependencyTreeItem& tree_out) {
-        expanded_nodes_.insert(parent_id);
+    struct ExpandedNodeRecord {
+        std::size_t node_id{0};
+        const IBinaryImage* parent_img{nullptr};
+        std::vector<RequestedDependency> requests{};
+        std::vector<PendingChild> pending{};
+    };
 
-        const auto requests = collect_direct_requests(parent_img);
-        if (requests.empty()) {
-            if (parent_img.format() == Format::ELF) {
-                for (const RequestedSymbolRef& u : collect_elf_undefined_symbols(parent_img)) {
-                    if (!u.weak_symbol) {
-                        ImportedSymbolBinding b;
-                        b.name = u.name;
-                        b.call_site_va = u.call_site_va;
-                        b.status = ImportedSymbolStatus::UnboundMissingExport;
-                        b.note = "No DT_NEEDED libraries declared to satisfy strong undefined symbol";
-                        graph_.nodes[parent_id].unresolved_symbols.push_back(std::move(b));
+    struct BfsExpandTask {
+        std::size_t node_id{0};
+        const IBinaryImage* img{nullptr};
+        std::filesystem::path origin{};
+        std::vector<std::pair<std::string, std::filesystem::path>> inherited_rpaths{};
+        std::uint32_t bfs_depth{0};
+        std::vector<std::size_t> bfs_ancestors{};
+    };
+
+    void expand_graph_bfs(
+        const std::vector<std::pair<std::string, std::filesystem::path>>& root_inherited_rpaths) {
+        std::queue<BfsExpandTask> bfs_queue;
+        std::unordered_set<std::size_t> enqueued_nodes{0};
+        min_bfs_depth_[0] = 0u;
+        bfs_queue.push(BfsExpandTask{
+            .node_id = 0,
+            .img = &root_image_,
+            .origin = root_origin_,
+            .inherited_rpaths = root_inherited_rpaths,
+            .bfs_depth = 0u,
+            .bfs_ancestors = {0},
+        });
+
+        std::vector<ExpandedNodeRecord> expanded_order;
+        while (!bfs_queue.empty()) {
+            BfsExpandTask task = std::move(bfs_queue.front());
+            bfs_queue.pop();
+            if (task.img == nullptr) {
+                continue;
+            }
+
+            std::vector<RequestedDependency> requests = collect_direct_requests(*task.img);
+            has_direct_requests_[task.node_id] = !requests.empty();
+
+            if (requests.empty()) {
+                expanded_nodes_.insert(task.node_id);
+                if (task.img->format() == Format::ELF) {
+                    for (const RequestedSymbolRef& u : collect_elf_undefined_symbols(*task.img)) {
+                        if (!u.weak_symbol) {
+                            ImportedSymbolBinding b;
+                            b.name = u.name;
+                            b.call_site_va = u.call_site_va;
+                            b.status = ImportedSymbolStatus::UnboundMissingExport;
+                            b.note = "No DT_NEEDED libraries declared to satisfy strong undefined symbol";
+                            graph_.nodes[task.node_id].unresolved_symbols.push_back(std::move(b));
+                        }
+                    }
+                }
+                direct_children_by_node_.try_emplace(task.node_id);
+                continue;
+            }
+
+            if (task.bfs_depth >= opts_.max_depth) {
+                continue;
+            }
+
+            expanded_nodes_.insert(task.node_id);
+            ExpandedNodeRecord rec;
+            rec.node_id = task.node_id;
+            rec.parent_img = task.img;
+            rec.requests = std::move(requests);
+            rec.pending.reserve(rec.requests.size());
+
+            for (const RequestedDependency& req : rec.requests) {
+                const DependencyNode parent_snapshot = graph_.nodes[task.node_id];
+                CandidateResult cand;
+                if (task.img->format() == Format::PE) {
+                    cand = resolve_pe_dependency(*task.img, task.origin, req.requested_name);
+                } else if (task.img->format() == Format::MachO) {
+                    cand = resolve_macho_dependency(*task.img, parent_snapshot, task.origin,
+                                                    task.inherited_rpaths, req.requested_name);
+                } else {
+                    cand = resolve_elf_dependency(*task.img, parent_snapshot, task.origin,
+                                                  task.inherited_rpaths, req.requested_name);
+                }
+
+                const IBinaryImage* child_img = nullptr;
+                const std::size_t child_id = get_or_create_node(req.requested_name, cand, child_img);
+                const bool is_cycle =
+                    std::ranges::find(task.bfs_ancestors, child_id) != task.bfs_ancestors.end();
+
+                DependencyEdge edge;
+                edge.parent_node_id = task.node_id;
+                edge.child_node_id = child_id;
+                edge.requested_name = req.requested_name;
+                edge.kind = req.kind;
+                edge.resolution_status = is_cycle ? DependencyResolutionStatus::CycleSkipped : cand.status;
+                edge.resolved_path = cand.path;
+                edge.resolution_reason = is_cycle
+                                             ? std::format("Cyclic dependency skipped ({} -> {})",
+                                                           graph_.nodes[task.node_id].display_name,
+                                                           graph_.nodes[child_id].display_name)
+                                             : cand.reason;
+                edge.searched_paths = std::move(cand.searched_paths);
+                edge.origin_assumptions = std::move(cand.origin_assumptions);
+
+                if (task.img->format() == Format::PE) {
+                    edge.symbol_bindings = bind_pe_symbols(req.symbols, cand.status, child_img);
+                }
+
+                const std::size_t edge_idx = graph_.edges.size();
+                graph_.edges.push_back(std::move(edge));
+
+                rec.pending.push_back(PendingChild{
+                    .edge_idx = edge_idx,
+                    .child_id = child_id,
+                    .child_img = child_img,
+                    .kind = req.kind,
+                    .status = cand.status,
+                    .is_bfs_cycle = is_cycle,
+                });
+
+                if (!is_cycle && child_img != nullptr &&
+                    (cand.status == DependencyResolutionStatus::ResolvedOnDisk ||
+                     cand.status == DependencyResolutionStatus::ResolvedInLiveProcess) &&
+                    enqueued_nodes.insert(child_id).second) {
+                    const std::uint32_t next_depth = task.bfs_depth + 1u;
+                    min_bfs_depth_[child_id] = next_depth;
+                    const std::filesystem::path child_origin =
+                        !graph_.nodes[child_id].resolved_path.empty()
+                            ? graph_.nodes[child_id].resolved_path.parent_path()
+                            : task.origin;
+                    std::vector<std::pair<std::string, std::filesystem::path>> child_rpaths;
+                    if (child_img->format() == Format::ELF &&
+                        graph_.nodes[child_id].elf_runpaths.empty()) {
+                        child_rpaths = task.inherited_rpaths;
+                        for (const std::string& rp : graph_.nodes[child_id].elf_rpaths) {
+                            child_rpaths.emplace_back(rp, child_origin);
+                        }
+                    } else if (child_img->format() == Format::MachO) {
+                        for (const std::string& rp : task.img->format() == Format::MachO
+                                                         ? graph_.nodes[task.node_id].macho_rpaths
+                                                         : std::vector<std::string>{}) {
+                            child_rpaths.emplace_back(rp, task.origin);
+                        }
+                        for (const auto& inh : task.inherited_rpaths) {
+                            const bool dup = std::ranges::any_of(
+                                child_rpaths,
+                                [&](const auto& x) {
+                                    return x.first == inh.first && x.second == inh.second;
+                                });
+                            if (!dup) {
+                                child_rpaths.push_back(inh);
+                            }
+                        }
+                    }
+                    std::vector<std::size_t> next_ancestors = task.bfs_ancestors;
+                    next_ancestors.push_back(child_id);
+                    bfs_queue.push(BfsExpandTask{
+                        .node_id = child_id,
+                        .img = child_img,
+                        .origin = child_origin,
+                        .inherited_rpaths = std::move(child_rpaths),
+                        .bfs_depth = next_depth,
+                        .bfs_ancestors = std::move(next_ancestors),
+                    });
+                }
+            }
+
+            direct_children_by_node_[task.node_id] = rec.pending;
+            expanded_order.push_back(std::move(rec));
+        }
+
+        // Bind ELF undefined dynamic symbols or Mach-O two-level/re-export symbols
+        // in reverse BFS order so deeper descendants & re-exports are bound first.
+        for (const ExpandedNodeRecord& rec : expanded_order | std::views::reverse) {
+            if (rec.parent_img == nullptr) {
+                continue;
+            }
+            if (rec.parent_img->format() == Format::ELF) {
+                bind_elf_symbols_for_parent(rec.node_id, *rec.parent_img, rec.pending);
+            } else if (rec.parent_img->format() == Format::MachO) {
+                for (std::size_t idx = 0u; idx < rec.requests.size() && idx < rec.pending.size(); ++idx) {
+                    if (!rec.requests[idx].symbols.empty()) {
+                        const DependencyResolutionStatus bind_st =
+                            rec.pending[idx].is_bfs_cycle
+                                ? DependencyResolutionStatus::CycleSkipped
+                                : rec.pending[idx].status;
+                        graph_.edges[rec.pending[idx].edge_idx].symbol_bindings = bind_macho_symbols(
+                            rec.requests[idx].symbols,
+                            rec.pending[idx].kind,
+                            bind_st,
+                            rec.pending[idx].child_id);
                     }
                 }
             }
-            expanded_subtree_by_node_[parent_id] = {};
+        }
+    }
+
+    void build_tree_children(std::size_t parent_id,
+                             std::uint32_t parent_depth,
+                             std::vector<std::size_t>& tree_ancestors,
+                             DependencyTreeItem& tree_out) {
+        if (parent_depth >= opts_.max_depth) {
+            if (const auto req_it = has_direct_requests_.find(parent_id);
+                req_it != has_direct_requests_.end() && req_it->second) {
+                tree_out.truncated_by_depth = true;
+            }
             return;
         }
-
-        if (depth >= opts_.max_depth) {
-            tree_out.truncated_by_depth = true;
+        const auto children_it = direct_children_by_node_.find(parent_id);
+        if (children_it == direct_children_by_node_.end()) {
             return;
         }
+        const std::uint32_t child_depth = parent_depth + 1u;
+        for (const PendingChild& pc : children_it->second) {
+            const bool is_cycle =
+                std::ranges::find(tree_ancestors, pc.child_id) != tree_ancestors.end();
+            const bool is_diamond = !is_cycle && !seen_in_tree_.insert(pc.child_id).second;
 
-        struct PendingChild {
-            std::size_t edge_idx{0};
-            std::size_t child_id{0};
-            const IBinaryImage* child_img{nullptr};
-            DependencyEdgeKind kind{DependencyEdgeKind::StandardImport};
-            DependencyResolutionStatus status{DependencyResolutionStatus::Unresolved};
-            bool is_cycle{false};
-            bool already_expanded{false};
-        };
-        std::vector<PendingChild> pending;
-        pending.reserve(requests.size());
-
-        for (const RequestedDependency& req : requests) {
-            const DependencyNode parent_snapshot = graph_.nodes[parent_id];
-            CandidateResult cand;
-            if (parent_img.format() == Format::PE) {
-                cand = resolve_pe_dependency(parent_img, parent_origin, req.requested_name);
-            } else if (parent_img.format() == Format::MachO) {
-                cand = resolve_macho_dependency(parent_img, parent_snapshot, parent_origin,
-                                                inherited_rpaths, req.requested_name);
-            } else {
-                cand = resolve_elf_dependency(parent_img, parent_snapshot, parent_origin,
-                                              inherited_rpaths, req.requested_name);
-            }
-
-            const IBinaryImage* child_img = nullptr;
-            const std::size_t child_id = get_or_create_node(req.requested_name, cand, child_img);
-            const bool is_cycle = std::ranges::find(ancestors, child_id) != ancestors.end();
-            const bool already_expanded = expanded_nodes_.contains(child_id);
-
-            DependencyEdge edge;
-            edge.parent_node_id = parent_id;
-            edge.child_node_id = child_id;
-            edge.requested_name = req.requested_name;
-            edge.kind = req.kind;
-            edge.resolution_status = is_cycle ? DependencyResolutionStatus::CycleSkipped : cand.status;
-            edge.resolved_path = cand.path;
-            edge.resolution_reason = is_cycle
-                                         ? std::format("Cyclic dependency skipped ({} -> {})",
-                                                       graph_.nodes[parent_id].display_name,
-                                                       graph_.nodes[child_id].display_name)
-                                         : cand.reason;
-            edge.searched_paths = std::move(cand.searched_paths);
-            edge.origin_assumptions = std::move(cand.origin_assumptions);
-
-            if (parent_img.format() == Format::PE) {
-                edge.symbol_bindings = bind_pe_symbols(req.symbols, cand.status, child_img);
-            }
-
-            const std::size_t edge_idx = graph_.edges.size();
-            graph_.edges.push_back(std::move(edge));
-
-            pending.push_back(PendingChild{
-                .edge_idx = edge_idx,
-                .child_id = child_id,
-                .child_img = child_img,
-                .kind = req.kind,
-                .status = is_cycle ? DependencyResolutionStatus::CycleSkipped : cand.status,
-                .is_cycle = is_cycle,
-                .already_expanded = already_expanded,
-            });
-        }
-
-        // Expand children first so ELF transitive export maps and Mach-O LC_REEXPORT_DYLIB chains are populated!
-        for (const PendingChild& pc : pending) {
-            const bool already_expanded = pc.already_expanded || expanded_nodes_.contains(pc.child_id);
             DependencyTreeItem item;
             item.node_id = pc.child_id;
             item.edge_index = pc.edge_idx;
             item.requested_name = graph_.edges[pc.edge_idx].requested_name;
             item.edge_kind = pc.kind;
-            item.status = pc.status;
-            item.depth = depth + 1;
-            item.is_cycle = pc.is_cycle;
-            item.is_diamond_ref = !pc.is_cycle && already_expanded;
+            item.status = is_cycle ? DependencyResolutionStatus::CycleSkipped : pc.status;
+            item.depth = child_depth;
+            item.is_cycle = is_cycle;
+            item.is_diamond_ref = is_diamond;
 
-            if (pc.is_cycle) {
-                ++cycle_edge_count_;
-            } else if (already_expanded) {
-                clone_cached_subtree(pc.child_id, depth + 1, ancestors, item);
+            if (is_cycle) {
+                if (counted_cycle_edges_.insert(pc.edge_idx).second) {
+                    ++cycle_edge_count_;
+                }
             } else if (pc.child_img != nullptr &&
                        (pc.status == DependencyResolutionStatus::ResolvedOnDisk ||
                         pc.status == DependencyResolutionStatus::ResolvedInLiveProcess)) {
-                ancestors.push_back(pc.child_id);
-                const std::filesystem::path child_origin =
-                    !graph_.nodes[pc.child_id].resolved_path.empty()
-                        ? graph_.nodes[pc.child_id].resolved_path.parent_path()
-                        : parent_origin;
-                std::vector<std::pair<std::string, std::filesystem::path>> child_rpaths;
-                if (pc.child_img->format() == Format::ELF &&
-                    graph_.nodes[pc.child_id].elf_runpaths.empty()) {
-                    child_rpaths = inherited_rpaths;
-                    for (const std::string& rp : graph_.nodes[pc.child_id].elf_rpaths) {
-                        child_rpaths.emplace_back(rp, child_origin);
-                    }
-                } else if (pc.child_img->format() == Format::MachO) {
-                    for (const std::string& rp : parent_img.format() == Format::MachO
-                                                     ? graph_.nodes[parent_id].macho_rpaths
-                                                     : std::vector<std::string>{}) {
-                        child_rpaths.emplace_back(rp, parent_origin);
-                    }
-                    for (const auto& inh : inherited_rpaths) {
-                        const bool dup = std::ranges::any_of(
-                            child_rpaths,
-                            [&](const auto& x) { return x.first == inh.first && x.second == inh.second; });
-                        if (!dup) {
-                            child_rpaths.push_back(inh);
-                        }
-                    }
-                }
-                expand_node(pc.child_id, *pc.child_img, child_origin, child_rpaths,
-                            depth + 1, ancestors, item);
-                ancestors.pop_back();
+                tree_ancestors.push_back(pc.child_id);
+                build_tree_children(pc.child_id, child_depth, tree_ancestors, item);
+                tree_ancestors.pop_back();
             }
 
             tree_out.children.push_back(std::move(item));
         }
-
-        // Bind ELF undefined dynamic symbols or Mach-O two-level/re-export symbols after child expansion
-        if (parent_img.format() == Format::ELF) {
-            bind_elf_symbols_for_parent(parent_id, parent_img, pending);
-        } else if (parent_img.format() == Format::MachO) {
-            for (std::size_t idx = 0u; idx < requests.size() && idx < pending.size(); ++idx) {
-                if (!requests[idx].symbols.empty()) {
-                    graph_.edges[pending[idx].edge_idx].symbol_bindings = bind_macho_symbols(
-                        requests[idx].symbols,
-                        pending[idx].kind,
-                        pending[idx].status,
-                        pending[idx].child_id);
-                }
-            }
-        }
-
-        expanded_subtree_by_node_[parent_id] = tree_out.children;
     }
 
     template <typename PendingVec>
@@ -1956,7 +2014,11 @@ private:
     std::unordered_map<std::string, std::size_t> node_id_by_key_{};
     std::unordered_map<std::size_t, const IBinaryImage*> image_by_node_id_{};
     std::unordered_set<std::size_t> expanded_nodes_{};
-    std::unordered_map<std::size_t, std::vector<DependencyTreeItem>> expanded_subtree_by_node_{};
+    std::unordered_map<std::size_t, std::uint32_t> min_bfs_depth_{};
+    std::unordered_map<std::size_t, bool> has_direct_requests_{};
+    std::unordered_map<std::size_t, std::vector<PendingChild>> direct_children_by_node_{};
+    std::unordered_set<std::size_t> seen_in_tree_{};
+    std::unordered_set<std::size_t> counted_cycle_edges_{};
     std::size_t cycle_edge_count_{0};
 };
 

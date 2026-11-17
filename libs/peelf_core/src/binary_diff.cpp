@@ -372,6 +372,41 @@ struct VaInterval {
     std::uint64_t end{0};
 };
 
+[[nodiscard]] std::vector<VaInterval> merge_va_intervals(std::vector<VaInterval> intervals) {
+    std::erase_if(intervals, [](const VaInterval& iv) noexcept { return iv.end <= iv.start; });
+    if (intervals.empty()) {
+        return intervals;
+    }
+    std::ranges::sort(intervals, [](const VaInterval& a, const VaInterval& b) noexcept {
+        return std::tie(a.start, a.end) < std::tie(b.start, b.end);
+    });
+    std::vector<VaInterval> merged;
+    merged.reserve(intervals.size());
+    merged.push_back(intervals.front());
+    for (std::size_t i = 1u; i < intervals.size(); ++i) {
+        VaInterval& back = merged.back();
+        if (intervals[i].start <= back.end) {
+            back.end = std::max(back.end, intervals[i].end);
+        } else {
+            merged.push_back(intervals[i]);
+        }
+    }
+    return merged;
+}
+
+[[nodiscard]] std::uint64_t elf_reloc_fixup_width(
+    const IBinaryImage& img,
+    const ElfRelocation& rel) noexcept {
+    if (img.architecture() == Architecture::X86_64) {
+        // 32-bit PC-relative / 32-bit direct x86_64 relocation types
+        if (rel.type == 2u || rel.type == 4u || rel.type == 9u || rel.type == 10u ||
+            rel.type == 11u || rel.type == 41u || rel.type == 42u) {
+            return 4u;
+        }
+    }
+    return img.is_64bit() ? 8u : 4u;
+}
+
 [[nodiscard]] std::vector<VaInterval> collect_relocation_va_intervals(const IBinaryImage& img) {
     std::vector<VaInterval> out;
     const std::uint64_t base = img.image_base();
@@ -395,18 +430,15 @@ struct VaInterval {
             }
         }
     }
-    const std::uint64_t ptr_sz = img.is_64bit() ? 8u : 4u;
     for (const ElfRelocation& rel : img.elf_relocations()) {
         if (rel.offset != 0u) {
-            if (const auto rel_end = checked_add_u64(rel.offset, ptr_sz); rel_end.has_value()) {
+            const std::uint64_t width = elf_reloc_fixup_width(img, rel);
+            if (const auto rel_end = checked_add_u64(rel.offset, width); rel_end.has_value()) {
                 out.push_back(VaInterval{rel.offset, *rel_end});
             }
         }
     }
-    std::ranges::sort(out, [](const VaInterval& a, const VaInterval& b) {
-        return std::tie(a.start, a.end) < std::tie(b.start, b.end);
-    });
-    return out;
+    return merge_va_intervals(std::move(out));
 }
 
 [[nodiscard]] bool range_fully_covered_by_relocs(
@@ -416,27 +448,181 @@ struct VaInterval {
     if (va_start >= va_end || sorted_relocs.empty()) {
         return false;
     }
-    std::uint64_t cur = va_start;
-    auto it = std::lower_bound(
+    const auto it = std::upper_bound(
         sorted_relocs.begin(),
         sorted_relocs.end(),
         va_start,
-        [](const VaInterval& iv, std::uint64_t v) { return iv.end <= v; });
-    while (it != sorted_relocs.end() && it->start <= cur && cur < va_end) {
-        cur = std::max(cur, it->end);
-        ++it;
+        [](std::uint64_t v, const VaInterval& iv) noexcept { return v < iv.start; });
+    if (it == sorted_relocs.begin()) {
+        return false;
     }
-    return cur >= va_end;
+    const VaInterval& covering = *std::prev(it);
+    return covering.start <= va_start && va_end <= covering.end;
 }
 
+[[nodiscard]] std::uint32_t fnv1a_nonzero_u32(std::string_view key) noexcept {
+    std::uint32_t h = 2166136261u;
+    for (const char ch : key) {
+        h ^= static_cast<std::uint8_t>(ch);
+        h *= 16777619u;
+    }
+    return h != 0u ? h : 1u;
+}
+
+void write_le32_bytes(std::span<std::uint8_t> buf, std::size_t off, std::uint32_t val) noexcept {
+    if (off + 4u > buf.size()) {
+        return;
+    }
+    buf[off + 0u] = static_cast<std::uint8_t>(val & 0xFFu);
+    buf[off + 1u] = static_cast<std::uint8_t>((val >> 8u) & 0xFFu);
+    buf[off + 2u] = static_cast<std::uint8_t>((val >> 16u) & 0xFFu);
+    buf[off + 3u] = static_cast<std::uint8_t>((val >> 24u) & 0xFFu);
+}
+
+struct X86Rel32CallSite {
+    std::size_t disp_offset{0};
+    std::uint64_t target_va{0};
+    bool covered_by_reloc{false};
+    std::string reloc_symbol{};
+};
+
+struct ImageCallTargetIndex {
+    std::unordered_map<std::uint64_t, std::string> named_or_import_by_va{};
+    std::unordered_map<std::uint64_t, std::string> reloc_symbol_by_va{};
+    const IBinaryImage* image{nullptr};
+    std::span<const std::uint8_t> raw_bytes{};
+
+    static ImageCallTargetIndex build(
+        const IBinaryImage& img,
+        std::span<const std::uint8_t> bytes = {}) {
+        ImageCallTargetIndex idx;
+        idx.image = &img;
+        idx.raw_bytes = bytes;
+
+        for (const ImportEntry& imp : img.imports()) {
+            if (imp.address == 0u) {
+                continue;
+            }
+            std::string key = (imp.import_by_ordinal || imp.name.empty())
+                                  ? std::format("imp_ord:{}#{}", stem_lower(imp.library), imp.ordinal)
+                                  : std::format("imp:{}", demangle_or_raw(imp.name));
+            idx.named_or_import_by_va.try_emplace(imp.address, std::move(key));
+        }
+
+        for (const ElfRelocation& rel : img.elf_relocations()) {
+            if (rel.offset == 0u || rel.symbol_name.empty()) {
+                continue;
+            }
+            const std::string sym = demangle_or_raw(rel.symbol_name);
+            idx.reloc_symbol_by_va.try_emplace(rel.offset, sym);
+            idx.named_or_import_by_va.try_emplace(rel.offset, std::format("imp:{}", sym));
+        }
+
+        for (const Symbol& sym : img.symbols()) {
+            if (sym.virtual_address == 0u || sym.type == 1u || sym.type == 3u || sym.type == 4u) {
+                continue;
+            }
+            if (sym.name.empty() || sym.name.starts_with("$x") || sym.name.starts_with("$d") ||
+                sym.name.starts_with("$a") || sym.name.starts_with("$t")) {
+                continue;
+            }
+            idx.named_or_import_by_va.try_emplace(
+                sym.virtual_address, std::format("sym:{}", demangle_or_raw(sym.name)));
+        }
+
+        for (const ExportEntry& exp : img.exports()) {
+            if (exp.virtual_address == 0u || !exp.forwarder.empty()) {
+                continue;
+            }
+            std::string key = !exp.name.empty()
+                                  ? std::format("sym:{}", demangle_or_raw(exp.name))
+                                  : std::format("ord:{}", exp.ordinal);
+            idx.named_or_import_by_va.try_emplace(exp.virtual_address, std::move(key));
+        }
+
+        return idx;
+    }
+
+    [[nodiscard]] std::string resolve_named_or_import(std::uint64_t target_va) const {
+        if (const auto it = named_or_import_by_va.find(target_va);
+            it != named_or_import_by_va.end()) {
+            return it->second;
+        }
+        // Decode PLT / IAT indirect-jump stub (`[ENDBR] [BND] FF 25 disp32`) when raw bytes exist.
+        if (image != nullptr && !raw_bytes.empty()) {
+            if (const auto foff = image->virtual_address_to_file_offset(target_va);
+                foff.has_value() && *foff < raw_bytes.size()) {
+                const auto stub = slice_safe(raw_bytes, *foff, 12u);
+                std::size_t p = 0u;
+                if (stub.size() >= 4u && stub[0] == 0xF3u && stub[1] == 0x0Fu &&
+                    stub[2] == 0x1Eu && (stub[3] == 0xFAu || stub[3] == 0xFBu)) {
+                    p += 4u;
+                }
+                if (p < stub.size() && stub[p] == 0xF2u) {
+                    ++p;
+                }
+                if (p + 6u <= stub.size() && stub[p] == 0xFFu && stub[p + 1u] == 0x25u) {
+                    const std::uint32_t raw_disp = read_le32(stub, p + 2u);
+                    const std::uint64_t slot_va =
+                        image->is_64bit()
+                            ? add_signed_offset_wrapping(
+                                  target_va + static_cast<std::uint64_t>(p + 6u),
+                                  static_cast<std::int64_t>(static_cast<std::int32_t>(raw_disp)))
+                            : static_cast<std::uint64_t>(raw_disp);
+                    if (const auto it = named_or_import_by_va.find(slot_va);
+                        it != named_or_import_by_va.end()) {
+                        return it->second;
+                    }
+                }
+            }
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::optional<std::pair<std::string, std::uint64_t>> resolve_section_offset(
+        std::uint64_t target_va) const {
+        if (image == nullptr) {
+            return std::nullopt;
+        }
+        for (const Section& sec : image->sections()) {
+            const std::uint64_t span = std::max(sec.virtual_size, sec.file_size);
+            if (span > 0u && target_va >= sec.virtual_address &&
+                (target_va - sec.virtual_address) < span) {
+                return std::pair<std::string, std::uint64_t>{
+                    sec.name, target_va - sec.virtual_address};
+            }
+        }
+        return std::nullopt;
+    }
+
+    [[nodiscard]] std::string find_reloc_symbol(
+        std::uint64_t disp_va,
+        std::uint64_t disp_end_va) const {
+        for (std::uint64_t va = disp_va; va < disp_end_va; ++va) {
+            if (const auto it = reloc_symbol_by_va.find(va); it != reloc_symbol_by_va.end()) {
+                return it->second;
+            }
+        }
+        return {};
+    }
+};
+
 // Lightweight x86/x86_64 instruction boundary & displacement masker so RIP-relative
-// memory operands (`[rip + disp32]`), inter-function `call`/`jmp`/`jcc rel32`, and
+// memory operands (`[rip + disp32]`), relocated `call`/`jmp` sites, `jcc rel32`, and
 // absolute image-base immediates normalize cleanly without linking Capstone in peelf_core.
-void mask_x86_function_displacements(std::span<std::uint8_t> buf,
-                                     std::uint64_t func_va,
-                                     bool is64,
-                                     std::uint64_t image_base,
-                                     std::uint64_t image_end) noexcept {
+// Un-relocated `E8`/`E9` `rel32` displacements are never blindly zeroed: they are tagged
+// with their resolved target identity (symbol/import/ordinal or section-relative offset)
+// and optionally recorded in `out_call_sites` for function-equivalence verification.
+void mask_x86_function_displacements(
+    std::span<std::uint8_t> buf,
+    std::uint64_t func_va,
+    bool is64,
+    std::uint64_t image_base,
+    std::uint64_t image_end,
+    const std::vector<VaInterval>& sorted_relocs,
+    const ImageCallTargetIndex* target_index,
+    bool zero_unrelocated_call_rel32_for_structural_hash = false,
+    std::vector<X86Rel32CallSite>* out_call_sites = nullptr) {
     const auto in_func = [&](std::uint64_t target) noexcept {
         return target >= func_va && (target - func_va) < buf.size();
     };
@@ -489,7 +675,8 @@ void mask_x86_function_displacements(std::span<std::uint8_t> buf,
         if ((op >= 0x70u && op <= 0x7Fu) || op == 0xEBu) {
             if (i < buf.size()) {
                 const auto rel8 = static_cast<std::int8_t>(buf[i]);
-                const std::uint64_t next_va = func_va + static_cast<std::uint64_t>(i + 1u);
+                const std::uint64_t next_va =
+                    add_signed_offset_wrapping(func_va, static_cast<std::int64_t>(i + 1u));
                 const std::uint64_t target =
                     add_signed_offset_wrapping(next_va, static_cast<std::int64_t>(rel8));
                 if (!in_func(target)) {
@@ -504,11 +691,58 @@ void mask_x86_function_displacements(std::span<std::uint8_t> buf,
         if (op == 0xE8u || op == 0xE9u) {
             if (i + 4u <= buf.size()) {
                 const auto rel32 = static_cast<std::int32_t>(read_le32(buf, i));
-                const std::uint64_t next_va = func_va + static_cast<std::uint64_t>(i + 4u);
+                const std::uint64_t disp_va =
+                    add_signed_offset_wrapping(func_va, static_cast<std::int64_t>(i));
+                const std::uint64_t next_va =
+                    add_signed_offset_wrapping(func_va, static_cast<std::int64_t>(i + 4u));
                 const std::uint64_t target =
                     add_signed_offset_wrapping(next_va, static_cast<std::int64_t>(rel32));
-                if (op == 0xE8u || !in_func(target)) {
-                    std::fill_n(buf.begin() + static_cast<std::ptrdiff_t>(i), 4, std::uint8_t{0});
+                const auto disp_end = checked_add_u64(disp_va, 4u);
+                const bool has_reloc =
+                    disp_end.has_value() &&
+                    range_fully_covered_by_relocs(sorted_relocs, disp_va, *disp_end);
+                std::string reloc_sym =
+                    (has_reloc && target_index != nullptr && disp_end.has_value())
+                        ? target_index->find_reloc_symbol(disp_va, *disp_end)
+                        : std::string{};
+
+                if (has_reloc || !in_func(target)) {
+                    if (out_call_sites != nullptr) {
+                        out_call_sites->push_back(X86Rel32CallSite{
+                            .disp_offset = i,
+                            .target_va = target,
+                            .covered_by_reloc = has_reloc,
+                            .reloc_symbol = reloc_sym,
+                        });
+                    }
+                }
+
+                if (has_reloc) {
+                    if (!reloc_sym.empty() && !zero_unrelocated_call_rel32_for_structural_hash) {
+                        write_le32_bytes(
+                            buf, i, fnv1a_nonzero_u32(std::format("rel:{}", reloc_sym)));
+                    } else {
+                        std::fill_n(
+                            buf.begin() + static_cast<std::ptrdiff_t>(i), 4, std::uint8_t{0});
+                    }
+                } else if (!in_func(target)) {
+                    if (zero_unrelocated_call_rel32_for_structural_hash) {
+                        std::fill_n(
+                            buf.begin() + static_cast<std::ptrdiff_t>(i), 4, std::uint8_t{0});
+                    } else if (target_index != nullptr) {
+                        if (const std::string named = target_index->resolve_named_or_import(target);
+                            !named.empty()) {
+                            write_le32_bytes(buf, i, fnv1a_nonzero_u32(named));
+                        } else if (const auto sec_off =
+                                       target_index->resolve_section_offset(target);
+                                   sec_off.has_value()) {
+                            write_le32_bytes(
+                                buf,
+                                i,
+                                fnv1a_nonzero_u32(std::format(
+                                    "sec:{}+0x{:X}", sec_off->first, sec_off->second)));
+                        }
+                    }
                 }
                 i += 4u;
             } else {
@@ -792,7 +1026,30 @@ struct ExtractedFunction {
     std::span<const std::uint8_t> raw_bytes{};
     std::vector<std::uint8_t> normalized_bytes{};
     std::string normalized_sha256{};
+    std::vector<std::uint8_t> structural_bytes{};
+    std::string structural_sha256{};
+    std::vector<X86Rel32CallSite> call_sites{};
 };
+
+void mask_reloc_spans_in_function_buffer(
+    std::span<std::uint8_t> norm,
+    std::uint64_t func_va,
+    const std::vector<VaInterval>& relocs) noexcept {
+    const auto norm_len = static_cast<std::uint64_t>(norm.size());
+    for (const VaInterval& iv : relocs) {
+        if (iv.end <= func_va || iv.start >= iv.end) {
+            continue;
+        }
+        const std::uint64_t s = (iv.start > func_va) ? (iv.start - func_va) : 0u;
+        if (s >= norm_len) {
+            continue;
+        }
+        const std::uint64_t e = std::min(iv.end - func_va, norm_len);
+        std::fill(norm.begin() + static_cast<std::ptrdiff_t>(s),
+                  norm.begin() + static_cast<std::ptrdiff_t>(e),
+                  std::uint8_t{0});
+    }
+}
 
 [[nodiscard]] const Section* find_exec_section_containing_va(
     const IBinaryImage& img,
@@ -811,7 +1068,10 @@ struct ExtractedFunction {
 
 [[nodiscard]] std::vector<ExtractedFunction> extract_functions_for_diff(
     const IBinaryImage& img,
-    std::span<const std::uint8_t> raw_image_bytes) {
+    std::span<const std::uint8_t> raw_image_bytes,
+    const std::vector<VaInterval>& relocs,
+    const ImageCallTargetIndex& target_index,
+    std::stop_token stop_token = {}) {
     struct Candidate {
         std::uint64_t va{0};
         std::uint64_t explicit_size{0};
@@ -883,7 +1143,15 @@ struct ExtractedFunction {
     std::vector<ExtractedFunction> result;
     result.reserve(ordered.size());
 
+    const std::uint64_t img_base = img.image_base();
+    const std::uint64_t img_end = saturating_add_u64(img_base, estimate_image_span(img));
+    const Architecture arch = img.architecture();
+    const bool is_x86_family = (arch == Architecture::X86 || arch == Architecture::X86_64);
+
     for (std::size_t idx = 0; idx < ordered.size(); ++idx) {
+        if (((idx & 0xFFu) == 0u) && stop_token.stop_requested()) {
+            break;
+        }
         const Candidate& c = ordered[idx];
         const Section* sec = find_exec_section_containing_va(img, c.va);
         if (sec == nullptr) {
@@ -897,10 +1165,16 @@ struct ExtractedFunction {
         const std::uint64_t sec_limit_span =
             sec->file_size > 0u ? sec->file_size : sec->virtual_size;
         const std::uint64_t offset_in_sec = c.va - sec->virtual_address;
+        const std::uint64_t sec_rem =
+            offset_in_sec < sec_limit_span ? (sec_limit_span - offset_in_sec) : 0u;
+        const std::uint64_t img_rem = raw_image_bytes.size() - *file_off;
+        const std::uint64_t max_bound = std::min(sec_rem, img_rem);
+
         std::uint64_t sz = c.explicit_size;
-        if (sz == 0u) {
-            std::uint64_t max_rem =
-                offset_in_sec < sec_limit_span ? (sec_limit_span - offset_in_sec) : 0u;
+        if (sz > 0u) {
+            sz = std::min(sz, max_bound);
+        } else {
+            std::uint64_t max_rem = max_bound;
             if (idx + 1u < ordered.size() && ordered[idx + 1u].va > c.va) {
                 max_rem = std::min(max_rem, ordered[idx + 1u].va - c.va);
             }
@@ -923,8 +1197,46 @@ struct ExtractedFunction {
         fn.has_real_name = !c.name.empty() && c.name != "_entry";
         fn.raw_name = c.name.empty() ? std::format("sub_{:X}", c.va) : c.name;
         fn.canonical_name = fn.has_real_name ? demangle_or_raw(fn.raw_name) : fn.raw_name;
-        fn.normalized_bytes = normalize_function_bytes_for_diff(bytes, c.va, img);
+
+        fn.normalized_bytes.assign(bytes.begin(), bytes.end());
+        if (is_x86_family) {
+            fn.structural_bytes = fn.normalized_bytes;
+            mask_x86_function_displacements(fn.normalized_bytes,
+                                            c.va,
+                                            img.is_64bit(),
+                                            img_base,
+                                            img_end,
+                                            relocs,
+                                            &target_index,
+                                            false,
+                                            &fn.call_sites);
+            mask_reloc_spans_in_function_buffer(fn.normalized_bytes, c.va, relocs);
+            for (const X86Rel32CallSite& cs : fn.call_sites) {
+                if (cs.covered_by_reloc && !cs.reloc_symbol.empty()) {
+                    write_le32_bytes(fn.normalized_bytes,
+                                     cs.disp_offset,
+                                     fnv1a_nonzero_u32(std::format("rel:{}", cs.reloc_symbol)));
+                }
+            }
+
+            mask_x86_function_displacements(fn.structural_bytes,
+                                            c.va,
+                                            img.is_64bit(),
+                                            img_base,
+                                            img_end,
+                                            relocs,
+                                            &target_index,
+                                            true,
+                                            nullptr);
+            mask_reloc_spans_in_function_buffer(fn.structural_bytes, c.va, relocs);
+        } else {
+            mask_reloc_spans_in_function_buffer(fn.normalized_bytes, c.va, relocs);
+            mask_fixed_width_risc_displacements(
+                fn.normalized_bytes, c.va, arch, img.endianness());
+            fn.structural_bytes = fn.normalized_bytes;
+        }
         fn.normalized_sha256 = sha256_hex(fn.normalized_bytes);
+        fn.structural_sha256 = sha256_hex(fn.structural_bytes);
         result.push_back(std::move(fn));
     }
 
@@ -1053,31 +1365,32 @@ std::vector<std::uint8_t> normalize_function_bytes_for_diff(
         return norm;
     }
 
-    const std::uint64_t norm_len = static_cast<std::uint64_t>(norm.size());
     const std::vector<VaInterval> relocs = collect_relocation_va_intervals(image);
-
-    // 1. Mask explicit PE/ELF relocation fixup spans inside [func_va, func_va + norm_len)
-    for (const VaInterval& iv : relocs) {
-        if (iv.end <= func_va || iv.start >= iv.end) {
-            continue;
-        }
-        const std::uint64_t s = (iv.start > func_va) ? (iv.start - func_va) : 0u;
-        if (s >= norm_len) {
-            continue;
-        }
-        const std::uint64_t e = std::min(iv.end - func_va, norm_len);
-        std::fill(norm.begin() + static_cast<std::ptrdiff_t>(s),
-                  norm.begin() + static_cast<std::ptrdiff_t>(e),
-                  std::uint8_t{0});
-    }
-
-    // 2. Mask PC/RIP-relative call/branch displacements and absolute image-base addresses
     const std::uint64_t img_base = image.image_base();
     const std::uint64_t img_end = saturating_add_u64(img_base, estimate_image_span(image));
     const Architecture arch = image.architecture();
     if (arch == Architecture::X86 || arch == Architecture::X86_64) {
-        mask_x86_function_displacements(norm, func_va, image.is_64bit(), img_base, img_end);
+        const ImageCallTargetIndex target_index = ImageCallTargetIndex::build(image);
+        std::vector<X86Rel32CallSite> call_sites;
+        mask_x86_function_displacements(norm,
+                                        func_va,
+                                        image.is_64bit(),
+                                        img_base,
+                                        img_end,
+                                        relocs,
+                                        &target_index,
+                                        false,
+                                        &call_sites);
+        mask_reloc_spans_in_function_buffer(norm, func_va, relocs);
+        for (const X86Rel32CallSite& cs : call_sites) {
+            if (cs.covered_by_reloc && !cs.reloc_symbol.empty()) {
+                write_le32_bytes(norm,
+                                 cs.disp_offset,
+                                 fnv1a_nonzero_u32(std::format("rel:{}", cs.reloc_symbol)));
+            }
+        }
     } else {
+        mask_reloc_spans_in_function_buffer(norm, func_va, relocs);
         mask_fixed_width_risc_displacements(norm, func_va, arch, image.endianness());
     }
 
@@ -1251,6 +1564,9 @@ Result<BinaryDiffReport> compare_binaries(
 
         std::size_t pos = 0;
         while (pos < common) {
+            if (((pos & 0x3FFFu) == 0u) && options.stop_token.stop_requested()) {
+                break;
+            }
             if (lb[pos] == rb[pos]) {
                 ++pos;
                 continue;
@@ -1261,6 +1577,9 @@ Result<BinaryDiffReport> compare_binaries(
             ++pos;
 
             while (pos < common) {
+                if (((pos & 0x3FFFu) == 0u) && options.stop_token.stop_requested()) {
+                    break;
+                }
                 if (lb[pos] != rb[pos]) {
                     hunk_end = pos + 1u;
                     ++diff_cnt;
@@ -1384,6 +1703,9 @@ Result<BinaryDiffReport> compare_binaries(
             lhs_image.image_base(),
             rhs_image.image_base(),
             ByteHunkClassification::HeaderChange);
+        if (options.stop_token.stop_requested()) {
+            return make_error("Binary diff cancelled");
+        }
     }
 
     const auto& l_secs = lhs_image.sections();
@@ -1675,56 +1997,47 @@ Result<BinaryDiffReport> compare_binaries(
         return make_error("Binary diff cancelled");
     }
     report_progress(3u, 5u, "Extracting & normalizing functions");
-    const std::vector<ExtractedFunction> l_funcs = extract_functions_for_diff(lhs_image, lhs_bytes);
+    const ImageCallTargetIndex lhs_targets = ImageCallTargetIndex::build(lhs_image, lhs_bytes);
+    const ImageCallTargetIndex rhs_targets = ImageCallTargetIndex::build(rhs_image, rhs_bytes);
+    const std::vector<ExtractedFunction> l_funcs =
+        extract_functions_for_diff(lhs_image, lhs_bytes, lhs_relocs, lhs_targets, options.stop_token);
     if (options.stop_token.stop_requested()) {
         return make_error("Binary diff cancelled");
     }
-    const std::vector<ExtractedFunction> r_funcs = extract_functions_for_diff(rhs_image, rhs_bytes);
+    const std::vector<ExtractedFunction> r_funcs =
+        extract_functions_for_diff(rhs_image, rhs_bytes, rhs_relocs, rhs_targets, options.stop_token);
+    if (options.stop_token.stop_requested()) {
+        return make_error("Binary diff cancelled");
+    }
     report_progress(4u, 5u, "Matching functions across builds");
+
+    std::unordered_map<std::uint64_t, std::size_t> l_func_by_va;
+    l_func_by_va.reserve(l_funcs.size());
+    for (std::size_t li = 0u; li < l_funcs.size(); ++li) {
+        l_func_by_va.try_emplace(l_funcs[li].va, li);
+    }
+    std::unordered_map<std::uint64_t, std::size_t> r_func_by_va;
+    r_func_by_va.reserve(r_funcs.size());
+    for (std::size_t ri = 0u; ri < r_funcs.size(); ++ri) {
+        r_func_by_va.try_emplace(r_funcs[ri].va, ri);
+    }
 
     std::vector<bool> l_used(l_funcs.size(), false);
     std::vector<bool> r_used(r_funcs.size(), false);
+    std::vector<std::optional<std::size_t>> l_partner(l_funcs.size(), std::nullopt);
+    struct MatchedPairRecord {
+        std::size_t li{0};
+        std::size_t ri{0};
+        std::string basis{};
+    };
+    std::vector<MatchedPairRecord> matched_pairs;
+    matched_pairs.reserve(std::min(l_funcs.size(), r_funcs.size()));
 
     auto record_matched_pair = [&](std::size_t li, std::size_t ri, std::string_view basis) {
         l_used[li] = true;
         r_used[ri] = true;
-        const ExtractedFunction& lf = l_funcs[li];
-        const ExtractedFunction& rf = r_funcs[ri];
-
-        FunctionDiffEntry fe;
-        fe.display_name = lf.has_real_name ? lf.canonical_name
-                                           : (rf.has_real_name ? rf.canonical_name : lf.canonical_name);
-        fe.raw_lhs_name = lf.raw_name;
-        fe.raw_rhs_name = rf.raw_name;
-        fe.match_basis = std::string(basis);
-        fe.lhs_va = lf.va;
-        fe.rhs_va = rf.va;
-        fe.lhs_file_offset = lf.file_offset;
-        fe.rhs_file_offset = rf.file_offset;
-        fe.lhs_size = lf.size;
-        fe.rhs_size = rf.size;
-        fe.size_delta = static_cast<std::int64_t>(rf.size) - static_cast<std::int64_t>(lf.size);
-        fe.lhs_normalized_sha256 = lf.normalized_sha256;
-        fe.rhs_normalized_sha256 = rf.normalized_sha256;
-
-        const bool raw_equal = (lf.raw_bytes.size() == rf.raw_bytes.size()) &&
-                               std::equal(lf.raw_bytes.begin(), lf.raw_bytes.end(), rf.raw_bytes.begin());
-        const bool norm_equal = (lf.size == rf.size) && (lf.normalized_sha256 == rf.normalized_sha256);
-
-        if (raw_equal && lf.va == rf.va) {
-            fe.status = FunctionMatchKind::Identical;
-            fe.similarity = 1.0;
-            ++report.functions_identical;
-        } else if (raw_equal || norm_equal) {
-            fe.status = FunctionMatchKind::IdenticalRelocated;
-            fe.similarity = 1.0;
-            ++report.functions_relocated;
-        } else {
-            fe.status = FunctionMatchKind::Modified;
-            fe.similarity = compute_normalized_similarity(lf.normalized_bytes, rf.normalized_bytes);
-            ++report.functions_modified;
-        }
-        report.functions.push_back(std::move(fe));
+        l_partner[li] = ri;
+        matched_pairs.push_back(MatchedPairRecord{li, ri, std::string(basis)});
     };
 
     // Pass 1: Exact canonical/demangled symbol name match
@@ -1735,6 +2048,9 @@ Result<BinaryDiffReport> compare_binaries(
         }
     }
     for (std::size_t li = 0; li < l_funcs.size(); ++li) {
+        if (((li & 0xFFu) == 0u) && options.stop_token.stop_requested()) {
+            return make_error("Binary diff cancelled");
+        }
         if (!l_funcs[li].has_real_name) {
             continue;
         }
@@ -1750,7 +2066,7 @@ Result<BinaryDiffReport> compare_binaries(
         }
     }
 
-    // Pass 2: Normalized instruction/byte fingerprint hash match (handles stripped & renamed functions)
+    // Pass 2a: Exact target-tagged normalized fingerprint match
     std::unordered_map<std::string, std::vector<std::size_t>> r_by_norm_hash;
     for (std::size_t ri = 0; ri < r_funcs.size(); ++ri) {
         if (!r_used[ri]) {
@@ -1758,11 +2074,51 @@ Result<BinaryDiffReport> compare_binaries(
         }
     }
     for (std::size_t li = 0; li < l_funcs.size(); ++li) {
+        if (((li & 0xFFu) == 0u) && options.stop_token.stop_requested()) {
+            return make_error("Binary diff cancelled");
+        }
         if (l_used[li]) {
             continue;
         }
         auto it = r_by_norm_hash.find(l_funcs[li].normalized_sha256);
         if (it == r_by_norm_hash.end()) {
+            continue;
+        }
+        std::optional<std::size_t> best_ri;
+        std::uint64_t best_dist = std::numeric_limits<std::uint64_t>::max();
+        for (const std::size_t ri : it->second) {
+            if (r_used[ri] || r_funcs[ri].size != l_funcs[li].size) {
+                continue;
+            }
+            const std::uint64_t dist = l_funcs[li].va > r_funcs[ri].va
+                                           ? (l_funcs[li].va - r_funcs[ri].va)
+                                           : (r_funcs[ri].va - l_funcs[li].va);
+            if (dist < best_dist) {
+                best_dist = dist;
+                best_ri = ri;
+            }
+        }
+        if (best_ri.has_value()) {
+            record_matched_pair(li, *best_ri, "NormalizedFingerprint");
+        }
+    }
+
+    // Pass 2b: Structural fingerprint match for renamed/anonymous callers whose targets also shifted
+    std::unordered_map<std::string, std::vector<std::size_t>> r_by_struct_hash;
+    for (std::size_t ri = 0; ri < r_funcs.size(); ++ri) {
+        if (!r_used[ri] && r_funcs[ri].size >= 8u) {
+            r_by_struct_hash[r_funcs[ri].structural_sha256].push_back(ri);
+        }
+    }
+    for (std::size_t li = 0; li < l_funcs.size(); ++li) {
+        if (((li & 0xFFu) == 0u) && options.stop_token.stop_requested()) {
+            return make_error("Binary diff cancelled");
+        }
+        if (l_used[li] || l_funcs[li].size < 8u) {
+            continue;
+        }
+        auto it = r_by_struct_hash.find(l_funcs[li].structural_sha256);
+        if (it == r_by_struct_hash.end()) {
             continue;
         }
         std::optional<std::size_t> best_ri;
@@ -1803,8 +2159,11 @@ Result<BinaryDiffReport> compare_binaries(
             if ((max_sz - min_sz) > min_sz) {
                 continue;
             }
-            const double sim = compute_normalized_similarity(
-                l_funcs[li].normalized_bytes, r_funcs[ri].normalized_bytes);
+            const double sim = std::max(
+                compute_normalized_similarity(
+                    l_funcs[li].normalized_bytes, r_funcs[ri].normalized_bytes),
+                compute_normalized_similarity(
+                    l_funcs[li].structural_bytes, r_funcs[ri].structural_bytes));
             if (sim > best_sim) {
                 best_sim = sim;
                 best_ri = ri;
@@ -1813,6 +2172,168 @@ Result<BinaryDiffReport> compare_binaries(
         if (best_ri.has_value()) {
             record_matched_pair(li, *best_ri, "Similarity");
         }
+    }
+
+    // Classify matched pairs: an x86/x64 function with un-relocated `E8`/`E9` `rel32` sites is
+    // `IdenticalRelocated` ONLY when every call/jump site is either covered by a parsed relocation
+    // or resolves to an equivalent target (matching symbol/import/ordinal identity, matching
+    // relocated partner function, or matching section-relative offset when un-symbolized).
+    const bool is_x86_diff =
+        (lhs_image.architecture() == Architecture::X86 ||
+         lhs_image.architecture() == Architecture::X86_64) &&
+        (rhs_image.architecture() == Architecture::X86 ||
+         rhs_image.architecture() == Architecture::X86_64);
+
+    std::vector<FunctionMatchKind> pair_status(
+        matched_pairs.size(), FunctionMatchKind::Modified);
+    std::unordered_map<std::size_t, std::size_t> pair_idx_by_lhs;
+    pair_idx_by_lhs.reserve(matched_pairs.size());
+    for (std::size_t pi = 0u; pi < matched_pairs.size(); ++pi) {
+        pair_idx_by_lhs.emplace(matched_pairs[pi].li, pi);
+    }
+
+    auto call_site_targets_equivalent = [&](const X86Rel32CallSite& ls,
+                                            const X86Rel32CallSite& rs,
+                                            bool optimistic_partner_equiv) -> bool {
+        if (ls.disp_offset != rs.disp_offset) {
+            return false;
+        }
+        if (ls.covered_by_reloc || rs.covered_by_reloc) {
+            return ls.reloc_symbol.empty() || rs.reloc_symbol.empty() ||
+                   ls.reloc_symbol == rs.reloc_symbol;
+        }
+
+        const std::string l_named = lhs_targets.resolve_named_or_import(ls.target_va);
+        const std::string r_named = rhs_targets.resolve_named_or_import(rs.target_va);
+        if (!l_named.empty() && !r_named.empty() && l_named == r_named) {
+            return true;
+        }
+
+        const auto lc_it = l_func_by_va.find(ls.target_va);
+        const auto rc_it = r_func_by_va.find(rs.target_va);
+        if (lc_it != l_func_by_va.end() && rc_it != r_func_by_va.end()) {
+            const std::size_t lc = lc_it->second;
+            const std::size_t rc = rc_it->second;
+            if (l_partner[lc].has_value() && *l_partner[lc] == rc) {
+                // If both targets carry distinct explicit symbol names and are tiny stubs,
+                // require matching symbol names so two distinct trivial stubs never alias.
+                const bool distinct_explicit_names =
+                    !l_named.empty() && !r_named.empty() && l_named != r_named;
+                if (!distinct_explicit_names || l_funcs[lc].size >= 8u) {
+                    if (optimistic_partner_equiv) {
+                        return true;
+                    }
+                    if (const auto p_it = pair_idx_by_lhs.find(lc); p_it != pair_idx_by_lhs.end()) {
+                        const FunctionMatchKind callee_kind = pair_status[p_it->second];
+                        if (callee_kind == FunctionMatchKind::Identical ||
+                            callee_kind == FunctionMatchKind::IdenticalRelocated) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+
+        if (!l_named.empty() || !r_named.empty() ||
+            lc_it != l_func_by_va.end() || rc_it != r_func_by_va.end()) {
+            return false;
+        }
+
+        const auto l_sec = lhs_targets.resolve_section_offset(ls.target_va);
+        const auto r_sec = rhs_targets.resolve_section_offset(rs.target_va);
+        return l_sec.has_value() && r_sec.has_value() && *l_sec == *r_sec;
+    };
+
+    // Greatest fixed-point refinement so mutually recursive relocated functions stay equivalent
+    // while callers of `Modified` callees with changed names/displacements degrade to `Modified`.
+    for (std::size_t pi = 0u; pi < matched_pairs.size(); ++pi) {
+        const ExtractedFunction& lf = l_funcs[matched_pairs[pi].li];
+        const ExtractedFunction& rf = r_funcs[matched_pairs[pi].ri];
+        const bool raw_equal =
+            (lf.raw_bytes.size() == rf.raw_bytes.size()) &&
+            std::equal(lf.raw_bytes.begin(), lf.raw_bytes.end(), rf.raw_bytes.begin());
+        if (raw_equal && lf.va == rf.va &&
+            (!is_x86_diff || lf.normalized_sha256 == rf.normalized_sha256)) {
+            pair_status[pi] = FunctionMatchKind::Identical;
+        } else if (lf.size == rf.size && lf.structural_sha256 == rf.structural_sha256 &&
+                   (!is_x86_diff || lf.call_sites.size() == rf.call_sites.size())) {
+            bool all_ok = true;
+            if (is_x86_diff) {
+                for (std::size_t k = 0u; k < lf.call_sites.size(); ++k) {
+                    if (!call_site_targets_equivalent(lf.call_sites[k], rf.call_sites[k], true)) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            pair_status[pi] =
+                all_ok ? FunctionMatchKind::IdenticalRelocated : FunctionMatchKind::Modified;
+        } else {
+            pair_status[pi] = FunctionMatchKind::Modified;
+        }
+    }
+
+    if (is_x86_diff) {
+        bool changed = true;
+        while (changed) {
+            if (options.stop_token.stop_requested()) {
+                return make_error("Binary diff cancelled");
+            }
+            changed = false;
+            for (std::size_t pi = 0u; pi < matched_pairs.size(); ++pi) {
+                if (pair_status[pi] != FunctionMatchKind::IdenticalRelocated) {
+                    continue;
+                }
+                const ExtractedFunction& lf = l_funcs[matched_pairs[pi].li];
+                const ExtractedFunction& rf = r_funcs[matched_pairs[pi].ri];
+                for (std::size_t k = 0u; k < lf.call_sites.size(); ++k) {
+                    if (!call_site_targets_equivalent(lf.call_sites[k], rf.call_sites[k], false)) {
+                        pair_status[pi] = FunctionMatchKind::Modified;
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    for (std::size_t pi = 0u; pi < matched_pairs.size(); ++pi) {
+        const ExtractedFunction& lf = l_funcs[matched_pairs[pi].li];
+        const ExtractedFunction& rf = r_funcs[matched_pairs[pi].ri];
+        FunctionDiffEntry fe;
+        fe.display_name = lf.has_real_name
+                              ? lf.canonical_name
+                              : (rf.has_real_name ? rf.canonical_name : lf.canonical_name);
+        fe.raw_lhs_name = lf.raw_name;
+        fe.raw_rhs_name = rf.raw_name;
+        fe.match_basis = matched_pairs[pi].basis;
+        fe.lhs_va = lf.va;
+        fe.rhs_va = rf.va;
+        fe.lhs_file_offset = lf.file_offset;
+        fe.rhs_file_offset = rf.file_offset;
+        fe.lhs_size = lf.size;
+        fe.rhs_size = rf.size;
+        fe.size_delta =
+            static_cast<std::int64_t>(rf.size) - static_cast<std::int64_t>(lf.size);
+        fe.lhs_normalized_sha256 = lf.normalized_sha256;
+        fe.rhs_normalized_sha256 = rf.normalized_sha256;
+        fe.status = pair_status[pi];
+
+        if (fe.status == FunctionMatchKind::Identical) {
+            fe.similarity = 1.0;
+            ++report.functions_identical;
+        } else if (fe.status == FunctionMatchKind::IdenticalRelocated) {
+            fe.similarity = 1.0;
+            ++report.functions_relocated;
+        } else {
+            fe.similarity = compute_normalized_similarity(lf.normalized_bytes, rf.normalized_bytes);
+            if (fe.similarity >= 1.0) {
+                fe.similarity = 0.99;
+            }
+            ++report.functions_modified;
+        }
+        report.functions.push_back(std::move(fe));
     }
 
     // Emit remaining unmatched functions as Removed / Added
@@ -2429,6 +2950,9 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
         std::size_t pos = 0;
         const std::size_t n = ps.expected.size();
         while (pos < n) {
+            if (((pos & 0x3FFFu) == 0u) && options.stop_token.stop_requested()) {
+                return make_error("Live integrity diff cancelled");
+            }
             if (live.valid[pos] == 0u || ps.ignore_mask[pos] != 0u ||
                 live.bytes[pos] == ps.expected[pos]) {
                 ++pos;
@@ -2441,6 +2965,9 @@ Result<LiveModuleIntegrityReport> compare_module_disk_to_live(
             ++pos;
 
             while (pos < n) {
+                if (((pos & 0x3FFFu) == 0u) && options.stop_token.stop_requested()) {
+                    return make_error("Live integrity diff cancelled");
+                }
                 if (live.valid[pos] != 0u && ps.ignore_mask[pos] == 0u &&
                     live.bytes[pos] != ps.expected[pos]) {
                     hunk_end = pos + 1u;

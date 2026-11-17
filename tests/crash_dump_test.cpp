@@ -4,6 +4,7 @@
 
 #include <peelf/crash_dump.hpp>
 #include <peelf/process_internals.hpp>
+#include <peelf/process_snapshot.hpp>
 #include <peelf/runtime_structures.hpp>
 #include <peelf/security_audit.hpp>
 #include <peelf/stack_tls.hpp>
@@ -643,6 +644,10 @@ public:
         ofs.write(reinterpret_cast<const char*>(bytes.data()),
                   static_cast<std::streamsize>(bytes.size()));
     }
+    ScopedTempDumpFile(const ScopedTempDumpFile&) = delete;
+    ScopedTempDumpFile& operator=(const ScopedTempDumpFile&) = delete;
+    ScopedTempDumpFile(ScopedTempDumpFile&&) = delete;
+    ScopedTempDumpFile& operator=(ScopedTempDumpFile&&) = delete;
     ~ScopedTempDumpFile() {
         std::error_code ec;
         std::filesystem::remove(path_, ec);
@@ -867,3 +872,181 @@ TEST(CrashDumpTest, ParsesBigEndianElf32PowerPcCoreDump) {
     EXPECT_EQ(insn[2], 0x00u);
     EXPECT_EQ(insn[3], 0x08u);
 }
+
+TEST(CrashDumpTest, RejectsOverflowing64BitElfCoreNoteAlignmentAndMarksTruncatedMinidumpPartial) {
+    // 1. ELF64 core dump with `namesz = 0xFFFF'FFFE` (which wraps 32-bit `align4` to 0!)
+    //    plus overflowing `PT_LOAD` (`vaddr + memsz`) and `NT_FILE` (`page_offset * page_size`).
+    {
+        std::vector<std::uint8_t> notes;
+        // Crafted overflowing note header: namesz = 0xFFFF'FFFE, descsz = 0, type = NT_PRPSINFO (3)
+        append_u32_le(notes, 0xFFFF'FFFEu);
+        append_u32_le(notes, 0u);
+        append_u32_le(notes, 3u);
+        // Trailing decoy NT_PRPSINFO note that MUST NOT be parsed after the overflowing note!
+        std::vector<std::uint8_t> decoy_prps(136u, 0u);
+        write_u32_le_at(decoy_prps, 24u, 4242u);
+        std::memcpy(decoy_prps.data() + 40u, "decoy_proc", 10u);
+        append_u32_le(notes, 5u);
+        append_u32_le(notes, static_cast<std::uint32_t>(decoy_prps.size()));
+        append_u32_le(notes, 3u);
+        notes.insert(notes.end(), {'C', 'O', 'R', 'E', 0u, 0u, 0u, 0u});
+        notes.insert(notes.end(), decoy_prps.begin(), decoy_prps.end());
+
+        // Second PT_NOTE segment with overflowing NT_FILE `page_offset * page_size`
+        std::vector<std::uint8_t> notes2;
+        std::vector<std::uint8_t> bad_nt_file;
+        append_u64_le(bad_nt_file, 1ULL);                        // count = 1
+        append_u64_le(bad_nt_file, 4096ULL);                     // page_size = 4096
+        append_u64_le(bad_nt_file, 0x400000ULL);                 // start
+        append_u64_le(bad_nt_file, 0x401000ULL);                 // end
+        append_u64_le(bad_nt_file, 0xFFFF'FFFF'FFFF'FFFFULL);    // page_offset * 4096 overflows!
+        const std::string_view bad_path = "/usr/bin/overflow_map";
+        bad_nt_file.insert(bad_nt_file.end(), bad_path.begin(), bad_path.end());
+        bad_nt_file.push_back(0u);
+        append_u32_le(notes2, 5u);
+        append_u32_le(notes2, static_cast<std::uint32_t>(bad_nt_file.size()));
+        append_u32_le(notes2, 0x46494C45u /*NT_FILE*/);
+        notes2.insert(notes2.end(), {'C', 'O', 'R', 'E', 0u, 0u, 0u, 0u});
+        notes2.insert(notes2.end(), bad_nt_file.begin(), bad_nt_file.end());
+        while ((notes2.size() % 4u) != 0u) {
+            notes2.push_back(0u);
+        }
+
+        const std::vector<std::uint8_t> valid_seg(0x40u, 0x90u);
+
+        auto build_core_image = [&](const std::vector<std::uint8_t>& first_note_seg,
+                                    std::uint64_t pt_load_vaddr) {
+            constexpr std::uint16_t kPhNum = 3u;
+            const std::size_t ph_off = 64u;
+            const std::size_t note1_off = ph_off + kPhNum * 56u;
+            const std::size_t note2_off = note1_off + first_note_seg.size();
+            const std::size_t seg_off = note2_off + notes2.size();
+
+            std::vector<std::uint8_t> core;
+            core.insert(core.end(), {0x7Fu, 'E', 'L', 'F', 2u, 1u, 1u, 0u,
+                                     0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u});
+            append_u16_le(core, 4u);  // ET_CORE
+            append_u16_le(core, 62u); // EM_X86_64
+            append_u32_le(core, 1u);
+            append_u64_le(core, 0u);
+            append_u64_le(core, ph_off);
+            append_u64_le(core, 0u);
+            append_u32_le(core, 0u);
+            append_u16_le(core, 64u);
+            append_u16_le(core, 56u);
+            append_u16_le(core, kPhNum);
+            append_u16_le(core, 64u);
+            append_u16_le(core, 0u);
+            append_u16_le(core, 0u);
+
+            auto push_ph = [&](std::uint32_t p_type, std::uint64_t off,
+                               std::uint64_t vaddr, std::uint64_t filesz, std::uint64_t memsz) {
+                append_u32_le(core, p_type);
+                append_u32_le(core, 5u);
+                append_u64_le(core, off);
+                append_u64_le(core, vaddr);
+                append_u64_le(core, 0u);
+                append_u64_le(core, filesz);
+                append_u64_le(core, memsz);
+                append_u64_le(core, 0x1000u);
+            };
+            push_ph(4u /*PT_NOTE*/, note1_off, 0u, first_note_seg.size(), first_note_seg.size());
+            push_ph(4u /*PT_NOTE*/, note2_off, 0u, notes2.size(), notes2.size());
+            push_ph(1u /*PT_LOAD*/, seg_off, pt_load_vaddr, valid_seg.size(), 0x1000ULL);
+
+            core.insert(core.end(), first_note_seg.begin(), first_note_seg.end());
+            core.insert(core.end(), notes2.begin(), notes2.end());
+            core.insert(core.end(), valid_seg.begin(), valid_seg.end());
+            return core;
+        };
+
+        // 1a. 0xFFFF'FFFE PT_NOTE namesz alignment overflow MUST be rejected cleanly
+        //     without wrapping 32-bit `align4` to 0 or misparsing the trailing decoy note!
+        const auto overflow_note_core = build_core_image(notes, 0x400000ULL);
+        const auto overflow_note_res =
+            peelf::open_elf_core_bytes(overflow_note_core, "overflow_note.core");
+        ASSERT_FALSE(overflow_note_res.has_value());
+        EXPECT_NE(overflow_note_res.error().message.find("0xFFFFFFFE"), std::string::npos);
+
+        // 1b. Overflowing PT_LOAD (vaddr + memsz wraps 64-bit) MUST be rejected cleanly!
+        const auto bad_load_core = build_core_image(notes2, 0xFFFF'FFFF'FFFF'F800ULL);
+        const auto bad_opened = peelf::open_elf_core_bytes(bad_load_core, "overflow_ptload.core");
+        ASSERT_FALSE(bad_opened.has_value());
+
+        // 1c. Overflowing NT_FILE (page_ofs * page_size wraps 64-bit) degrades status to Partial:
+        const auto nt_file_core = build_core_image(notes2, 0x400000ULL);
+        auto opened = peelf::open_elf_core_bytes(nt_file_core, "overflow_ntfile.core");
+        ASSERT_TRUE(opened.has_value()) << opened.error().message;
+        peelf::ICrashDumpSession& sess = **opened;
+        EXPECT_EQ(sess.crash_summary().status.availability, peelf::Availability::Partial);
+        EXPECT_FALSE(sess.crash_summary().diagnostics.empty());
+        EXPECT_EQ(sess.modules_status().availability, peelf::Availability::Partial);
+
+        const auto regs = sess.memory_regions();
+        ASSERT_TRUE(regs.has_value());
+        ASSERT_EQ(regs->size(), 1u);
+        EXPECT_EQ((*regs)[0].start_address, 0x400000ULL);
+    }
+
+    // 2. Minidump with truncated `ModuleListStream` (claims 3 modules, supplies bytes for 2 where
+    //    entry 0 overflows `base + size` and entry 1 is valid) -> degrades to `Partial`!
+    {
+        std::vector<std::uint8_t> dmp(32u + 2u * 12u, 0u); // 32-byte header + 2 directory entries
+        std::memcpy(dmp.data(), "MDMP", 4u);
+        dmp[4] = 0x93u;
+        dmp[5] = 0xA7u;
+        write_u32_le_at(dmp, 8u, 2u);   // NumberOfStreams = 2
+        write_u32_le_at(dmp, 12u, 32u); // StreamDirectoryRva = 32
+
+        // Stream 0: SystemInfoStream (type = 7, 56 bytes)
+        const auto sys_rva = static_cast<std::uint32_t>(dmp.size());
+        dmp.resize(sys_rva + 56u, 0u);
+        dmp[sys_rva + 0u] = 9u; // PROCESSOR_ARCHITECTURE_AMD64
+
+        // Module name strings
+        const std::uint32_t bad_name_rva = append_minidump_utf16_string(dmp, "C:\\wrap.dll");
+        const std::uint32_t ok_name_rva = append_minidump_utf16_string(dmp, "C:\\valid.exe");
+
+        // Stream 1: ModuleListStream (type = 4): claims 3 modules, only stores 2 * 108 bytes!
+        const auto mod_rva = static_cast<std::uint32_t>(dmp.size());
+        append_u32_le(dmp, 3u); // NumberOfModules = 3 (truncated before 3rd entry!)
+        const std::size_t m0 = dmp.size();
+        dmp.resize(m0 + 2u * 108u, 0u);
+        // Entry 0: BaseOfImage + SizeOfImage wraps 64-bit!
+        write_u64_le_at(dmp, m0 + 0u, 0xFFFF'FFFF'FFFF'F000ULL);
+        write_u32_le_at(dmp, m0 + 8u, 0x2000u);
+        write_u32_le_at(dmp, m0 + 20u, bad_name_rva);
+        // Entry 1: valid module
+        const std::size_t m1 = m0 + 108u;
+        write_u64_le_at(dmp, m1 + 0u, 0x00007FF610000000ULL);
+        write_u32_le_at(dmp, m1 + 8u, 0x4000u);
+        write_u32_le_at(dmp, m1 + 20u, ok_name_rva);
+        const auto mod_stream_sz = static_cast<std::uint32_t>(dmp.size() - mod_rva);
+
+        // Populate directory entries at offset 32
+        write_u32_le_at(dmp, 32u + 0u, 7u);
+        write_u32_le_at(dmp, 32u + 4u, 56u);
+        write_u32_le_at(dmp, 32u + 8u, sys_rva);
+
+        write_u32_le_at(dmp, 44u + 0u, 4u);
+        write_u32_le_at(dmp, 44u + 4u, mod_stream_sz);
+        write_u32_le_at(dmp, 44u + 8u, mod_rva);
+
+        auto opened = peelf::open_minidump_bytes(dmp, "truncated_mods.dmp");
+        ASSERT_TRUE(opened.has_value()) << opened.error().message;
+        peelf::ICrashDumpSession& sess = **opened;
+
+        const auto mods = sess.modules();
+        ASSERT_TRUE(mods.has_value());
+        ASSERT_EQ(mods->size(), 1u);
+        EXPECT_EQ((*mods)[0].name, "valid.exe");
+        EXPECT_EQ(sess.modules_status().availability, peelf::Availability::Partial);
+        EXPECT_EQ(sess.crash_summary().status.availability, peelf::Availability::Partial);
+        EXPECT_FALSE(sess.crash_summary().diagnostics.empty());
+
+        const peelf::ProcessStateSnapshot snap = peelf::capture_process_snapshot(sess);
+        EXPECT_EQ(snap.modules.availability, peelf::CaptureAvailability::Partial);
+        EXPECT_EQ(snap.snapshot_stamp.availability, peelf::CaptureAvailability::Partial);
+    }
+}
+

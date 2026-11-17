@@ -1,5 +1,6 @@
 #include "peelf/crash_dump.hpp"
 
+#include "image_internal.hpp"
 #include "peelf/sha256.hpp"
 
 #include <algorithm>
@@ -63,17 +64,28 @@ struct DumpMemorySlice {
     std::size_t file_offset{0};
 
     [[nodiscard]] constexpr std::uint64_t va_end() const noexcept {
-        return va_start + size;
+        return size <= (std::numeric_limits<std::uint64_t>::max() - va_start)
+                   ? (va_start + size)
+                   : std::numeric_limits<std::uint64_t>::max();
     }
 };
 
 [[nodiscard]] bool checked_range(std::size_t total_size,
                                  std::uint64_t offset,
                                  std::uint64_t size) noexcept {
-    if (offset > static_cast<std::uint64_t>(total_size)) {
-        return false;
+    const auto end = checked_add_u64(offset, size);
+    return end.has_value() && *end <= static_cast<std::uint64_t>(total_size);
+}
+
+[[nodiscard]] std::string join_stream_diagnostics(std::span<const std::string> notes) {
+    std::string out;
+    for (std::size_t i = 0u; i < notes.size(); ++i) {
+        if (i > 0u) {
+            out += "; ";
+        }
+        out += notes[i];
     }
-    return size <= (static_cast<std::uint64_t>(total_size) - offset);
+    return out;
 }
 
 [[nodiscard]] std::string basename_win_or_posix(std::string_view full_path) {
@@ -450,7 +462,10 @@ public:
                     std::vector<ModuleInfo> modules,
                     std::vector<ThreadInfo> threads,
                     std::unordered_map<ThreadId, ThreadContext> contexts,
-                    ProcessInternalsSnapshot internals)
+                    ProcessInternalsSnapshot internals,
+                    SubsystemStatus regions_status,
+                    SubsystemStatus modules_status,
+                    SubsystemStatus threads_status)
         : bytes_(std::move(bytes)),
           info_(std::move(info)),
           summary_(std::move(summary)),
@@ -459,13 +474,20 @@ public:
           modules_(std::move(modules)),
           threads_(std::move(threads)),
           contexts_(std::move(contexts)),
-          internals_(std::move(internals)) {}
+          internals_(std::move(internals)),
+          regions_status_(std::move(regions_status)),
+          modules_status_(std::move(modules_status)),
+          threads_status_(std::move(threads_status)) {}
 
     [[nodiscard]] const ProcessInfo& info() const noexcept override { return info_; }
     [[nodiscard]] const CrashDumpSummary& crash_summary() const noexcept override { return summary_; }
     [[nodiscard]] const ProcessInternalsSnapshot& crash_internals() const noexcept override {
         return internals_;
     }
+
+    [[nodiscard]] SubsystemStatus memory_regions_status() const override { return regions_status_; }
+    [[nodiscard]] SubsystemStatus modules_status() const override { return modules_status_; }
+    [[nodiscard]] SubsystemStatus threads_status() const override { return threads_status_; }
 
     [[nodiscard]] Result<std::vector<MemoryRegion>> memory_regions() override {
         return regions_;
@@ -516,13 +538,18 @@ public:
             const std::uint64_t avail = slice.size - delta;
             const std::size_t chunk = static_cast<std::size_t>(
                 std::min<std::uint64_t>(avail, buffer.size() - total_copied));
-            const std::size_t src_off = slice.file_offset + static_cast<std::size_t>(delta);
-            if (src_off > bytes_.size() || chunk > (bytes_.size() - src_off)) {
+            const auto src_off_u64 = checked_add_u64(slice.file_offset, delta);
+            if (!src_off_u64.has_value() || !checked_range(bytes_.size(), *src_off_u64, chunk)) {
                 break;
             }
+            const auto src_off = static_cast<std::size_t>(*src_off_u64);
             std::copy_n(bytes_.data() + src_off, chunk, buffer.data() + total_copied);
             total_copied += chunk;
-            cursor += chunk;
+            const auto next_cursor = checked_add_u64(cursor, chunk);
+            if (!next_cursor.has_value()) {
+                break;
+            }
+            cursor = *next_cursor;
         }
 
         if (total_copied == 0u) {
@@ -539,9 +566,13 @@ public:
             if (!th.teb_address.has_value() || *th.teb_address == 0u) {
                 continue;
             }
+            const auto peb_ptr_va = checked_add_u64(*th.teb_address, peb_offset_in_teb);
+            if (!peb_ptr_va.has_value()) {
+                continue;
+            }
             std::array<std::uint8_t, 8> ptr_buf{};
             const std::size_t ptr_sz = layout.pointer_size();
-            auto rd_res = read_memory(*th.teb_address + peb_offset_in_teb,
+            auto rd_res = read_memory(*peb_ptr_va,
                                       std::span<std::uint8_t>(ptr_buf.data(), ptr_sz));
             if (rd_res && *rd_res == ptr_sz) {
                 const EndianReader rd(std::span<const std::uint8_t>(ptr_buf.data(), ptr_sz), layout);
@@ -571,6 +602,9 @@ private:
     std::vector<ThreadInfo> threads_;
     std::unordered_map<ThreadId, ThreadContext> contexts_;
     ProcessInternalsSnapshot internals_;
+    SubsystemStatus regions_status_{SubsystemStatus::available("minidump")};
+    SubsystemStatus modules_status_{SubsystemStatus::available("minidump")};
+    SubsystemStatus threads_status_{SubsystemStatus::available("minidump")};
 };
 
 }  // namespace
@@ -728,48 +762,87 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
 
     const TargetLayout layout = TargetLayout::from_arch(arch, is_64bit, Endianness::Little);
 
+    std::vector<std::string> mem_warnings;
+    std::vector<std::string> mod_warnings;
+    std::vector<std::string> thread_warnings;
+    std::vector<std::string> handle_warnings;
+
     // 2. Collect memory slices (`Memory64ListStream` & `MemoryListStream`).
     std::vector<DumpMemorySlice> slices;
-    const auto add_slice = [&](std::uint64_t va, std::uint64_t sz, std::uint64_t file_off) {
-        if (sz == 0u || !checked_range(bytes.size(), file_off, sz)) {
-            return;
+    const auto add_slice = [&](std::uint64_t va,
+                               std::uint64_t sz,
+                               std::uint64_t file_off,
+                               std::string_view source_stream) -> bool {
+        if (sz == 0u) {
+            return true;
         }
-        if (sz > std::numeric_limits<std::uint64_t>::max() - va) {
-            return;
+        const auto va_end = checked_add_u64(va, sz);
+        if (!va_end.has_value()) {
+            mem_warnings.push_back(std::format(
+                "Skipped {} range at VA 0x{:X} with overflowing size 0x{:X}",
+                source_stream, va, sz));
+            return false;
+        }
+        if (!checked_range(bytes.size(), file_off, sz)) {
+            mem_warnings.push_back(std::format(
+                "Truncated {} range [0x{:X}..0x{:X}) at RVA 0x{:X} exceeds file bounds",
+                source_stream, va, *va_end, file_off));
+            return false;
         }
         slices.push_back(DumpMemorySlice{
             .va_start = va,
             .size = sz,
             .file_offset = static_cast<std::size_t>(file_off),
         });
+        return true;
     };
 
     for (const DirEntry& s : streams) {
-        if (s.type == kStreamMemory64List && s.size >= 16u) {
+        if (s.type == kStreamMemory64List) {
+            if (s.size < 16u) {
+                mem_warnings.push_back("Truncated Memory64ListStream header");
+                continue;
+            }
             const std::uint64_t num_ranges = rd.read_u64(s.rva).value_or(0);
             std::uint64_t data_rva = rd.read_u64(static_cast<std::size_t>(s.rva) + 8u).value_or(0);
             const std::uint64_t max_entries = (s.size - 16u) / 16u;
+            if (num_ranges > max_entries) {
+                mem_warnings.push_back(std::format(
+                    "Truncated Memory64ListStream: header declares {} ranges, stream holds {}",
+                    num_ranges, max_entries));
+            }
             const std::uint64_t count = std::min<std::uint64_t>(num_ranges, max_entries);
             for (std::uint64_t i = 0; i < count; ++i) {
                 const std::size_t desc_off = static_cast<std::size_t>(s.rva) + 16u + static_cast<std::size_t>(i) * 16u;
                 const std::uint64_t start_va = rd.read_u64(desc_off).value_or(0);
                 const std::uint64_t range_sz = rd.read_u64(desc_off + 8u).value_or(0);
-                add_slice(start_va, range_sz, data_rva);
-                if (range_sz > std::numeric_limits<std::uint64_t>::max() - data_rva) {
+                (void)add_slice(start_va, range_sz, data_rva, "Memory64ListStream");
+                const auto next_rva = checked_add_u64(data_rva, range_sz);
+                if (!next_rva.has_value()) {
+                    mem_warnings.push_back("Memory64ListStream RVA cursor overflowed 64-bit bounds");
                     break;
                 }
-                data_rva += range_sz;
+                data_rva = *next_rva;
             }
-        } else if (s.type == kStreamMemoryList && s.size >= 4u) {
+        } else if (s.type == kStreamMemoryList) {
+            if (s.size < 4u) {
+                mem_warnings.push_back("Truncated MemoryListStream header");
+                continue;
+            }
             const std::uint32_t num_ranges = rd.read_u32(s.rva).value_or(0);
             const std::uint32_t max_entries = (s.size - 4u) / 16u;
+            if (num_ranges > max_entries) {
+                mem_warnings.push_back(std::format(
+                    "Truncated MemoryListStream: header declares {} ranges, stream holds {}",
+                    num_ranges, max_entries));
+            }
             const std::uint32_t count = std::min(num_ranges, max_entries);
             for (std::uint32_t i = 0; i < count; ++i) {
                 const std::size_t desc_off = static_cast<std::size_t>(s.rva) + 4u + static_cast<std::size_t>(i) * 16u;
                 const std::uint64_t start_va = rd.read_u64(desc_off).value_or(0);
                 const std::uint32_t range_sz = rd.read_u32(desc_off + 8u).value_or(0);
                 const std::uint32_t mem_rva  = rd.read_u32(desc_off + 12u).value_or(0);
-                add_slice(start_va, range_sz, mem_rva);
+                (void)add_slice(start_va, range_sz, mem_rva, "MemoryListStream");
             }
         }
     }
@@ -777,11 +850,20 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
     // 3. Parse `ModuleListStream` (`MINIDUMP_MODULE` = 108 bytes under #pragma pack(4)).
     std::vector<ModuleInfo> modules;
     for (const DirEntry& s : streams) {
-        if (s.type != kStreamModuleList || s.size < 4u) {
+        if (s.type != kStreamModuleList) {
+            continue;
+        }
+        if (s.size < 4u) {
+            mod_warnings.push_back("Truncated ModuleListStream header");
             continue;
         }
         const std::uint32_t num_mods = rd.read_u32(s.rva).value_or(0);
         const std::uint32_t max_mods = (s.size - 4u) / 108u;
+        if (num_mods > max_mods) {
+            mod_warnings.push_back(std::format(
+                "Truncated ModuleListStream: header declares {} modules, stream holds {}",
+                num_mods, max_mods));
+        }
         const std::uint32_t count = std::min(num_mods, max_mods);
         modules.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -789,7 +871,20 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
             const std::uint64_t base_va = rd.read_u64(moff).value_or(0);
             const std::uint32_t size_img = rd.read_u32(moff + 8u).value_or(0);
             const std::uint32_t name_rva = rd.read_u32(moff + 20u).value_or(0);
-            const std::string mod_path_str = read_minidump_string(rd, name_rva).value_or("");
+            const auto mod_end = checked_add_u64(base_va, size_img);
+            if (!mod_end.has_value()) {
+                mod_warnings.push_back(std::format(
+                    "Skipped ModuleListStream entry {} at 0x{:X} with overflowing SizeOfImage 0x{:X}",
+                    i, base_va, size_img));
+                continue;
+            }
+            const auto mod_path_opt = read_minidump_string(rd, name_rva);
+            if (name_rva != 0u && !mod_path_opt.has_value()) {
+                mod_warnings.push_back(std::format(
+                    "ModuleListStream entry {} at 0x{:X} has truncated ModuleNameRva 0x{:X}",
+                    i, base_va, name_rva));
+            }
+            const std::string mod_path_str = mod_path_opt.value_or("");
             std::string mod_name = basename_win_or_posix(mod_path_str);
             if (mod_name.empty()) {
                 mod_name = std::format("module_{:X}.dll", base_va);
@@ -801,7 +896,7 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
                 .size = size_img,
                 .entry_point = 0u,
                 .format = Format::PE,
-                .is_main_module = (i == 0u),
+                .is_main_module = modules.empty(),
             });
         }
     }
@@ -812,17 +907,26 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
     struct ThreadStackHint {
         ThreadId tid{0};
         std::uint64_t start_va{0};
-        std::uint64_t size{0};
+        std::uint64_t end_va{0};
     };
     std::vector<ThreadStackHint> stack_hints;
 
     for (const DirEntry& s : streams) {
-        if ((s.type != kStreamThreadList && s.type != kStreamThreadExList) || s.size < 4u) {
+        if (s.type != kStreamThreadList && s.type != kStreamThreadExList) {
+            continue;
+        }
+        if (s.size < 4u) {
+            thread_warnings.push_back("Truncated ThreadListStream header");
             continue;
         }
         const std::size_t stride = (s.type == kStreamThreadExList) ? 64u : 48u;
         const std::uint32_t num_threads = rd.read_u32(s.rva).value_or(0);
         const std::uint32_t max_threads = static_cast<std::uint32_t>((s.size - 4u) / stride);
+        if (num_threads > max_threads) {
+            thread_warnings.push_back(std::format(
+                "Truncated ThreadListStream: header declares {} threads, stream holds {}",
+                num_threads, max_threads));
+        }
         const std::uint32_t count = std::min(num_threads, max_threads);
         for (std::uint32_t i = 0; i < count; ++i) {
             const std::size_t toff = static_cast<std::size_t>(s.rva) + 4u + static_cast<std::size_t>(i) * stride;
@@ -835,9 +939,23 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
             const std::uint32_t ctx_sz = rd.read_u32(toff + 40u).value_or(0);
             const std::uint32_t ctx_rva = rd.read_u32(toff + 44u).value_or(0);
 
-            if (stk_sz > 0u && stk_rva != 0u) {
-                add_slice(stk_va, stk_sz, stk_rva);
-                stack_hints.push_back(ThreadStackHint{tid, stk_va, stk_sz});
+            bool stack_partial = false;
+            if (stk_sz > 0u) {
+                const auto stk_end = checked_add_u64(stk_va, stk_sz);
+                if (!stk_end.has_value()) {
+                    stack_partial = true;
+                    thread_warnings.push_back(std::format(
+                        "Thread {} stack descriptor [0x{:X} + 0x{:X}) overflows 64-bit bounds",
+                        tid, stk_va, stk_sz));
+                } else if (stk_rva != 0u) {
+                    if (add_slice(stk_va, stk_sz, stk_rva, "ThreadListStream.Stack")) {
+                        stack_hints.push_back(ThreadStackHint{tid, stk_va, *stk_end});
+                    } else {
+                        stack_partial = true;
+                        thread_warnings.push_back(std::format(
+                            "Thread {} stack slice at RVA 0x{:X} is truncated", tid, stk_rva));
+                    }
+                }
             }
 
             std::optional<std::uint64_t> opt_teb = (teb != 0u) ? std::optional<std::uint64_t>(teb) : std::nullopt;
@@ -849,6 +967,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
                     opt_teb,
                     std::span<const std::uint8_t>(bytes.data() + ctx_rva, ctx_sz));
                 contexts[tid] = decoded;
+            } else if (ctx_sz > 0u) {
+                thread_warnings.push_back(std::format(
+                    "Thread {} CONTEXT at RVA 0x{:X} (size 0x{:X}) exceeds file bounds",
+                    tid, ctx_rva, ctx_sz));
             }
 
             ThreadInfo tinfo{};
@@ -869,9 +991,14 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
                 tinfo.user_time_ns = proc_user_ns;
                 tinfo.kernel_time_ns = proc_kernel_ns;
             }
-            tinfo.status = decoded.status.availability == Availability::Available
-                ? decoded.status
-                : SubsystemStatus::partial("minidump", "Thread listed without full register context");
+            if (stack_partial) {
+                tinfo.status = SubsystemStatus::partial(
+                    "minidump", "Thread stack or register context descriptor is truncated");
+            } else {
+                tinfo.status = decoded.status.availability == Availability::Available
+                    ? decoded.status
+                    : SubsystemStatus::partial("minidump", "Thread listed without full register context");
+            }
             threads.push_back(std::move(tinfo));
         }
     }
@@ -1005,16 +1132,26 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
     // 6. Build VMMap `MemoryRegion`s from `MemoryInfoListStream` (or synthesize from slices + modules).
     std::vector<MemoryRegion> regions;
     for (const DirEntry& s : streams) {
-        if (s.type != kStreamMemoryInfoList || s.size < 16u) {
+        if (s.type != kStreamMemoryInfoList) {
+            continue;
+        }
+        if (s.size < 16u) {
+            mem_warnings.push_back("Truncated MemoryInfoListStream header");
             continue;
         }
         const std::uint32_t hdr_sz = rd.read_u32(s.rva).value_or(0);
         const std::uint32_t entry_sz = rd.read_u32(static_cast<std::size_t>(s.rva) + 4u).value_or(0);
         const std::uint64_t num_entries = rd.read_u64(static_cast<std::size_t>(s.rva) + 8u).value_or(0);
         if (hdr_sz < 16u || entry_sz < 48u || hdr_sz > s.size) {
+            mem_warnings.push_back("Malformed MemoryInfoListStream header sizes");
             continue;
         }
         const std::uint64_t max_entries = (s.size - hdr_sz) / entry_sz;
+        if (num_entries > max_entries) {
+            mem_warnings.push_back(std::format(
+                "Truncated MemoryInfoListStream: header declares {} entries, stream holds {}",
+                num_entries, max_entries));
+        }
         const std::uint64_t count = std::min<std::uint64_t>(num_entries, max_entries);
         regions.reserve(static_cast<std::size_t>(count));
         for (std::uint64_t i = 0; i < count; ++i) {
@@ -1026,13 +1163,19 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
             const std::uint32_t state = rd.read_u32(eoff + 32u).value_or(0);
             const std::uint32_t protect = rd.read_u32(eoff + 36u).value_or(0);
             const std::uint32_t mtype = rd.read_u32(eoff + 40u).value_or(0);
-            if (state == kMemFree || reg_size == 0u ||
-                reg_size > std::numeric_limits<std::uint64_t>::max() - base_addr) {
+            if (state == kMemFree || reg_size == 0u) {
+                continue;
+            }
+            const auto end_addr = checked_add_u64(base_addr, reg_size);
+            if (!end_addr.has_value()) {
+                mem_warnings.push_back(std::format(
+                    "Skipped MemoryInfoListStream entry at 0x{:X} with overflowing size 0x{:X}",
+                    base_addr, reg_size));
                 continue;
             }
             MemoryRegion reg{};
             reg.start_address = base_addr;
-            reg.end_address = base_addr + reg_size;
+            reg.end_address = *end_addr;
             reg.protection = decode_win32_protect(protect, state, mtype);
             if (mtype == kMemImage) reg.kind = MemoryRegionKind::Image;
             else if (mtype == kMemMapped) reg.kind = MemoryRegionKind::MappedFile;
@@ -1059,9 +1202,13 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
 
     if (regions.empty()) {
         for (const DumpMemorySlice& sl : clean_slices) {
+            const auto sl_end = checked_add_u64(sl.va_start, sl.size);
+            if (!sl_end.has_value()) {
+                continue;
+            }
             MemoryRegion reg{};
             reg.start_address = sl.va_start;
-            reg.end_address = sl.va_end();
+            reg.end_address = *sl_end;
             reg.protection = MemoryProtection{.readable = true, .writable = true, .executable = false};
             reg.kind = MemoryRegionKind::Anonymous;
             reg.usage.committed_bytes = sl.size;
@@ -1070,9 +1217,11 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
         }
         for (const ModuleInfo& mod : modules) {
             if (mod.size == 0u) continue;
+            const auto mod_end = checked_add_u64(mod.base_address, mod.size);
+            if (!mod_end.has_value()) continue;
             bool covered = false;
             for (MemoryRegion& reg : regions) {
-                if (reg.start_address >= mod.base_address && reg.end_address <= mod.end_address()) {
+                if (reg.start_address >= mod.base_address && reg.end_address <= *mod_end) {
                     reg.kind = MemoryRegionKind::Image;
                     reg.protection.executable = true;
                     reg.protection.writable = false;
@@ -1084,13 +1233,13 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
             if (!covered) {
                 MemoryRegion mod_reg{};
                 mod_reg.start_address = mod.base_address;
-                mod_reg.end_address = mod.end_address();
+                mod_reg.end_address = *mod_end;
                 mod_reg.protection = MemoryProtection{.readable = true, .writable = false, .executable = true};
                 mod_reg.kind = MemoryRegionKind::Image;
                 mod_reg.module_name = mod.name;
                 mod_reg.pathname = mod.path.string();
                 mod_reg.usage.committed_bytes = mod.size;
-                mod_reg.usage.rss_bytes = captured_bytes_in_span(mod.base_address, mod.end_address());
+                mod_reg.usage.rss_bytes = captured_bytes_in_span(mod.base_address, *mod_end);
                 regions.push_back(std::move(mod_reg));
             }
         }
@@ -1110,7 +1259,7 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
             }
         }
         for (const ThreadStackHint& sh : stack_hints) {
-            if (reg.start_address < (sh.start_va + sh.size) && reg.end_address > sh.start_va) {
+            if (reg.start_address < sh.end_va && reg.end_address > sh.start_va) {
                 reg.kind = MemoryRegionKind::Stack;
                 reg.usage.owner_tid = sh.tid;
                 if (reg.pathname.empty()) {
@@ -1129,17 +1278,29 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
     std::vector<ProcessHandleEntry> handle_entries;
     bool has_handle_stream = false;
     for (const DirEntry& s : streams) {
-        if (s.type != kStreamHandleData || s.size < 16u) {
+        if (s.type != kStreamHandleData) {
+            continue;
+        }
+        if (s.size < 16u) {
+            has_handle_stream = true;
+            handle_warnings.push_back("Truncated HandleDataStream header");
             continue;
         }
         const std::uint32_t hdr_sz = rd.read_u32(s.rva).value_or(0);
         const std::uint32_t desc_sz = rd.read_u32(static_cast<std::size_t>(s.rva) + 4u).value_or(0);
         const std::uint32_t num_desc = rd.read_u32(static_cast<std::size_t>(s.rva) + 8u).value_or(0);
         if (hdr_sz < 16u || desc_sz < 32u || hdr_sz > s.size) {
+            has_handle_stream = true;
+            handle_warnings.push_back("Malformed HandleDataStream descriptor header");
             continue;
         }
         has_handle_stream = true;
         const std::uint32_t max_desc = (s.size - hdr_sz) / desc_sz;
+        if (num_desc > max_desc) {
+            handle_warnings.push_back(std::format(
+                "Truncated HandleDataStream: header declares {} handles, stream holds {}",
+                num_desc, max_desc));
+        }
         const std::uint32_t count = std::min(num_desc, max_desc);
         handle_entries.reserve(count);
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -1164,9 +1325,11 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
         internals.total_os_handle_count = static_cast<std::uint32_t>(handle_entries.size());
         internals.handles = {
             handle_entries,
-            SubsystemStatus::available(
-                "minidump",
-                std::format("Parsed {} handle descriptors from HandleDataStream", handle_entries.size())),
+            handle_warnings.empty()
+                ? SubsystemStatus::available(
+                      "minidump",
+                      std::format("Parsed {} handle descriptors from HandleDataStream", handle_entries.size()))
+                : SubsystemStatus::partial("minidump", join_stream_diagnostics(handle_warnings)),
         };
     } else {
         internals.handles = {
@@ -1185,17 +1348,31 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
 
     // Probe PE `AddressOfEntryPoint` from captured module header bytes when available.
     for (ModuleInfo& mod : modules) {
+        const auto probe_end = checked_add_u64(mod.base_address, 0x200u);
+        if (!probe_end.has_value() || (mod.size > 0u && mod.size < 0x200u)) {
+            continue;
+        }
         for (const DumpMemorySlice& sl : clean_slices) {
-            if (mod.base_address >= sl.va_start && (mod.base_address + 0x200u) <= sl.va_end()) {
-                const std::size_t off =
-                    sl.file_offset + static_cast<std::size_t>(mod.base_address - sl.va_start);
+            const auto sl_end = checked_add_u64(sl.va_start, sl.size);
+            if (!sl_end.has_value()) {
+                continue;
+            }
+            if (mod.base_address >= sl.va_start && *probe_end <= *sl_end) {
+                const auto off_u64 = checked_add_u64(sl.file_offset, mod.base_address - sl.va_start);
+                if (!off_u64.has_value() || *off_u64 > bytes.size()) {
+                    break;
+                }
+                const auto off = static_cast<std::size_t>(*off_u64);
                 if (rd.can_read(off, 0x200u) &&
                     rd.read_u16(off).value_or(0) == 0x5A4Du) {
                     const std::uint32_t lfanew = rd.read_u32(off + 0x3Cu).value_or(0);
-                    if (lfanew < 0x180u && rd.read_u32(off + lfanew).value_or(0) == 0x00004550u) {
+                    if (lfanew <= (0x200u - 44u) &&
+                        rd.read_u32(off + lfanew).value_or(0) == 0x00004550u) {
                         const std::uint32_t ep_rva = rd.read_u32(off + lfanew + 24u + 16u).value_or(0);
-                        if (ep_rva != 0u) {
-                            mod.entry_point = mod.base_address + ep_rva;
+                        if (ep_rva != 0u && (mod.size == 0u || ep_rva < mod.size)) {
+                            if (const auto ep_va = checked_add_u64(mod.base_address, ep_rva)) {
+                                mod.entry_point = *ep_va;
+                            }
                         }
                     }
                 }
@@ -1218,6 +1395,22 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
     pinfo.is_64bit = is_64bit;
     pinfo.access = ProcessAccessStatus::ReadOnly;
 
+    SubsystemStatus regions_status = mem_warnings.empty()
+        ? SubsystemStatus::available("minidump", "Parsed minidump memory streams")
+        : SubsystemStatus::partial("minidump", join_stream_diagnostics(mem_warnings));
+    SubsystemStatus modules_status = mod_warnings.empty()
+        ? SubsystemStatus::available("minidump", "Parsed ModuleListStream")
+        : SubsystemStatus::partial("minidump", join_stream_diagnostics(mod_warnings));
+    SubsystemStatus threads_status = thread_warnings.empty()
+        ? SubsystemStatus::available("minidump", "Parsed ThreadListStream")
+        : SubsystemStatus::partial("minidump", join_stream_diagnostics(thread_warnings));
+
+    std::vector<std::string> all_diags;
+    all_diags.insert(all_diags.end(), mem_warnings.begin(), mem_warnings.end());
+    all_diags.insert(all_diags.end(), mod_warnings.begin(), mod_warnings.end());
+    all_diags.insert(all_diags.end(), thread_warnings.begin(), thread_warnings.end());
+    all_diags.insert(all_diags.end(), handle_warnings.begin(), handle_warnings.end());
+
     CrashDumpSummary summary{};
     summary.kind = CrashDumpKind::WindowsMinidump;
     summary.dump_path = std::move(source_path);
@@ -1234,6 +1427,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
     summary.thread_count = threads.size();
     summary.region_count = regions.size();
     summary.handle_count = handle_entries.size();
+    summary.diagnostics = all_diags;
+    summary.status = all_diags.empty()
+        ? SubsystemStatus::available("minidump")
+        : SubsystemStatus::partial("minidump", join_stream_diagnostics(all_diags));
 
     return std::make_unique<MinidumpSession>(
         std::move(bytes),
@@ -1244,7 +1441,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_minidump_bytes(
         std::move(modules),
         std::move(threads),
         std::move(contexts),
-        std::move(internals));
+        std::move(internals),
+        std::move(regions_status),
+        std::move(modules_status),
+        std::move(threads_status));
 }
 
 Result<std::unique_ptr<ICrashDumpSession>> open_crash_dump_bytes(

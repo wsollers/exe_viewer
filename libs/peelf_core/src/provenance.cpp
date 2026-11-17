@@ -248,6 +248,10 @@ BackingImageIdentity extract_backing_image_identity(
             id.elf_gnu_debuglink_crc32 = dlink->crc32;
         }
     } else if (image.format() == Format::MachO) {
+        if (const MachOHeader* mhdr = image.macho_header(); mhdr != nullptr) {
+            id.macho_cpu_type = mhdr->cpu_type;
+            id.macho_cpu_subtype = mhdr->cpu_subtype;
+        }
         if (const auto uuid = image.macho_uuid(); uuid.has_value()) {
             id.macho_uuid_hex = bytes_to_lower_hex(*uuid);
         }
@@ -293,6 +297,14 @@ BackingIdentityMatchResult verify_backing_image_identity(
             "Address width mismatch: disk={} vs live={}",
             to_string(disk_identity.address_width),
             to_string(live_identity.address_width)));
+    }
+    if (disk_identity.endianness != live_identity.endianness) {
+        out.comparable = true;
+        out.matches = false;
+        out.mismatches.push_back(std::format(
+            "Endianness mismatch: disk={} vs live={}",
+            to_string(disk_identity.endianness),
+            to_string(live_identity.endianness)));
     }
 
     if (disk_identity.format == Format::ELF && live_identity.format == Format::ELF) {
@@ -342,10 +354,61 @@ BackingIdentityMatchResult verify_backing_image_identity(
                     *live_identity.pe_size_of_image));
             }
         }
+    } else if (disk_identity.format == Format::MachO && live_identity.format == Format::MachO) {
+        if (disk_identity.macho_cpu_type.has_value() && live_identity.macho_cpu_type.has_value()) {
+            const bool cpu_mismatch =
+                *disk_identity.macho_cpu_type != *live_identity.macho_cpu_type;
+            const bool subtype_mismatch =
+                disk_identity.macho_cpu_subtype.has_value() &&
+                live_identity.macho_cpu_subtype.has_value() &&
+                *disk_identity.macho_cpu_subtype != *live_identity.macho_cpu_subtype;
+            if (cpu_mismatch || subtype_mismatch) {
+                out.comparable = true;
+                out.matches = false;
+                out.mismatches.push_back(std::format(
+                    "Mach-O CPU slice mismatch: disk=0x{:08X}/0x{:08X} vs live=0x{:08X}/0x{:08X}",
+                    *disk_identity.macho_cpu_type,
+                    disk_identity.macho_cpu_subtype.value_or(0u),
+                    *live_identity.macho_cpu_type,
+                    live_identity.macho_cpu_subtype.value_or(0u)));
+            }
+        }
+        if (!disk_identity.macho_uuid_hex.empty() && !live_identity.macho_uuid_hex.empty()) {
+            out.comparable = true;
+            if (disk_identity.macho_uuid_hex != live_identity.macho_uuid_hex) {
+                out.matches = false;
+                out.mismatches.push_back(std::format(
+                    "Mach-O LC_UUID mismatch: disk={} vs live={}",
+                    disk_identity.macho_uuid_hex,
+                    live_identity.macho_uuid_hex));
+            }
+        }
+    }
+
+    if (!out.comparable && !disk_identity.file_sha256.empty() && !live_identity.file_sha256.empty()) {
+        out.comparable = true;
+        if (disk_identity.file_sha256 != live_identity.file_sha256) {
+            out.matches = false;
+            out.mismatches.push_back(std::format(
+                "Backing image SHA-256 mismatch: disk={} vs live={}",
+                disk_identity.file_sha256.substr(0u, 16u),
+                live_identity.file_sha256.substr(0u, 16u)));
+        }
+    }
+
+    if (!out.comparable && disk_identity.dump_nonce != 0u && live_identity.dump_nonce != 0u) {
+        out.comparable = true;
+        if (disk_identity.dump_nonce != live_identity.dump_nonce) {
+            out.matches = false;
+            out.mismatches.push_back(std::format(
+                "Dump nonce mismatch: disk=0x{:X} vs live=0x{:X}",
+                disk_identity.dump_nonce,
+                live_identity.dump_nonce));
+        }
     }
 
     if (!out.comparable) {
-        out.summary = "No strong build identifier (.note.gnu.build-id / RSDS / PE header) present in both disk and live images";
+        out.summary = "No strong build identifier (.note.gnu.build-id / LC_UUID / RSDS / PE header) present in both disk and live images";
     } else if (out.matches) {
         out.summary = std::format("Backing image identity verified ({})",
                                   out.live_identifier.empty() ? "headers match" : out.live_identifier);

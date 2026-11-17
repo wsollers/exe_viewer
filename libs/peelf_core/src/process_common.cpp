@@ -1274,6 +1274,18 @@ ForgivingValue<ProcessMemorySummary> IProcessSession::memory_summary(
         regions = owned;
     }
     ProcessMemorySummary summary = summarize_process_memory(regions);
+    const SubsystemStatus reg_st = memory_regions_status();
+    if (reg_st.availability == Availability::Partial ||
+        reg_st.availability == Availability::Unavailable) {
+        return {
+            summary,
+            SubsystemStatus::partial(
+                "vmmap",
+                reg_st.detail.empty()
+                    ? std::string("memory region stream is partial or truncated")
+                    : reg_st.detail),
+        };
+    }
     const SubsystemStatus st = summary.rss_bytes.has_value()
                                    ? SubsystemStatus::available("vmmap", "physical RSS telemetry")
                                    : SubsystemStatus::partial(
