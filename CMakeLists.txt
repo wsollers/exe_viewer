@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 project(peelf_explorer
   VERSION 0.0.1
   DESCRIPTION "PE/ELF executable viewer (core parser + Vulkan/GLFW/ImGui GUI)"
-  LANGUAGES CXX
+  LANGUAGES C CXX
 )
 
 # Prevent FetchContent from re-running

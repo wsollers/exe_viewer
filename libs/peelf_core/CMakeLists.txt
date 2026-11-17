@@ -57,6 +57,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/gdb_remote_rsp.cpp
   src/gdb_remote_session.cpp
   src/gdb_remote_debug.cpp
+  src/scripting.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
@@ -71,6 +72,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/process_snapshot.hpp
   include/peelf/execution_timeline.hpp
   include/peelf/gdb_remote.hpp
+  include/peelf/scripting.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
   include/peelf/macho_image.hpp
@@ -107,7 +109,7 @@ target_include_directories(peelf_core
 
 target_compile_features(peelf_core PUBLIC cxx_std_23)
 
-target_link_libraries(peelf_core PRIVATE peelf::asmtk)
+target_link_libraries(peelf_core PRIVATE peelf::asmtk capstone lua54_static)
 
 peelf_apply_project_warnings(peelf_core)
 

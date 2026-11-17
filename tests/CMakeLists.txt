@@ -85,6 +85,7 @@ add_executable(peelf_tests
   gdb_remote_rsp_test.cpp
   gdb_remote_debug_test.cpp
   workspace_context_actions_test.cpp
+  scripting_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/ui/workspace_layout.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/ui/context_actions.cpp

@@ -223,3 +223,65 @@ if(PEELF_ENABLE_GRAPHVIZ)
 else()
         target_compile_definitions(peelf_graphviz INTERFACE PEELF_GRAPHVIZ_SOURCE_AVAILABLE=0)
 endif()
+
+# MIT Lua 5.4.7 (embedded sandboxed scripting host — WU-28a)
+FetchContent_Declare(
+        lua54_src
+        URL      https://www.lua.org/ftp/lua-5.4.7.tar.gz
+        URL_HASH SHA256=9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+)
+FetchContent_MakeAvailable(lua54_src)
+
+add_library(lua54_static STATIC
+        ${lua54_src_SOURCE_DIR}/src/lapi.c
+        ${lua54_src_SOURCE_DIR}/src/lauxlib.c
+        ${lua54_src_SOURCE_DIR}/src/lbaselib.c
+        ${lua54_src_SOURCE_DIR}/src/lcode.c
+        ${lua54_src_SOURCE_DIR}/src/lcorolib.c
+        ${lua54_src_SOURCE_DIR}/src/lctype.c
+        ${lua54_src_SOURCE_DIR}/src/ldblib.c
+        ${lua54_src_SOURCE_DIR}/src/ldebug.c
+        ${lua54_src_SOURCE_DIR}/src/ldo.c
+        ${lua54_src_SOURCE_DIR}/src/ldump.c
+        ${lua54_src_SOURCE_DIR}/src/lfunc.c
+        ${lua54_src_SOURCE_DIR}/src/lgc.c
+        ${lua54_src_SOURCE_DIR}/src/linit.c
+        ${lua54_src_SOURCE_DIR}/src/liolib.c
+        ${lua54_src_SOURCE_DIR}/src/llex.c
+        ${lua54_src_SOURCE_DIR}/src/lmathlib.c
+        ${lua54_src_SOURCE_DIR}/src/lmem.c
+        ${lua54_src_SOURCE_DIR}/src/loadlib.c
+        ${lua54_src_SOURCE_DIR}/src/lobject.c
+        ${lua54_src_SOURCE_DIR}/src/lopcodes.c
+        ${lua54_src_SOURCE_DIR}/src/loslib.c
+        ${lua54_src_SOURCE_DIR}/src/lparser.c
+        ${lua54_src_SOURCE_DIR}/src/lstate.c
+        ${lua54_src_SOURCE_DIR}/src/lstring.c
+        ${lua54_src_SOURCE_DIR}/src/lstrlib.c
+        ${lua54_src_SOURCE_DIR}/src/ltable.c
+        ${lua54_src_SOURCE_DIR}/src/ltablib.c
+        ${lua54_src_SOURCE_DIR}/src/ltm.c
+        ${lua54_src_SOURCE_DIR}/src/lundump.c
+        ${lua54_src_SOURCE_DIR}/src/lutf8lib.c
+        ${lua54_src_SOURCE_DIR}/src/lvm.c
+        ${lua54_src_SOURCE_DIR}/src/lzio.c
+)
+add_library(peelf::lua ALIAS lua54_static)
+
+set_target_properties(lua54_static PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(lua54_static SYSTEM PUBLIC
+        ${lua54_src_SOURCE_DIR}/src
+)
+if(UNIX)
+        target_compile_definitions(lua54_static PRIVATE LUA_USE_POSIX)
+        target_link_libraries(lua54_static PUBLIC m)
+endif()
+if(MSVC)
+        target_compile_definitions(lua54_static PRIVATE _CRT_SECURE_NO_WARNINGS)
+        target_compile_options(lua54_static PRIVATE /W0 /FS)
+else()
+        target_compile_options(lua54_static PRIVATE -w)
+endif()
