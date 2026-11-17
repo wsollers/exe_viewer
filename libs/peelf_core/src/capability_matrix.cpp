@@ -280,6 +280,20 @@ enum class IsaTier : std::uint8_t {
                : SupportState::SupportedExperimental;
 }
 
+[[nodiscard]] constexpr SupportState macho_static_support(
+    const TargetProfile& p,
+    IsaTier isa_tier) noexcept {
+    if (p.os == OsKind::Windows ||
+        p.abi == AbiKind::PeWindows32 ||
+        p.abi == AbiKind::PeWindows64 ||
+        isa_tier == IsaTier::Invalid) {
+        return SupportState::Unsupported;
+    }
+    return isa_tier == IsaTier::Validated
+               ? SupportState::SupportedValidated
+               : SupportState::SupportedExperimental;
+}
+
 [[nodiscard]] std::uint32_t read_note_u32(
     std::span<const std::uint8_t> desc,
     std::size_t offset,
@@ -567,6 +581,14 @@ TargetProfile derive_target_profile(
             p.abi = p.address_width == AddressWidth::Bits64 ? AbiKind::PeWindows64 : AbiKind::PeWindows32;
         } else if (p.format == Format::ELF) {
             classify_elf_abi_and_os(*image, p);
+        } else if (p.format == Format::MachO) {
+            if (p.architecture == Architecture::ARM64) {
+                p.abi = AbiKind::AArch64SysV;
+            } else if (p.architecture == Architecture::ARM) {
+                p.abi = AbiKind::ArmEabi;
+            } else {
+                p.abi = AbiKind::SysV;
+            }
         }
     }
 
@@ -738,6 +760,8 @@ TargetCapabilityMatrix capabilities_for(
         format_tier = pe_static_support(profile);
     } else if (profile.format == Format::ELF) {
         format_tier = elf_static_support(profile, isa_tier);
+    } else if (profile.format == Format::MachO) {
+        format_tier = macho_static_support(profile, isa_tier);
     }
 
     if (profile.format != Format::Unknown && format_tier == SupportState::Unsupported) {
@@ -759,7 +783,9 @@ TargetCapabilityMatrix capabilities_for(
                                           : SupportState::SupportedExperimental);
 
     // 1. ImageParsing & ExecutableSettings
-    if (profile.format == Format::PE || profile.format == Format::ELF) {
+    if (profile.format == Format::PE ||
+        profile.format == Format::ELF ||
+        profile.format == Format::MachO) {
         set_cap(Operation::ImageParsing,
                 format_tier,
                 true,
@@ -771,7 +797,9 @@ TargetCapabilityMatrix capabilities_for(
                 "peelf_core",
                 profile.format == Format::PE
                     ? "Bounded PE RT_MANIFEST, RT_VERSION, and CLR metadata extraction"
-                    : "Bounded ELF PT_INTERP, GNU notes, and dynamic settings extraction");
+                    : (profile.format == Format::ELF
+                           ? "Bounded ELF PT_INTERP, GNU notes, and dynamic settings extraction"
+                           : "Bounded Mach-O LC_BUILD_VERSION, rpath, entitlements, and code-signature metadata extraction"));
     } else {
         set_cap(Operation::ImageParsing,
                 SupportState::Unsupported,
@@ -903,7 +931,9 @@ TargetCapabilityMatrix capabilities_for(
 
     set_cap(Operation::StaticPatching,
             (profile.backend == BackendKind::StaticFile &&
-             (profile.format == Format::PE || profile.format == Format::ELF))
+             (profile.format == Format::PE ||
+              profile.format == Format::ELF ||
+              profile.format == Format::MachO))
                 ? format_tier
                 : SupportState::Unsupported,
             true,
@@ -927,17 +957,21 @@ TargetCapabilityMatrix capabilities_for(
                 true,
                 "peelf_dwarf",
                 "Embedded DWARF v4/v5 symbol, type, and line reader (for MinGW/Clang PE builds)");
-    } else if (profile.format == Format::ELF) {
+    } else if (profile.format == Format::ELF || profile.format == Format::MachO) {
         set_cap(Operation::DebugSymbolsPdb,
                 SupportState::Unsupported,
                 facts.dia_sdk_available,
                 "DIA SDK",
-                "PDB debug symbols apply to PE/COFF targets, not ELF");
+                profile.format == Format::ELF
+                    ? "PDB debug symbols apply to PE/COFF targets, not ELF"
+                    : "PDB debug symbols apply to PE/COFF targets, not Mach-O");
         set_cap(Operation::DebugSymbolsDwarf,
                 format_tier,
                 true,
                 "peelf_dwarf",
-                "Built-in DWARF v4/v5 (.debug_info/.debug_line/.gnu_debuglink/build-id) reader");
+                profile.format == Format::ELF
+                    ? "Built-in DWARF v4/v5 (.debug_info/.debug_line/.gnu_debuglink/build-id) reader"
+                    : "Built-in DWARF v4/v5 (__DWARF / dSYM) symbol, type, and line reader");
     } else {
         set_cap(Operation::DebugSymbolsPdb,
                 SupportState::Unsupported,
@@ -948,7 +982,7 @@ TargetCapabilityMatrix capabilities_for(
                 SupportState::Unsupported,
                 true,
                 "peelf_dwarf",
-                "No ELF/PE container loaded");
+                "No ELF/PE/Mach-O container loaded");
     }
 
     // 6. Security Audit
@@ -958,14 +992,18 @@ TargetCapabilityMatrix capabilities_for(
         profile.backend == BackendKind::CrashDumpMinidump ||
         profile.backend == BackendKind::CrashDumpElfCore;
 
-    if (profile.format == Format::PE || profile.format == Format::ELF) {
+    if (profile.format == Format::PE ||
+        profile.format == Format::ELF ||
+        profile.format == Format::MachO) {
         set_cap(Operation::SecurityAudit,
                 format_tier,
                 true,
                 "peelf_security_audit",
                 is_live_or_dump
-                    ? "Static PE/ELF mitigation rules + live RWX/unbacked-code/token rules"
-                    : "Static PE/ELF mitigation and hardening audit");
+                    ? "Static container mitigation rules + live RWX/unbacked-code/token rules"
+                    : (profile.format == Format::MachO
+                           ? "Static Mach-O mitigation, entitlements, and code-signature posture audit"
+                           : "Static PE/ELF mitigation and hardening audit"));
     } else if (is_live_or_dump && (profile.os == OsKind::Linux || profile.os == OsKind::Windows)) {
         set_cap(Operation::SecurityAudit,
                 SupportState::Partial,

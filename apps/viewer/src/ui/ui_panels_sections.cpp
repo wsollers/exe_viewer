@@ -38,6 +38,7 @@ void draw_permissions(bool readable, bool writable, bool executable) {
         std::string filter = filter_buf_;
         bool has_filter = !filter.empty();
 
+        std::optional<PendingEntityContextAction> pending_ctx_action;
         ImGui::Separator();
         ImGui::BeginChild("SectionsList", ImVec2(0,0), false);
 
@@ -62,14 +63,40 @@ void draw_permissions(bool readable, bool writable, bool executable) {
                 s.file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) &&
                 range_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
 
-            ImGui::PushID(s.name.c_str());
-            if (can_navigate && ImGui::Selectable(s.name.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
-                if (on_section_activated_) {
+            ImGui::PushID(static_cast<int>(section_index));
+            if (ImGui::Selectable(s.name.empty() ? "<unnamed>" : s.name.c_str(),
+                                  false,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                if (can_navigate && on_section_activated_) {
                     on_section_activated_(s, section_index);
                 }
-            } else if (!can_navigate) {
-                ImGui::TextDisabled("%s", s.name.c_str());
             }
+            draw_inspectable_entity_context_menu(
+                "SectionRowCtx",
+                model_,
+                pending_ctx_action,
+                [&]() -> InspectableEntity {
+                    const bool static_img = model_has_static_image(model_);
+                    std::string perms;
+                    perms.push_back(s.readable ? 'R' : '-');
+                    perms.push_back(s.writable ? 'W' : '-');
+                    perms.push_back(s.executable ? 'X' : '-');
+                    return InspectableEntity{
+                        .va = s.virtual_address != 0
+                            ? std::optional<std::uint64_t>(s.virtual_address)
+                            : std::nullopt,
+                        .file_offset = (static_img && s.file_size != 0)
+                            ? std::optional<std::uint64_t>(s.file_offset)
+                            : std::nullopt,
+                        .size = range_size,
+                        .symbol_or_label = s.name,
+                        .module_name = model_.file_info().path,
+                        .extra_json_fields = {
+                            {"kind", "section"},
+                            {"permissions", std::move(perms)},
+                        },
+                    };
+                });
             ImGui::PopID();
             ImGui::NextColumn();
             ImGui::Text("0x%" PRIX64, s.virtual_address); ImGui::NextColumn();
@@ -101,6 +128,9 @@ void draw_permissions(bool readable, bool writable, bool executable) {
         }
 
         ImGui::EndChild();
+        if (pending_ctx_action.has_value() && on_context_action_) {
+            on_context_action_(pending_ctx_action->kind, pending_ctx_action->entity);
+        }
     }
 
 } // namespace viewer

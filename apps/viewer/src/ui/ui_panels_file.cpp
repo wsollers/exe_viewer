@@ -136,6 +136,7 @@ namespace viewer {
         }
 
         const auto& info = model_.file_info();
+        std::optional<PendingEntityContextAction> pending_ctx_action;
 
         if (ImGui::CollapsingHeader("Image properties", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (ImGui::BeginTable("ImageProperties", 2, ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
@@ -156,18 +157,89 @@ namespace viewer {
                     model_.active_slice_index() < model_.container_info().slices.size()) {
                     const peelf::BinarySliceDescriptor& sl =
                         model_.container_info().slices[model_.active_slice_index()];
-                    row("Slice range",
+                    const std::string slice_val =
                         std::format("offset 0x{:X} .. 0x{:X} ({} bytes, align 2^{})",
                                     sl.container_offset,
                                     sl.container_offset + sl.slice_size,
                                     sl.slice_size,
-                                    sl.align_log2));
+                                    sl.align_log2);
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::TextDisabled("%s", "Slice range");
+                    ImGui::TableNextColumn();
+                    (void)ImGui::Selectable(slice_val.c_str(), false, ImGuiSelectableFlags_SpanAllColumns);
+                    draw_inspectable_entity_context_menu(
+                        "SliceRangeCtx",
+                        model_,
+                        pending_ctx_action,
+                        [&]() -> InspectableEntity {
+                            return InspectableEntity{
+                                .va = std::nullopt,
+                                .file_offset = 0u,
+                                .size = sl.slice_size,
+                                .symbol_or_label = sl.arch_name.empty()
+                                    ? std::string(peelf::to_string(sl.arch))
+                                    : sl.arch_name,
+                                .module_name = info.path,
+                                .extra_json_fields = {
+                                    {"container_offset", std::format("0x{:X}", sl.container_offset)},
+                                    {"slice_index", std::to_string(sl.slice_index)},
+                                },
+                            };
+                        });
                 }
                 row("Size", std::format("{} bytes", info.size_bytes));
                 row("Window base", std::format("0x{:X}", model_.view_base_address()));
-                row("Entry point", std::format("0x{:X}", info.entry_point));
+
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextDisabled("%s", "Entry point");
+                ImGui::TableNextColumn();
+                const std::string ep_str = std::format("0x{:X}", info.entry_point);
+                if (ImGui::Selectable(ep_str.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    if (info.entry_point != 0 && on_context_action_) {
+                        pending_ctx_action = PendingEntityContextAction{
+                            .kind = ContextActionKind::FollowInDisassembly,
+                            .entity = InspectableEntity{
+                                .va = info.entry_point,
+                                .file_offset = model_has_static_image(model_)
+                                    ? model_.virtual_address_to_offset(info.entry_point)
+                                    : std::nullopt,
+                                .size = 1u,
+                                .symbol_or_label = "entry_point",
+                                .module_name = info.path,
+                            },
+                        };
+                    }
+                }
+                draw_inspectable_entity_context_menu(
+                    "EntryPointCtx",
+                    model_,
+                    pending_ctx_action,
+                    [&]() -> InspectableEntity {
+                        const std::optional<std::uint64_t> ep_va =
+                            info.entry_point != 0
+                                ? std::optional<std::uint64_t>(info.entry_point)
+                                : std::nullopt;
+                        return InspectableEntity{
+                            .va = ep_va,
+                            .file_offset = (ep_va.has_value() && model_has_static_image(model_))
+                                ? model_.virtual_address_to_offset(*ep_va)
+                                : std::nullopt,
+                            .size = 1u,
+                            .symbol_or_label = "entry_point",
+                            .module_name = info.path,
+                            .extra_json_fields = {
+                                {"format", info.format_str},
+                                {"architecture", info.arch_str},
+                            },
+                        };
+                    });
                 ImGui::EndTable();
             }
+        }
+        if (pending_ctx_action.has_value() && on_context_action_) {
+            on_context_action_(pending_ctx_action->kind, pending_ctx_action->entity);
         }
 
         if (!info.flags.empty() && ImGui::CollapsingHeader("Image flags", ImGuiTreeNodeFlags_DefaultOpen)) {

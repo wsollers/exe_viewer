@@ -9,15 +9,238 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include <charconv>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace viewer {
 namespace {
 using detail::activate_panel;
+
+struct WorkspaceSettingsIniState {
+    std::uint32_t loaded_schema_version{0u};
+    WorkspacePreset active_preset{WorkspacePreset::StaticReverseEngineering};
+    bool saw_ini_section{false};
+};
+
+// Trivial static storage so ImGui::DestroyContext() INI flush after ~UiApp() remains valid.
+WorkspaceSettingsIniState g_workspace_ini_state{};
+
+[[nodiscard]] std::string_view trim_ini_token(std::string_view sv) noexcept {
+    while (!sv.empty() && (sv.front() == ' ' || sv.front() == '\t' || sv.front() == '\r')) {
+        sv.remove_prefix(1);
+    }
+    while (!sv.empty() && (sv.back() == ' ' || sv.back() == '\t' || sv.back() == '\r')) {
+        sv.remove_suffix(1);
+    }
+    return sv;
+}
+
+void* workspace_settings_read_open(
+    ImGuiContext* /*ctx*/,
+    ImGuiSettingsHandler* /*handler*/,
+    const char* name) {
+    if (name != nullptr && std::string_view(name) == "State") {
+        g_workspace_ini_state.saw_ini_section = true;
+        return &g_workspace_ini_state;
+    }
+    return nullptr;
+}
+
+void workspace_settings_read_line(
+    ImGuiContext* /*ctx*/,
+    ImGuiSettingsHandler* /*handler*/,
+    void* entry,
+    const char* line) {
+    auto* state = static_cast<WorkspaceSettingsIniState*>(entry);
+    if (state == nullptr || line == nullptr) {
+        return;
+    }
+    const std::string_view sv = trim_ini_token(line);
+    const std::size_t eq = sv.find('=');
+    if (eq == std::string_view::npos) {
+        return;
+    }
+    const std::string_view key = trim_ini_token(sv.substr(0, eq));
+    const std::string_view val = trim_ini_token(sv.substr(eq + 1));
+    if (key == "SchemaVersion") {
+        std::uint32_t parsed = 0u;
+        const auto [ptr, ec] = std::from_chars(val.data(), val.data() + val.size(), parsed);
+        if (ec == std::errc{} && ptr == val.data() + val.size()) {
+            state->loaded_schema_version = parsed;
+        }
+    } else if (key == "ActivePreset") {
+        if (const auto preset = parse_workspace_preset_id(val); preset.has_value()) {
+            state->active_preset = *preset;
+        }
+    }
+}
+
+void workspace_settings_write_all(
+    ImGuiContext* /*ctx*/,
+    ImGuiSettingsHandler* handler,
+    ImGuiTextBuffer* out_buf) {
+    if (handler == nullptr || out_buf == nullptr) {
+        return;
+    }
+    const std::string_view preset_id = workspace_preset_id(g_workspace_ini_state.active_preset);
+    out_buf->appendf("[%s][State]\n", handler->TypeName);
+    out_buf->appendf("SchemaVersion=%u\n", kWorkspaceLayoutSchemaVersion);
+    out_buf->appendf(
+        "ActivePreset=%.*s\n\n",
+        static_cast<int>(preset_id.size()),
+        preset_id.data());
+}
+
+void build_imgui_dock_subtree(
+    const DockNodeSpec& node,
+    ImGuiID node_id,
+    std::vector<WorkspacePanelId>& out_active_tabs,
+    ImGuiID& fallback_leaf_id) {
+    if (node.is_leaf()) {
+        if (fallback_leaf_id == 0) {
+            fallback_leaf_id = node_id;
+        }
+        for (const WorkspacePanelId panel : node.tabbed_panels) {
+            const std::string title(workspace_panel_window_name(panel));
+            ImGui::DockBuilderDockWindow(title.c_str(), node_id);
+        }
+        if (node.active_tab.has_value()) {
+            out_active_tabs.push_back(*node.active_tab);
+            if (auto* dock_node = ImGui::DockBuilderGetNode(node_id)) {
+                const std::string active_title(workspace_panel_window_name(*node.active_tab));
+                dock_node->SelectedTabId = ImHashStr(active_title.c_str());
+            }
+        }
+        return;
+    }
+
+    if (node.first == nullptr || node.second == nullptr) {
+        return;
+    }
+
+    ImGuiID first_id = 0;
+    ImGuiID second_id = 0;
+    const ImGuiDir split_dir =
+        (node.split_axis == DockSplitAxis::Horizontal) ? ImGuiDir_Left : ImGuiDir_Up;
+    ImGui::DockBuilderSplitNode(node_id, split_dir, node.split_ratio, &first_id, &second_id);
+    build_imgui_dock_subtree(*node.first, first_id, out_active_tabs, fallback_leaf_id);
+    build_imgui_dock_subtree(*node.second, second_id, out_active_tabs, fallback_leaf_id);
+}
+
 } // namespace
+
+void UiApp::register_workspace_settings_handler() {
+    if (ImGui::GetCurrentContext() == nullptr) {
+        return;
+    }
+    if (ImGui::FindSettingsHandler("WorkspaceLayout") != nullptr) {
+        return;
+    }
+    ImGuiSettingsHandler handler{};
+    handler.TypeName = "WorkspaceLayout";
+    handler.TypeHash = ImHashStr("WorkspaceLayout");
+    handler.ReadOpenFn = workspace_settings_read_open;
+    handler.ReadLineFn = workspace_settings_read_line;
+    handler.WriteAllFn = workspace_settings_write_all;
+    ImGui::AddSettingsHandler(&handler);
+}
+
+void UiApp::request_workspace_preset(WorkspacePreset preset) noexcept {
+    pending_workspace_preset_ = preset;
+}
+
+void UiApp::request_workspace_reset() noexcept {
+    pending_workspace_preset_ = active_workspace_preset_;
+    reset_dock_layout_ = true;
+}
+
+void UiApp::set_workspace_panel_visible(WorkspacePanelId panel, bool visible) noexcept {
+    switch (panel) {
+        case WorkspacePanelId::FileInfo:           file_panel_.set_visible(visible); break;
+        case WorkspacePanelId::MemoryMap:          memory_map_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Structure:          structure_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Details:            details_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Sections:           sections_panel_.set_visible(visible); break;
+        case WorkspacePanelId::HexView:            hex_panel_.set_visible(visible); break;
+        case WorkspacePanelId::PatchSet:           patch_set_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Shellcode:          shellcode_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Imports:            imports_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Exports:            exports_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Symbols:            symbols_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Functions:          functions_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ThreadsAndStack:    threads_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ThreadLocals:       thread_locals_panel_.set_visible(visible); break;
+        case WorkspacePanelId::MemorySearch:       memory_search_panel_.set_visible(visible); break;
+        case WorkspacePanelId::RuntimeAndFlags:    runtime_flags_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Handlers:           handlers_panel_.set_visible(visible); break;
+        case WorkspacePanelId::DataStructures:     show_data_types_ = visible; break;
+        case WorkspacePanelId::ReferencesAndNotes: references_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Strings:            strings_panel_.set_visible(visible); break;
+        case WorkspacePanelId::StructureView:      struct_view_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ProcessInternals:   process_internals_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Dependencies:       dependencies_panel_.set_visible(visible); break;
+        case WorkspacePanelId::BinaryDiff:         binary_diff_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Debugger:           debugger_panel_.set_visible(visible); break;
+        case WorkspacePanelId::TargetCapabilities: capabilities_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ExecutableSettings: executable_settings_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ExecutionTimeline:  timeline_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Decompiler:         show_decompiler_ = visible; break;
+        case WorkspacePanelId::PeHeaders:          pe_headers_panel_.set_visible(visible); break;
+        case WorkspacePanelId::PeImports:          pe_imports_panel_.set_visible(visible); break;
+        case WorkspacePanelId::PeExports:          pe_exports_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Disassembly:        show_disassembly_panel_ = visible; break;
+        case WorkspacePanelId::FlowGraph:          show_call_graph_panel_ = visible; break;
+        case WorkspacePanelId::Log:                log_panel_.set_visible(visible); break;
+    }
+}
+
+bool UiApp::is_workspace_panel_visible(WorkspacePanelId panel) const noexcept {
+    switch (panel) {
+        case WorkspacePanelId::FileInfo:           return file_panel_.visible();
+        case WorkspacePanelId::MemoryMap:          return memory_map_panel_.visible();
+        case WorkspacePanelId::Structure:          return structure_panel_.visible();
+        case WorkspacePanelId::Details:            return details_panel_.visible();
+        case WorkspacePanelId::Sections:           return sections_panel_.visible();
+        case WorkspacePanelId::HexView:            return hex_panel_.visible();
+        case WorkspacePanelId::PatchSet:           return patch_set_panel_.visible();
+        case WorkspacePanelId::Shellcode:          return shellcode_panel_.visible();
+        case WorkspacePanelId::Imports:            return imports_panel_.visible();
+        case WorkspacePanelId::Exports:            return exports_panel_.visible();
+        case WorkspacePanelId::Symbols:            return symbols_panel_.visible();
+        case WorkspacePanelId::Functions:          return functions_panel_.visible();
+        case WorkspacePanelId::ThreadsAndStack:    return threads_panel_.visible();
+        case WorkspacePanelId::ThreadLocals:       return thread_locals_panel_.visible();
+        case WorkspacePanelId::MemorySearch:       return memory_search_panel_.visible();
+        case WorkspacePanelId::RuntimeAndFlags:    return runtime_flags_panel_.visible();
+        case WorkspacePanelId::Handlers:           return handlers_panel_.visible();
+        case WorkspacePanelId::DataStructures:     return show_data_types_;
+        case WorkspacePanelId::ReferencesAndNotes: return references_panel_.visible();
+        case WorkspacePanelId::Strings:            return strings_panel_.visible();
+        case WorkspacePanelId::StructureView:      return struct_view_panel_.visible();
+        case WorkspacePanelId::ProcessInternals:   return process_internals_panel_.visible();
+        case WorkspacePanelId::Dependencies:       return dependencies_panel_.visible();
+        case WorkspacePanelId::BinaryDiff:         return binary_diff_panel_.visible();
+        case WorkspacePanelId::Debugger:           return debugger_panel_.visible();
+        case WorkspacePanelId::TargetCapabilities: return capabilities_panel_.visible();
+        case WorkspacePanelId::ExecutableSettings: return executable_settings_panel_.visible();
+        case WorkspacePanelId::ExecutionTimeline:  return timeline_panel_.visible();
+        case WorkspacePanelId::Decompiler:         return show_decompiler_;
+        case WorkspacePanelId::PeHeaders:          return pe_headers_panel_.visible();
+        case WorkspacePanelId::PeImports:          return pe_imports_panel_.visible();
+        case WorkspacePanelId::PeExports:          return pe_exports_panel_.visible();
+        case WorkspacePanelId::Disassembly:        return show_disassembly_panel_;
+        case WorkspacePanelId::FlowGraph:          return show_call_graph_panel_;
+        case WorkspacePanelId::Log:                return log_panel_.visible();
+    }
+    return false;
+}
 
 void UiApp::render_main_menu() {
     if (!ImGui::GetIO().WantTextInput) {
@@ -293,6 +516,21 @@ void UiApp::render_main_menu() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
+        if (ImGui::BeginMenu("Workspaces")) {
+            for (const WorkspacePreset preset : kAllWorkspacePresets) {
+                const std::string label(workspace_preset_display_name(preset));
+                const bool is_active = (active_workspace_preset_ == preset);
+                if (ImGui::MenuItem(label.c_str(), nullptr, is_active)) {
+                    request_workspace_preset(preset);
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Reset Current Workspace Layout")) {
+                request_workspace_reset();
+            }
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
         ImGui::MenuItem("Data Structures", nullptr, &show_data_types_);
         {
             bool demangle = model_.demangle_symbols();
@@ -302,7 +540,7 @@ void UiApp::render_main_menu() {
             }
         }
         if (ImGui::MenuItem("Reset Layout")) {
-            reset_dock_layout_ = true;
+            request_workspace_reset();
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Reload theme")) ui::load_theme();
@@ -430,6 +668,10 @@ void UiApp::render_main_menu() {
         }
 
         {
+            ImGui::MenuItem("Decompiler", nullptr, &show_decompiler_);
+        }
+
+        {
             bool v = log_panel_.visible();
             if (ImGui::MenuItem(log_panel_.name().c_str(), nullptr, &v))
                 log_panel_.set_visible(v);
@@ -461,6 +703,8 @@ void UiApp::render_main_menu() {
 }
 
 void UiApp::render_dockspace() {
+    register_workspace_settings_handler();
+
     ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
@@ -482,13 +726,35 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV7");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV8");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
-    if (reset_dock_layout_ || ImGui::DockBuilderGetNode(dockspace_id) == nullptr ||
-        (compact_dock_layout_ && *compact_dock_layout_ != compact)) {
-        build_default_dock_layout(dockspace_id, viewport->WorkSize);
+    const bool missing_dockspace = (ImGui::DockBuilderGetNode(dockspace_id) == nullptr);
+
+    bool needs_migration = false;
+    if (!workspace_layout_checked_) {
+        workspace_layout_checked_ = true;
+        if (g_workspace_ini_state.saw_ini_section) {
+            loaded_layout_schema_version_ = g_workspace_ini_state.loaded_schema_version;
+            active_workspace_preset_ = g_workspace_ini_state.active_preset;
+        }
+        if (should_migrate_workspace_layout(loaded_layout_schema_version_)) {
+            needs_migration = true;
+            Log().info(
+                "Migrating workspace layout from schema v{} to v{} ({})",
+                loaded_layout_schema_version_,
+                kWorkspaceLayoutSchemaVersion,
+                workspace_preset_display_name(active_workspace_preset_));
+        }
+    }
+
+    if (pending_workspace_preset_.has_value() || reset_dock_layout_ || missing_dockspace ||
+        needs_migration || (compact_dock_layout_ && *compact_dock_layout_ != compact)) {
+        const WorkspacePreset target_preset =
+            pending_workspace_preset_.value_or(active_workspace_preset_);
+        pending_workspace_preset_.reset();
         reset_dock_layout_ = false;
+        apply_workspace_preset(target_preset, dockspace_id, viewport->WorkSize);
     }
     compact_dock_layout_ = compact;
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), dock_flags);
@@ -496,60 +762,58 @@ void UiApp::render_dockspace() {
     ImGui::End();
 }
 
-void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size) {
-    focus_workspace_ = true;
+void UiApp::apply_workspace_preset(
+    WorkspacePreset preset,
+    ImGuiID dockspace_id,
+    const ImVec2& dockspace_size) {
+    WorkspacePresetSpec spec = build_workspace_preset(preset);
+    if (const auto validation = validate_workspace_preset(spec); !validation) {
+        Log().error("Invalid workspace preset '{}': {}", spec.display_name, validation.error().message);
+        spec = build_workspace_preset(WorkspacePreset::StaticReverseEngineering);
+        preset = WorkspacePreset::StaticReverseEngineering;
+    }
+
+    active_workspace_preset_ = preset;
+    loaded_layout_schema_version_ = spec.schema_version;
+    g_workspace_ini_state.active_preset = preset;
+    g_workspace_ini_state.loaded_schema_version = spec.schema_version;
+    g_workspace_ini_state.saw_ini_section = true;
+
+    std::unordered_set<WorkspacePanelId> visible_set;
+    visible_set.reserve(spec.visible_panels.size());
+    for (const WorkspacePanelId panel : spec.visible_panels) {
+        visible_set.insert(panel);
+    }
+    for (const WorkspacePanelId panel : all_workspace_panels()) {
+        set_workspace_panel_visible(panel, visible_set.contains(panel));
+    }
+
     ImGui::DockBuilderRemoveNode(dockspace_id);
     ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dockspace_id, dockspace_size);
 
-    ImGuiID main_id = dockspace_id;
-    const bool compact = dockspace_size.x < ImGui::GetFontSize() * 100.0f;
-    const ImGuiID bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.12f, nullptr, &main_id);
-    const ImGuiID left_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Left, compact ? 0.25f : 0.19f, nullptr, &main_id);
-    const ImGuiID right_id = compact ? left_id : ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Right, 0.25f, nullptr, &main_id);
-    const ImGuiID center_bottom_id = ImGui::DockBuilderSplitNode(main_id, ImGuiDir_Down, 0.26f, nullptr, &main_id);
+    std::vector<WorkspacePanelId> active_tabs;
+    ImGuiID fallback_leaf_id = 0;
+    build_imgui_dock_subtree(spec.root, dockspace_id, active_tabs, fallback_leaf_id);
 
-    ImGui::DockBuilderDockWindow(structure_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(memory_map_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(functions_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(symbols_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow(sections_panel_.name().c_str(), left_id);
-    ImGui::DockBuilderDockWindow("Data Structures", left_id);
-
-    ImGui::DockBuilderDockWindow(file_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(capabilities_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(executable_settings_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(details_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(threads_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(thread_locals_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(runtime_flags_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(handlers_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(references_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(strings_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(struct_view_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(process_internals_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(dependencies_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(imports_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(exports_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(patch_set_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(pe_headers_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(pe_imports_panel_.name().c_str(), right_id);
-    ImGui::DockBuilderDockWindow(pe_exports_panel_.name().c_str(), right_id);
-
-    ImGui::DockBuilderDockWindow(hex_panel_.name().c_str(), center_bottom_id);
-    ImGui::DockBuilderDockWindow(debugger_panel_.name().c_str(), center_bottom_id);
-    ImGui::DockBuilderDockWindow(timeline_panel_.name().c_str(), center_bottom_id);
-    ImGui::DockBuilderDockWindow(memory_search_panel_.name().c_str(), center_bottom_id);
-    ImGui::DockBuilderDockWindow(shellcode_panel_.name().c_str(), center_bottom_id);
-    ImGui::DockBuilderDockWindow("Disassembly", main_id);
-    ImGui::DockBuilderDockWindow(binary_diff_panel_.name().c_str(), main_id);
-    ImGui::DockBuilderDockWindow("Flow Graph", main_id);
-    ImGui::DockBuilderDockWindow("Decompiler", right_id);
-    if (auto* node = ImGui::DockBuilderGetNode(left_id)) node->SelectedTabId = ImHashStr(functions_panel_.name().c_str());
-    if (auto* node = ImGui::DockBuilderGetNode(right_id)) node->SelectedTabId = ImHashStr(details_panel_.name().c_str());
-    ImGui::DockBuilderDockWindow(log_panel_.name().c_str(), bottom_id);
+    if (fallback_leaf_id != 0) {
+        for (const WorkspacePanelId panel : all_workspace_panels()) {
+            if (!visible_set.contains(panel)) {
+                const std::string title(workspace_panel_window_name(panel));
+                ImGui::DockBuilderDockWindow(title.c_str(), fallback_leaf_id);
+            }
+        }
+    }
 
     ImGui::DockBuilderFinish(dockspace_id);
+    ImGui::MarkIniSettingsDirty();
+
+    pending_preset_active_tabs_ = std::move(active_tabs);
+    focus_workspace_ = false;
+}
+
+void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size) {
+    apply_workspace_preset(WorkspacePreset::StaticReverseEngineering, dockspace_id, dockspace_size);
 }
 
 } // namespace viewer

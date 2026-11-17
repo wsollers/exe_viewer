@@ -142,6 +142,7 @@ void RuntimeAndFlagsPanel::draw_contents() {
             const std::string_view afilter(audit_filter_buf_);
 
             std::optional<std::uint64_t> pending_audit_nav_va;
+            std::optional<PendingEntityContextAction> pending_ctx_action;
             if (ImGui::BeginTable("SecurityAuditTable",
                                   5,
                                   ImGuiTableFlags_Borders |
@@ -191,16 +192,39 @@ void RuntimeAndFlagsPanel::draw_contents() {
                     if (!nav_va.has_value() && f.file_offset.has_value()) {
                         nav_va = model_.offset_to_virtual_address(*f.file_offset);
                     }
-                    if (nav_va.has_value() && on_address_activated_) {
-                        if (ImGui::Selectable(f.rule_id.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    if (ImGui::Selectable(f.rule_id.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        if (nav_va.has_value() && on_address_activated_) {
                             pending_audit_nav_va = *nav_va;
                         }
-                    } else {
-                        ImGui::TextUnformatted(f.rule_id.c_str());
                     }
                     if (ImGui::IsItemHovered()) {
                         ImGui::SetTooltip("%s\n%s", f.rule_name.c_str(), f.evidence.c_str());
                     }
+                    draw_inspectable_entity_context_menu(
+                        "SecurityFindingCtx",
+                        model_,
+                        pending_ctx_action,
+                        [&]() -> InspectableEntity {
+                            const bool static_img = model_has_static_image(model_);
+                            std::optional<std::uint64_t> eff_off = f.file_offset;
+                            if (!eff_off.has_value() && nav_va.has_value() && static_img) {
+                                eff_off = model_.virtual_address_to_offset(*nav_va);
+                            }
+                            return InspectableEntity{
+                                .va = nav_va,
+                                .file_offset = static_img ? eff_off : std::nullopt,
+                                .size = 1u,
+                                .symbol_or_label = f.rule_id + ": " + f.rule_name,
+                                .module_name = f.subject,
+                                .extra_json_fields = {
+                                    {"rule_id", f.rule_id},
+                                    {"severity", std::string(peelf::to_string(f.severity))},
+                                    {"summary", f.summary},
+                                    {"evidence", f.evidence},
+                                    {"remediation", f.remediation},
+                                },
+                            };
+                        });
                     ImGui::PopID();
 
                     ImGui::TableNextColumn();
@@ -226,6 +250,9 @@ void RuntimeAndFlagsPanel::draw_contents() {
             }
             if (pending_audit_nav_va.has_value() && on_address_activated_) {
                 on_address_activated_(*pending_audit_nav_va, PreferredView::Hex);
+            }
+            if (pending_ctx_action.has_value() && on_context_action_) {
+                on_context_action_(pending_ctx_action->kind, pending_ctx_action->entity);
             }
             ImGui::EndTabItem();
         }

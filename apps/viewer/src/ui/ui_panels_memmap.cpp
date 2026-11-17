@@ -718,6 +718,7 @@ void MemoryMapPanel::draw_contents() {
         kColPath,
     };
 
+    std::optional<PendingEntityContextAction> pending_ctx_action;
     if (ImGui::BeginTable("MemMapTable",
                           12,
                           ImGuiTableFlags_Borders |
@@ -801,6 +802,27 @@ void MemoryMapPanel::draw_contents() {
                             on_region_activated_(i, false);
                         }
                     }
+                    ImGui::Separator();
+                    const bool has_backing_file =
+                        !reg.pathname.empty() && reg.pathname.front() != '[';
+                    const InspectableEntity reg_entity{
+                        .va = reg.start_address,
+                        .file_offset = has_backing_file
+                            ? std::optional<std::uint64_t>(reg.file_offset)
+                            : std::nullopt,
+                        .size = reg.size(),
+                        .symbol_or_label = !reg.pathname.empty()
+                            ? reg.pathname
+                            : std::string("<anonymous>"),
+                        .module_name = has_backing_file ? reg.pathname : std::string{},
+                        .extra_json_fields = {
+                            {"end_va", std::format("0x{:X}", reg.end_address)},
+                            {"permissions", peelf::format_protection(reg.protection)},
+                            {"region_kind", std::string(kind_str)},
+                        },
+                    };
+                    (void)draw_inspectable_entity_context_menu_items(
+                        reg_entity, model_, pending_ctx_action);
                     ImGui::EndPopup();
                 }
                 ImGui::PopID();
@@ -857,6 +879,9 @@ void MemoryMapPanel::draw_contents() {
         }
 
         ImGui::EndTable();
+    }
+    if (pending_ctx_action.has_value() && on_context_action_) {
+        on_context_action_(pending_ctx_action->kind, pending_ctx_action->entity);
     }
 }
 

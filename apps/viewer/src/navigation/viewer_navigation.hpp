@@ -104,9 +104,12 @@ struct DeferredNavigationRequest {
     PreferredView preferred_view = PreferredView::Disassembly;
     std::size_t highlight_size = 0;
     bool request_decompile = false;
+    bool open_structure_view = false;
     bool prefer_module_context = true;
     std::function<void()> custom_action{};
 };
+
+using NavigationRequest = DeferredNavigationRequest;
 
 // Defers panel-initiated navigation until the end of UiApp's panel-render phase so
 // live-module switches cannot replace BinaryModel vectors/spans mid-table-render.

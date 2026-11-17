@@ -47,6 +47,12 @@ add_library(peelf_gui SHARED
         src/model/binary_model_live.cpp
         src/ui/ui_panel.hpp
         src/ui/ui_panels.hpp
+        src/ui/workspace_layout.hpp
+        src/ui/workspace_layout.cpp
+        src/ui/context_actions.hpp
+        src/ui/context_actions.cpp
+        src/ui/ui_context_menu.hpp
+        src/ui/ui_context_menu.cpp
         src/ui/ui_app.hpp
         src/ui/ui_app_internal.hpp
         src/ui/ui_app.cpp

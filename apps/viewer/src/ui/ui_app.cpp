@@ -567,6 +567,17 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
             last_navigation_selection_ = current_selection_;
         });
     });
+
+    auto bind_ctx = [this](ContextActionKind kind, const InspectableEntity& entity) {
+        dispatch_entity_context_action(kind, entity);
+    };
+    file_panel_.set_context_action_callback(bind_ctx);
+    memory_map_panel_.set_context_action_callback(bind_ctx);
+    sections_panel_.set_context_action_callback(bind_ctx);
+    symbols_panel_.set_context_action_callback(bind_ctx);
+    imports_panel_.set_context_action_callback(bind_ctx);
+    exports_panel_.set_context_action_callback(bind_ctx);
+    runtime_flags_panel_.set_context_action_callback(bind_ctx);
 }
 
 UiApp::~UiApp() {
@@ -799,7 +810,14 @@ void UiApp::render() {
     }
     if (focus_listing_) { activate_panel("Disassembly"); focus_listing_ = false; }
     navigation_history_.visit(current_selection_);
-    if (focus_workspace_) {
+    if (!pending_preset_active_tabs_.empty()) {
+        for (const WorkspacePanelId panel : pending_preset_active_tabs_) {
+            const std::string title(workspace_panel_window_name(panel));
+            activate_panel(title.c_str());
+        }
+        pending_preset_active_tabs_.clear();
+        focus_workspace_ = false;
+    } else if (focus_workspace_) {
         activate_panel(symbols_panel_.name().c_str());
         activate_panel(details_panel_.name().c_str());
         activate_panel("Disassembly");

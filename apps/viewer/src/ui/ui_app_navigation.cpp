@@ -158,6 +158,7 @@ void UiApp::open_structure_view(std::string_view type_name,
                 ? std::numeric_limits<int>::max()
                 : static_cast<int>(current_instructions_.size());
         ImGuiListClipper clipper;
+        std::optional<PendingEntityContextAction> pending_ctx_action;
         clipper.Begin(clipped_inst_count);
         if (scroll_to_row && *scroll_to_row >= 0 && *scroll_to_row < clipped_inst_count) {
             clipper.IncludeItemByIndex(*scroll_to_row);
@@ -220,6 +221,32 @@ void UiApp::open_structure_view(std::string_view type_name,
                     last_navigation_selection_ = current_selection_;
                 }
             }
+            draw_inspectable_entity_context_menu(
+                "DisasmRowCtx",
+                model_,
+                pending_ctx_action,
+                [&]() -> InspectableEntity {
+                    const bool static_img = model_has_static_image(model_);
+                    std::string bytes_hex;
+                    bytes_hex.reserve(inst.bytes.size() * 2u);
+                    for (const std::uint8_t b : inst.bytes) {
+                        bytes_hex += std::format("{:02X}", b);
+                    }
+                    return InspectableEntity{
+                        .va = inst.address,
+                        .file_offset = static_img
+                            ? model_.virtual_address_to_offset(inst.address)
+                            : std::nullopt,
+                        .size = inst.bytes.size(),
+                        .symbol_or_label = inst.to_string(),
+                        .module_name = model_.file_info().path,
+                        .extra_json_fields = {
+                            {"mnemonic", inst.mnemonic},
+                            {"operands", inst.operands},
+                            {"bytes", std::move(bytes_hex)},
+                        },
+                    };
+                });
             ImGui::PopID();
 
             // Bytes
@@ -313,6 +340,9 @@ void UiApp::open_structure_view(std::string_view type_name,
         }
 
         ImGui::EndTable();
+        if (pending_ctx_action.has_value()) {
+            dispatch_entity_context_action(pending_ctx_action->kind, pending_ctx_action->entity);
+        }
                           }
     if (pending_bp_toggle_va.has_value() && model_.is_debug_session()) {
         (void)model_.toggle_software_breakpoint(*pending_bp_toggle_va);
@@ -391,11 +421,86 @@ void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
     } else if (view == PreferredView::Hex) {
         hex_panel_.set_visible(true);
         activate_panel("Hex View");
-    } else {
+    } else if (view == PreferredView::Disassembly) {
         show_disassembly_panel_ = true;
         focus_listing_ = true;
     }
     navigation_history_.visit(current_selection_);
+}
+
+void UiApp::dispatch_entity_context_action(
+    ContextActionKind kind,
+    const InspectableEntity& entity) {
+    if (const auto clip = format_context_copy_payload(kind, entity); clip.has_value()) {
+        if (ImGui::GetCurrentContext() != nullptr) {
+            ImGui::SetClipboardText(clip->c_str());
+        }
+        return;
+    }
+
+    switch (kind) {
+        case ContextActionKind::FollowInHex:
+        case ContextActionKind::FollowInDisassembly:
+        case ContextActionKind::FollowInDecompiler:
+        case ContextActionKind::FollowInStructureView: {
+            (void)enqueue_context_navigation_action(
+                pending_navigations_,
+                kind,
+                entity,
+                model_has_static_image(model_));
+            return;
+        }
+        case ContextActionKind::AddBookmark: {
+            pending_navigations_.enqueue_custom([this, entity]() {
+                if (!model_.has_file()) {
+                    return;
+                }
+                const bool has_va = entity.va.has_value();
+                const bool has_off = entity.file_offset.has_value();
+                if (!has_va && !has_off) {
+                    return;
+                }
+                const bool is_off = !has_va && has_off;
+                const std::uint64_t addr = has_va ? *entity.va : *entity.file_offset;
+                std::string label = entity.symbol_or_label;
+                if (label.empty()) {
+                    label = is_off ? std::format("off_{:X}", addr) : std::format("loc_{:X}", addr);
+                }
+                model_.add_or_update_bookmark(Bookmark{
+                    .address = addr,
+                    .is_file_offset = is_off,
+                    .label = std::move(label),
+                    .category = "User",
+                    .note = {},
+                });
+                open_references();
+                Log().info("Added bookmark at {}{:X}", is_off ? "off+0x" : "0x", addr);
+            });
+            return;
+        }
+        case ContextActionKind::ToggleSoftwareBreakpoint: {
+            if (!entity.va.has_value()) {
+                return;
+            }
+            const std::uint64_t bp_va = *entity.va;
+            pending_navigations_.enqueue_custom([this, bp_va]() {
+                if (!model_.is_debug_session()) {
+                    return;
+                }
+                if (auto r = model_.toggle_software_breakpoint(bp_va); r) {
+                    Log().info("{} software breakpoint at 0x{:X}", *r ? "Set" : "Removed", bp_va);
+                } else {
+                    Log().error("Breakpoint toggle at 0x{:X}: {}", bp_va, r.error().message);
+                }
+            });
+            return;
+        }
+        case ContextActionKind::CopyVirtualAddress:
+        case ContextActionKind::CopyFileOffset:
+        case ContextActionKind::CopyLabel:
+        case ContextActionKind::CopyJsonSummary:
+            return;
+    }
 }
 
 void UiApp::enqueue_navigation(std::uint64_t address,
@@ -418,6 +523,9 @@ void UiApp::drain_pending_navigations() {
                 if (req.request_decompile) {
                     request_decompile();
                 }
+                if (req.open_structure_view) {
+                    open_structure_view({}, req.target, false);
+                }
                 break;
             }
             case DeferredNavigationRequest::Kind::Offset: {
@@ -432,12 +540,22 @@ void UiApp::drain_pending_navigations() {
                     .file_offset = req.target,
                     .virtual_address = va,
                     .size = sz,
-                    .preferred_view = PreferredView::Hex,
+                    .preferred_view = req.preferred_view,
                 };
-                hex_panel_.set_visible(true);
-                hex_panel_.navigate_to_range(req.target, sz);
-                if (va) {
-                    disassemble_at_offset(req.target, *va);
+                if (req.preferred_view == PreferredView::Disassembly) {
+                    disassemble_at_offset(req.target, va.value_or(req.target));
+                    show_disassembly_panel_ = true;
+                    focus_listing_ = true;
+                } else if (req.open_structure_view) {
+                    hex_panel_.navigate_to_range(req.target, sz);
+                    open_structure_view({}, req.target, true);
+                } else {
+                    hex_panel_.set_visible(true);
+                    hex_panel_.navigate_to_range(req.target, sz);
+                    activate_panel("Hex View");
+                    if (va) {
+                        disassemble_at_offset(req.target, *va);
+                    }
                 }
                 last_navigation_selection_ = current_selection_;
                 break;

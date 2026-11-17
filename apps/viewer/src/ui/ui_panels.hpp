@@ -13,6 +13,7 @@
 #include "symbols/symbol_index.hpp"
 #include "tools/shellcode_converter.hpp"
 #include "ui_panel.hpp"
+#include "ui/ui_context_menu.hpp"
 #include "analysis/patch_preview.hpp"
 #include "navigation/byte_range.hpp"
 
@@ -34,6 +35,9 @@ namespace viewer {
         void set_slice_selected_callback(std::function<void(std::size_t)> cb) {
             on_slice_selected_ = std::move(cb);
         }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
@@ -43,6 +47,7 @@ namespace viewer {
         std::function<void()> on_detach_requested_;
         std::function<void()> on_pause_toggle_;
         std::function<void(std::size_t)> on_slice_selected_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class MemoryMapPanel : public UiPanel {
@@ -58,6 +63,9 @@ namespace viewer {
         void set_region_activated_callback(
             std::function<void(std::size_t region_index, bool prefer_module_context)> cb) {
             on_region_activated_ = std::move(cb);
+        }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
         }
     protected:
         void draw_contents() override;
@@ -77,6 +85,7 @@ namespace viewer {
         std::function<void()> on_pause_toggle_;
         std::function<void(std::size_t)> on_module_selected_;
         std::function<void(std::size_t, bool)> on_region_activated_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class StructureNavigatorPanel : public UiPanel {
@@ -108,12 +117,16 @@ namespace viewer {
             std::function<void(const peelf::Section& section, std::uint64_t object_index)> cb) {
             on_section_activated_ = std::move(cb);
         }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
         std::function<void(const peelf::Section& section, std::uint64_t object_index)> on_section_activated_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class HexViewPanel : public UiPanel {
@@ -232,6 +245,9 @@ namespace viewer {
     class DisassemblyPanel : public UiPanel {
     public:
         explicit DisassemblyPanel(BinaryModel& model, std::vector<Instruction>& instructions);
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
         std::vector<Instruction>& current_instructions_;
     protected:
         void draw_contents() override;
@@ -239,6 +255,7 @@ namespace viewer {
 
     private:
         BinaryModel& model_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class SymbolsPanel : public UiPanel {
@@ -254,6 +271,9 @@ namespace viewer {
         void set_demangle_changed_callback(std::function<void(bool)> cb) {
             on_demangle_changed_ = std::move(cb);
         }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
@@ -268,6 +288,7 @@ namespace viewer {
         std::function<std::string(const SymbolRecord&)> display_name_resolver_;
         std::function<void(const SymbolRecord& symbol, std::uint64_t object_index)> on_symbol_activated_;
         std::function<void(bool)> on_demangle_changed_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class ImportsPanel : public UiPanel {
@@ -277,12 +298,16 @@ namespace viewer {
             std::function<void(const peelf::ImportEntry& entry, std::uint64_t object_index)> cb) {
             on_import_activated_ = std::move(cb);
         }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
         std::function<void(const peelf::ImportEntry& entry, std::uint64_t object_index)> on_import_activated_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class ExportsPanel : public UiPanel {
@@ -292,12 +317,16 @@ namespace viewer {
             std::function<void(const peelf::ExportEntry& entry, std::uint64_t object_index)> cb) {
             on_export_activated_ = std::move(cb);
         }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         BinaryModel& model_;
         char filter_buf_[128] = {};
         std::function<void(const peelf::ExportEntry& entry, std::uint64_t object_index)> on_export_activated_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class LogPanel : public UiPanel {
@@ -437,6 +466,9 @@ namespace viewer {
             std::function<void(std::uint64_t virtual_address, PreferredView view)> cb) {
             on_address_activated_ = std::move(cb);
         }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
@@ -445,6 +477,7 @@ namespace viewer {
         char audit_filter_buf_[128] = {};
         int audit_severity_filter_ = 0; // 0 = All, 1 = Warnings & Errors, 2 = Errors Only
         std::function<void(std::uint64_t, PreferredView)> on_address_activated_;
+        EntityContextActionCallback on_context_action_;
     };
 
     class HandlersPanel : public UiPanel {

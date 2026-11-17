@@ -26,6 +26,7 @@ namespace viewer {
                 ? std::optional<std::uint64_t>(model_.debug_session()->stop_status().instruction_pointer)
                 : std::nullopt;
 
+        std::optional<PendingEntityContextAction> pending_ctx_action;
         if (ImGui::BeginTable("Instructions", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
             for (const char* column : {"BP", "Address", "Bytes", "Mnemonic", "Operands", "Comment"}) ImGui::TableSetupColumn(column);
             ImGui::TableHeadersRow();
@@ -46,7 +47,30 @@ namespace viewer {
                         ImGui::TextColored(ImVec4(0.25f, 0.92f, 0.98f, 1.0f), "▶");
                     }
                     ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(std::format("{:016X}", instruction.address).c_str());
+                    ImGui::PushID(row);
+                    const std::string addr_str = std::format("{:016X}", instruction.address);
+                    (void)ImGui::Selectable(addr_str.c_str(), false);
+                    draw_inspectable_entity_context_menu(
+                        "DisasmPanelRowCtx",
+                        model_,
+                        pending_ctx_action,
+                        [&]() -> InspectableEntity {
+                            const bool static_img = model_has_static_image(model_);
+                            return InspectableEntity{
+                                .va = instruction.address,
+                                .file_offset = static_img
+                                    ? model_.virtual_address_to_offset(instruction.address)
+                                    : std::nullopt,
+                                .size = instruction.bytes.size(),
+                                .symbol_or_label = instruction.to_string(),
+                                .module_name = model_.file_info().path,
+                                .extra_json_fields = {
+                                    {"mnemonic", instruction.mnemonic},
+                                    {"operands", instruction.operands},
+                                },
+                            };
+                        });
+                    ImGui::PopID();
                     ImGui::TableNextColumn();
                     std::string bytes;
                     for (auto byte : instruction.bytes) bytes += std::format("{:02X} ", byte);
@@ -63,6 +87,9 @@ namespace viewer {
         }
 
         ImGui::EndChild();
+        if (pending_ctx_action.has_value() && on_context_action_) {
+            on_context_action_(pending_ctx_action->kind, pending_ctx_action->entity);
+        }
     }
 
 } // namespace viewer

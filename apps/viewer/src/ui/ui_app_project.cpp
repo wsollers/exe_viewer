@@ -79,6 +79,8 @@ void UiApp::poll_project_autosave(bool force_now) {
     std::size_t layout_size = 0;
     const char* layout_ptr = ImGui::GetCurrentContext() ? ImGui::SaveIniSettingsToMemory(&layout_size) : nullptr;
     std::string layout_str = layout_ptr ? std::string(layout_ptr, layout_size) : std::string{};
+    layout_str = stamp_workspace_layout_metadata(
+        layout_str, active_workspace_preset_, kWorkspaceLayoutSchemaVersion);
     const AnalysisProject snapshot = build_analysis_project(
         model_,
         current_project_path_,
@@ -128,8 +130,24 @@ void UiApp::apply_loaded_project_metadata(const AnalysisProject& project) {
         }
         navigation_history_.restore(project.history, project.cursor);
     }
-    if (!project.layout.empty() && ImGui::GetCurrentContext() != nullptr) {
-        ImGui::LoadIniSettingsFromMemory(project.layout.c_str(), project.layout.size());
+    if (!project.layout.empty()) {
+        const PersistedWorkspaceLayoutMetadata meta = parse_workspace_layout_metadata(project.layout);
+        if (should_migrate_workspace_layout_ini(project.layout)) {
+            active_workspace_preset_ = meta.active_preset;
+            pending_workspace_preset_ = meta.active_preset;
+            loaded_layout_schema_version_ = kWorkspaceLayoutSchemaVersion;
+            Log().info(
+                "Project layout schema v{} differs from v{}; migrating to '{}' workspace preset",
+                meta.schema_version,
+                kWorkspaceLayoutSchemaVersion,
+                workspace_preset_display_name(meta.active_preset));
+        } else {
+            active_workspace_preset_ = meta.active_preset;
+            loaded_layout_schema_version_ = meta.schema_version;
+            if (ImGui::GetCurrentContext() != nullptr) {
+                ImGui::LoadIniSettingsFromMemory(project.layout.c_str(), project.layout.size());
+            }
+        }
     }
     focus_workspace_ = false;
     references_dirty_ = true;
@@ -160,6 +178,8 @@ peelf::Result<void> UiApp::save_project(const std::filesystem::path& path) {
     std::size_t size = 0;
     const char* layout = ImGui::GetCurrentContext() ? ImGui::SaveIniSettingsToMemory(&size) : nullptr;
     std::string layout_str = layout ? std::string(layout, size) : std::string{};
+    layout_str = stamp_workspace_layout_metadata(
+        layout_str, active_workspace_preset_, kWorkspaceLayoutSchemaVersion);
     const AnalysisProject project = build_analysis_project(
         model_,
         path,

@@ -85,6 +85,7 @@ void SymbolsPanel::draw_contents() {
                 if (selected_index == i) selected_row = static_cast<int>(matches.size());
                 matches.push_back(i);
             }
+        std::optional<PendingEntityContextAction> pending_ctx_action;
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(matches.size()));
         if (selected_row && last_scrolled_selected_ != selected_index)
@@ -105,6 +106,32 @@ void SymbolsPanel::draw_contents() {
                     on_symbol_activated_(symbol, row_id);
                 }
             }
+            draw_inspectable_entity_context_menu(
+                "SymbolRowCtx",
+                model_,
+                pending_ctx_action,
+                [&]() -> InspectableEntity {
+                    const bool static_img = model_has_static_image(model_);
+                    const char* src_kind = "image_symbol";
+                    switch (symbol.source) {
+                        case SymbolSource::DebugSymbol: src_kind = "debug_symbol"; break;
+                        case SymbolSource::Import:      src_kind = "import"; break;
+                        case SymbolSource::Export:      src_kind = "export"; break;
+                        case SymbolSource::EntryPoint:  src_kind = "entry_point"; break;
+                        case SymbolSource::ImageSymbol: break;
+                    }
+                    return InspectableEntity{
+                        .va = symbol.virtual_address,
+                        .file_offset = static_img ? symbol.file_offset : std::nullopt,
+                        .size = symbol.size,
+                        .symbol_or_label = resolved_name,
+                        .module_name = !symbol.library.empty() ? symbol.library : model_.file_info().path,
+                        .extra_json_fields = {
+                            {"raw_name", !symbol.raw_name.empty() ? symbol.raw_name : symbol.name},
+                            {"source", src_kind},
+                        },
+                    };
+                });
             if (ImGui::IsItemHovered()) {
                 const std::string& raw = !symbol.raw_name.empty() ? symbol.raw_name : symbol.name;
                 const SourceLineMapping* src = symbol.virtual_address
@@ -143,6 +170,9 @@ void SymbolsPanel::draw_contents() {
         }
 
         ImGui::EndTable();
+        if (pending_ctx_action.has_value() && on_context_action_) {
+            on_context_action_(pending_ctx_action->kind, pending_ctx_action->entity);
+        }
     }
 }
 

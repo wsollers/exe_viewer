@@ -15,6 +15,8 @@
 #include "model/binary_model.hpp"
 #include "model/recent_binaries.hpp"
 #include "ui_panels.hpp"
+#include "ui/context_actions.hpp"
+#include "ui/workspace_layout.hpp"
 #include "ui_panels_references.hpp"
 #include "ui_panels_strings.hpp"
 #include "ui_panels_struct_view.hpp"
@@ -87,6 +89,13 @@ namespace viewer {
                                 std::size_t highlight_size = 0,
                                 bool request_decompile = false);
 
+        void request_workspace_preset(WorkspacePreset preset) noexcept;
+        void request_workspace_reset() noexcept;
+        [[nodiscard]] WorkspacePreset active_workspace_preset() const noexcept {
+            return active_workspace_preset_;
+        }
+        void dispatch_entity_context_action(ContextActionKind kind, const InspectableEntity& entity);
+
         ImVec4 get_mnemonic_color(const std::string &mnemonic) const;
 
         void disassemble_section(const std::string &section_name, std::size_t max_size);
@@ -135,6 +144,11 @@ namespace viewer {
         bool focus_graph_ = false;
         bool focus_workspace_ = true;
         bool focus_listing_ = false;
+        WorkspacePreset active_workspace_preset_ = WorkspacePreset::StaticReverseEngineering;
+        std::optional<WorkspacePreset> pending_workspace_preset_;
+        std::uint32_t loaded_layout_schema_version_ = 0u;
+        bool workspace_layout_checked_ = false;
+        std::vector<WorkspacePanelId> pending_preset_active_tabs_;
         BinaryModel& model_;
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
@@ -315,6 +329,10 @@ namespace viewer {
                                                       double graph_max_y,
                                                       const ImVec2& mouse_pos) const;
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
+        void register_workspace_settings_handler();
+        void apply_workspace_preset(WorkspacePreset preset, ImGuiID dockspace_id, const ImVec2& dockspace_size);
+        void set_workspace_panel_visible(WorkspacePanelId panel, bool visible) noexcept;
+        [[nodiscard]] bool is_workspace_panel_visible(WorkspacePanelId panel) const noexcept;
         void apply_structure_selection_navigation();
 
 
