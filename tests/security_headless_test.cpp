@@ -213,6 +213,8 @@ struct ElfSecuritySpec {
     bool rwx_segment{false};
     std::string rpath{};
     std::string runpath{"/usr/lib/myapp"};
+    bool emit_empty_rpath{false};
+    bool emit_empty_runpath{false};
     bool has_cet_note{true};
     std::uint8_t code_imm{0x2Au};
 };
@@ -323,8 +325,8 @@ std::vector<std::uint8_t> build_elf64_security_fixture(const ElfSecuritySpec& sp
 
     push_dyn(5u, dynstr_va);            // DT_STRTAB
     push_dyn(10u, dynstr.size());       // DT_STRSZ
-    if (!spec.rpath.empty()) push_dyn(15u, rpath_off);
-    if (!spec.runpath.empty()) push_dyn(29u, runpath_off);
+    if (!spec.rpath.empty() || spec.emit_empty_rpath) push_dyn(15u, rpath_off);
+    if (!spec.runpath.empty() || spec.emit_empty_runpath) push_dyn(29u, runpath_off);
     std::uint64_t flags_1 = 0u;
     if (spec.pie) flags_1 |= 0x08000000ull;      // DF_1_PIE
     if (spec.bind_now) flags_1 |= 0x00000001ull; // DF_1_NOW
@@ -681,6 +683,70 @@ TEST(SecurityAuditTest, LiveProcessRulesDetectRwxUnbackedExecAndDisabledMitigati
 
     EXPECT_EQ(find_rule(bad_live, "LIVE3002")->severity, peelf::SecuritySeverity::Warning);
     EXPECT_EQ(find_rule(bad_live, "LIVE3003")->severity, peelf::SecuritySeverity::Error);
+
+    // Indeterminate live profile: empty ProcessSecurityProfile (no observed telemetry) must report Note, not Pass!
+    peelf::ProcessSecurityProfile empty_prof{};
+    const auto empty_live = peelf::audit_live_process_security(clean_sess, &empty_prof);
+    const auto* l3003_empty = find_rule(empty_live, "LIVE3003");
+    ASSERT_NE(l3003_empty, nullptr);
+    EXPECT_EQ(l3003_empty->severity, peelf::SecuritySeverity::Note);
+}
+
+TEST(SecurityAuditTest, DetectsEmptyColonRpathCwdHazardAndStrippedPeRelocations) {
+    // 1. ELF2007: empty DT_RPATH (""), empty DT_RUNPATH (""), consecutive colons ("::"),
+    //    leading colon (":/usr/lib"), and trailing colon ("/usr/lib:") all imply CWD loading!
+    {
+        ElfSecuritySpec empty_rpath_spec;
+        empty_rpath_spec.runpath.clear();
+        empty_rpath_spec.emit_empty_rpath = true;
+        const auto raw = build_elf64_security_fixture(empty_rpath_spec);
+        const auto img = peelf::parse_image(raw);
+        ASSERT_TRUE(img.has_value()) << img.error().message;
+        const auto report = peelf::audit_security(**img, raw);
+        const auto* elf2007 = find_rule(report, "ELF2007");
+        ASSERT_NE(elf2007, nullptr);
+        EXPECT_EQ(elf2007->severity, peelf::SecuritySeverity::Error);
+    }
+    {
+        ElfSecuritySpec empty_runpath_spec;
+        empty_runpath_spec.runpath.clear();
+        empty_runpath_spec.emit_empty_runpath = true;
+        const auto raw = build_elf64_security_fixture(empty_runpath_spec);
+        const auto img = peelf::parse_image(raw);
+        ASSERT_TRUE(img.has_value()) << img.error().message;
+        const auto report = peelf::audit_security(**img, raw);
+        const auto* elf2007 = find_rule(report, "ELF2007");
+        ASSERT_NE(elf2007, nullptr);
+        EXPECT_EQ(elf2007->severity, peelf::SecuritySeverity::Error);
+    }
+    for (std::string_view colon_path : {"/usr/lib::/opt/lib", ":/usr/lib", "/usr/lib:"}) {
+        ElfSecuritySpec colon_spec;
+        colon_spec.rpath = std::string(colon_path);
+        colon_spec.runpath.clear();
+        const auto raw = build_elf64_security_fixture(colon_spec);
+        const auto img = peelf::parse_image(raw);
+        ASSERT_TRUE(img.has_value()) << img.error().message;
+        const auto report = peelf::audit_security(**img, raw);
+        const auto* elf2007 = find_rule(report, "ELF2007");
+        ASSERT_NE(elf2007, nullptr) << colon_path;
+        EXPECT_EQ(elf2007->severity, peelf::SecuritySeverity::Error) << colon_path;
+    }
+
+    // 2. PE1001: setting IMAGE_FILE_RELOCS_STRIPPED (0x0001) on a PE64 image that otherwise has
+    //    DYNAMIC_BASE | HIGH_ENTROPY_VA set must fail PE1001 as Error!
+    {
+        auto stripped_pe = build_hardened_pe64();
+        put16(stripped_pe, 0x96u, 0x0023u); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | RELOCS_STRIPPED
+        const auto img = peelf::parse_image(stripped_pe);
+        ASSERT_TRUE(img.has_value()) << img.error().message;
+        const auto report = peelf::audit_security(**img, stripped_pe);
+        const auto* pe1001 = find_rule(report, "PE1001");
+        ASSERT_NE(pe1001, nullptr);
+        EXPECT_EQ(pe1001->severity, peelf::SecuritySeverity::Error);
+        EXPECT_EQ(pe1001->subject, "FileHeader.Characteristics");
+        EXPECT_EQ(pe1001->file_offset, std::optional<std::uint64_t>(0x96u));
+        EXPECT_NE(pe1001->evidence.find("RELOCS_STRIPPED=1"), std::string::npos);
+    }
 }
 
 TEST(SecurityHeadlessCliTest, JsonSarifComparePolicyGatesAndBinaryModelIntegration) {

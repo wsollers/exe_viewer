@@ -1,24 +1,12 @@
 #include "peelf/patching.hpp"
 
+#include "atomic_file_writer.hpp"
+
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <format>
 #include <fstream>
 #include <limits>
 #include <utility>
-
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <unistd.h>
-#endif
 
 namespace peelf {
 namespace {
@@ -29,56 +17,6 @@ namespace {
 
 [[nodiscard]] std::uint64_t span_end(std::uint64_t offset, std::uint64_t size) noexcept {
     return offset + size;
-}
-
-struct TempFileGuard {
-    std::filesystem::path path;
-    bool active{true};
-
-    explicit TempFileGuard(std::filesystem::path p) : path(std::move(p)) {}
-
-    ~TempFileGuard() {
-        if (active && !path.empty()) {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-        }
-    }
-
-    TempFileGuard(const TempFileGuard&) = delete;
-    TempFileGuard& operator=(const TempFileGuard&) = delete;
-
-    void release() noexcept { active = false; }
-};
-
-[[nodiscard]] std::uint64_t current_process_tag() noexcept {
-#ifdef _WIN32
-    return static_cast<std::uint64_t>(GetCurrentProcessId());
-#else
-    return static_cast<std::uint64_t>(::getpid());
-#endif
-}
-
-[[nodiscard]] std::filesystem::path make_unique_sibling_temp_path(
-    const std::filesystem::path& output_base,
-    const std::filesystem::path& filename) {
-    static std::atomic<std::uint64_t> counter{0};
-    const std::uint64_t pid = current_process_tag();
-    const std::filesystem::path base_name =
-        filename.empty() ? std::filesystem::path("patched.bin") : filename;
-    for (unsigned attempt = 0; attempt < 64u; ++attempt) {
-        const auto ticks = static_cast<std::uint64_t>(
-            std::chrono::steady_clock::now().time_since_epoch().count());
-        const std::uint64_t seq = ++counter;
-        std::filesystem::path candidate = output_base / base_name;
-        candidate += std::format(".{}-{}-{}.tmp", pid, ticks, seq);
-        std::error_code ec;
-        if (!std::filesystem::exists(candidate, ec) && !ec) {
-            return candidate;
-        }
-    }
-    std::filesystem::path fallback = output_base / base_name;
-    fallback += std::format(".{}-{}.tmp", pid, ++counter);
-    return fallback;
 }
 
 void rebuild_committed_interval_into(
@@ -618,40 +556,27 @@ Result<void> PagedBinaryImage::save_as(const std::filesystem::path& output_path,
     if (same_file && !overwrite) {
         return make_error("refusing to overwrite the input file");
     }
-    if (!overwrite && output_exists) {
-        return make_error("output file already exists");
+
+    auto writer = detail::AtomicFileWriter::open(output_path, false);
+    if (!writer) {
+        return std::unexpected(writer.error());
     }
 
-    const std::filesystem::path temp_path =
-        make_unique_sibling_temp_path(output_base, output_path.filename());
-    TempFileGuard temp_guard{temp_path};
-
-    {
-        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-        if (!output) {
-            return make_error("failed to open temporary output file");
+    std::uint64_t offset = 0;
+    while (offset < size_) {
+        const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
+        auto bytes = read_effective(offset, chunk_size);
+        if (!bytes) {
+            return std::unexpected(bytes.error());
         }
-
-        std::uint64_t offset = 0;
-        while (offset < size_) {
-            const std::uint64_t chunk_size = std::min<std::uint64_t>(page_size_, size_ - offset);
-            auto bytes = read_effective(offset, chunk_size);
-            if (!bytes) {
-                return std::unexpected(bytes.error());
-            }
-            output.write(reinterpret_cast<const char*>(bytes->data()),
-                         static_cast<std::streamsize>(bytes->size()));
-            if (!output) {
-                return make_error("failed to write output file");
-            }
-            offset += chunk_size;
+        if (auto wr = writer->write(*bytes); !wr) {
+            return wr;
         }
+        offset += chunk_size;
+    }
 
-        output.flush();
-        output.close();
-        if (!output) {
-            return make_error("failed to flush output file");
-        }
+    if (auto flushed = writer->flush_and_close(); !flushed) {
+        return flushed;
     }
 
     const bool reopen_backing_stream = same_file && input_.is_open();
@@ -659,28 +584,24 @@ Result<void> PagedBinaryImage::save_as(const std::filesystem::path& output_path,
         input_.close();
     }
 
-    std::error_code replace_ec;
-#ifdef _WIN32
-    if (!MoveFileExW(temp_path.c_str(),
-                     output_path.c_str(),
-                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        replace_ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
-    }
-#else
-    std::filesystem::rename(temp_path, output_path, replace_ec);
-#endif
-    if (replace_ec) {
+    if (auto committed = writer->commit(overwrite); !committed) {
         if (reopen_backing_stream) {
             input_.clear();
             input_.open(path_, std::ios::binary);
         }
-        return make_error("failed to replace output file");
+        return committed;
     }
 
-    temp_guard.release();
+    std::error_code post_eq_ec;
+    const bool backing_replaced =
+        (normalized_input == normalized_output) ||
+        (std::filesystem::equivalent(path_, output_path, post_eq_ec) && !post_eq_ec);
 
-    if (same_file) {
+    if (backing_replaced) {
         page_cache_.clear();
+        patches_.clear();
+    }
+    if (reopen_backing_stream || backing_replaced) {
         input_.clear();
         input_.open(path_, std::ios::binary);
         if (!input_) {
@@ -1163,26 +1084,31 @@ Result<std::size_t> LiveMemoryPatchSpace::commit_to_process(IProcessSession& ses
         return std::size_t{0};
     }
 
-    // Stage all map/vector allocations into local copies before writing to target RAM
-    // so neither allocation failure nor partial write_memory failure leaves state inconsistent.
+    struct WritePlan {
+        std::uint64_t address{0};
+        std::vector<std::uint8_t> pre_write_live;
+        std::span<const std::uint8_t> patched;
+    };
+
+    // Snapshot every target interval's current live bytes and prepare map updates
+    // up front so neither allocation failure nor partial/failed write_memory leaves
+    // target RAM or tracking maps inconsistent.
     auto next_orig = original_ram_;
+    std::vector<WritePlan> plans;
+    plans.reserve(staged_.size());
     for (const auto& [addr, interval] : staged_) {
-        bool missing_any = false;
+        auto current = read_live_baseline(session, addr, interval.patched.size());
+        if (!current) {
+            return std::unexpected(current.error());
+        }
         for (std::size_t i = 0; i < interval.patched.size(); ++i) {
-            if (!next_orig.contains(addr + static_cast<std::uint64_t>(i))) {
-                missing_any = true;
-                break;
-            }
+            next_orig.try_emplace(addr + static_cast<std::uint64_t>(i), (*current)[i]);
         }
-        if (missing_any) {
-            auto current = read_live_baseline(session, addr, interval.patched.size());
-            if (!current) {
-                return std::unexpected(current.error());
-            }
-            for (std::size_t i = 0; i < interval.patched.size(); ++i) {
-                next_orig.try_emplace(addr + static_cast<std::uint64_t>(i), (*current)[i]);
-            }
-        }
+        plans.push_back(WritePlan{
+            .address = addr,
+            .pre_write_live = std::move(*current),
+            .patched = interval.patched,
+        });
     }
 
     auto next_committed = committed_;
@@ -1190,28 +1116,29 @@ Result<std::size_t> LiveMemoryPatchSpace::commit_to_process(IProcessSession& ses
         rebuild_committed_interval_into(next_committed, next_orig, addr, interval.patched);
     }
 
-    struct AppliedSpan {
-        std::uint64_t address{0};
-        const std::vector<std::uint8_t>* previous_live{nullptr};
-    };
-
-    std::vector<AppliedSpan> applied;
-    applied.reserve(staged_.size());
     std::size_t total_bytes = 0;
-
-    for (const auto& [addr, interval] : staged_) {
-        auto write_res = session.write_memory(addr, interval.patched, options);
-        if (!write_res || *write_res != interval.patched.size()) {
-            // Best-effort rollback of any intervals already written in this transaction.
-            for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
-                (void)session.write_memory(it->address, *it->previous_live, options);
+    for (std::size_t idx = 0; idx < plans.size(); ++idx) {
+        const WritePlan& plan = plans[idx];
+        auto write_res = session.write_memory(plan.address, plan.patched, options);
+        if (!write_res || *write_res != plan.patched.size()) {
+            // Roll back any bytes touched in the current interval, then all previously applied intervals.
+            const std::size_t current_rollback_len =
+                write_res ? std::min(*write_res, plan.pre_write_live.size())
+                          : plan.pre_write_live.size();
+            if (current_rollback_len > 0u) {
+                (void)session.write_memory(
+                    plan.address,
+                    std::span<const std::uint8_t>(plan.pre_write_live).first(current_rollback_len),
+                    options);
+            }
+            for (std::size_t rev = idx; rev-- > 0u;) {
+                (void)session.write_memory(plans[rev].address, plans[rev].pre_write_live, options);
             }
             return make_error(write_res ? "partial write while committing patch to process memory"
                                         : std::string(write_res.error().message));
         }
 
-        applied.push_back(AppliedSpan{addr, &interval.original});
-        total_bytes += interval.patched.size();
+        total_bytes += plan.patched.size();
     }
 
     original_ram_.swap(next_orig);
@@ -1239,6 +1166,15 @@ Result<std::size_t> LiveMemoryPatchSpace::revert_committed(IProcessSession& sess
     for (const auto& [addr, interval] : committed_) {
         auto write_res = session.write_memory(addr, interval.original, options);
         if (!write_res || *write_res != interval.original.size()) {
+            const std::size_t current_rollback_len =
+                write_res ? std::min(*write_res, interval.committed.size())
+                          : interval.committed.size();
+            if (current_rollback_len > 0u) {
+                (void)session.write_memory(
+                    addr,
+                    std::span<const std::uint8_t>(interval.committed).first(current_rollback_len),
+                    options);
+            }
             for (auto it = reverted.rbegin(); it != reverted.rend(); ++it) {
                 (void)session.write_memory(it->address, *it->committed_bytes, options);
             }
@@ -1278,11 +1214,22 @@ Result<void> LiveMemoryPatchSpace::revert_committed_interval(IProcessSession& se
         orig_bytes[i] = it->second;
     }
 
+    auto pre_revert = read_live_baseline(session, address, len);
     auto next_committed = committed_;
     rebuild_committed_interval_into(next_committed, original_ram_, address, orig_bytes);
 
     auto write_res = session.write_memory(address, orig_bytes, options);
     if (!write_res || *write_res != orig_bytes.size()) {
+        if (pre_revert.has_value()) {
+            const std::size_t current_rollback_len =
+                write_res ? std::min(*write_res, pre_revert->size()) : pre_revert->size();
+            if (current_rollback_len > 0u) {
+                (void)session.write_memory(
+                    address,
+                    std::span<const std::uint8_t>(*pre_revert).first(current_rollback_len),
+                    options);
+            }
+        }
         return make_error(write_res ? "partial write while reverting committed RAM interval"
                                     : std::string(write_res.error().message));
     }

@@ -117,7 +117,7 @@ private:
     std::uint64_t size_{};
     std::uint64_t page_size_{default_page_size};
     mutable std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> page_cache_;
-    std::map<std::uint64_t, PatchInterval> patches_;
+    mutable std::map<std::uint64_t, PatchInterval> patches_;
     mutable std::ifstream input_;
     std::vector<std::vector<PatchEdit>> undo_stack_;
     std::vector<std::vector<PatchEdit>> redo_stack_;

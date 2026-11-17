@@ -391,3 +391,165 @@ TEST(LiveMemoryPatchSpace, TransactionalRollbackPreservesStateOnReadOrWriteFailu
     EXPECT_TRUE(space.has_committed_patches());
     EXPECT_FALSE(space.has_staged_patches());
 }
+
+TEST(PagedBinaryImage, NonDestructiveSavePreservesExistingTargetAndSelfOverwriteRebasesUndo) {
+    const std::vector<std::uint8_t> initial_src{0x10u, 0x20u, 0x30u, 0x40u, 0x50u, 0x60u, 0x70u, 0x80u};
+    const std::vector<std::uint8_t> existing_dest{0xDEu, 0xADu, 0xBEu, 0xEFu, 0xCAu, 0xFEu};
+
+    const std::filesystem::path src_path = write_temp_binary(initial_src);
+    const std::filesystem::path dest_path = write_temp_binary(existing_dest);
+    struct CleanupGuard {
+        std::filesystem::path a;
+        std::filesystem::path b;
+        CleanupGuard(std::filesystem::path first, std::filesystem::path second)
+            : a(std::move(first)), b(std::move(second)) {}
+        CleanupGuard(const CleanupGuard&) = delete;
+        CleanupGuard& operator=(const CleanupGuard&) = delete;
+        CleanupGuard(CleanupGuard&&) = delete;
+        CleanupGuard& operator=(CleanupGuard&&) = delete;
+        ~CleanupGuard() {
+            std::error_code ec;
+            std::filesystem::remove(a, ec);
+            std::filesystem::remove(b, ec);
+        }
+    } guard{src_path, dest_path};
+
+    auto image = peelf::PagedBinaryImage::open(src_path, 4u);
+    ASSERT_TRUE(image.has_value()) << image.error().message;
+
+    ASSERT_TRUE(image->apply_patch(1u, std::vector<std::uint8_t>{0xAAu, 0xBBu, 0xCCu}, "patch mid").has_value());
+    EXPECT_TRUE(image->dirty());
+
+    // 1. `save_as(dest_path, false)` must fail WITHOUT deleting or modifying `dest_path`.
+    EXPECT_FALSE(image->save_as(dest_path, false).has_value());
+    {
+        std::ifstream in(dest_path, std::ios::binary);
+        const std::vector<std::uint8_t> on_disk(
+            (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(on_disk, existing_dest);
+    }
+
+    // 2. `save_as(src_path, false)` must also fail and leave `src_path` untouched.
+    EXPECT_FALSE(image->save_as(src_path, false).has_value());
+    {
+        std::ifstream in(src_path, std::ios::binary);
+        const std::vector<std::uint8_t> on_disk(
+            (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(on_disk, initial_src);
+    }
+
+    // 3. `save_as(dest_path, true)` atomically replaces `dest_path` while `image` stays dirty relative to `src_path`.
+    ASSERT_TRUE(image->save_as(dest_path, true).has_value());
+    const std::vector<std::uint8_t> expected_patched{
+        0x10u, 0xAAu, 0xBBu, 0xCCu, 0x50u, 0x60u, 0x70u, 0x80u};
+    {
+        std::ifstream in(dest_path, std::ios::binary);
+        const std::vector<std::uint8_t> on_disk(
+            (std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_EQ(on_disk, expected_patched);
+    }
+    EXPECT_TRUE(image->dirty());
+
+    // 4. `save_as(src_path, true)` atomically replaces the backing file AND rebases `patches_` cleanly
+    //    so `dirty()` becomes false while `undo()` / `redo()` remain 100% self-consistent!
+    ASSERT_TRUE(image->save_as(src_path, true).has_value());
+    EXPECT_FALSE(image->dirty());
+    EXPECT_TRUE(image->changed_intervals().empty());
+    EXPECT_EQ(*image->read_original(0u, 8u), expected_patched);
+    EXPECT_EQ(*image->read_effective(0u, 8u), expected_patched);
+
+    ASSERT_TRUE(image->undo().has_value());
+    EXPECT_TRUE(image->dirty());
+    EXPECT_EQ(*image->read_effective(0u, 8u), initial_src);
+
+    ASSERT_TRUE(image->redo().has_value());
+    EXPECT_FALSE(image->dirty());
+    EXPECT_EQ(*image->read_effective(0u, 8u), expected_patched);
+}
+
+TEST(LiveMemoryPatchSpace, RollsBackCurrentPartiallyWrittenSpanAndPriorSpansOnWriteFailure) {
+    constexpr std::uint64_t kBase = 0x500000ull;
+
+    class PartialWriteLiveSession final : public peelf::IProcessSession {
+    public:
+        explicit PartialWriteLiveSession(std::vector<std::uint8_t> initial)
+            : ram_(std::move(initial)) {
+            info_.pid = 888;
+            info_.is_64bit = true;
+            info_.architecture = peelf::Architecture::X86_64;
+            info_.access = peelf::ProcessAccessStatus::Accessible;
+        }
+
+        [[nodiscard]] const peelf::ProcessInfo& info() const noexcept override { return info_; }
+        [[nodiscard]] bool is_alive() const noexcept override { return true; }
+        [[nodiscard]] peelf::Result<std::vector<peelf::MemoryRegion>> memory_regions() override {
+            return std::vector<peelf::MemoryRegion>{};
+        }
+        [[nodiscard]] peelf::Result<std::vector<peelf::ModuleInfo>> modules() override {
+            return std::vector<peelf::ModuleInfo>{};
+        }
+        [[nodiscard]] peelf::Result<std::size_t> read_memory(
+            std::uint64_t address,
+            std::span<std::uint8_t> buffer) override {
+            if (address < kBase || (address - kBase) >= ram_.size()) {
+                return peelf::make_error("unmapped");
+            }
+            const auto off = static_cast<std::size_t>(address - kBase);
+            const std::size_t n = std::min(buffer.size(), ram_.size() - off);
+            std::copy_n(ram_.begin() + static_cast<std::ptrdiff_t>(off), n, buffer.begin());
+            return n;
+        }
+        [[nodiscard]] peelf::Result<std::size_t> write_memory(
+            std::uint64_t address,
+            std::span<const std::uint8_t> data,
+            peelf::MemoryWriteOptions) override {
+            const auto off = static_cast<std::size_t>(address - kBase);
+            if (partial_fault_at.has_value() && address == *partial_fault_at && !fault_triggered) {
+                fault_triggered = true;
+                // Dirty the first 2 bytes of the target span before reporting a partial write / error!
+                const std::size_t dirty_len = std::min<std::size_t>(2u, data.size());
+                std::copy_n(data.begin(), dirty_len, ram_.begin() + static_cast<std::ptrdiff_t>(off));
+                if (return_error_after_dirty) {
+                    return peelf::make_error("mid-span page fault");
+                }
+                return dirty_len;
+            }
+            std::copy(data.begin(), data.end(), ram_.begin() + static_cast<std::ptrdiff_t>(off));
+            return data.size();
+        }
+
+        std::vector<std::uint8_t> ram_;
+        std::optional<std::uint64_t> partial_fault_at{};
+        bool return_error_after_dirty{false};
+        bool fault_triggered{false};
+
+    private:
+        peelf::ProcessInfo info_{};
+    };
+
+    std::vector<std::uint8_t> baseline(32u);
+    for (std::size_t i = 0; i < baseline.size(); ++i) {
+        baseline[i] = static_cast<std::uint8_t>(0x30u + i);
+    }
+
+    for (const bool error_mode : {false, true}) {
+        PartialWriteLiveSession session(baseline);
+        peelf::LiveMemoryPatchSpace space;
+
+        const std::array<peelf::PendingPatchWrite, 2> writes{{
+            {kBase + 0u, {0xA1u, 0xA2u, 0xA3u, 0xA4u}},
+            {kBase + 16u, {0xB1u, 0xB2u, 0xB3u, 0xB4u}},
+        }};
+        ASSERT_TRUE(space.stage_writes(session, writes, "atomic two-span commit").has_value());
+
+        session.partial_fault_at = kBase + 16u;
+        session.return_error_after_dirty = error_mode;
+        EXPECT_FALSE(space.commit_to_process(session).has_value());
+
+        // Both span #1 (0..4) AND the partially dirtied bytes of span #2 (16..20) must be rolled back!
+        EXPECT_EQ(session.ram_, baseline) << "mode=" << (error_mode ? "error" : "partial");
+        EXPECT_FALSE(space.has_committed_patches());
+        EXPECT_TRUE(space.has_staged_patches());
+    }
+}
+

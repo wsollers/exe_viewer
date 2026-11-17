@@ -30,6 +30,8 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/demangle.cpp
   src/dwarf.cpp
   src/subprocess.cpp
+  src/atomic_file_writer.hpp
+  src/atomic_file_writer.cpp
   src/assembler.cpp
   src/patching.cpp
   src/patch_bundle.cpp

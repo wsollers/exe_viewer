@@ -125,16 +125,35 @@ struct SplitSymbolWrapper {
     return true;
 }
 
-[[nodiscard]] std::string unescape_rust_legacy_segment(std::string_view seg) {
+[[nodiscard]] std::optional<std::string> unescape_rust_legacy_segment(
+    std::string_view seg,
+    std::size_t& remaining_budget) {
     std::string out;
-    out.reserve(seg.size());
+    out.reserve(std::min(seg.size(), remaining_budget));
+    const auto append_checked = [&](std::string_view piece) noexcept -> bool {
+        if (piece.size() > remaining_budget) {
+            return false;
+        }
+        remaining_budget -= piece.size();
+        out.append(piece);
+        return true;
+    };
+    const auto push_checked = [&](char ch) noexcept -> bool {
+        if (remaining_budget == 0) {
+            return false;
+        }
+        --remaining_budget;
+        out.push_back(ch);
+        return true;
+    };
+
     std::size_t i = 0;
     if (seg.starts_with('_') && seg.size() > 1 && seg[1] == '$') {
         i = 1; // Leading `_$` escape marker in Rust legacy identifiers
     }
-    while (i < seg.size() && out.size() < kMaxDemangledOutputLength) {
+    while (i < seg.size()) {
         if (i + 1 < seg.size() && seg[i] == '.' && seg[i + 1] == '.') {
-            out += "::";
+            if (!append_checked("::")) return std::nullopt;
             i += 2;
             continue;
         }
@@ -142,14 +161,14 @@ struct SplitSymbolWrapper {
             const std::size_t close = seg.find('$', i + 1);
             if (close != std::string_view::npos) {
                 const std::string_view tok = seg.substr(i + 1, close - i - 1);
-                if (tok == "SP") { out.push_back('@'); i = close + 1; continue; }
-                if (tok == "BP") { out.push_back('*'); i = close + 1; continue; }
-                if (tok == "RF") { out.push_back('&'); i = close + 1; continue; }
-                if (tok == "LT") { out.push_back('<'); i = close + 1; continue; }
-                if (tok == "GT") { out.push_back('>'); i = close + 1; continue; }
-                if (tok == "LP") { out.push_back('('); i = close + 1; continue; }
-                if (tok == "RP") { out.push_back(')'); i = close + 1; continue; }
-                if (tok == "C")  { out += ", ";        i = close + 1; continue; }
+                if (tok == "SP") { if (!push_checked('@')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "BP") { if (!push_checked('*')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "RF") { if (!push_checked('&')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "LT") { if (!push_checked('<')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "GT") { if (!push_checked('>')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "LP") { if (!push_checked('(')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "RP") { if (!push_checked(')')) return std::nullopt; i = close + 1; continue; }
+                if (tok == "C")  { if (!append_checked(", ")) return std::nullopt; i = close + 1; continue; }
                 if (tok.size() >= 2 && tok.size() <= 7 && tok[0] == 'u') {
                     std::uint32_t cp = 0;
                     bool ok = true;
@@ -159,14 +178,16 @@ struct SplitSymbolWrapper {
                         cp = (cp << 4u) | hv;
                     }
                     if (ok && cp <= 0x10FFFFu && !(cp >= 0xD800u && cp <= 0xDFFFu)) {
-                        append_utf8_cp(out, cp);
+                        std::string utf8_piece;
+                        append_utf8_cp(utf8_piece, cp);
+                        if (!append_checked(utf8_piece)) return std::nullopt;
                         i = close + 1;
                         continue;
                     }
                 }
             }
         }
-        out.push_back(seg[i]);
+        if (!push_checked(seg[i])) return std::nullopt;
         ++i;
     }
     return out;
@@ -198,10 +219,13 @@ struct SplitSymbolWrapper {
         std::size_t len = 0;
         while (pos < body.size() && is_ascii_digit(body[pos])) {
             const auto d = static_cast<std::size_t>(body[pos] - '0');
-            if (len > (body.size() - d) / 10u) {
+            if (len > body.size()) {
                 return std::nullopt;
             }
             len = len * 10u + d;
+            if (len > body.size()) {
+                return std::nullopt;
+            }
             ++pos;
         }
         if (len == 0 || pos + len > body.size()) {
@@ -228,12 +252,21 @@ struct SplitSymbolWrapper {
         }
     }
 
+    std::size_t remaining_budget = kMaxDemangledOutputLength;
     std::string result;
     for (std::size_t i = 0; i < raw_parts.size(); ++i) {
         if (i > 0) {
+            if (remaining_budget < 2u) {
+                return std::nullopt;
+            }
+            remaining_budget -= 2u;
             result += "::";
         }
-        result += unescape_rust_legacy_segment(raw_parts[i]);
+        auto seg = unescape_rust_legacy_segment(raw_parts[i], remaining_budget);
+        if (!seg) {
+            return std::nullopt;
+        }
+        result += *seg;
         if (result.size() > kMaxDemangledOutputLength) {
             return std::nullopt;
         }
@@ -262,28 +295,49 @@ public:
         if (pos_ < s_.size() && s_[pos_] != '.') {
             const std::size_t saved = pos_;
             if (!parse_path(0)) {
+                if (out_overflow_) {
+                    return std::nullopt;
+                }
                 pos_ = saved;
             }
         }
         // Optional vendor suffix `.llvm.1234`
         std::string suffix;
         if (pos_ < s_.size() && s_[pos_] == '.') {
-            suffix = std::string(" (") + std::string(s_.substr(pos_ + 1)) + ")";
+            const std::string_view vendor = s_.substr(pos_ + 1);
+            if (!consume_budget(vendor.size() + 3u)) {
+                return std::nullopt;
+            }
+            suffix = std::string(" (") + std::string(vendor) + ")";
             pos_ = s_.size();
         }
-        if (pos_ != s_.size()) {
+        if (pos_ != s_.size() || out_overflow_) {
             return std::nullopt;
         }
-        return *path + suffix;
+        std::string out = *path + suffix;
+        if (!check_len(out)) {
+            return std::nullopt;
+        }
+        return out;
     }
 
 private:
     std::string_view s_;
     std::size_t pos_ = 0;
+    std::size_t budget_used_ = 0;
     bool out_overflow_ = false;
 
+    [[nodiscard]] bool consume_budget(std::size_t bytes) noexcept {
+        if (out_overflow_ || bytes > kMaxDemangledOutputLength - budget_used_) {
+            out_overflow_ = true;
+            return false;
+        }
+        budget_used_ += bytes;
+        return true;
+    }
+
     [[nodiscard]] bool check_len(std::string_view piece) noexcept {
-        if (piece.size() > kMaxDemangledOutputLength) {
+        if (out_overflow_ || piece.size() > kMaxDemangledOutputLength) {
             out_overflow_ = true;
             return false;
         }
@@ -349,6 +403,9 @@ private:
     }
 
     [[nodiscard]] std::optional<std::string> parse_ident() {
+        if (out_overflow_) {
+            return std::nullopt;
+        }
         bool is_punycode = false;
         if (pos_ < s_.size() && s_[pos_] == 'u') {
             is_punycode = true;
@@ -364,14 +421,18 @@ private:
         if (*len > s_.size() - pos_) {
             return std::nullopt;
         }
-        const std::string_view raw = s_.substr(pos_, static_cast<std::size_t>(*len));
-        pos_ += static_cast<std::size_t>(*len);
+        const auto ident_len = static_cast<std::size_t>(*len);
+        if (!consume_budget(ident_len)) {
+            return std::nullopt;
+        }
+        const std::string_view raw = s_.substr(pos_, ident_len);
+        pos_ += ident_len;
         (void)is_punycode;
         return std::string(raw);
     }
 
     [[nodiscard]] std::optional<std::string> parse_lifetime() {
-        if (pos_ >= s_.size() || s_[pos_] != 'L') {
+        if (out_overflow_ || pos_ >= s_.size() || s_[pos_] != 'L') {
             return std::nullopt;
         }
         ++pos_;
@@ -379,17 +440,21 @@ private:
         if (!idx) {
             return std::nullopt;
         }
-        if (*idx == 0) {
-            return std::string("'_");
+        std::string out = (*idx == 0) ? std::string("'_") : (std::string("'l") + std::to_string(*idx));
+        if (!consume_budget(out.size())) {
+            return std::nullopt;
         }
-        return std::string("'l") + std::to_string(*idx);
+        return out;
     }
 
     [[nodiscard]] std::optional<std::string> parse_const(std::size_t depth) {
-        if (depth > kMaxDemangleDepth || pos_ >= s_.size()) {
+        if (out_overflow_ || depth > kMaxDemangleDepth || pos_ >= s_.size()) {
             return std::nullopt;
         }
         if (s_[pos_] == 'B') {
+            if (!consume_budget(1u)) {
+                return std::nullopt;
+            }
             ++pos_;
             const std::size_t backref_origin = pos_ - 1;
             const auto target = parse_base62();
@@ -400,9 +465,15 @@ private:
             pos_ = static_cast<std::size_t>(*target);
             auto res = parse_const(depth + 1);
             pos_ = saved;
+            if (!res || !check_len(*res)) {
+                return std::nullopt;
+            }
             return res;
         }
         if (s_[pos_] == 'p') {
+            if (!consume_budget(1u)) {
+                return std::nullopt;
+            }
             ++pos_;
             return std::string("_");
         }
@@ -432,15 +503,18 @@ private:
             return std::nullopt;
         }
         ++pos_;
-        if (*ty == "bool") {
-            return val == 0 ? std::string("false") : std::string("true");
-        }
         (void)hex_start;
-        return (neg ? std::string("-") : std::string{}) + std::to_string(val);
+        std::string rendered = (*ty == "bool")
+            ? (val == 0 ? std::string("false") : std::string("true"))
+            : ((neg ? std::string("-") : std::string{}) + std::to_string(val));
+        if (!consume_budget(rendered.size())) {
+            return std::nullopt;
+        }
+        return rendered;
     }
 
     [[nodiscard]] std::optional<std::string> parse_generic_arg(std::size_t depth) {
-        if (depth > kMaxDemangleDepth || pos_ >= s_.size()) {
+        if (out_overflow_ || depth > kMaxDemangleDepth || pos_ >= s_.size()) {
             return std::nullopt;
         }
         if (s_[pos_] == 'L') {
@@ -454,7 +528,7 @@ private:
     }
 
     [[nodiscard]] std::optional<std::string> parse_path(std::size_t depth) {
-        if (depth > kMaxDemangleDepth || pos_ >= s_.size()) {
+        if (out_overflow_ || depth > kMaxDemangleDepth || pos_ >= s_.size()) {
             return std::nullopt;
         }
         const char tag = s_[pos_++];
@@ -468,8 +542,10 @@ private:
             if (!parse_opt_disambiguator()) return std::nullopt;
             if (!parse_path(depth + 1)) return std::nullopt;
             auto ty = parse_type(depth + 1);
-            if (!ty) return std::nullopt;
-            return "<" + *ty + ">";
+            if (!ty || !consume_budget(2u)) return std::nullopt;
+            std::string combined = "<" + *ty + ">";
+            if (!check_len(combined)) return std::nullopt;
+            return combined;
         }
         case 'X': {
             // Trait impl: `X <impl-path> <type> <trait-path>`
@@ -477,14 +553,18 @@ private:
             if (!parse_path(depth + 1)) return std::nullopt;
             auto ty = parse_type(depth + 1);
             auto tr = parse_path(depth + 1);
-            if (!ty || !tr) return std::nullopt;
-            return "<" + *ty + " as " + *tr + ">";
+            if (!ty || !tr || !consume_budget(6u)) return std::nullopt;
+            std::string combined = "<" + *ty + " as " + *tr + ">";
+            if (!check_len(combined)) return std::nullopt;
+            return combined;
         }
         case 'Y': {
             auto ty = parse_type(depth + 1);
             auto tr = parse_path(depth + 1);
-            if (!ty || !tr) return std::nullopt;
-            return "<" + *ty + " as " + *tr + ">";
+            if (!ty || !tr || !consume_budget(6u)) return std::nullopt;
+            std::string combined = "<" + *ty + " as " + *tr + ">";
+            if (!check_len(combined)) return std::nullopt;
+            return combined;
         }
         case 'N': {
             if (pos_ >= s_.size()) return std::nullopt;
@@ -497,15 +577,28 @@ private:
             if (!ident) return std::nullopt;
 
             std::string seg;
+            std::size_t extra_wrapper = 0;
             if (ns == 'C') {
-                seg = ident->empty()
-                    ? ("{closure#" + std::to_string(*disambig) + "}")
-                    : ("{closure:" + *ident + "}");
+                if (ident->empty()) {
+                    seg = "{closure#" + std::to_string(*disambig) + "}";
+                    extra_wrapper = seg.size();
+                } else {
+                    seg = "{closure:" + *ident + "}";
+                    extra_wrapper = 10u;
+                }
             } else if (ns == 'S') {
-                seg = ident->empty() ? "{shim}" : ("{" + *ident + "}");
+                if (ident->empty()) {
+                    seg = "{shim}";
+                    extra_wrapper = 6u;
+                } else {
+                    seg = "{" + *ident + "}";
+                    extra_wrapper = 2u;
+                }
             } else {
                 seg = *ident;
             }
+            const std::size_t sep_bytes = seg.empty() ? 0u : 2u;
+            if (!consume_budget(extra_wrapper + sep_bytes)) return std::nullopt;
             std::string combined = seg.empty() ? *parent : (*parent + "::" + seg);
             if (!check_len(combined)) return std::nullopt;
             return combined;
@@ -521,18 +614,25 @@ private:
             while (pos_ < s_.size() && s_[pos_] != 'E') {
                 auto arg = parse_generic_arg(depth + 1);
                 if (!arg) return std::nullopt;
-                if (!first) args += ", ";
+                if (!first) {
+                    if (!consume_budget(2u)) return std::nullopt;
+                    args += ", ";
+                }
                 first = false;
                 args += *arg;
                 if (!check_len(args)) return std::nullopt;
             }
             if (pos_ >= s_.size() || s_[pos_] != 'E') return std::nullopt;
             ++pos_;
+            if (!consume_budget(is_value_path ? 4u : 2u)) return std::nullopt;
             std::string combined = *base + (is_value_path ? "::<" : "<") + args + ">";
             if (!check_len(combined)) return std::nullopt;
             return combined;
         }
         case 'B': {
+            if (!consume_budget(1u)) {
+                return std::nullopt;
+            }
             const std::size_t backref_origin = pos_ - 1;
             const auto target = parse_base62();
             if (!target || *target >= backref_origin) {
@@ -542,6 +642,9 @@ private:
             pos_ = static_cast<std::size_t>(*target);
             auto res = parse_path(depth + 1);
             pos_ = saved;
+            if (!res || !check_len(*res)) {
+                return std::nullopt;
+            }
             return res;
         }
         default:
@@ -549,61 +652,81 @@ private:
         }
     }
 
+    [[nodiscard]] std::optional<std::string> emit_primitive(std::string_view lit) {
+        if (!consume_budget(lit.size())) {
+            return std::nullopt;
+        }
+        return std::string(lit);
+    }
+
     [[nodiscard]] std::optional<std::string> parse_type(std::size_t depth) {
-        if (depth > kMaxDemangleDepth || pos_ >= s_.size()) {
+        if (out_overflow_ || depth > kMaxDemangleDepth || pos_ >= s_.size()) {
             return std::nullopt;
         }
         const char tag = s_[pos_++];
         switch (tag) {
-        case 'a': return std::string("i8");
-        case 'b': return std::string("bool");
-        case 'c': return std::string("char");
-        case 'd': return std::string("f64");
-        case 'e': return std::string("str");
-        case 'f': return std::string("f32");
-        case 'h': return std::string("u8");
-        case 'i': return std::string("isize");
-        case 'j': return std::string("usize");
-        case 'l': return std::string("i32");
-        case 'm': return std::string("u32");
-        case 'n': return std::string("i128");
-        case 'o': return std::string("u128");
-        case 'p': return std::string("_");
-        case 's': return std::string("i16");
-        case 't': return std::string("u16");
-        case 'u': return std::string("()");
-        case 'v': return std::string("...");
-        case 'x': return std::string("i64");
-        case 'y': return std::string("u64");
-        case 'z': return std::string("!");
+        case 'a': return emit_primitive("i8");
+        case 'b': return emit_primitive("bool");
+        case 'c': return emit_primitive("char");
+        case 'd': return emit_primitive("f64");
+        case 'e': return emit_primitive("str");
+        case 'f': return emit_primitive("f32");
+        case 'h': return emit_primitive("u8");
+        case 'i': return emit_primitive("isize");
+        case 'j': return emit_primitive("usize");
+        case 'l': return emit_primitive("i32");
+        case 'm': return emit_primitive("u32");
+        case 'n': return emit_primitive("i128");
+        case 'o': return emit_primitive("u128");
+        case 'p': return emit_primitive("_");
+        case 's': return emit_primitive("i16");
+        case 't': return emit_primitive("u16");
+        case 'u': return emit_primitive("()");
+        case 'v': return emit_primitive("...");
+        case 'x': return emit_primitive("i64");
+        case 'y': return emit_primitive("u64");
+        case 'z': return emit_primitive("!");
         case 'R':
         case 'Q': {
             std::string lt;
             if (pos_ < s_.size() && s_[pos_] == 'L') {
                 auto parsed_lt = parse_lifetime();
                 if (!parsed_lt) return std::nullopt;
-                if (*parsed_lt != "'_") lt = *parsed_lt + " ";
+                if (*parsed_lt != "'_") {
+                    if (!consume_budget(1u)) return std::nullopt;
+                    lt = *parsed_lt + " ";
+                }
             }
             auto inner = parse_type(depth + 1);
             if (!inner) return std::nullopt;
-            return std::string("&") + lt + (tag == 'Q' ? "mut " : "") + *inner;
+            if (!consume_budget(tag == 'Q' ? 5u : 1u)) return std::nullopt;
+            std::string out = std::string("&") + lt + (tag == 'Q' ? "mut " : "") + *inner;
+            if (!check_len(out)) return std::nullopt;
+            return out;
         }
         case 'P':
         case 'O': {
             auto inner = parse_type(depth + 1);
             if (!inner) return std::nullopt;
-            return std::string(tag == 'O' ? "*mut " : "*const ") + *inner;
+            if (!consume_budget(tag == 'O' ? 5u : 7u)) return std::nullopt;
+            std::string out = std::string(tag == 'O' ? "*mut " : "*const ") + *inner;
+            if (!check_len(out)) return std::nullopt;
+            return out;
         }
         case 'S': {
             auto inner = parse_type(depth + 1);
-            if (!inner) return std::nullopt;
-            return "[" + *inner + "]";
+            if (!inner || !consume_budget(2u)) return std::nullopt;
+            std::string out = "[" + *inner + "]";
+            if (!check_len(out)) return std::nullopt;
+            return out;
         }
         case 'A': {
             auto inner = parse_type(depth + 1);
             auto len = parse_const(depth + 1);
-            if (!inner || !len) return std::nullopt;
-            return "[" + *inner + "; " + *len + "]";
+            if (!inner || !len || !consume_budget(4u)) return std::nullopt;
+            std::string out = "[" + *inner + "; " + *len + "]";
+            if (!check_len(out)) return std::nullopt;
+            return out;
         }
         case 'T': {
             std::string elems;
@@ -611,15 +734,24 @@ private:
             while (pos_ < s_.size() && s_[pos_] != 'E') {
                 auto elem = parse_type(depth + 1);
                 if (!elem) return std::nullopt;
-                if (count > 0) elems += ", ";
+                if (count > 0) {
+                    if (!consume_budget(2u)) return std::nullopt;
+                    elems += ", ";
+                }
                 elems += *elem;
                 ++count;
                 if (!check_len(elems)) return std::nullopt;
             }
             if (pos_ >= s_.size() || s_[pos_] != 'E') return std::nullopt;
             ++pos_;
-            if (count == 1) elems += ",";
-            return "(" + elems + ")";
+            if (count == 1) {
+                if (!consume_budget(1u)) return std::nullopt;
+                elems += ",";
+            }
+            if (!consume_budget(2u)) return std::nullopt;
+            std::string out = "(" + elems + ")";
+            if (!check_len(out)) return std::nullopt;
+            return out;
         }
         case 'F': {
             // Binder + unsafe + ABI + params + E + return
@@ -629,17 +761,19 @@ private:
             }
             std::string prefix;
             if (pos_ < s_.size() && s_[pos_] == 'U') {
+                if (!consume_budget(7u)) return std::nullopt;
                 prefix += "unsafe ";
                 ++pos_;
             }
             if (pos_ < s_.size() && s_[pos_] == 'K') {
                 ++pos_;
                 if (pos_ < s_.size() && s_[pos_] == 'C') {
+                    if (!consume_budget(11u)) return std::nullopt;
                     ++pos_;
                     prefix += "extern \"C\" ";
                 } else {
                     auto abi = parse_ident();
-                    if (!abi) return std::nullopt;
+                    if (!abi || !consume_budget(10u)) return std::nullopt;
                     prefix += "extern \"" + *abi + "\" ";
                 }
             }
@@ -648,21 +782,30 @@ private:
             while (pos_ < s_.size() && s_[pos_] != 'E') {
                 auto p = parse_type(depth + 1);
                 if (!p) return std::nullopt;
-                if (!first) params += ", ";
+                if (!first) {
+                    if (!consume_budget(2u)) return std::nullopt;
+                    params += ", ";
+                }
                 first = false;
                 params += *p;
+                if (!check_len(params)) return std::nullopt;
             }
             if (pos_ >= s_.size() || s_[pos_] != 'E') return std::nullopt;
             ++pos_;
             auto ret = parse_type(depth + 1);
-            if (!ret) return std::nullopt;
+            if (!ret || !consume_budget(4u)) return std::nullopt;
             std::string out = prefix + "fn(" + params + ")";
             if (*ret != "()") {
+                if (!consume_budget(4u)) return std::nullopt;
                 out += " -> " + *ret;
             }
+            if (!check_len(out)) return std::nullopt;
             return out;
         }
         case 'B': {
+            if (!consume_budget(1u)) {
+                return std::nullopt;
+            }
             const std::size_t backref_origin = pos_ - 1;
             const auto target = parse_base62();
             if (!target || *target >= backref_origin) {
@@ -672,6 +815,9 @@ private:
             pos_ = static_cast<std::size_t>(*target);
             auto res = parse_type(depth + 1);
             pos_ = saved;
+            if (!res || !check_len(*res)) {
+                return std::nullopt;
+            }
             return res;
         }
         default:
@@ -716,14 +862,18 @@ public:
             default: return std::nullopt;
             }
             auto ty = parse_type(0);
-            if (!ty || pos_ != s_.size()) return std::nullopt;
-            return std::string(label) + *ty;
+            if (!ty || overflow_ || pos_ != s_.size()) return std::nullopt;
+            std::string out = std::string(label) + *ty;
+            if (out.size() > kMaxDemangledOutputLength) return std::nullopt;
+            return out;
         }
         if (s_.substr(pos_, 2) == "GV") {
             pos_ += 2;
             auto nm = parse_name(0, nullptr);
-            if (!nm || pos_ != s_.size()) return std::nullopt;
-            return "guard variable for " + *nm;
+            if (!nm || overflow_ || pos_ != s_.size()) return std::nullopt;
+            std::string out = "guard variable for " + *nm;
+            if (out.size() > kMaxDemangledOutputLength) return std::nullopt;
+            return out;
         }
 
         bool has_return_type = false;
@@ -739,7 +889,7 @@ public:
         std::string ret_prefix;
         if (has_return_type) {
             auto ret = parse_type(0);
-            if (!ret) return std::nullopt;
+            if (!ret || overflow_) return std::nullopt;
             ret_prefix = *ret + " ";
         }
 
@@ -754,6 +904,10 @@ public:
             if (!first) params += ", ";
             first = false;
             params += *p;
+            if (params.size() > kMaxDemangledOutputLength) {
+                overflow_ = true;
+                return std::nullopt;
+            }
         }
         std::string out = ret_prefix + *name_info + "(" + params + ")" + trailing_cv_ref_;
         if (out.size() > kMaxDemangledOutputLength) {
@@ -768,7 +922,18 @@ private:
     std::vector<std::string> subs_;
     std::vector<std::string> tparams_;
     std::string trailing_cv_ref_;
+    std::size_t budget_used_ = 0;
     bool overflow_ = false;
+
+    [[nodiscard]] bool consume_budget(std::size_t bytes) noexcept {
+        constexpr std::size_t kMaxExpansionBudget = kMaxDemangledOutputLength * 2u;
+        if (overflow_ || bytes > kMaxExpansionBudget - budget_used_) {
+            overflow_ = true;
+            return false;
+        }
+        budget_used_ += bytes;
+        return true;
+    }
 
     void record_sub(std::string val) {
         if (subs_.size() < 256 && val.size() <= kMaxDemangledOutputLength) {
@@ -783,8 +948,9 @@ private:
         std::size_t v = 0;
         while (pos_ < s_.size() && is_ascii_digit(s_[pos_])) {
             const auto d = static_cast<std::size_t>(s_[pos_] - '0');
-            if (v > (s_.size() - d) / 10u) return std::nullopt;
+            if (v > s_.size()) return std::nullopt;
             v = v * 10u + d;
+            if (v > s_.size()) return std::nullopt;
             ++pos_;
         }
         return v;
@@ -792,7 +958,7 @@ private:
 
     [[nodiscard]] std::optional<std::string> parse_source_name() {
         const auto len = parse_length();
-        if (!len || *len == 0 || pos_ + *len > s_.size()) {
+        if (!len || *len == 0 || pos_ + *len > s_.size() || !consume_budget(*len)) {
             return std::nullopt;
         }
         std::string out(s_.substr(pos_, *len));
@@ -800,8 +966,8 @@ private:
         return out;
     }
 
-    [[nodiscard]] std::optional<std::string> parse_operator_name() {
-        if (pos_ + 2 > s_.size()) return std::nullopt;
+    [[nodiscard]] std::optional<std::string> parse_operator_name(std::size_t depth) {
+        if (overflow_ || depth > kMaxDemangleDepth || pos_ + 2 > s_.size()) return std::nullopt;
         const std::string_view op = s_.substr(pos_, 2);
         pos_ += 2;
         if (op == "nw") return std::string("operator new");
@@ -847,7 +1013,7 @@ private:
         if (op == "cl") return std::string("operator()");
         if (op == "ix") return std::string("operator[]");
         if (op == "cv") {
-            auto ty = parse_type(0);
+            auto ty = parse_type(depth + 1);
             if (!ty) return std::nullopt;
             return "operator " + *ty;
         }
@@ -856,20 +1022,20 @@ private:
     }
 
     [[nodiscard]] std::optional<std::string> parse_substitution() {
-        if (pos_ >= s_.size() || s_[pos_] != 'S') return std::nullopt;
+        if (overflow_ || pos_ >= s_.size() || s_[pos_] != 'S') return std::nullopt;
         ++pos_;
         if (pos_ >= s_.size()) return std::nullopt;
         const char c = s_[pos_];
-        if (c == 't') { ++pos_; return std::string("std"); }
-        if (c == 'a') { ++pos_; return std::string("std::allocator"); }
-        if (c == 'b') { ++pos_; return std::string("std::basic_string"); }
-        if (c == 's') { ++pos_; return std::string("std::string"); }
-        if (c == 'i') { ++pos_; return std::string("std::istream"); }
-        if (c == 'o') { ++pos_; return std::string("std::ostream"); }
-        if (c == 'd') { ++pos_; return std::string("std::iostream"); }
+        if (c == 't') { ++pos_; return consume_budget(3u) ? std::optional<std::string>("std") : std::nullopt; }
+        if (c == 'a') { ++pos_; return consume_budget(14u) ? std::optional<std::string>("std::allocator") : std::nullopt; }
+        if (c == 'b') { ++pos_; return consume_budget(17u) ? std::optional<std::string>("std::basic_string") : std::nullopt; }
+        if (c == 's') { ++pos_; return consume_budget(11u) ? std::optional<std::string>("std::string") : std::nullopt; }
+        if (c == 'i') { ++pos_; return consume_budget(12u) ? std::optional<std::string>("std::istream") : std::nullopt; }
+        if (c == 'o') { ++pos_; return consume_budget(12u) ? std::optional<std::string>("std::ostream") : std::nullopt; }
+        if (c == 'd') { ++pos_; return consume_budget(13u) ? std::optional<std::string>("std::iostream") : std::nullopt; }
         if (c == '_') {
             ++pos_;
-            if (subs_.empty()) return std::nullopt;
+            if (subs_.empty() || !consume_budget(subs_[0].size())) return std::nullopt;
             return subs_[0];
         }
         std::size_t idx = 0;
@@ -879,12 +1045,13 @@ private:
             if (ch >= '0' && ch <= '9') d = static_cast<std::size_t>(ch - '0');
             else if (ch >= 'A' && ch <= 'Z') d = static_cast<std::size_t>(10 + (ch - 'A'));
             else return std::nullopt;
+            if (idx > subs_.size()) return std::nullopt;
             idx = idx * 36u + d;
         }
         if (pos_ >= s_.size() || s_[pos_] != '_') return std::nullopt;
         ++pos_;
         ++idx;
-        if (idx >= subs_.size()) return std::nullopt;
+        if (idx >= subs_.size() || !consume_budget(subs_[idx].size())) return std::nullopt;
         return subs_[idx];
     }
 
@@ -985,13 +1152,14 @@ private:
                         ++pos_;
                     } else {
                         while (pos_ < s_.size() && is_ascii_digit(s_[pos_])) {
+                            if (tidx > tparams_.size()) return std::nullopt;
                             tidx = tidx * 10u + static_cast<std::size_t>(s_[pos_++] - '0');
                         }
                         if (pos_ >= s_.size() || s_[pos_] != '_') return std::nullopt;
                         ++pos_;
                         ++tidx;
                     }
-                    if (tidx >= tparams_.size()) return std::nullopt;
+                    if (tidx >= tparams_.size() || !consume_budget(tparams_[tidx].size())) return std::nullopt;
                     part = tparams_[tidx];
                 } else if (s_[pos_] == 'C' && pos_ + 1 < s_.size() &&
                            (s_[pos_ + 1] >= '1' && s_[pos_ + 1] <= '5')) {
@@ -1009,7 +1177,7 @@ private:
                     part = parse_source_name();
                     if (part) last_unqualified = *part;
                 } else {
-                    part = parse_operator_name();
+                    part = parse_operator_name(depth + 1);
                 }
 
                 if (!part) return std::nullopt;
@@ -1064,7 +1232,7 @@ private:
         if (pos_ < s_.size() && is_ascii_digit(s_[pos_])) {
             base = parse_source_name();
         } else {
-            base = parse_operator_name();
+            base = parse_operator_name(depth + 1);
         }
         if (!base) return std::nullopt;
 
@@ -1167,10 +1335,18 @@ private:
                 if (!first) params += ", ";
                 first = false;
                 params += *p;
+                if (params.size() > kMaxDemangledOutputLength) {
+                    overflow_ = true;
+                    return std::nullopt;
+                }
             }
             if (pos_ >= s_.size() || s_[pos_] != 'E') return std::nullopt;
             ++pos_;
             std::string res = *ret + " (" + params + ")";
+            if (res.size() > kMaxDemangledOutputLength) {
+                overflow_ = true;
+                return std::nullopt;
+            }
             record_sub(res);
             return res;
         }
@@ -1181,13 +1357,15 @@ private:
                 ++pos_;
             } else {
                 while (pos_ < s_.size() && is_ascii_digit(s_[pos_])) {
-                    tidx = tidx * 10u + static_cast<std::size_t>(s_[pos_++] - '0');
+                    const auto d = static_cast<std::size_t>(s_[pos_++] - '0');
+                    if (tidx > tparams_.size()) return std::nullopt;
+                    tidx = tidx * 10u + d;
                 }
                 if (pos_ >= s_.size() || s_[pos_] != '_') return std::nullopt;
                 ++pos_;
                 ++tidx;
             }
-            if (tidx >= tparams_.size()) return std::nullopt;
+            if (tidx >= tparams_.size() || !consume_budget(tparams_[tidx].size())) return std::nullopt;
             record_sub(tparams_[tidx]);
             return tparams_[tidx];
         }
@@ -1369,16 +1547,35 @@ private:
     std::size_t pos_ = 0;
     std::vector<std::string> name_backrefs_;
     std::vector<std::string> type_backrefs_;
+    std::size_t budget_used_ = 0;
     bool overflow_ = false;
 
+    [[nodiscard]] bool consume_budget(std::size_t bytes) noexcept {
+        constexpr std::size_t kMaxExpansionBudget = kMaxDemangledOutputLength * 2u;
+        if (overflow_ || bytes > kMaxExpansionBudget - budget_used_) {
+            overflow_ = true;
+            return false;
+        }
+        budget_used_ += bytes;
+        return true;
+    }
+
+    [[nodiscard]] bool check_len(std::string_view piece) noexcept {
+        if (overflow_ || piece.size() > kMaxDemangledOutputLength) {
+            overflow_ = true;
+            return false;
+        }
+        return true;
+    }
+
     void add_name_backref(std::string_view name) {
-        if (!name.empty() && name_backrefs_.size() < 10) {
+        if (!name.empty() && name_backrefs_.size() < 10 && name.size() <= kMaxDemangledOutputLength) {
             name_backrefs_.emplace_back(name);
         }
     }
 
     void add_type_backref(std::string_view ty) {
-        if (!ty.empty() && type_backrefs_.size() < 10) {
+        if (!ty.empty() && type_backrefs_.size() < 10 && ty.size() <= kMaxDemangledOutputLength) {
             type_backrefs_.emplace_back(ty);
         }
     }
@@ -1414,21 +1611,26 @@ private:
         }
     }
 
-    [[nodiscard]] std::optional<std::string> parse_source_fragment(bool record_backref) {
-        if (pos_ >= s_.size()) return std::nullopt;
+    [[nodiscard]] std::optional<std::string> parse_source_fragment(std::size_t depth, bool record_backref) {
+        if (overflow_ || depth > kMaxDemangleDepth || pos_ >= s_.size()) return std::nullopt;
         if (is_ascii_digit(s_[pos_])) {
             const auto idx = static_cast<std::size_t>(s_[pos_++] - '0');
-            if (idx >= name_backrefs_.size()) return std::nullopt;
+            if (idx >= name_backrefs_.size() || !consume_budget(name_backrefs_[idx].size())) {
+                return std::nullopt;
+            }
             return name_backrefs_[idx];
         }
         if (s_.substr(pos_, 2) == "?$") {
-            return parse_template_name(0, record_backref);
+            return parse_template_name(depth + 1, record_backref);
         }
         const std::size_t at = s_.find('@', pos_);
         if (at == std::string_view::npos || at == pos_) {
             return std::nullopt;
         }
         const std::string_view frag = s_.substr(pos_, at - pos_);
+        if (!consume_budget(frag.size())) {
+            return std::nullopt;
+        }
         pos_ = at + 1;
         if (record_backref) {
             add_name_backref(frag);
@@ -1437,7 +1639,7 @@ private:
     }
 
     [[nodiscard]] std::optional<std::string> parse_template_name(std::size_t depth, bool record_outer_backref) {
-        if (depth > kMaxDemangleDepth || s_.substr(pos_, 2) != "?$") {
+        if (overflow_ || depth > kMaxDemangleDepth || s_.substr(pos_, 2) != "?$") {
             return std::nullopt;
         }
         pos_ += 2;
@@ -1448,7 +1650,7 @@ private:
         name_backrefs_.clear();
         type_backrefs_.clear();
 
-        auto base = parse_source_fragment(true);
+        auto base = parse_source_fragment(depth + 1, true);
         if (!base) {
             name_backrefs_ = std::move(saved_names);
             type_backrefs_ = std::move(saved_types);
@@ -1477,8 +1679,7 @@ private:
             if (!first) args += ", ";
             first = false;
             args += *arg;
-            if (args.size() > kMaxDemangledOutputLength) {
-                overflow_ = true;
+            if (!check_len(args)) {
                 name_backrefs_ = std::move(saved_names);
                 type_backrefs_ = std::move(saved_types);
                 return std::nullopt;
@@ -1495,6 +1696,9 @@ private:
         type_backrefs_ = std::move(saved_types);
 
         std::string inst = *base + "<" + args + ">";
+        if (!check_len(inst)) {
+            return std::nullopt;
+        }
         if (record_outer_backref) {
             add_name_backref(inst);
         }
@@ -1525,18 +1729,18 @@ private:
     }
 
     [[nodiscard]] std::optional<std::string> parse_scope_chain(std::size_t depth) {
-        if (depth > kMaxDemangleDepth) return std::nullopt;
+        if (overflow_ || depth > kMaxDemangleDepth) return std::nullopt;
         std::vector<std::string> scopes;
         while (pos_ < s_.size() && s_[pos_] != '@') {
             if (s_.substr(pos_, 2) == "?A") {
                 // Anonymous namespace `?A0x...`@
                 const std::size_t at = s_.find('@', pos_ + 2);
-                if (at == std::string_view::npos) return std::nullopt;
+                if (at == std::string_view::npos || !consume_budget(21u)) return std::nullopt;
                 pos_ = at + 1;
                 scopes.emplace_back("`anonymous namespace'");
                 continue;
             }
-            auto sc = parse_source_fragment(true);
+            auto sc = parse_source_fragment(depth + 1, true);
             if (!sc) return std::nullopt;
             scopes.push_back(std::move(*sc));
             if (scopes.size() > 64) return std::nullopt;
@@ -1548,6 +1752,7 @@ private:
         for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
             if (!joined.empty()) joined += "::";
             joined += *it;
+            if (!check_len(joined)) return std::nullopt;
         }
         return joined;
     }
@@ -1654,7 +1859,7 @@ private:
                 }
             }
         } else {
-            auto frag = parse_source_fragment(true);
+            auto frag = parse_source_fragment(depth + 1, true);
             if (!frag) return std::nullopt;
             unqualified = std::move(*frag);
         }
@@ -1691,19 +1896,23 @@ private:
                 ? "const "
                 : "";
             res.full_name = prefix + (scope->empty() ? unqualified : (*scope + "::" + unqualified));
+            if (!check_len(res.full_name)) return std::nullopt;
             return res;
         }
 
         res.full_name = scope->empty() ? unqualified : (*scope + "::" + unqualified);
+        if (!check_len(res.full_name)) return std::nullopt;
         return res;
     }
 
     [[nodiscard]] std::optional<std::string> parse_type(std::size_t depth, bool record_param_backref) {
-        if (depth > kMaxDemangleDepth || pos_ >= s_.size()) return std::nullopt;
+        if (overflow_ || depth > kMaxDemangleDepth || pos_ >= s_.size()) return std::nullopt;
 
         if (is_ascii_digit(s_[pos_])) {
             const auto idx = static_cast<std::size_t>(s_[pos_++] - '0');
-            if (idx >= type_backrefs_.size()) return std::nullopt;
+            if (idx >= type_backrefs_.size() || !consume_budget(type_backrefs_[idx].size())) {
+                return std::nullopt;
+            }
             return type_backrefs_[idx];
         }
 
@@ -1777,17 +1986,20 @@ private:
                         if (!first) fparams += ", ";
                         first = false;
                         fparams += *fp;
+                        if (!check_len(fparams)) return std::nullopt;
                     }
                     if (pos_ < s_.size() && s_[pos_] == '@') ++pos_;
                 }
                 if (pos_ < s_.size() && s_[pos_] == 'Z') ++pos_;
                 out = *ret + " (" + std::string(cc) + " *" + outer_ptr_cv + ")(" + fparams + ")";
+                if (!check_len(*out)) return std::nullopt;
                 break;
             }
             const std::string pointee_cv = parse_cv_qualifiers();
             auto pointee = parse_type(depth + 1, false);
             if (!pointee) return std::nullopt;
             out = *pointee + pointee_cv + (is_ref ? " &" : (" *" + outer_ptr_cv));
+            if (!check_len(*out)) return std::nullopt;
             break;
         }
         case '$': {
@@ -1804,6 +2016,7 @@ private:
                     auto inner = parse_type(depth + 1, false);
                     if (!inner) return std::nullopt;
                     out = *inner + rcv + " &&";
+                    if (!check_len(*out)) return std::nullopt;
                     break;
                 }
                 if (m2 == 'T') {
@@ -1815,6 +2028,7 @@ private:
                     auto inner = parse_type(depth + 1, false);
                     if (!inner) return std::nullopt;
                     out = *inner + cv;
+                    if (!check_len(*out)) return std::nullopt;
                     break;
                 }
             }
@@ -1828,11 +2042,12 @@ private:
             if (c == 'W' && pos_ < s_.size()) {
                 ++pos_; // underlying enum type code (e.g. `4` = int)
             }
-            auto frag = parse_source_fragment(true);
+            auto frag = parse_source_fragment(depth + 1, true);
             if (!frag) return std::nullopt;
             auto sc = parse_scope_chain(depth + 1);
             if (!sc) return std::nullopt;
             out = sc->empty() ? *frag : (*sc + "::" + *frag);
+            if (!check_len(*out)) return std::nullopt;
             break;
         }
         default:
@@ -1883,8 +2098,16 @@ DemangleResult demangle_symbol(std::string_view raw_name) {
     }
 
     const auto wrap = [&](std::string inner, ManglingScheme scheme) -> DemangleResult {
+        const std::size_t total_len = parts.prefix.size() + inner.size() + parts.suffix.size();
+        if (total_len > kMaxDemangledOutputLength) {
+            return DemangleResult{
+                .demangled = std::string(raw_name),
+                .scheme = ManglingScheme::None,
+                .succeeded = false,
+            };
+        }
         std::string full;
-        full.reserve(parts.prefix.size() + inner.size() + parts.suffix.size());
+        full.reserve(total_len);
         full.append(parts.prefix);
         full.append(inner);
         full.append(parts.suffix);

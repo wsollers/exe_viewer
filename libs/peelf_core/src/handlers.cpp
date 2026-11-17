@@ -1764,14 +1764,15 @@ void inspect_pe_live_handlers(HandlerInspectorContext& ctx,
             return std::nullopt;
         }
         const std::uint8_t byte = buf[cursor++];
-        if (shift < 64u) {
-            const auto low = static_cast<std::uint64_t>(byte & 0x7Fu);
-            if (shift == 63u && low > 1u) {
+        if (shift == 63u) {
+            if ((byte & 0x80u) != 0u || (byte & 0x7Fu) > 0x01u) {
                 return std::nullopt;
             }
-            result |= (low << shift);
+            result |= (static_cast<std::uint64_t>(byte & 0x01u) << 63u);
+            return result;
         }
-        if ((byte & 0x80u) == 0) {
+        result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
+        if ((byte & 0x80u) == 0u) {
             return result;
         }
         shift += 7u;
@@ -1783,18 +1784,22 @@ void inspect_pe_live_handlers(HandlerInspectorContext& ctx,
                                                        std::size_t& cursor) noexcept {
     std::uint64_t result = 0;
     unsigned int shift = 0;
-    std::uint8_t byte = 0;
     for (std::size_t i = 0; i < 10u; ++i) {
         if (cursor >= buf.size()) {
             return std::nullopt;
         }
-        byte = buf[cursor++];
-        if (shift < 64u) {
-            result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
+        const std::uint8_t byte = buf[cursor++];
+        if (shift == 63u) {
+            if (byte != 0x00u && byte != 0x7Fu) {
+                return std::nullopt;
+            }
+            result |= (static_cast<std::uint64_t>(byte & 0x01u) << 63u);
+            return static_cast<std::int64_t>(result);
         }
+        result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
         shift += 7u;
-        if ((byte & 0x80u) == 0) {
-            if (shift < 64u && (byte & 0x40u) != 0) {
+        if ((byte & 0x80u) == 0u) {
+            if (shift < 64u && (byte & 0x40u) != 0u) {
                 result |= (~std::uint64_t{0} << shift);
             }
             return static_cast<std::int64_t>(result);
@@ -1828,6 +1833,10 @@ struct EhDecodeBases {
         return DecodedEhPointer{0, {}};
     }
 
+    if (cursor > reader.size() ||
+        static_cast<std::uint64_t>(cursor) > std::numeric_limits<std::uint64_t>::max() - bases.eh_frame_va) {
+        return std::nullopt;
+    }
     const TargetLayout layout = reader.layout();
     const std::size_t ptr_size = layout.pointer_size();
     const std::uint64_t field_va = bases.eh_frame_va + static_cast<std::uint64_t>(cursor);
@@ -1836,7 +1845,7 @@ struct EhDecodeBases {
         const std::uint64_t rem = field_va % static_cast<std::uint64_t>(ptr_size);
         if (rem != 0) {
             const auto pad = static_cast<std::size_t>(static_cast<std::uint64_t>(ptr_size) - rem);
-            if (pad > reader.size() - cursor) {
+            if (cursor > reader.size() || pad > reader.size() - cursor) {
                 return std::nullopt;
             }
             cursor += pad;
@@ -2441,8 +2450,11 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
                         if (seg.type != 1u) {
                             continue;
                         }
+                        const std::uint64_t seg_span = std::max(seg.virtual_size, seg.file_size);
                         const std::uint64_t seg_end =
-                            seg.virtual_address + std::max(seg.virtual_size, seg.file_size);
+                            (seg_span <= std::numeric_limits<std::uint64_t>::max() - seg.virtual_address)
+                                ? (seg.virtual_address + seg_span)
+                                : std::numeric_limits<std::uint64_t>::max();
                         if (*eh_frame_va >= seg.virtual_address && *eh_frame_va < seg_end) {
                             eh_frame_size =
                                 std::min<std::uint64_t>(seg_end - *eh_frame_va, 4ull * 1024ull * 1024ull);
@@ -2536,14 +2548,17 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
             content_len = *len64;
         }
 
-        if (content_len < 4u || content_len > eh_bytes->size() - pos) {
+        if (pos > eh_bytes->size() || content_len < 4u || content_len > eh_bytes->size() - pos) {
             eh_truncated = true;
             break;
         }
 
         const std::size_t id_pos = pos;
         const std::size_t record_end = pos + static_cast<std::size_t>(content_len);
-        const auto cie_id = eh_reader.read_u32(id_pos);
+        const std::span<const std::uint8_t> rec_bytes =
+            std::span<const std::uint8_t>(*eh_bytes).first(record_end);
+        const EndianReader rec_reader(rec_bytes, layout);
+        const auto cie_id = rec_reader.read_u32(id_pos);
         if (!cie_id) {
             eh_truncated = true;
             break;
@@ -2558,33 +2573,33 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
                 continue;
             }
             CieRecord cie;
-            cie.version = (*eh_bytes)[cur++];
+            cie.version = rec_bytes[cur++];
 
-            while (cur < record_end && (*eh_bytes)[cur] != 0) {
-                cie.augmentation.push_back(static_cast<char>((*eh_bytes)[cur++]));
+            while (cur < record_end && rec_bytes[cur] != 0) {
+                cie.augmentation.push_back(static_cast<char>(rec_bytes[cur++]));
             }
-            if (cur >= record_end || (*eh_bytes)[cur] != 0) {
+            if (cur >= record_end || rec_bytes[cur] != 0) {
                 pos = record_end;
                 continue;
             }
             ++cur;  // skip NUL
 
             if (cie.augmentation == "eh") {
-                if (ptr_size > record_end - cur) {
+                if (cur > record_end || ptr_size > record_end - cur) {
                     pos = record_end;
                     continue;
                 }
                 cur += ptr_size;
             }
             if (cie.version >= 4u) {
-                if (record_end - cur < 2u) {
+                if (cur > record_end || record_end - cur < 2u) {
                     pos = record_end;
                     continue;
                 }
                 cur += 2u;  // address_size + segment_selector_size
             }
 
-            if (!read_uleb128(*eh_bytes, cur) || !read_sleb128(*eh_bytes, cur) || cur > record_end) {
+            if (!read_uleb128(rec_bytes, cur) || !read_sleb128(rec_bytes, cur) || cur > record_end) {
                 pos = record_end;
                 continue;
             }
@@ -2595,7 +2610,7 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
                 }
                 ++cur;  // ubyte return_address_register
             } else {
-                if (!read_uleb128(*eh_bytes, cur) || cur > record_end) {
+                if (!read_uleb128(rec_bytes, cur) || cur > record_end) {
                     pos = record_end;
                     continue;
                 }
@@ -2603,50 +2618,64 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
 
             if (!cie.augmentation.empty() && cie.augmentation.front() == 'z') {
                 cie.has_z = true;
-                const auto aug_len = read_uleb128(*eh_bytes, cur);
-                if (!aug_len || *aug_len > record_end - cur) {
+                const auto aug_len = read_uleb128(rec_bytes, cur);
+                if (!aug_len || cur > record_end || *aug_len > record_end - cur) {
                     pos = record_end;
                     continue;
                 }
                 const std::size_t aug_end = cur + static_cast<std::size_t>(*aug_len);
-                for (std::size_t ai = 1; ai < cie.augmentation.size() && cur <= aug_end; ++ai) {
+                const EndianReader aug_reader(rec_bytes.subspan(0, aug_end), layout);
+                bool aug_ok = true;
+                for (std::size_t ai = 1; ai < cie.augmentation.size(); ++ai) {
                     const char ch = cie.augmentation[ai];
                     if (ch == 'L') {
                         if (cur >= aug_end) {
+                            aug_ok = false;
                             break;
                         }
-                        cie.lsda_encoding = (*eh_bytes)[cur++];
+                        cie.lsda_encoding = rec_bytes[cur++];
                     } else if (ch == 'P') {
                         if (cur >= aug_end) {
+                            aug_ok = false;
                             break;
                         }
-                        cie.personality_encoding = (*eh_bytes)[cur++];
+                        cie.personality_encoding = rec_bytes[cur++];
                         if (auto p = decode_dw_eh_pe(
-                                cie.personality_encoding, eh_reader, cur, bases, ctx)) {
+                                cie.personality_encoding, aug_reader, cur, bases, ctx);
+                            p && cur <= aug_end) {
                             cie.has_personality = (p->address != 0 || !p->symbol_hint.empty());
                             cie.personality_va = p->address;
                             cie.personality_symbol =
                                 !p->symbol_hint.empty() ? p->symbol_hint
                                                         : ctx.resolve_symbol(p->address);
                         } else {
+                            aug_ok = false;
                             break;
                         }
                     } else if (ch == 'R') {
                         if (cur >= aug_end) {
+                            aug_ok = false;
                             break;
                         }
-                        cie.fde_encoding = (*eh_bytes)[cur++];
+                        cie.fde_encoding = rec_bytes[cur++];
                     } else if (ch == 'S') {
                         cie.is_signal_frame = true;
                     } else if (ch == 'B' || ch == 'G') {
                         // AArch64 PAC-RET (B-key) / MTE flags carry no augmentation payload bytes.
                     }
                 }
+                if (!aug_ok || cur > aug_end) {
+                    pos = record_end;
+                    continue;
+                }
+                cur = aug_end;
             }
 
-            const std::uint64_t cie_va = *eh_frame_va + static_cast<std::uint64_t>(record_start);
             if ((cie.has_personality || cie.is_signal_frame) &&
-                emitted_eh < kMaxEmittedEhEntries) {
+                emitted_eh < kMaxEmittedEhEntries &&
+                static_cast<std::uint64_t>(record_start) <=
+                    std::numeric_limits<std::uint64_t>::max() - *eh_frame_va) {
+                const std::uint64_t cie_va = *eh_frame_va + static_cast<std::uint64_t>(record_start);
                 std::string det = "CIE v" + std::to_string(cie.version) + " aug=\"" +
                                   cie.augmentation + "\"";
                 if (cie.has_personality) {
@@ -2676,34 +2705,43 @@ void inspect_elf_static_and_unwind(HandlerInspectorContext& ctx, HandlersReport&
                 if (cie_it != cies.end()) {
                     const CieRecord& cie = cie_it->second;
                     const auto pc_begin =
-                        decode_dw_eh_pe(cie.fde_encoding, eh_reader, cur, bases, ctx, false);
+                        decode_dw_eh_pe(cie.fde_encoding, rec_reader, cur, bases, ctx, false);
                     const auto pc_range = decode_dw_eh_pe(
                         static_cast<std::uint8_t>(cie.fde_encoding & 0x0Fu),
-                        eh_reader,
+                        rec_reader,
                         cur,
                         bases,
                         ctx,
                         true);
                     if (pc_begin && pc_range && cur <= record_end) {
                         std::uint64_t lsda_va = 0;
+                        bool fde_aug_ok = true;
                         if (cie.has_z) {
-                            if (const auto fde_aug_len = read_uleb128(*eh_bytes, cur)) {
-                                if (*fde_aug_len <= record_end - cur &&
-                                    cie.lsda_encoding != 0xFFu && *fde_aug_len > 0) {
-                                    EhDecodeBases fde_bases = bases;
-                                    fde_bases.func_base = pc_begin->address;
-                                    if (const auto lsda = decode_dw_eh_pe(cie.lsda_encoding,
-                                                                          eh_reader,
-                                                                          cur,
-                                                                          fde_bases,
-                                                                          ctx)) {
-                                        lsda_va = lsda->address;
-                                    }
+                            const auto fde_aug_len = read_uleb128(rec_bytes, cur);
+                            if (!fde_aug_len || cur > record_end || *fde_aug_len > record_end - cur) {
+                                fde_aug_ok = false;
+                            } else if (cie.lsda_encoding != 0xFFu && *fde_aug_len > 0u) {
+                                const std::size_t fde_aug_end =
+                                    cur + static_cast<std::size_t>(*fde_aug_len);
+                                const EndianReader fde_aug_reader(
+                                    rec_bytes.subspan(0, fde_aug_end), layout);
+                                EhDecodeBases fde_bases = bases;
+                                fde_bases.func_base = pc_begin->address;
+                                if (const auto lsda = decode_dw_eh_pe(cie.lsda_encoding,
+                                                                      fde_aug_reader,
+                                                                      cur,
+                                                                      fde_bases,
+                                                                      ctx);
+                                    lsda && cur <= fde_aug_end) {
+                                    lsda_va = lsda->address;
+                                } else {
+                                    fde_aug_ok = false;
                                 }
                             }
                         }
 
-                        if ((lsda_va != 0 || cie.has_personality) &&
+                        if (fde_aug_ok &&
+                            (lsda_va != 0 || cie.has_personality) &&
                             emitted_eh < kMaxEmittedEhEntries &&
                             static_cast<std::uint64_t>(record_start) <=
                                 std::numeric_limits<std::uint64_t>::max() - *eh_frame_va) {

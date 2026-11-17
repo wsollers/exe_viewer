@@ -1,5 +1,7 @@
 #include <peelf/security_audit.hpp>
 
+#include "atomic_file_writer.hpp"
+
 #include <peelf/demangle.hpp>
 #include <peelf/endian_reader.hpp>
 #include <peelf/macho_image.hpp>
@@ -10,6 +12,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstring>
+#include <filesystem>
 #include <format>
 #include <fstream>
 #include <iostream>
@@ -30,11 +33,6 @@
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
-#include <atomic>
-#include <filesystem>
-#include <process.h>
-#else
-#include <unistd.h>
 #endif
 
 namespace peelf {
@@ -42,7 +40,7 @@ namespace {
 
 constexpr std::array<SecurityRuleDescriptor, 25> kRuleCatalog = {{
     {"PE1001", "EnableAddressSpaceLayoutRandomization", SecurityRuleDomain::PE, SecuritySeverity::Error,
-     "PE binaries must enable DYNAMIC_BASE (and HIGH_ENTROPY_VA on 64-bit targets).",
+     "PE binaries must enable DYNAMIC_BASE without IMAGE_FILE_RELOCS_STRIPPED (and HIGH_ENTROPY_VA on 64-bit targets).",
      "Link with /DYNAMICBASE (and /HIGHENTROPYVA on 64-bit targets) and retain base relocations."},
     {"PE1002", "EnableDataExecutionPrevention", SecurityRuleDomain::PE, SecuritySeverity::Error,
      "PE binaries must opt in to hardware Data Execution Prevention (NX_COMPAT).",
@@ -175,37 +173,13 @@ struct WinVerifyOutcome {
         return out;
     }
 
-    wchar_t temp_dir[MAX_PATH] = {};
-    const DWORD dir_len = ::GetTempPathW(MAX_PATH, temp_dir);
-    if (dir_len == 0u || dir_len >= MAX_PATH) {
-        out.status = ERROR_PATH_NOT_FOUND;
+    auto staged = detail::ExclusiveTempFile::create("peelf_wvt_", ".bin", raw_bytes);
+    if (!staged) {
+        out.status = ERROR_WRITE_FAULT;
         return out;
     }
 
-    static std::atomic<std::uint64_t> s_seq{0};
-    const std::uint64_t seq = s_seq.fetch_add(1u, std::memory_order_relaxed);
-    const std::filesystem::path tmp_path =
-        std::filesystem::path(temp_dir) /
-        std::format(L"peelf_wvt_{}_{}.bin", ::GetCurrentProcessId(), seq);
-
-    struct ScopedTempCleanup {
-        std::filesystem::path path;
-        ~ScopedTempCleanup() {
-            std::error_code ec;
-            std::filesystem::remove(path, ec);
-        }
-    } cleanup{tmp_path};
-
-    {
-        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!ofs.write(reinterpret_cast<const char*>(raw_bytes.data()),
-                       static_cast<std::streamsize>(raw_bytes.size()))) {
-            out.status = ERROR_WRITE_FAULT;
-            return out;
-        }
-    }
-
-    const std::wstring wide_path = tmp_path.wstring();
+    const std::wstring wide_path = staged->path().wstring();
     WINTRUST_FILE_INFO file_info{};
     file_info.cbStruct = sizeof(file_info);
     file_info.pcwszFilePath = wide_path.c_str();
@@ -252,7 +226,13 @@ void evaluate_pe_rules(const IBinaryImage& image,
 
     const std::optional<std::uint64_t> opt_off = locate_pe_optional_header_offset(raw_bytes);
     const std::optional<std::uint64_t> dll_chars_off =
-        opt_off.has_value() ? std::optional<std::uint64_t>(*opt_off + 0x46u) : std::nullopt;
+        (opt_off.has_value() && *opt_off + 0x48u <= raw_bytes.size())
+            ? std::optional<std::uint64_t>(*opt_off + 0x46u)
+            : std::nullopt;
+    const std::optional<std::uint64_t> file_chars_off =
+        (opt_off.has_value() && *opt_off >= 2u && *opt_off <= raw_bytes.size())
+            ? std::optional<std::uint64_t>(*opt_off - 2u)
+            : std::nullopt;
     const std::uint64_t base_va = image.image_base();
 
     const std::uint16_t dll_ch = pe->dll_characteristics;
@@ -267,15 +247,16 @@ void evaluate_pe_rules(const IBinaryImage& image,
     const bool relocs_stripped = (file_ch & 0x0001u) != 0u;
     const bool has_reloc_blocks = !image.pe_base_relocations().empty();
 
-    // PE1001: ASLR (`DYNAMIC_BASE` + `HIGH_ENTROPY_VA` on 64-bit)
+    // PE1001: ASLR (`DYNAMIC_BASE` without `IMAGE_FILE_RELOCS_STRIPPED` + `HIGH_ENTROPY_VA` on 64-bit)
     {
         SecurityFinding f;
         f.rule_id = "PE1001";
         f.rule_name = "EnableAddressSpaceLayoutRandomization";
         f.domain = SecurityRuleDomain::PE;
-        f.subject = "OptionalHeader.DllCharacteristics";
+        f.subject = (dynamic_base && relocs_stripped) ? "FileHeader.Characteristics"
+                                                      : "OptionalHeader.DllCharacteristics";
         f.virtual_address = base_va;
-        f.file_offset = dll_chars_off;
+        f.file_offset = (dynamic_base && relocs_stripped) ? file_chars_off : dll_chars_off;
         f.remediation =
             "Link with /DYNAMICBASE (and /HIGHENTROPYVA on 64-bit targets) and avoid /FIXED or stripping .reloc.";
 
@@ -283,7 +264,7 @@ void evaluate_pe_rules(const IBinaryImage& image,
             f.severity = SecuritySeverity::Error;
             f.summary = !dynamic_base
                             ? "ASLR is disabled (IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE is not set)."
-                            : "IMAGE_FILE_RELOCS_STRIPPED is set, preventing runtime base relocation.";
+                            : "IMAGE_FILE_RELOCS_STRIPPED is set, preventing runtime base relocation despite DYNAMIC_BASE.";
             f.evidence = std::format(
                 "DllCharacteristics=0x{:04X} (DYNAMIC_BASE={}), Characteristics=0x{:04X} (RELOCS_STRIPPED={}), BaseRelocBlocks={}",
                 dll_ch,
@@ -295,8 +276,9 @@ void evaluate_pe_rules(const IBinaryImage& image,
             f.severity = SecuritySeverity::Warning;
             f.summary = "DYNAMIC_BASE is enabled, but 64-bit HIGH_ENTROPY_VA (0x0020) is not set.";
             f.evidence = std::format(
-                "DllCharacteristics=0x{:04X} (DYNAMIC_BASE=1, HIGH_ENTROPY_VA=0), ImageBase=0x{:X}, BaseRelocBlocks={}",
+                "DllCharacteristics=0x{:04X} (DYNAMIC_BASE=1, HIGH_ENTROPY_VA=0), Characteristics=0x{:04X} (RELOCS_STRIPPED=0), ImageBase=0x{:X}, BaseRelocBlocks={}",
                 dll_ch,
+                file_ch,
                 base_va,
                 image.pe_base_relocations().size());
         } else {
@@ -305,10 +287,11 @@ void evaluate_pe_rules(const IBinaryImage& image,
                             ? "ASLR and 64-bit High-Entropy VA are enabled."
                             : "ASLR (DYNAMIC_BASE) is enabled.";
             f.evidence = std::format(
-                "DllCharacteristics=0x{:04X} (DYNAMIC_BASE=1{}{}), BaseRelocBlocks={}",
+                "DllCharacteristics=0x{:04X} (DYNAMIC_BASE=1{}{}), Characteristics=0x{:04X} (RELOCS_STRIPPED=0), BaseRelocBlocks={}",
                 dll_ch,
                 image.is_64bit() ? ", HIGH_ENTROPY_VA=1" : "",
                 has_reloc_blocks ? ", .reloc present" : "",
+                file_ch,
                 image.pe_base_relocations().size());
         }
         tally_finding(report, std::move(f));
@@ -824,9 +807,9 @@ void evaluate_elf_rules(const IBinaryImage& image,
             dt_flags = dyn.value;
         } else if (dyn.tag == 0x6FFFFFFBull) { // DT_FLAGS_1
             dt_flags_1 = dyn.value;
-        } else if (dyn.tag == 15u && !dyn.string_value.empty()) { // DT_RPATH
+        } else if (dyn.tag == 15u) { // DT_RPATH (preserve empty "" for implicit CWD detection)
             rpaths.push_back(dyn.string_value);
-        } else if (dyn.tag == 29u && !dyn.string_value.empty()) { // DT_RUNPATH
+        } else if (dyn.tag == 29u) { // DT_RUNPATH (preserve empty "" for implicit CWD detection)
             runpaths.push_back(dyn.string_value);
         }
     }
@@ -1419,8 +1402,12 @@ void evaluate_live_rules(IProcessSession& session,
             f.evidence = "Insufficient OS privileges or unsupported session backend for security profile query.";
         } else {
             bool dep_or_aslr_disabled = false;
+            bool any_enabled_mitigation = false;
             std::vector<std::string> disabled_policies;
             for (const ProcessMitigationEntry& m : prof->mitigations) {
+                if (m.enabled) {
+                    any_enabled_mitigation = true;
+                }
                 const std::string low = lower_ascii(m.policy);
                 if (!m.enabled &&
                     (low.find("dep") != std::string::npos ||
@@ -1432,10 +1419,15 @@ void evaluate_live_rules(IProcessSession& session,
             }
 
             const std::string seccomp_low = lower_ascii(prof->seccomp_mode);
+            const bool seccomp_observed = !prof->seccomp_mode.empty();
             const bool seccomp_disabled =
-                !prof->seccomp_mode.empty() &&
+                seccomp_observed &&
                 (prof->seccomp_mode == "0" || seccomp_low.starts_with("0 ") ||
                  seccomp_low.find("disabled") != std::string::npos);
+            const bool seccomp_active = seccomp_observed && !seccomp_disabled;
+            const bool no_new_privs_active = prof->no_new_privs.value_or(false);
+            const bool has_affirmative_protection =
+                any_enabled_mitigation || seccomp_active || no_new_privs_active;
 
             if (dep_or_aslr_disabled) {
                 f.severity = SecuritySeverity::Error;
@@ -1443,6 +1435,9 @@ void evaluate_live_rules(IProcessSession& session,
             } else if (seccomp_disabled) {
                 f.severity = SecuritySeverity::Warning;
                 f.summary = "Process is running without a Seccomp syscall filter.";
+            } else if (!has_affirmative_protection) {
+                f.severity = SecuritySeverity::Note;
+                f.summary = "Indeterminate: ProcessSecurityProfile contains no affirmative runtime mitigation or Seccomp telemetry.";
             } else {
                 f.severity = SecuritySeverity::Pass;
                 f.summary = "Process runtime mitigation profile shows active OS protections.";
@@ -2205,55 +2200,7 @@ void append_json_escaped(std::string& out, std::string_view text) {
 [[nodiscard]] Result<void> write_text_file_atomically(
     const std::filesystem::path& output_path,
     std::string_view content) {
-    std::error_code ec;
-    const std::filesystem::path parent = output_path.parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-        if (ec) {
-            return make_error(std::format("Failed to create parent directory '{}': {}",
-                                          parent.string(),
-                                          ec.message()));
-        }
-    }
-
-#ifdef _WIN32
-    const int pid = _getpid();
-#else
-    const int pid = static_cast<int>(::getpid());
-#endif
-    const std::filesystem::path tmp_path =
-        output_path.string() + std::format(".tmp.{}", pid);
-
-    {
-        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!ofs) {
-            return make_error(std::format("Failed to open temporary output file '{}'",
-                                          tmp_path.string()));
-        }
-        ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-        ofs.flush();
-        if (!ofs) {
-            ofs.close();
-            std::filesystem::remove(tmp_path, ec);
-            return make_error(std::format("Failed while writing temporary output file '{}'",
-                                          tmp_path.string()));
-        }
-    }
-
-    std::filesystem::rename(tmp_path, output_path, ec);
-    if (ec) {
-        std::filesystem::remove(output_path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp_path, output_path, ec);
-        if (ec) {
-            std::error_code rm_ec;
-            std::filesystem::remove(tmp_path, rm_ec);
-            return make_error(std::format("Failed to commit output file '{}': {}",
-                                          output_path.string(),
-                                          ec.message()));
-        }
-    }
-    return {};
+    return detail::write_text_atomically(output_path, content, true, true);
 }
 
 [[nodiscard]] bool is_printable_ascii_char(std::uint8_t b) noexcept {

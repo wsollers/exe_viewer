@@ -515,58 +515,79 @@ Result<AssembleOutput> AsmTkAssemblerProvider::assemble(const AssembleRequest& r
 // llvm-mc helpers & LlvmMcAssemblerProvider
 // ---------------------------------------------------------------------------
 
-std::optional<std::string> llvm_mc_triple_for_target(
+namespace {
+
+[[nodiscard]] constexpr std::optional<std::string_view> llvm_mc_triple_view_for_target(
     Architecture architecture,
     Endianness endianness,
     bool is_64bit,
-    bool thumb_mode) {
+    bool thumb_mode) noexcept {
     switch (architecture) {
         case Architecture::X86:
-            return endianness == Endianness::Little ? std::optional<std::string>("i686-unknown-none-elf")
-                                                    : std::nullopt;
+            return endianness == Endianness::Little
+                       ? std::optional<std::string_view>("i686-unknown-none-elf")
+                       : std::nullopt;
         case Architecture::X86_64:
-            return endianness == Endianness::Little ? std::optional<std::string>("x86_64-unknown-none-elf")
-                                                    : std::nullopt;
+            return endianness == Endianness::Little
+                       ? std::optional<std::string_view>("x86_64-unknown-none-elf")
+                       : std::nullopt;
         case Architecture::ARM:
             if (thumb_mode) {
                 return endianness == Endianness::Big
-                           ? std::optional<std::string>("thumbebv7-unknown-none-eabi")
-                           : std::optional<std::string>("thumbv7-unknown-none-eabi");
+                           ? std::optional<std::string_view>("thumbebv7-unknown-none-eabi")
+                           : std::optional<std::string_view>("thumbv7-unknown-none-eabi");
             }
             return endianness == Endianness::Big
-                       ? std::optional<std::string>("armebv7-unknown-none-eabi")
-                       : std::optional<std::string>("armv7-unknown-none-eabi");
+                       ? std::optional<std::string_view>("armebv7-unknown-none-eabi")
+                       : std::optional<std::string_view>("armv7-unknown-none-eabi");
         case Architecture::ARM64:
             return endianness == Endianness::Big
-                       ? std::optional<std::string>("aarch64_be-unknown-none-elf")
-                       : std::optional<std::string>("aarch64-unknown-none-elf");
+                       ? std::optional<std::string_view>("aarch64_be-unknown-none-elf")
+                       : std::optional<std::string_view>("aarch64-unknown-none-elf");
         case Architecture::RISCV32:
-            return endianness == Endianness::Little ? std::optional<std::string>("riscv32-unknown-none-elf")
-                                                    : std::nullopt;
+            return endianness == Endianness::Little
+                       ? std::optional<std::string_view>("riscv32-unknown-none-elf")
+                       : std::nullopt;
         case Architecture::RISCV64:
-            return endianness == Endianness::Little ? std::optional<std::string>("riscv64-unknown-none-elf")
-                                                    : std::nullopt;
+            return endianness == Endianness::Little
+                       ? std::optional<std::string_view>("riscv64-unknown-none-elf")
+                       : std::nullopt;
         case Architecture::PowerPC:
             return endianness == Endianness::Little
-                       ? std::optional<std::string>("powerpcle-unknown-none-elf")
-                       : std::optional<std::string>("powerpc-unknown-none-elf");
+                       ? std::optional<std::string_view>("powerpcle-unknown-none-elf")
+                       : std::optional<std::string_view>("powerpc-unknown-none-elf");
         case Architecture::PowerPC64:
             return endianness == Endianness::Little
-                       ? std::optional<std::string>("powerpc64le-unknown-none-elf")
-                       : std::optional<std::string>("powerpc64-unknown-none-elf");
+                       ? std::optional<std::string_view>("powerpc64le-unknown-none-elf")
+                       : std::optional<std::string_view>("powerpc64-unknown-none-elf");
         case Architecture::MIPS32:
             return endianness == Endianness::Little
-                       ? std::optional<std::string>("mipsel-unknown-none-elf")
-                       : std::optional<std::string>("mips-unknown-none-elf");
+                       ? std::optional<std::string_view>("mipsel-unknown-none-elf")
+                       : std::optional<std::string_view>("mips-unknown-none-elf");
         case Architecture::MIPS64:
             return endianness == Endianness::Little
-                       ? std::optional<std::string>("mips64el-unknown-none-elf")
-                       : std::optional<std::string>("mips64-unknown-none-elf");
+                       ? std::optional<std::string_view>("mips64el-unknown-none-elf")
+                       : std::optional<std::string_view>("mips64-unknown-none-elf");
         case Architecture::Unknown:
             (void)is_64bit;
             return std::nullopt;
     }
     return std::nullopt;
+}
+
+} // namespace
+
+std::optional<std::string> llvm_mc_triple_for_target(
+    Architecture architecture,
+    Endianness endianness,
+    bool is_64bit,
+    bool thumb_mode) {
+    const auto triple = llvm_mc_triple_view_for_target(
+        architecture, endianness, is_64bit, thumb_mode);
+    if (!triple.has_value()) {
+        return std::nullopt;
+    }
+    return std::string(*triple);
 }
 
 Result<AssembleOutput> parse_llvm_mc_show_encoding_output(
@@ -725,7 +746,7 @@ bool LlvmMcAssemblerProvider::supports_target(Architecture architecture,
                                               Endianness endianness,
                                               bool is_64bit,
                                               bool thumb_mode) const noexcept {
-    return llvm_mc_triple_for_target(architecture, endianness, is_64bit, thumb_mode).has_value();
+    return llvm_mc_triple_view_for_target(architecture, endianness, is_64bit, thumb_mode).has_value();
 }
 
 Result<AssembleOutput> LlvmMcAssemblerProvider::assemble(const AssembleRequest& request) const {

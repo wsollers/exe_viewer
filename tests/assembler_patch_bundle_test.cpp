@@ -43,6 +43,11 @@ struct ScopedTempDir {
         std::filesystem::create_directories(path);
     }
 
+    ScopedTempDir(const ScopedTempDir&) = delete;
+    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+    ScopedTempDir(ScopedTempDir&&) = delete;
+    ScopedTempDir& operator=(ScopedTempDir&&) = delete;
+
     ~ScopedTempDir() {
         std::error_code ec;
         std::filesystem::remove_all(path, ec);
@@ -482,3 +487,125 @@ TEST(PatchBundleTest, StrictlyRejectsReadOnlyLiveProcessSessions) {
                      live_model, live_model.symbol_index(), 0, "nop\n", false, false)
                      .has_value());
 }
+
+TEST(PatchBundleTest, DecodesSurrogatePairsValidatesExpectedSha256AndSweepsNestedOverlaps) {
+    ScopedTempDir tmp;
+    const std::filesystem::path copy_path = tmp.path / "sample.exe";
+    std::filesystem::copy_file(fixture_pe64_path(), copy_path);
+    auto img = peelf::PagedBinaryImage::open(copy_path);
+    ASSERT_TRUE(img.has_value()) << img.error().message;
+
+    auto base_orig = img->read_original(0u, 64u);
+    ASSERT_TRUE(base_orig.has_value());
+
+    // 1. Valid UTF-16 surrogate pairs (`\uD83D\uDE80` -> U+1F680, `\uD834\uDD1E` -> U+1D11E) decode to 4-byte UTF-8,
+    //    while lone high/low surrogates are rejected cleanly.
+    const std::string valid_sha(64u, 'a');
+    const std::string surrogate_json = std::format(
+        R"({{"schema_version":1,"name":"Rocket \uD83D\uDE80","description":"Clef \uD834\uDD1E","expected_sha256":"{}","expected_size":0,"entries":[{{"offset":0,"label":"Tag \uD83D\uDE80","original_bytes_hex":"4d5a","patched_bytes_hex":"9090"}}]}})",
+        valid_sha);
+    auto decoded = peelf::decode_patch_bundle_json(surrogate_json);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(decoded->name, "Rocket \xF0\x9F\x9A\x80");
+    EXPECT_EQ(decoded->description, "Clef \xF0\x9D\x84\x9E");
+    ASSERT_EQ(decoded->entries.size(), 1u);
+    EXPECT_EQ(decoded->entries[0].label, "Tag \xF0\x9F\x9A\x80");
+
+    // Lone high surrogate followed by non-surrogate
+    const std::string lone_high_json = std::format(
+        R"({{"schema_version":1,"name":"Bad \uD83D!","expected_sha256":"{}","expected_size":0,"entries":[]}})",
+        valid_sha);
+    EXPECT_FALSE(peelf::decode_patch_bundle_json(lone_high_json).has_value());
+
+    // Lone high surrogate followed by BMP \u0041
+    const std::string high_bmp_json = std::format(
+        R"({{"schema_version":1,"name":"Bad \uD83D\u0041","expected_sha256":"{}","expected_size":0,"entries":[]}})",
+        valid_sha);
+    EXPECT_FALSE(peelf::decode_patch_bundle_json(high_bmp_json).has_value());
+
+    // Unpaired low surrogate
+    const std::string lone_low_json = std::format(
+        R"({{"schema_version":1,"name":"Bad \uDE80","expected_sha256":"{}","expected_size":0,"entries":[]}})",
+        valid_sha);
+    EXPECT_FALSE(peelf::decode_patch_bundle_json(lone_low_json).has_value());
+
+    // 2. Empty or malformed `expected_sha256` rejected in JSON AND rejected by preview/apply unless overridden.
+    const std::string empty_sha_json =
+        R"({"schema_version":1,"name":"EmptySha","expected_sha256":"","expected_size":0,"entries":[]})";
+    EXPECT_FALSE(peelf::decode_patch_bundle_json(empty_sha_json).has_value());
+
+    const std::string malformed_sha_json =
+        R"({"schema_version":1,"name":"BadSha","expected_sha256":"not_64_hex_chars","expected_size":0,"entries":[]})";
+    EXPECT_FALSE(peelf::decode_patch_bundle_json(malformed_sha_json).has_value());
+
+    peelf::PatchBundle empty_sha_bundle = *decoded;
+    empty_sha_bundle.expected_sha256.clear();
+    empty_sha_bundle.entries[0].original_bytes = {(*base_orig)[0], (*base_orig)[1]};
+    auto empty_prev = peelf::preview_patch_bundle(empty_sha_bundle, *img);
+    ASSERT_TRUE(empty_prev.has_value()) << empty_prev.error().message;
+    EXPECT_FALSE(empty_prev->sha256_matches);
+    EXPECT_FALSE(empty_prev->can_apply);
+    EXPECT_FALSE(peelf::apply_patch_bundle(empty_sha_bundle, *img).has_value());
+
+    auto override_empty_prev = peelf::preview_patch_bundle(
+        empty_sha_bundle, *img, {.allow_hash_mismatch_if_original_bytes_match = true});
+    ASSERT_TRUE(override_empty_prev.has_value());
+    EXPECT_TRUE(override_empty_prev->can_apply);
+    EXPECT_TRUE(override_empty_prev->sha256_mismatch_overridden);
+
+    // 3. O(N log N) sorted sweep catches nested + non-adjacent overlaps ([0, 16) enclosing [2, 4) and [8, 12))
+    //    AND accepts large reverse-sorted disjoint entry sets cleanly.
+    peelf::PatchBundle nested_overlap;
+    nested_overlap.name = "NestedOverlap";
+    nested_overlap.expected_sha256 = empty_prev->actual_sha256;
+    nested_overlap.expected_size = img->size();
+    nested_overlap.entries = {
+        peelf::PatchBundleEntry{
+            .offset = 8u,
+            .original_bytes = std::vector<std::uint8_t>(base_orig->begin() + 8, base_orig->begin() + 12),
+            .patched_bytes = {0x90u, 0x90u, 0x90u, 0x90u},
+        },
+        peelf::PatchBundleEntry{
+            .offset = 0u,
+            .original_bytes = std::vector<std::uint8_t>(base_orig->begin(), base_orig->begin() + 16),
+            .patched_bytes = std::vector<std::uint8_t>(16u, 0xCCu),
+        },
+        peelf::PatchBundleEntry{
+            .offset = 2u,
+            .original_bytes = std::vector<std::uint8_t>(base_orig->begin() + 2, base_orig->begin() + 4),
+            .patched_bytes = {0x90u, 0x90u},
+        },
+    };
+    auto nested_prev = peelf::preview_patch_bundle(nested_overlap, *img);
+    ASSERT_TRUE(nested_prev.has_value()) << nested_prev.error().message;
+    EXPECT_FALSE(nested_prev->can_apply);
+    EXPECT_EQ(nested_prev->conflict_count, 3u);
+    for (std::size_t i = 0; i < 3u; ++i) {
+        EXPECT_EQ(nested_prev->entry_previews[i].status,
+                  peelf::PatchEntryConflictKind::OverlappingEntry)
+            << "entry " << i;
+    }
+
+    const std::size_t max_disjoint = static_cast<std::size_t>(std::min<std::uint64_t>(256u, img->size() / 2u));
+    auto full_prefix = img->read_original(0u, static_cast<std::uint64_t>(max_disjoint * 2u));
+    ASSERT_TRUE(full_prefix.has_value());
+    peelf::PatchBundle disjoint;
+    disjoint.name = "DisjointSweep";
+    disjoint.expected_sha256 = empty_prev->actual_sha256;
+    disjoint.expected_size = img->size();
+    for (std::size_t k = max_disjoint; k-- > 0u;) {
+        const std::size_t off = k * 2u;
+        const std::uint8_t orig = (*full_prefix)[off];
+        disjoint.entries.push_back(peelf::PatchBundleEntry{
+            .offset = static_cast<std::uint64_t>(off),
+            .original_bytes = {orig},
+            .patched_bytes = {static_cast<std::uint8_t>(orig ^ 0xFFu)},
+        });
+    }
+    auto disjoint_prev = peelf::preview_patch_bundle(disjoint, *img);
+    ASSERT_TRUE(disjoint_prev.has_value()) << disjoint_prev.error().message;
+    EXPECT_TRUE(disjoint_prev->can_apply);
+    EXPECT_EQ(disjoint_prev->clean_count, max_disjoint);
+    EXPECT_EQ(disjoint_prev->conflict_count, 0u);
+}
+

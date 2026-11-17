@@ -138,18 +138,23 @@ constexpr std::uint8_t kDW_LNE_set_discriminator  = 4;
                                                         std::size_t& cursor) noexcept {
     std::uint64_t result = 0;
     unsigned shift = 0;
-    for (unsigned i = 0; i < 10; ++i) {
+    for (unsigned i = 0; i < 10u; ++i) {
         if (cursor >= data.size()) {
             return std::nullopt;
         }
         const std::uint8_t byte = data[cursor++];
-        if (shift < 64) {
-            result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
-        }
-        if ((byte & 0x80u) == 0) {
+        if (shift == 63u) {
+            if ((byte & 0x80u) != 0u || (byte & 0x7Fu) > 0x01u) {
+                return std::nullopt;
+            }
+            result |= (static_cast<std::uint64_t>(byte & 0x01u) << 63u);
             return result;
         }
-        shift += 7;
+        result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
+        if ((byte & 0x80u) == 0u) {
+            return result;
+        }
+        shift += 7u;
     }
     return std::nullopt;
 }
@@ -158,18 +163,22 @@ constexpr std::uint8_t kDW_LNE_set_discriminator  = 4;
                                                        std::size_t& cursor) noexcept {
     std::uint64_t result = 0;
     unsigned shift = 0;
-    std::uint8_t byte = 0;
-    for (unsigned i = 0; i < 10; ++i) {
+    for (unsigned i = 0; i < 10u; ++i) {
         if (cursor >= data.size()) {
             return std::nullopt;
         }
-        byte = data[cursor++];
-        if (shift < 64) {
-            result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
+        const std::uint8_t byte = data[cursor++];
+        if (shift == 63u) {
+            if (byte != 0x00u && byte != 0x7Fu) {
+                return std::nullopt;
+            }
+            result |= (static_cast<std::uint64_t>(byte & 0x01u) << 63u);
+            return static_cast<std::int64_t>(result);
         }
-        shift += 7;
-        if ((byte & 0x80u) == 0) {
-            if (shift < 64 && (byte & 0x40u) != 0) {
+        result |= (static_cast<std::uint64_t>(byte & 0x7Fu) << shift);
+        shift += 7u;
+        if ((byte & 0x80u) == 0u) {
+            if (shift < 64u && (byte & 0x40u) != 0u) {
                 result |= (~std::uint64_t{0} << shift);
             }
             return static_cast<std::int64_t>(result);
@@ -485,8 +494,12 @@ struct AttrValue {
                                                        std::uint64_t form,
                                                        std::int64_t implicit_const) {
     std::span<const std::uint8_t> raw = info_reader.bytes();
+    limit = std::min(limit, raw.size());
+    if (cursor > limit) {
+        return std::nullopt;
+    }
     while (form == kDW_FORM_indirect) {
-        const auto actual = read_uleb128(raw, cursor);
+        const auto actual = read_uleb128(raw.subspan(0, limit), cursor);
         if (!actual || cursor > limit) return std::nullopt;
         form = *actual;
     }
@@ -686,8 +699,8 @@ struct AttrValue {
         if (form == kDW_FORM_block1) len = read_sized_uint(info_reader, cursor, 1);
         else if (form == kDW_FORM_block2) len = read_sized_uint(info_reader, cursor, 2);
         else if (form == kDW_FORM_block4) len = read_sized_uint(info_reader, cursor, 4);
-        else len = read_uleb128(raw, cursor);
-        if (!len || *len > limit - cursor) return std::nullopt;
+        else len = read_uleb128(raw.subspan(0, limit), cursor);
+        if (!len || cursor > limit || *len > limit - cursor) return std::nullopt;
         const auto sz = static_cast<std::size_t>(*len);
         val.kind = AttrValue::Kind::Block;
         if (sz <= 256) {
@@ -874,7 +887,7 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
     std::vector<std::uint64_t> die_order;
 
     std::size_t cursor = 0;
-    while (cursor + 4 <= views.debug_info.size()) {
+    while (cursor <= views.debug_info.size() && views.debug_info.size() - cursor >= 4u) {
         const std::size_t cu_start = cursor;
         const auto initial_len32 = reader.read_u32(cursor);
         if (!initial_len32 || *initial_len32 == 0) {
@@ -890,12 +903,19 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
             is_dwarf64 = true;
             unit_len = *len64;
         }
-        if (unit_len > views.debug_info.size() - cursor) {
+        if (cursor > views.debug_info.size() || unit_len > views.debug_info.size() - cursor) {
             break;
         }
         const std::size_t cu_end = cursor + static_cast<std::size_t>(unit_len);
+        const std::span<const std::uint8_t> cu_bytes =
+            std::span<const std::uint8_t>(views.debug_info).first(cu_end);
+        const EndianReader cu_reader(cu_bytes, views.endian);
 
-        const auto version = reader.read_u16(cursor);
+        if (cursor > cu_end || cu_end - cursor < 2u) {
+            cursor = cu_end;
+            continue;
+        }
+        const auto version = cu_reader.read_u16(cursor);
         if (!version || *version < 2 || *version > 5) {
             cursor = cu_end;
             continue;
@@ -911,38 +931,42 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
 
         std::uint64_t abbrev_offset = 0;
         if (*version >= 5) {
-            const auto unit_type = reader.read_u8(cursor);
-            const auto addr_sz = reader.read_u8(cursor + 1);
+            if (cursor > cu_end || cu_end - cursor < 2u) {
+                cursor = cu_end;
+                continue;
+            }
+            const auto unit_type = cu_reader.read_u8(cursor);
+            const auto addr_sz = cu_reader.read_u8(cursor + 1);
             if (!unit_type || !addr_sz) {
                 cursor = cu_end;
                 continue;
             }
             cursor += 2;
             cu.address_size = *addr_sz;
-            const auto abbrev_off = read_sized_uint(reader, cursor, cu.offset_size);
+            const auto abbrev_off = read_sized_uint(cu_reader, cursor, cu.offset_size);
             if (!abbrev_off || cursor > cu_end) {
                 cursor = cu_end;
                 continue;
             }
             abbrev_offset = *abbrev_off;
             if (*unit_type == kDW_UT_skeleton || *unit_type == kDW_UT_split_compile) {
-                if (cu_end - cursor < 8u) { cursor = cu_end; continue; }
+                if (cursor > cu_end || cu_end - cursor < 8u) { cursor = cu_end; continue; }
                 cursor += 8;
             } else if (*unit_type == kDW_UT_type || *unit_type == kDW_UT_split_type) {
-                if (cu_end - cursor < static_cast<std::size_t>(8u + cu.offset_size)) {
+                if (cursor > cu_end || cu_end - cursor < static_cast<std::size_t>(8u + cu.offset_size)) {
                     cursor = cu_end;
                     continue;
                 }
                 cursor += 8u + cu.offset_size;
             }
         } else {
-            const auto abbrev_off = read_sized_uint(reader, cursor, cu.offset_size);
+            const auto abbrev_off = read_sized_uint(cu_reader, cursor, cu.offset_size);
             if (!abbrev_off || cursor >= cu_end) {
                 cursor = cu_end;
                 continue;
             }
             abbrev_offset = *abbrev_off;
-            const auto addr_sz = reader.read_u8(cursor);
+            const auto addr_sz = cu_reader.read_u8(cursor);
             if (!addr_sz) {
                 cursor = cu_end;
                 continue;
@@ -967,7 +991,7 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
 
         while (cursor < cu_end) {
             const std::uint64_t die_offset = static_cast<std::uint64_t>(cursor);
-            const auto abbrev_code = read_uleb128(views.debug_info, cursor);
+            const auto abbrev_code = read_uleb128(cu_bytes, cursor);
             if (!abbrev_code || cursor > cu_end) {
                 break;
             }
@@ -996,7 +1020,7 @@ void parse_debug_info_units(const DwarfSectionViews& views, DwarfDebugData& out)
             bool attrs_ok = true;
 
             for (const AbbrevAttrSpec& spec : decl.attrs) {
-                const auto val = read_form_value(views, reader, cursor, cu_end, cu, spec.form, spec.implicit_const);
+                const auto val = read_form_value(views, cu_reader, cursor, cu_end, cu, spec.form, spec.implicit_const);
                 if (!val) {
                     attrs_ok = false;
                     break;
@@ -1280,7 +1304,7 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
     EndianReader reader(views.debug_line, views.endian);
     std::size_t cursor = 0;
 
-    while (cursor + 4 <= views.debug_line.size()) {
+    while (cursor <= views.debug_line.size() && views.debug_line.size() - cursor >= 4u) {
         const auto init32 = reader.read_u32(cursor);
         if (!init32 || *init32 == 0) {
             break;
@@ -1295,12 +1319,19 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
             is_dwarf64 = true;
             unit_len = *len64;
         }
-        if (unit_len > views.debug_line.size() - cursor) {
+        if (cursor > views.debug_line.size() || unit_len > views.debug_line.size() - cursor) {
             break;
         }
         const std::size_t unit_end = cursor + static_cast<std::size_t>(unit_len);
+        const std::span<const std::uint8_t> unit_bytes =
+            std::span<const std::uint8_t>(views.debug_line).first(unit_end);
+        const EndianReader unit_reader(unit_bytes, views.endian);
 
-        const auto version = reader.read_u16(cursor);
+        if (cursor > unit_end || unit_end - cursor < 2u) {
+            cursor = unit_end;
+            continue;
+        }
+        const auto version = unit_reader.read_u16(cursor);
         if (!version || *version < 2 || *version > 5) {
             cursor = unit_end;
             continue;
@@ -1310,8 +1341,12 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
         const std::uint8_t offset_size = is_dwarf64 ? 8 : 4;
         std::uint8_t address_size = views.default_address_size;
         if (*version >= 5) {
-            const auto addr_sz = reader.read_u8(cursor);
-            const auto seg_sz = reader.read_u8(cursor + 1);
+            if (cursor > unit_end || unit_end - cursor < 2u) {
+                cursor = unit_end;
+                continue;
+            }
+            const auto addr_sz = unit_reader.read_u8(cursor);
+            const auto seg_sz = unit_reader.read_u8(cursor + 1);
             if (!addr_sz || !seg_sz) {
                 cursor = unit_end;
                 continue;
@@ -1320,24 +1355,26 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
             address_size = *addr_sz;
         }
 
-        const auto header_len = read_sized_uint(reader, cursor, offset_size);
-        if (!header_len || *header_len > unit_end - cursor) {
+        const auto header_len = read_sized_uint(unit_reader, cursor, offset_size);
+        if (!header_len || cursor > unit_end || *header_len > unit_end - cursor) {
             cursor = unit_end;
             continue;
         }
         const std::size_t program_start = cursor + static_cast<std::size_t>(*header_len);
+        const std::span<const std::uint8_t> header_bytes = unit_bytes.subspan(0, program_start);
+        const EndianReader header_reader(header_bytes, views.endian);
 
-        const auto min_inst_len = reader.read_u8(cursor++);
+        const auto min_inst_len = header_reader.read_u8(cursor++);
         std::uint8_t max_ops_per_inst = 1;
         if (*version >= 4) {
-            const auto mops = reader.read_u8(cursor++);
+            const auto mops = header_reader.read_u8(cursor++);
             if (!mops) { cursor = unit_end; continue; }
             max_ops_per_inst = (*mops == 0) ? 1 : *mops;
         }
-        const auto default_is_stmt = reader.read_u8(cursor++);
-        const auto line_base_u8 = reader.read_u8(cursor++);
-        const auto line_range = reader.read_u8(cursor++);
-        const auto opcode_base = reader.read_u8(cursor++);
+        const auto default_is_stmt = header_reader.read_u8(cursor++);
+        const auto line_base_u8 = header_reader.read_u8(cursor++);
+        const auto line_range = header_reader.read_u8(cursor++);
+        const auto opcode_base = header_reader.read_u8(cursor++);
         if (!min_inst_len || !default_is_stmt || !line_base_u8 || !line_range || !opcode_base ||
             *min_inst_len == 0 || *line_range == 0 || *opcode_base == 0) {
             cursor = unit_end;
@@ -1346,12 +1383,13 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
         const auto line_base = static_cast<std::int8_t>(*line_base_u8);
 
         std::vector<std::uint8_t> std_opcode_lengths(*opcode_base, 0);
+        bool opcodes_ok = true;
         for (std::uint8_t i = 1; i < *opcode_base; ++i) {
-            const auto n = reader.read_u8(cursor++);
-            if (!n) { cursor = unit_end; break; }
+            const auto n = header_reader.read_u8(cursor++);
+            if (!n) { opcodes_ok = false; break; }
             std_opcode_lengths[i] = *n;
         }
-        if (cursor > program_start) {
+        if (!opcodes_ok || cursor > program_start) {
             cursor = unit_end;
             continue;
         }
@@ -1366,17 +1404,17 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
 
         if (*version >= 5) {
             // Directory format + entries
-            const auto dir_fmt_cnt = reader.read_u8(cursor++);
+            const auto dir_fmt_cnt = header_reader.read_u8(cursor++);
             if (!dir_fmt_cnt) { cursor = unit_end; continue; }
             std::vector<std::pair<std::uint64_t, std::uint64_t>> dir_fmt;
             bool ok = true;
             for (std::uint8_t i = 0; i < *dir_fmt_cnt; ++i) {
-                const auto ct = read_uleb128(views.debug_line, cursor);
-                const auto fm = read_uleb128(views.debug_line, cursor);
+                const auto ct = read_uleb128(header_bytes, cursor);
+                const auto fm = read_uleb128(header_bytes, cursor);
                 if (!ct || !fm) { ok = false; break; }
                 dir_fmt.emplace_back(*ct, *fm);
             }
-            const auto dir_cnt = ok ? read_uleb128(views.debug_line, cursor) : std::nullopt;
+            const auto dir_cnt = ok ? read_uleb128(header_bytes, cursor) : std::nullopt;
             if (!dir_cnt || (*dir_cnt > 0 && dir_fmt.empty()) || *dir_cnt > 65536u) {
                 cursor = unit_end;
                 continue;
@@ -1384,7 +1422,7 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
             for (std::uint64_t d = 0; d < *dir_cnt && ok; ++d) {
                 std::string dpath;
                 for (const auto& [ct, fm] : dir_fmt) {
-                    const auto v = read_form_value(views, reader, cursor, program_start, line_cu, fm, 0);
+                    const auto v = read_form_value(views, header_reader, cursor, program_start, line_cu, fm, 0);
                     if (!v) { ok = false; break; }
                     if (ct == kDW_LNCT_path) dpath = v->str;
                 }
@@ -1393,16 +1431,16 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
 
             // File format + entries
             if (!ok) { cursor = unit_end; continue; }
-            const auto file_fmt_cnt = reader.read_u8(cursor++);
+            const auto file_fmt_cnt = header_reader.read_u8(cursor++);
             if (!file_fmt_cnt) { cursor = unit_end; continue; }
             std::vector<std::pair<std::uint64_t, std::uint64_t>> file_fmt;
             for (std::uint8_t i = 0; i < *file_fmt_cnt; ++i) {
-                const auto ct = read_uleb128(views.debug_line, cursor);
-                const auto fm = read_uleb128(views.debug_line, cursor);
+                const auto ct = read_uleb128(header_bytes, cursor);
+                const auto fm = read_uleb128(header_bytes, cursor);
                 if (!ct || !fm) { ok = false; break; }
                 file_fmt.emplace_back(*ct, *fm);
             }
-            const auto file_cnt = ok ? read_uleb128(views.debug_line, cursor) : std::nullopt;
+            const auto file_cnt = ok ? read_uleb128(header_bytes, cursor) : std::nullopt;
             if (!file_cnt || (*file_cnt > 0 && file_fmt.empty()) || *file_cnt > 262144u) {
                 cursor = unit_end;
                 continue;
@@ -1410,25 +1448,29 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
             for (std::uint64_t f = 0; f < *file_cnt && ok; ++f) {
                 LineFileEntry fe;
                 for (const auto& [ct, fm] : file_fmt) {
-                    const auto v = read_form_value(views, reader, cursor, program_start, line_cu, fm, 0);
+                    const auto v = read_form_value(views, header_reader, cursor, program_start, line_cu, fm, 0);
                     if (!v) { ok = false; break; }
                     if (ct == kDW_LNCT_path) fe.path = v->str;
                     else if (ct == kDW_LNCT_directory_index) fe.dir_index = v->uval;
                 }
                 files.push_back(std::move(fe));
             }
+            if (!ok) {
+                cursor = unit_end;
+                continue;
+            }
         } else {
             while (cursor < program_start) {
-                const auto d = read_c_string(views.debug_line, cursor);
+                const auto d = read_c_string(header_bytes, cursor);
                 if (!d || d->empty()) break;
                 directories.push_back(*d);
             }
             while (cursor < program_start) {
-                const auto fn = read_c_string(views.debug_line, cursor);
+                const auto fn = read_c_string(header_bytes, cursor);
                 if (!fn || fn->empty()) break;
-                const auto dir_idx = read_uleb128(views.debug_line, cursor);
-                const auto mtime = read_uleb128(views.debug_line, cursor);
-                const auto fsz = read_uleb128(views.debug_line, cursor);
+                const auto dir_idx = read_uleb128(header_bytes, cursor);
+                const auto mtime = read_uleb128(header_bytes, cursor);
+                const auto fsz = read_uleb128(header_bytes, cursor);
                 if (!dir_idx || !mtime || !fsz) break;
                 files.push_back(LineFileEntry{.path = *fn, .dir_index = *dir_idx});
             }
@@ -1494,62 +1536,79 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
         };
 
         while (cursor < unit_end) {
-            const std::uint8_t op = views.debug_line[cursor++];
+            const std::uint8_t op = unit_bytes[cursor++];
             if (op == 0) {
                 // Extended opcode
-                const auto ext_len = read_uleb128(views.debug_line, cursor);
-                if (!ext_len || *ext_len == 0 || *ext_len > unit_end - cursor) {
+                const auto ext_len = read_uleb128(unit_bytes, cursor);
+                if (!ext_len || *ext_len == 0 || cursor > unit_end || *ext_len > unit_end - cursor) {
                     break;
                 }
                 const std::size_t ext_end = cursor + static_cast<std::size_t>(*ext_len);
-                const std::uint8_t ext_op = views.debug_line[cursor++];
+                const std::span<const std::uint8_t> ext_bytes = unit_bytes.subspan(0, ext_end);
+                const EndianReader ext_reader(ext_bytes, views.endian);
+                const std::uint8_t ext_op = ext_bytes[cursor++];
                 switch (ext_op) {
                 case kDW_LNE_end_sequence:
                     regs = reset_regs();
                     break;
                 case kDW_LNE_set_address: {
-                    const auto addr = read_sized_uint(reader, cursor, address_size);
-                    if (addr) {
+                    const auto addr = read_sized_uint(ext_reader, cursor, address_size);
+                    if (addr && cursor <= ext_end) {
                         regs.address = *addr;
                         regs.op_index = 0;
                     }
                     break;
                 }
                 case kDW_LNE_define_file: {
-                    const auto fn = read_c_string(views.debug_line, cursor);
-                    const auto dir_idx = read_uleb128(views.debug_line, cursor);
-                    const auto mtime = read_uleb128(views.debug_line, cursor);
-                    const auto fsz = read_uleb128(views.debug_line, cursor);
-                    if (fn && dir_idx && mtime && fsz) {
+                    const auto fn = read_c_string(ext_bytes, cursor);
+                    const auto dir_idx = read_uleb128(ext_bytes, cursor);
+                    const auto mtime = read_uleb128(ext_bytes, cursor);
+                    const auto fsz = read_uleb128(ext_bytes, cursor);
+                    if (fn && dir_idx && mtime && fsz && cursor <= ext_end) {
                         files.push_back(LineFileEntry{.path = *fn, .dir_index = *dir_idx});
                     }
                     break;
                 }
                 case kDW_LNE_set_discriminator:
-                    (void)read_uleb128(views.debug_line, cursor);
+                    (void)read_uleb128(ext_bytes, cursor);
                     break;
                 default:
                     break;
                 }
                 cursor = ext_end;
             } else if (op < *opcode_base) {
+                bool std_ok = true;
                 switch (op) {
                 case kDW_LNS_copy:
                     emit_row();
                     break;
                 case kDW_LNS_advance_pc:
-                    if (const auto adv = read_uleb128(views.debug_line, cursor)) advance_addr(*adv);
+                    if (const auto adv = read_uleb128(unit_bytes, cursor)) {
+                        advance_addr(*adv);
+                    } else {
+                        std_ok = false;
+                    }
                     break;
                 case kDW_LNS_advance_line:
-                    if (const auto dline = read_sleb128(views.debug_line, cursor)) {
+                    if (const auto dline = read_sleb128(unit_bytes, cursor)) {
                         advance_line_checked(*dline);
+                    } else {
+                        std_ok = false;
                     }
                     break;
                 case kDW_LNS_set_file:
-                    if (const auto f = read_uleb128(views.debug_line, cursor)) regs.file = *f;
+                    if (const auto f = read_uleb128(unit_bytes, cursor)) {
+                        regs.file = *f;
+                    } else {
+                        std_ok = false;
+                    }
                     break;
                 case kDW_LNS_set_column:
-                    if (const auto c = read_uleb128(views.debug_line, cursor)) regs.column = *c;
+                    if (const auto c = read_uleb128(unit_bytes, cursor)) {
+                        regs.column = *c;
+                    } else {
+                        std_ok = false;
+                    }
                     break;
                 case kDW_LNS_negate_stmt:
                     regs.is_stmt = !regs.is_stmt;
@@ -1562,19 +1621,29 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
                     advance_addr((255u - *opcode_base) / *line_range);
                     break;
                 case kDW_LNS_fixed_advance_pc:
-                    if (const auto delta = reader.read_u16(cursor)) {
+                    if (const auto delta = unit_reader.read_u16(cursor)) {
                         cursor += 2;
-                        regs.address += *delta;
+                        regs.address = checked_add_u64(regs.address, *delta).value_or(0u);
                         regs.op_index = 0;
+                    } else {
+                        std_ok = false;
                     }
                     break;
                 case kDW_LNS_set_isa:
-                    (void)read_uleb128(views.debug_line, cursor);
+                    if (!read_uleb128(unit_bytes, cursor)) {
+                        std_ok = false;
+                    }
                     break;
                 default:
                     for (std::uint8_t a = 0; a < std_opcode_lengths[op]; ++a) {
-                        (void)read_uleb128(views.debug_line, cursor);
+                        if (!read_uleb128(unit_bytes, cursor)) {
+                            std_ok = false;
+                            break;
+                        }
                     }
+                    break;
+                }
+                if (!std_ok) {
                     break;
                 }
             } else {

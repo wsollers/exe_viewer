@@ -1,5 +1,7 @@
 #include <peelf/patch_bundle.hpp>
 
+#include "atomic_file_writer.hpp"
+
 #include <peelf/sha256.hpp>
 
 #include <algorithm>
@@ -27,6 +29,18 @@ namespace {
         ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
     }
     return out;
+}
+
+[[nodiscard]] bool is_valid_sha256_hex(std::string_view sv) noexcept {
+    if (sv.size() != 64u) {
+        return false;
+    }
+    for (const char ch : sv) {
+        if (!std::isxdigit(static_cast<unsigned char>(ch))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 [[nodiscard]] std::string format_to_json_token(Format fmt) {
@@ -218,27 +232,63 @@ private:
                 case 'r':  out.push_back('\r'); break;
                 case 't':  out.push_back('\t'); break;
                 case 'u': {
-                    if (pos_ + 4u > text_.size()) {
-                        return make_error("Incomplete \\uXXXX escape in JSON string");
+                    auto parse_hex4 = [this]() -> Result<std::uint32_t> {
+                        if (pos_ + 4u > text_.size()) {
+                            return make_error("Incomplete \\uXXXX escape in JSON string");
+                        }
+                        std::uint32_t unit = 0;
+                        for (std::size_t i = 0; i < 4u; ++i) {
+                            const char hc = text_[pos_++];
+                            unit <<= 4u;
+                            if (hc >= '0' && hc <= '9') {
+                                unit |= static_cast<std::uint32_t>(hc - '0');
+                            } else if (hc >= 'a' && hc <= 'f') {
+                                unit |= static_cast<std::uint32_t>(10 + (hc - 'a'));
+                            } else if (hc >= 'A' && hc <= 'F') {
+                                unit |= static_cast<std::uint32_t>(10 + (hc - 'A'));
+                            } else {
+                                return make_error("Invalid hex digit in \\uXXXX JSON escape");
+                            }
+                        }
+                        return unit;
+                    };
+
+                    const auto first = parse_hex4();
+                    if (!first) {
+                        return std::unexpected(first.error());
                     }
-                    unsigned int code = 0;
-                    for (std::size_t i = 0; i < 4u; ++i) {
-                        const char hc = text_[pos_++];
-                        code <<= 4u;
-                        if (hc >= '0' && hc <= '9') code |= static_cast<unsigned int>(hc - '0');
-                        else if (hc >= 'a' && hc <= 'f') code |= static_cast<unsigned int>(10 + (hc - 'a'));
-                        else if (hc >= 'A' && hc <= 'F') code |= static_cast<unsigned int>(10 + (hc - 'A'));
-                        else return make_error("Invalid hex digit in \\uXXXX JSON escape");
+                    std::uint32_t codepoint = *first;
+                    if (codepoint >= 0xD800u && codepoint <= 0xDBFFu) {
+                        if (pos_ + 2u > text_.size() || text_[pos_] != '\\' || text_[pos_ + 1u] != 'u') {
+                            return make_error("Unpaired UTF-16 high surrogate in JSON string");
+                        }
+                        pos_ += 2u;
+                        const auto low = parse_hex4();
+                        if (!low) {
+                            return std::unexpected(low.error());
+                        }
+                        if (*low < 0xDC00u || *low > 0xDFFFu) {
+                            return make_error("Invalid UTF-16 low surrogate following high surrogate in JSON string");
+                        }
+                        codepoint = 0x10000u + (((codepoint - 0xD800u) << 10u) | (*low - 0xDC00u));
+                    } else if (codepoint >= 0xDC00u && codepoint <= 0xDFFFu) {
+                        return make_error("Unpaired UTF-16 low surrogate in JSON string");
                     }
-                    if (code <= 0x7Fu) {
-                        out.push_back(static_cast<char>(code));
-                    } else if (code <= 0x7FFu) {
-                        out.push_back(static_cast<char>(0xC0u | ((code >> 6u) & 0x1Fu)));
-                        out.push_back(static_cast<char>(0x80u | (code & 0x3Fu)));
+
+                    if (codepoint <= 0x7Fu) {
+                        out.push_back(static_cast<char>(codepoint));
+                    } else if (codepoint <= 0x7FFu) {
+                        out.push_back(static_cast<char>(0xC0u | ((codepoint >> 6u) & 0x1Fu)));
+                        out.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
+                    } else if (codepoint <= 0xFFFFu) {
+                        out.push_back(static_cast<char>(0xE0u | ((codepoint >> 12u) & 0x0Fu)));
+                        out.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3Fu)));
+                        out.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
                     } else {
-                        out.push_back(static_cast<char>(0xE0u | ((code >> 12u) & 0x0Fu)));
-                        out.push_back(static_cast<char>(0x80u | ((code >> 6u) & 0x3Fu)));
-                        out.push_back(static_cast<char>(0x80u | (code & 0x3Fu)));
+                        out.push_back(static_cast<char>(0xF0u | ((codepoint >> 18u) & 0x07u)));
+                        out.push_back(static_cast<char>(0x80u | ((codepoint >> 12u) & 0x3Fu)));
+                        out.push_back(static_cast<char>(0x80u | ((codepoint >> 6u) & 0x3Fu)));
+                        out.push_back(static_cast<char>(0x80u | (codepoint & 0x3Fu)));
                     }
                     break;
                 }
@@ -543,8 +593,8 @@ Result<PatchBundle> decode_patch_bundle_json(std::string_view json_text) {
 
     if (const JsonValue* v = find_field(*obj, "expected_sha256")) {
         const auto* s = v->as_string();
-        if (s == nullptr) {
-            return make_error("'expected_sha256' must be a hex string");
+        if (s == nullptr || !is_valid_sha256_hex(*s)) {
+            return make_error("'expected_sha256' must be a 64-character SHA-256 hex string");
         }
         bundle.expected_sha256 = to_lower_ascii(*s);
     } else {
@@ -634,41 +684,8 @@ Result<void> save_patch_bundle_file(const PatchBundle& bundle,
     if (path.empty()) {
         return make_error("Patch bundle output path is empty");
     }
-    std::error_code ec;
-    const auto parent = path.parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent, ec);
-    }
-
-    std::filesystem::path tmp_path = path;
-    tmp_path += ".tmp";
-
     const std::string encoded = encode_patch_bundle_json(bundle);
-    {
-        std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!out) {
-            return make_error(std::format("Failed to open '{}' for writing", tmp_path.string()));
-        }
-        out.write(encoded.data(), static_cast<std::streamsize>(encoded.size()));
-        out.flush();
-        if (!out) {
-            out.close();
-            std::filesystem::remove(tmp_path, ec);
-            return make_error(std::format("Failed to write patch bundle '{}'", tmp_path.string()));
-        }
-    }
-
-    std::filesystem::rename(tmp_path, path, ec);
-    if (ec) {
-        std::filesystem::remove(path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp_path, path, ec);
-        if (ec) {
-            std::filesystem::remove(tmp_path, ec);
-            return make_error(std::format("Failed to finalize patch bundle '{}'", path.string()));
-        }
-    }
-    return {};
+    return detail::write_text_atomically(path, encoded, true, true);
 }
 
 Result<PatchBundle> load_patch_bundle_file(const std::filesystem::path& path) {
@@ -703,19 +720,62 @@ Result<PatchBundlePreview> preview_patch_bundle(
     preview.actual_sha256 = to_lower_ascii(*sha_res);
     preview.actual_size = target.size();
     preview.size_matches = (bundle.expected_size == 0) || (bundle.expected_size == preview.actual_size);
-    preview.sha256_matches = bundle.expected_sha256.empty() ||
-                             (to_lower_ascii(bundle.expected_sha256) == preview.actual_sha256);
+    const bool valid_expected_sha256 = is_valid_sha256_hex(bundle.expected_sha256);
+    preview.sha256_matches =
+        valid_expected_sha256 && (to_lower_ascii(bundle.expected_sha256) == preview.actual_sha256);
 
     preview.entry_previews.reserve(bundle.entries.size());
 
-    // Detect pairwise overlaps among valid-sized entries
-    auto ranges_overlap = [](std::uint64_t a_off, std::uint64_t a_sz,
-                             std::uint64_t b_off, std::uint64_t b_sz) noexcept -> bool {
-        if (a_sz == 0 || b_sz == 0) return false;
-        const std::uint64_t a_end = a_off + a_sz;
-        const std::uint64_t b_end = b_off + b_sz;
-        return a_off < b_end && b_off < a_end;
+    // Precompute pairwise overlaps among valid in-bounds entries in O(N log N).
+    struct IndexedRange {
+        std::uint64_t start{0};
+        std::uint64_t end{0};
+        std::size_t entry_index{0};
     };
+    std::vector<IndexedRange> sorted_ranges;
+    sorted_ranges.reserve(bundle.entries.size());
+    for (std::size_t i = 0; i < bundle.entries.size(); ++i) {
+        const PatchBundleEntry& e = bundle.entries[i];
+        const auto sz = static_cast<std::uint64_t>(e.patched_bytes.size());
+        if (sz == 0u || e.original_bytes.size() != e.patched_bytes.size()) {
+            continue;
+        }
+        if (e.offset > target.size() || sz > target.size() - e.offset) {
+            continue;
+        }
+        sorted_ranges.push_back(IndexedRange{
+            .start = e.offset,
+            .end = e.offset + sz,
+            .entry_index = i,
+        });
+    }
+    std::sort(sorted_ranges.begin(),
+              sorted_ranges.end(),
+              [](const IndexedRange& a, const IndexedRange& b) noexcept {
+                  if (a.start != b.start) return a.start < b.start;
+                  if (a.end != b.end) return a.end < b.end;
+                  return a.entry_index < b.entry_index;
+              });
+
+    std::vector<std::optional<std::size_t>> overlap_peer(bundle.entries.size());
+    if (!sorted_ranges.empty()) {
+        std::size_t max_end_pos = 0u;
+        for (std::size_t k = 1u; k < sorted_ranges.size(); ++k) {
+            const IndexedRange& active = sorted_ranges[max_end_pos];
+            const IndexedRange& cur = sorted_ranges[k];
+            if (cur.start < active.end) {
+                if (!overlap_peer[cur.entry_index].has_value()) {
+                    overlap_peer[cur.entry_index] = active.entry_index;
+                }
+                if (!overlap_peer[active.entry_index].has_value()) {
+                    overlap_peer[active.entry_index] = cur.entry_index;
+                }
+            }
+            if (cur.end > active.end) {
+                max_end_pos = k;
+            }
+        }
+    }
 
     for (std::size_t i = 0; i < bundle.entries.size(); ++i) {
         const PatchBundleEntry& e = bundle.entries[i];
@@ -746,19 +806,7 @@ Result<PatchBundlePreview> preview_patch_bundle(
             continue;
         }
 
-        std::optional<std::size_t> overlap_idx;
-        for (std::size_t j = 0; j < bundle.entries.size(); ++j) {
-            if (j == i || bundle.entries[j].patched_bytes.empty() ||
-                bundle.entries[j].original_bytes.size() != bundle.entries[j].patched_bytes.size()) {
-                continue;
-            }
-            if (ranges_overlap(e.offset, ep.size,
-                               bundle.entries[j].offset,
-                               static_cast<std::uint64_t>(bundle.entries[j].patched_bytes.size()))) {
-                overlap_idx = j;
-                break;
-            }
-        }
+        const std::optional<std::size_t> overlap_idx = overlap_peer[i];
         if (overlap_idx.has_value()) {
             ep.status = PatchEntryConflictKind::OverlappingEntry;
             ep.detail = std::format("Overlaps with bundle entry [{}] at {:#x}",
@@ -824,12 +872,18 @@ Result<PatchBundlePreview> preview_patch_bundle(
 
     if (!preview.sha256_matches) {
         preview.can_apply = false;
-        preview.summary = std::format(
-            "Target SHA-256 mismatch (expected {}, actual {}); {} clean, {} conflict(s)",
-            bundle.expected_sha256,
-            preview.actual_sha256,
-            preview.clean_count,
-            preview.conflict_count);
+        preview.summary = !valid_expected_sha256
+                              ? std::format(
+                                    "Invalid or missing target SHA-256 in patch bundle ('{}'); {} clean, {} conflict(s)",
+                                    bundle.expected_sha256,
+                                    preview.clean_count,
+                                    preview.conflict_count)
+                              : std::format(
+                                    "Target SHA-256 mismatch (expected {}, actual {}); {} clean, {} conflict(s)",
+                                    bundle.expected_sha256,
+                                    preview.actual_sha256,
+                                    preview.clean_count,
+                                    preview.conflict_count);
         return preview;
     }
     if (!preview.size_matches) {
