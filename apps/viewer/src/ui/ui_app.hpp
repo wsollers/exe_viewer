@@ -220,7 +220,7 @@ namespace viewer {
         std::optional<AnalysisProject> pending_recovery_project_;
         std::filesystem::path pending_recovery_key_path_;
 
-        // Live process attach modal state
+        // Live process attach & GDB Remote modal state
         bool open_attach_modal_next_frame_ = false;
         std::vector<peelf::ProcessInfo> cached_process_list_;
         char process_filter_buf_[128] = {};
@@ -228,6 +228,16 @@ namespace viewer {
         bool process_accessible_only_ = false;
         std::optional<peelf::ProcessId> selected_attach_pid_;
         std::string attach_error_message_;
+
+        bool open_gdb_remote_modal_next_frame_ = false;
+        bool gdb_remote_modal_debug_mode_ = false;
+        std::array<char, 256> gdb_remote_host_buf_{"127.0.0.1"};
+        int gdb_remote_port_ = 1234;
+        int gdb_remote_timeout_ms_ = 3000;
+        int gdb_remote_fallback_arch_idx_ = 0;
+        bool gdb_remote_allow_unencrypted_ = false;
+        bool gdb_remote_consent_acknowledged_ = false;
+        std::string gdb_remote_error_message_;
 
         // Current disassembly cursor for live refresh
         std::optional<std::uint64_t> last_disasm_offset_;
@@ -281,6 +291,7 @@ namespace viewer {
                                  bool is_file_offset = false);
         void render_dockspace();
         void render_attach_process_modal();
+        void render_gdb_remote_modal();
         void render_relocate_project_modal();
         void render_recovery_banner();
         void toggle_bookmark_at_selection();
@@ -289,6 +300,7 @@ namespace viewer {
         void mark_autosave_baseline() noexcept;
         [[nodiscard]] std::filesystem::path active_recovery_key_path() const;
         void open_attach_process_modal();
+        void open_gdb_remote_modal(bool debug_opt_in);
         void refresh_process_list();
         void sync_live_process_view(bool navigate_to_entry);
         void render_call_graph_panel();

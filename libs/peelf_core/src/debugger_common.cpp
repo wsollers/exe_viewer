@@ -487,6 +487,13 @@ ForgivingValue<X86DebugRegisterPlan> build_x86_debug_register_plan(
             }
             rw_bits = 0b00ULL;
             len_bits = 0b00ULL;
+        } else if (bp.kind == BreakpointKind::HardwareRead) {
+            return {
+                std::nullopt,
+                SubsystemStatus::unavailable(
+                    "debugger_hw",
+                    "x86 DR0..DR7 debug registers do not support read-only watchpoints; use HardwareReadWrite"),
+            };
         } else {
             rw_bits = (bp.kind == BreakpointKind::HardwareWrite) ? 0b01ULL : 0b11ULL;
             switch (bp.byte_size) {

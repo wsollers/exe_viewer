@@ -171,6 +171,8 @@ void DebuggerPanel::render_opt_in_modal() {
         return;
     }
 
+    bool deferred_session_changed = false;
+
     // Mode comparison banner explicitly distinguishing Read-Only Attach vs Opt-In Active Debugger
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.17f, 0.22f, 1.0f));
     if (ImGui::BeginChild("##ModeDistinctionBanner", ImVec2(0.0f, 108.0f), ImGuiChildFlags_Borders)) {
@@ -330,7 +332,121 @@ void DebuggerPanel::render_opt_in_modal() {
                 if (auto res = model_.attach_debug_process(*selected_pid_); res.has_value()) {
                     set_visible(true);
                     status_msg_ = std::format("Attached opt-in debugger to PID {}.", *selected_pid_);
-                    if (on_session_changed_) on_session_changed_();
+                    deferred_session_changed = true;
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    modal_error_ = res.error().message;
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Connect GDB Remote (Opt-In)")) {
+            static constexpr std::array<const char*, 9> kRemoteFallbackArchLabels{
+                "Auto (target.xml / RSP negotiation)",
+                "x86_64 (Little-Endian)",
+                "x86 (32-bit Little-Endian)",
+                "ARM64 / AArch64 (Little-Endian)",
+                "ARM (32-bit Little-Endian)",
+                "RISC-V 64 (Little-Endian)",
+                "RISC-V 32 (Little-Endian)",
+                "PowerPC64 (Big-Endian)",
+                "PowerPC64 ELFv2 (Little-Endian)",
+            };
+            static constexpr std::array<peelf::Architecture, 9> kRemoteFallbackArchs{
+                peelf::Architecture::Unknown,
+                peelf::Architecture::X86_64,
+                peelf::Architecture::X86,
+                peelf::Architecture::ARM64,
+                peelf::Architecture::ARM,
+                peelf::Architecture::RISCV64,
+                peelf::Architecture::RISCV32,
+                peelf::Architecture::PowerPC64,
+                peelf::Architecture::PowerPC64,
+            };
+            static constexpr std::array<peelf::Endianness, 9> kRemoteFallbackEndians{
+                peelf::Endianness::Little,
+                peelf::Endianness::Little,
+                peelf::Endianness::Little,
+                peelf::Endianness::Little,
+                peelf::Endianness::Little,
+                peelf::Endianness::Little,
+                peelf::Endianness::Little,
+                peelf::Endianness::Big,
+                peelf::Endianness::Little,
+            };
+
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(300.0f);
+            ImGui::InputTextWithHint("Endpoint Host",
+                                     "127.0.0.1, ::1, localhost, or remote IP...",
+                                     remote_host_buf_.data(),
+                                     remote_host_buf_.size());
+            ImGui::SetNextItemWidth(140.0f);
+            if (ImGui::InputInt("TCP Port", &remote_port_, 1, 100)) {
+                remote_port_ = std::clamp(remote_port_, 1, 65535);
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(140.0f);
+            if (ImGui::InputInt("Timeout (ms)", &remote_timeout_ms_, 250, 1000)) {
+                remote_timeout_ms_ = std::clamp(remote_timeout_ms_, 250, 60000);
+            }
+            ImGui::SetNextItemWidth(300.0f);
+            ImGui::Combo("Fallback Architecture",
+                         &remote_fallback_arch_idx_,
+                         kRemoteFallbackArchLabels.data(),
+                         static_cast<int>(kRemoteFallbackArchLabels.size()));
+
+            const std::string_view host_sv = trim_ws(remote_host_buf_.data());
+            const bool host_valid = !host_sv.empty();
+            const bool is_loopback = host_valid && peelf::is_loopback_endpoint_host(host_sv);
+
+            ImGui::Spacing();
+            ImGui::Checkbox("Allow unencrypted plaintext RSP TCP connection to non-loopback endpoint",
+                            &remote_allow_unencrypted_);
+            if (host_valid && !is_loopback) {
+                ImGui::TextColored(
+                    remote_allow_unencrypted_
+                        ? ImVec4(0.95f, 0.78f, 0.30f, 1.0f)
+                        : ImVec4(0.95f, 0.45f, 0.45f, 1.0f),
+                    "Security notice: '%.*s' is non-loopback; plaintext RSP requires explicit confirmation.",
+                    static_cast<int>(host_sv.size()),
+                    host_sv.data());
+            }
+            ImGui::Checkbox(
+                "I consent to active target mutation (breakpoints, execution step/continue, register & memory writes)",
+                &remote_consent_acknowledged_);
+
+            ImGui::Spacing();
+            const bool can_connect_remote =
+                host_valid && remote_port_ >= 1 && remote_port_ <= 65535 &&
+                (is_loopback || remote_allow_unencrypted_) && remote_consent_acknowledged_;
+            ImGui::BeginDisabled(!can_connect_remote);
+            if (ImGui::Button("Connect GDB Remote Debugger (Opt-In)", ImVec2(290.0f, 0.0f))) {
+                const auto idx = static_cast<std::size_t>(std::clamp(
+                    remote_fallback_arch_idx_,
+                    0,
+                    static_cast<int>(kRemoteFallbackArchLabels.size()) - 1));
+                peelf::GdbRemoteOpenOptions opts{};
+                opts.endpoint.host = std::string(host_sv);
+                opts.endpoint.port = static_cast<std::uint16_t>(std::clamp(remote_port_, 1, 65535));
+                const auto timeout_ms = std::chrono::milliseconds{
+                    std::clamp(remote_timeout_ms_, 250, 60000)};
+                opts.endpoint.connect_timeout = timeout_ms;
+                opts.endpoint.io_timeout = timeout_ms;
+                opts.endpoint.allow_unencrypted_remote_endpoint = remote_allow_unencrypted_;
+                opts.fallback_architecture = kRemoteFallbackArchs[idx];
+                opts.fallback_endianness = kRemoteFallbackEndians[idx];
+                const peelf::ExplicitDebugConsent consent{
+                    .acknowledged_target_mutation = remote_consent_acknowledged_,
+                };
+                if (auto res = model_.connect_gdb_remote_debug(opts, consent); res.has_value()) {
+                    set_visible(true);
+                    status_msg_ = std::format("Connected opt-in GDB Remote debugger to {}:{}.",
+                                              opts.endpoint.host,
+                                              opts.endpoint.port);
+                    deferred_session_changed = true;
                     ImGui::CloseCurrentPopup();
                 } else {
                     modal_error_ = res.error().message;
@@ -353,6 +469,10 @@ void DebuggerPanel::render_opt_in_modal() {
     }
 
     ImGui::EndPopup();
+
+    if (deferred_session_changed && on_session_changed_) {
+        on_session_changed_();
+    }
 }
 
 void DebuggerPanel::draw_transport_bar() {
@@ -430,6 +550,7 @@ void DebuggerPanel::draw_transport_bar() {
     ImGui::BeginDisabled(!is_active);
     if (ImGui::Button("Detach Cleanly")) {
         if (auto r = dbg->detach(); !r.has_value()) {
+            model_.refresh_debug_breakpoints();
             status_msg_ = r.error().message;
         } else {
             model_.detach_process();
@@ -494,13 +615,14 @@ void DebuggerPanel::draw_breakpoints_tab() {
     ImGui::InputTextWithHint("##BpAddrSym", "0xVA or symbol name...",
                              bp_expr_buf_.data(), bp_expr_buf_.size());
     ImGui::SameLine();
-    static constexpr std::array<const char*, 4> kBreakpointKinds{
-        "Software (Trap)",
-        "Hardware Execute (DR)",
-        "Hardware Write (DR)",
-        "Hardware Read/Write (DR)"
+    static constexpr std::array<const char*, 5> kBreakpointKinds{
+        "Software (Trap / Z0)",
+        "Hardware Execute (DR / Z1)",
+        "Hardware Write (DR / Z2)",
+        "Hardware Read/Write (DR / Z4)",
+        "Hardware Read (Z3)"
     };
-    ImGui::SetNextItemWidth(185.0f);
+    ImGui::SetNextItemWidth(205.0f);
     ImGui::Combo("##BpKind", &bp_kind_idx_, kBreakpointKinds.data(),
                  static_cast<int>(kBreakpointKinds.size()));
 
@@ -544,6 +666,7 @@ void DebuggerPanel::draw_breakpoints_tab() {
                 const peelf::debugger::BreakpointKind hw_kind =
                     bp_kind_idx_ == 1 ? peelf::debugger::BreakpointKind::HardwareExecute
                   : bp_kind_idx_ == 2 ? peelf::debugger::BreakpointKind::HardwareWrite
+                  : bp_kind_idx_ == 4 ? peelf::debugger::BreakpointKind::HardwareRead
                                       : peelf::debugger::BreakpointKind::HardwareReadWrite;
                 constexpr std::array<std::uint8_t, 4> kSizes{1u, 2u, 4u, 8u};
                 const std::uint8_t sz = kSizes[static_cast<std::size_t>(std::clamp(bp_hw_size_idx_, 0, 3))];

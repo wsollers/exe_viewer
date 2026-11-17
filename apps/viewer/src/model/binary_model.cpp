@@ -138,17 +138,72 @@ using detail::utf8_path;
     }
 
     void BinaryModel::recompute_capabilities() noexcept {
-        const bool dbg_active = debug_session_ != nullptr ||
-                                (session_ != nullptr && !session_->is_read_only() && !session_->is_crash_dump());
-        target_profile_ = peelf::derive_target_profile(
-            image_.get(),
-            is_live_process() ? session_.get() : nullptr,
-            dbg_active,
-            false);
-        if (!is_live_process() && source_kind_ == BinarySourceKind::None) {
-            target_profile_ = {};
+        try {
+            const peelf::IProcessSession* underlying_session =
+                is_live_process()
+                    ? (debug_session_ != nullptr ? &debug_session_->session() : session_.get())
+                    : nullptr;
+            const bool dbg_active =
+                debug_session_ != nullptr ||
+                (underlying_session != nullptr &&
+                 !underlying_session->is_read_only() &&
+                 !underlying_session->is_crash_dump());
+            const auto* gdb_ro = dynamic_cast<const peelf::IGdbRemoteSession*>(underlying_session);
+            const auto* gdb_dbg =
+                dynamic_cast<const peelf::IGdbRemoteDebugSession*>(debug_session_.get());
+            target_profile_ = peelf::derive_target_profile(
+                image_.get(),
+                underlying_session,
+                dbg_active,
+                gdb_ro != nullptr || gdb_dbg != nullptr);
+            if (!is_live_process() && source_kind_ == BinarySourceKind::None) {
+                target_profile_ = {};
+            }
+            peelf::ProviderFacts effective_facts = provider_facts_;
+            if (gdb_ro != nullptr || gdb_dbg != nullptr) {
+                effective_facts.remote_gdb_stub_available = true;
+            }
+            capability_matrix_ = peelf::capabilities_for(target_profile_, effective_facts);
+            if (gdb_dbg != nullptr) {
+                const peelf::TargetCapabilityMatrix sess_mat = gdb_dbg->capability_matrix();
+                std::array<peelf::Capability, peelf::kOperationCount> merged{};
+                const auto base_entries = capability_matrix_.entries();
+                std::copy(base_entries.begin(), base_entries.end(), merged.begin());
+                for (const peelf::Operation op : {
+                         peelf::Operation::SoftwareBreakpoints,
+                         peelf::Operation::HardwareWatchpoints,
+                         peelf::Operation::ExecutionTimeline}) {
+                    merged[static_cast<std::size_t>(op)] = sess_mat.get(op);
+                }
+                effective_facts.remote_gdb_stub_available =
+                    sess_mat.provider_facts().remote_gdb_stub_available;
+                capability_matrix_ = peelf::TargetCapabilityMatrix(
+                    target_profile_, effective_facts, std::move(merged));
+            } else if (gdb_ro != nullptr && !dbg_active) {
+                std::array<peelf::Capability, peelf::kOperationCount> merged{};
+                const auto base_entries = capability_matrix_.entries();
+                std::copy(base_entries.begin(), base_entries.end(), merged.begin());
+                merged[static_cast<std::size_t>(peelf::Operation::SoftwareBreakpoints)] =
+                    peelf::Capability{
+                        .operation = peelf::Operation::SoftwareBreakpoints,
+                        .state = peelf::SupportState::Unsupported,
+                        .provider_available = effective_facts.remote_gdb_stub_available,
+                        .provider_name = "gdb_rsp",
+                        .reason = "Read-only GDB RSP session; connect via Opt-In GDB Remote Debugger for software breakpoints",
+                    };
+                merged[static_cast<std::size_t>(peelf::Operation::HardwareWatchpoints)] =
+                    peelf::Capability{
+                        .operation = peelf::Operation::HardwareWatchpoints,
+                        .state = peelf::SupportState::Unsupported,
+                        .provider_available = effective_facts.remote_gdb_stub_available,
+                        .provider_name = "gdb_rsp",
+                        .reason = "Read-only GDB RSP session; connect via Opt-In GDB Remote Debugger for watchpoints",
+                    };
+                capability_matrix_ = peelf::TargetCapabilityMatrix(
+                    target_profile_, effective_facts, std::move(merged));
+            }
+        } catch (...) {
         }
-        capability_matrix_ = peelf::capabilities_for(target_profile_, provider_facts_);
     }
 
     void BinaryModel::set_provider_facts(peelf::ProviderFacts facts) noexcept {

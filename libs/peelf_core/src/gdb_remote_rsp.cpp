@@ -1415,7 +1415,11 @@ void apply_osabi_string(std::string_view raw_osabi, RspTargetDescription& desc) 
     if (lgroup == "system" || lgroup == "csr" || lgroup == "cp0") {
         return RegisterCategory::System;
     }
-    if (ltype == "code_ptr" && lname != "lr" && lname != "ra") {
+    if (ltype == "code_ptr" && lname != "lr" && lname != "ra" &&
+        lname != "x30" && lname != "r14" && lname != "ctr" &&
+        lname != "r31" && lname != "$31" &&
+        lname != "elr_el1" && lname != "elr_el2" && lname != "elr_el3" &&
+        lname != "mepc" && lname != "sepc") {
         return RegisterCategory::InstructionPointer;
     }
     return RegisterCategory::General;

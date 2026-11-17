@@ -1,10 +1,12 @@
 #pragma once
 
 // Clean-room GDB Remote Serial Protocol (RSP) transport, framing, XML target
-// negotiation, and strictly read-only IProcessSession backend (WU-25a).
+// negotiation, strictly read-only IProcessSession backend (WU-25a), and opt-in
+// IDebugSession debugger backend (WU-25b).
 
 #include <peelf/binary_image.hpp>
 #include <peelf/capability_matrix.hpp>
+#include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
 #include <peelf/error.hpp>
 #include <peelf/forgiving.hpp>
@@ -184,6 +186,28 @@ struct RspCapabilities {
     bool qxfer_auxv_read{false};
     std::vector<std::string> raw_features{};
 };
+
+/// Negotiated `vCont?` action flags advertised by a GDB RSP stub (`WU-25b`).
+struct RspVContCapabilities {
+    bool probed{false};
+    bool supported{false};
+    bool cont{false};          ///< `vCont;c`
+    bool cont_signal{false};   ///< `vCont;C<sig>`
+    bool step{false};          ///< `vCont;s`
+    bool step_signal{false};   ///< `vCont;S<sig>`
+    bool stop{false};          ///< `vCont;t`
+    bool range_step{false};    ///< `vCont;r<start>,<end>`
+};
+
+/// Explicit opt-in consent required before opening a mutating GDB remote `IDebugSession` (`WU-25b`).
+/// Prevents accidental target halting, trap injection, or register/memory mutation on live endpoints.
+struct ExplicitDebugConsent {
+    bool acknowledged_target_mutation{false};
+};
+
+namespace debugger {
+using ExplicitDebugConsent = ::peelf::ExplicitDebugConsent;
+}  // namespace debugger
 
 /// Parses a semicolon-delimited `qSupported` stub reply into `RspCapabilities`.
 [[nodiscard]] RspCapabilities parse_qsupported_reply(
@@ -463,6 +487,35 @@ public:
         std::span<std::uint8_t> buffer,
         std::stop_token stop_token = {});
 
+    /// Writes target memory via chunked hex `M<addr>,<len>:<hex>` packets (`WU-25b`).
+    /// Refused immediately when `is_read_only_mode()` is true.
+    [[nodiscard]] Result<std::size_t> write_memory(
+        std::uint64_t address,
+        std::span<const std::uint8_t> data,
+        std::stop_token stop_token = {});
+
+    /// Probes `vCont?` action support (`vCont;c`, `vCont;C`, `vCont;s`, `vCont;S`, `vCont;t`, `vCont;r`).
+    [[nodiscard]] Result<RspVContCapabilities> negotiate_vcont(
+        std::stop_token stop_token = {});
+
+    /// Transmits an execution-resume or kill command (`vCont;c`, `c`, `vCont;s`, `s`, `k`) and consumes
+    /// its `+` ACK (when not in `QStartNoAckMode`) without blocking on the subsequent stop-reply packet.
+    [[nodiscard]] Result<void> send_command_no_reply(
+        std::string_view payload,
+        std::stop_token stop_token = {});
+
+    /// Transmits an unframed asynchronous `0x03` (`Ctrl-C`) interrupt byte to pause a running target.
+    [[nodiscard]] Result<void> send_interrupt(std::stop_token stop_token = {});
+
+    /// Polls up to `timeout` for the next complete RSP frame (e.g. asynchronous stop-reply `$T05...#csum`),
+    /// returning `std::nullopt` if no packet begins before `timeout` elapses.
+    [[nodiscard]] Result<std::optional<std::string>> try_receive_packet(
+        std::chrono::milliseconds timeout,
+        std::stop_token stop_token = {});
+
+    /// Clears cached `Hg` thread selection after target execution or stop transitions.
+    void reset_selected_thread() noexcept { selected_hg_thread_.clear(); }
+
 private:
     [[nodiscard]] Result<std::uint8_t> read_byte(
         std::chrono::milliseconds timeout,
@@ -514,6 +567,26 @@ public:
         ThreadId local_tid) = 0;
 };
 
+/// Extended opt-in GDB remote `IDebugSession` interface exposing negotiated `vCont`
+/// capabilities, `IGdbRemoteSession` metadata, runtime-probed `TargetCapabilityMatrix`,
+/// and `Z3`/`z3` read-watchpoint support alongside the full `debugger::IDebugSession` contract (`WU-25b`).
+class IGdbRemoteDebugSession : public debugger::IDebugSession {
+public:
+    ~IGdbRemoteDebugSession() override = default;
+
+    [[nodiscard]] virtual IGdbRemoteSession& remote_session() noexcept = 0;
+    [[nodiscard]] virtual const IGdbRemoteSession& remote_session() const noexcept = 0;
+    [[nodiscard]] virtual const RspVContCapabilities& vcont_capabilities() const noexcept = 0;
+    [[nodiscard]] virtual const ProviderFacts& provider_facts() const noexcept = 0;
+    [[nodiscard]] virtual TargetCapabilityMatrix capability_matrix() const = 0;
+
+    /// Adds a hardware read-only watchpoint (`Z3`/`z3`) in addition to `Z1`/`Z2`/`Z4` via `add_hardware_breakpoint`.
+    [[nodiscard]] virtual ForgivingValue<debugger::BreakpointDescriptor> add_read_watchpoint(
+        std::uint64_t address,
+        std::uint8_t byte_size = 1,
+        std::string label = {}) = 0;
+};
+
 class GdbRemoteBackend {
 public:
     [[nodiscard]] static Result<std::unique_ptr<IProcessSession>> open_read_only(
@@ -531,6 +604,31 @@ public:
 
     [[nodiscard]] static Result<std::unique_ptr<IProcessSession>> open_read_only(
         std::unique_ptr<IRspTransport> transport,
+        const GdbRemoteOpenOptions& options = {},
+        std::stop_token stop_token = {});
+
+    /// Opens an opt-in interactive GDB remote `IDebugSession` (`WU-25b`).
+    /// Rejects immediately without connecting or transmitting packets if
+    /// `!consent.acknowledged_target_mutation`.
+    [[nodiscard]] static Result<std::unique_ptr<debugger::IDebugSession>> open_debug(
+        const GdbRemoteOpenOptions& options,
+        ExplicitDebugConsent consent,
+        std::stop_token stop_token = {});
+
+    [[nodiscard]] static Result<std::unique_ptr<debugger::IDebugSession>> open_debug(
+        const RemoteEndpointOptions& endpoint,
+        ExplicitDebugConsent consent,
+        std::stop_token stop_token = {});
+
+    [[nodiscard]] static Result<std::unique_ptr<debugger::IDebugSession>> open_debug(
+        std::string_view endpoint_spec,
+        ExplicitDebugConsent consent,
+        bool allow_unencrypted_remote_endpoint = false,
+        std::stop_token stop_token = {});
+
+    [[nodiscard]] static Result<std::unique_ptr<debugger::IDebugSession>> open_debug(
+        std::unique_ptr<IRspTransport> transport,
+        ExplicitDebugConsent consent,
         const GdbRemoteOpenOptions& options = {},
         std::stop_token stop_token = {});
 };

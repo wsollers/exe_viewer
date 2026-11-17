@@ -59,6 +59,14 @@ private:
     std::optional<peelf::ProcessId> selected_pid_{};
     std::string modal_error_{};
 
+    // Remote GDB RSP opt-in tab state
+    std::array<char, 256> remote_host_buf_{"127.0.0.1"};
+    int remote_port_{1234};
+    int remote_timeout_ms_{3000};
+    int remote_fallback_arch_idx_{0};
+    bool remote_allow_unencrypted_{false};
+    bool remote_consent_acknowledged_{false};
+
     // Breakpoint editor state
     std::array<char, 256> bp_expr_buf_{};
     std::array<char, 128> bp_label_buf_{};

@@ -55,6 +55,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/execution_timeline.cpp
   src/gdb_remote_rsp.cpp
   src/gdb_remote_session.cpp
+  src/gdb_remote_debug.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp

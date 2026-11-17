@@ -46,6 +46,7 @@ enum class BreakpointKind : std::uint8_t {
     Software = 0,
     HardwareExecute,
     HardwareWrite,
+    HardwareRead,
     HardwareReadWrite,
 };
 
@@ -54,6 +55,7 @@ enum class BreakpointKind : std::uint8_t {
         case BreakpointKind::Software:          return "Software";
         case BreakpointKind::HardwareExecute:   return "HardwareExecute";
         case BreakpointKind::HardwareWrite:     return "HardwareWrite";
+        case BreakpointKind::HardwareRead:      return "HardwareRead";
         case BreakpointKind::HardwareReadWrite: return "HardwareReadWrite";
     }
     return "Software";

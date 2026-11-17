@@ -249,6 +249,13 @@ void UiApp::render_main_menu() {
             open_attach_process_modal();
         }
         ImGui::Separator();
+        if (ImGui::MenuItem("Connect GDB Remote / QEMU (Read-Only)...")) {
+            open_gdb_remote_modal(false);
+        }
+        if (ImGui::MenuItem("Connect GDB Remote Debugger (Opt-in)...")) {
+            open_gdb_remote_modal(true);
+        }
+        ImGui::Separator();
         auto* dbg = model_.debug_session();
         const bool dbg_paused = dbg != nullptr && dbg->state() == peelf::debugger::DebugSessionState::Paused;
         const bool dbg_running = dbg != nullptr && dbg->state() == peelf::debugger::DebugSessionState::Running;
@@ -275,9 +282,13 @@ void UiApp::render_main_menu() {
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Detach Debugger Cleanly", nullptr, false, dbg_paused || dbg_running)) {
-            (void)dbg->detach();
-            model_.detach_process();
-            on_process_attached();
+            if (auto r = dbg->detach(); !r.has_value()) {
+                model_.refresh_debug_breakpoints();
+                Log().error("Detach failed (target remains attached): {}", r.error().message);
+            } else {
+                model_.detach_process();
+                on_process_attached();
+            }
         }
         ImGui::EndMenu();
     }

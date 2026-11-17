@@ -24,6 +24,7 @@
 #include <peelf/executable_settings.hpp>
 #include <peelf/execution_timeline.hpp>
 #include <peelf/forgiving.hpp>
+#include <peelf/gdb_remote.hpp>
 #include <peelf/handlers.hpp>
 #include <peelf/memory_search.hpp>
 #include <peelf/patch_bundle.hpp>
@@ -115,6 +116,22 @@ namespace viewer {
         [[nodiscard]] peelf::Result<void> attach_debug_session(
             std::unique_ptr<peelf::debugger::IDebugSession> debug_session,
             bool launched_by_session = false);
+
+        // Remote GDB RSP / QEMU / kgdb / OpenOCD connection API
+        // (strictly read-only by default; opt-in debugger requires ExplicitDebugConsent).
+        [[nodiscard]] peelf::Result<void> connect_gdb_remote_readonly(
+            const peelf::GdbRemoteOpenOptions& options);
+        [[nodiscard]] peelf::Result<void> connect_gdb_remote_readonly(
+            std::unique_ptr<peelf::IRspTransport> transport,
+            const peelf::GdbRemoteOpenOptions& options = {});
+        [[nodiscard]] peelf::Result<void> connect_gdb_remote_debug(
+            const peelf::GdbRemoteOpenOptions& options,
+            peelf::ExplicitDebugConsent consent);
+        [[nodiscard]] peelf::Result<void> connect_gdb_remote_debug(
+            std::unique_ptr<peelf::IRspTransport> transport,
+            peelf::ExplicitDebugConsent consent,
+            const peelf::GdbRemoteOpenOptions& options = {});
+
         [[nodiscard]] bool is_debug_session() const noexcept { return debug_session_ != nullptr; }
         [[nodiscard]] peelf::debugger::IDebugSession* debug_session() noexcept { return debug_session_.get(); }
         [[nodiscard]] const peelf::debugger::IDebugSession* debug_session() const noexcept {

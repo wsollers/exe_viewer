@@ -217,17 +217,25 @@ private:
                 session_->info().working_directory);
         }
 
+        const bool is_remote_gdb =
+            dynamic_cast<const peelf::IGdbRemoteSession*>(session_.get()) != nullptr;
+        if (is_remote_gdb) {
+            provider_facts_.remote_gdb_stub_available = true;
+        }
+
         target_instance_id_ = peelf::TargetInstanceId{
             .backend = session_->is_crash_dump()
                            ? (crash_dump_summary() != nullptr &&
                                       crash_dump_summary()->kind == peelf::CrashDumpKind::WindowsMinidump
                                   ? peelf::BackendKind::CrashDumpMinidump
                                   : peelf::BackendKind::CrashDumpElfCore)
-                           : (session_->is_read_only()
-                                  ? peelf::BackendKind::LiveNativeReadOnly
-                                  : peelf::BackendKind::ActiveDebugger),
+                           : (is_remote_gdb
+                                  ? peelf::BackendKind::RemoteGdbRsp
+                                  : (session_->is_read_only()
+                                         ? peelf::BackendKind::LiveNativeReadOnly
+                                         : peelf::BackendKind::ActiveDebugger)),
             .pid = session_->pid(),
-            .creation_identity = session_->is_crash_dump()
+            .creation_identity = (session_->is_crash_dump() || is_remote_gdb)
                                      ? std::nullopt
                                      : peelf::query_process_creation_identity(session_->pid()),
             .image_sha256 = {},
@@ -308,6 +316,51 @@ private:
         return attach_debug_session(std::move(*attached), false);
     }
 
+    peelf::Result<void> BinaryModel::connect_gdb_remote_readonly(
+        const peelf::GdbRemoteOpenOptions& options) {
+        auto opened = peelf::GdbRemoteBackend::open_read_only(options);
+        if (!opened) {
+            last_diagnostic_ = opened.error().message;
+            return std::unexpected(opened.error());
+        }
+        return attach_session(std::move(*opened));
+    }
+
+    peelf::Result<void> BinaryModel::connect_gdb_remote_readonly(
+        std::unique_ptr<peelf::IRspTransport> transport,
+        const peelf::GdbRemoteOpenOptions& options) {
+        auto opened = peelf::GdbRemoteBackend::open_read_only(std::move(transport), options);
+        if (!opened) {
+            last_diagnostic_ = opened.error().message;
+            return std::unexpected(opened.error());
+        }
+        return attach_session(std::move(*opened));
+    }
+
+    peelf::Result<void> BinaryModel::connect_gdb_remote_debug(
+        const peelf::GdbRemoteOpenOptions& options,
+        peelf::ExplicitDebugConsent consent) {
+        auto opened = peelf::GdbRemoteBackend::open_debug(options, consent);
+        if (!opened) {
+            last_diagnostic_ = opened.error().message;
+            return std::unexpected(opened.error());
+        }
+        return attach_debug_session(std::move(*opened), false);
+    }
+
+    peelf::Result<void> BinaryModel::connect_gdb_remote_debug(
+        std::unique_ptr<peelf::IRspTransport> transport,
+        peelf::ExplicitDebugConsent consent,
+        const peelf::GdbRemoteOpenOptions& options) {
+        auto opened =
+            peelf::GdbRemoteBackend::open_debug(std::move(transport), consent, options);
+        if (!opened) {
+            last_diagnostic_ = opened.error().message;
+            return std::unexpected(opened.error());
+        }
+        return attach_debug_session(std::move(*opened), false);
+    }
+
     peelf::Result<void> BinaryModel::attach_debug_session(
         std::unique_ptr<peelf::debugger::IDebugSession> debug_session,
         bool launched_by_session) {
@@ -326,20 +379,31 @@ private:
                             : peelf::Architecture::X86_64;
         endianness_ = session_->info().endianness;
 
+        const bool is_remote_gdb =
+            dynamic_cast<const peelf::IGdbRemoteDebugSession*>(debug_session_.get()) != nullptr ||
+            dynamic_cast<const peelf::IGdbRemoteSession*>(&debug_session_->session()) != nullptr;
+        if (is_remote_gdb) {
+            provider_facts_.remote_gdb_stub_available = true;
+        }
+
         std::error_code ec;
         if (!session_->info().executable_path.empty() &&
             std::filesystem::is_regular_file(session_->info().executable_path, ec)) {
             resolved_exe_path_ = session_->info().executable_path;
-        } else if (!session_->info().command_line.empty()) {
+        } else if (!is_remote_gdb && !session_->info().command_line.empty()) {
             resolved_exe_path_ = peelf::resolve_executable_from_command_line(
                 session_->info().command_line,
                 session_->info().working_directory);
         }
 
         target_instance_id_ = peelf::TargetInstanceId{
-            .backend = peelf::BackendKind::ActiveDebugger,
+            .backend = is_remote_gdb
+                           ? peelf::BackendKind::RemoteGdbRsp
+                           : peelf::BackendKind::ActiveDebugger,
             .pid = session_->pid(),
-            .creation_identity = peelf::query_process_creation_identity(session_->pid()),
+            .creation_identity = is_remote_gdb
+                                     ? std::nullopt
+                                     : peelf::query_process_creation_identity(session_->pid()),
             .image_sha256 = {},
             .build_id_or_pdb_guid = {},
         };
@@ -454,6 +518,9 @@ private:
     void BinaryModel::refresh_debug_breakpoints() {
         if (debug_session_) {
             debug_breakpoints_ = debug_session_->breakpoints();
+            if (dynamic_cast<const peelf::IGdbRemoteDebugSession*>(debug_session_.get()) != nullptr) {
+                recompute_capabilities();
+            }
         } else {
             debug_breakpoints_.clear();
         }
