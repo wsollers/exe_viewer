@@ -1823,3 +1823,360 @@ TEST(BinaryImageReview, LiveMappedHeaderOnlyElfFallsBackToMappedSpan) {
     EXPECT_EQ(img.file_offset_to_virtual_address(0x1200), std::nullopt);
     EXPECT_EQ(img.virtual_address_to_file_offset(kLiveBase + 0x1200), std::nullopt);
 }
+
+TEST(Fbf03aParserHardening, PeZeroEntryPointPreservedAcrossRebase) {
+    std::vector<std::uint8_t> pe(0x400, 0);
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    put32(pe, 0x3C, 0x80);
+    pe[0x80] = 'P';
+    pe[0x81] = 'E';
+
+    const std::size_t coff = 0x84;
+    put16(pe, coff + 0, 0x8664);  // AMD64
+    put16(pe, coff + 2, 1);       // NumberOfSections
+    put16(pe, coff + 16, 0x00F0); // SizeOfOptionalHeader
+    put16(pe, coff + 18, 0x2022); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DLL
+
+    const std::size_t opt = coff + 20;
+    put16(pe, opt + 0, 0x020B);           // PE32+
+    put32(pe, opt + 16, 0u);              // AddressOfEntryPoint == 0 (no entrypoint)
+    put64(pe, opt + 24, 0x180000000ULL);  // ImageBase
+    put32(pe, opt + 32, 0x1000);          // SectionAlignment
+    put32(pe, opt + 36, 0x200);           // FileAlignment
+    put32(pe, opt + 56, 0x2000);          // SizeOfImage
+    put32(pe, opt + 60, 0x200);           // SizeOfHeaders
+
+    const std::size_t sect = opt + 0xF0;
+    put_ascii(pe, sect, ".rdata");
+    put32(pe, sect + 8, 0x100);
+    put32(pe, sect + 12, 0x1000);
+    put32(pe, sect + 16, 0x100);
+    put32(pe, sect + 20, 0x200);
+    put32(pe, sect + 36, 0x40000040);
+
+    auto base_parsed = peelf::parse_image(pe);
+    ASSERT_TRUE(base_parsed.has_value()) << base_parsed.error().message;
+    EXPECT_EQ((*base_parsed)->entry_point(), 0u);
+
+    constexpr std::uint64_t kNewBase = 0x7FF900000000ULL;
+    auto rebased = peelf::parse_rebased_image(pe, kNewBase);
+    ASSERT_TRUE(rebased.has_value()) << rebased.error().message;
+    EXPECT_EQ((*rebased)->image_base(), kNewBase);
+    EXPECT_EQ((*rebased)->entry_point(), 0u);
+}
+
+TEST(Fbf03aParserHardening, PeBoundImportsSkipsModuleForwarderRefs) {
+    std::vector<std::uint8_t> pe(0x600, 0);
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    put32(pe, 0x3C, 0x80);
+    pe[0x80] = 'P';
+    pe[0x81] = 'E';
+
+    const std::size_t coff = 0x84;
+    put16(pe, coff + 0, 0x8664);
+    put16(pe, coff + 2, 1);
+    put16(pe, coff + 16, 0x00F0);
+    put16(pe, coff + 18, 0x0022);
+
+    const std::size_t opt = coff + 20;
+    put16(pe, opt + 0, 0x020B);
+    put32(pe, opt + 16, 0x1000);
+    put64(pe, opt + 24, 0x140000000ULL);
+    put32(pe, opt + 32, 0x1000);
+    put32(pe, opt + 36, 0x200);
+    put32(pe, opt + 56, 0x2000);
+    put32(pe, opt + 60, 0x400);  // SizeOfHeaders covers bound import table at 0x220
+    put32(pe, opt + 108, 16);    // NumberOfRvaAndSizes
+
+    // DataDirectory[11] = Bound Import table at RVA/file offset 0x220, size 0x60.
+    constexpr std::size_t kBoundDir = 0x220;
+    put32(pe, opt + 112 + 11 * 8, static_cast<std::uint32_t>(kBoundDir));
+    put32(pe, opt + 112 + 11 * 8 + 4, 0x60u);
+
+    const std::size_t sect = opt + 0xF0;
+    put_ascii(pe, sect, ".text");
+    put32(pe, sect + 8, 0x100);
+    put32(pe, sect + 12, 0x1000);
+    put32(pe, sect + 16, 0x100);
+    put32(pe, sect + 20, 0x400);
+    put32(pe, sect + 36, 0x60000020);
+
+    // Descriptor 0: KERNEL32.DLL with 1 IMAGE_BOUND_FORWARDER_REF immediately following.
+    put32(pe, kBoundDir + 0, 0x60000001u);
+    put16(pe, kBoundDir + 4, 32u);
+    put16(pe, kBoundDir + 6, 1u);
+    // Forwarder Ref 0 (must be skipped, NOT parsed as a top-level bound import descriptor).
+    put32(pe, kBoundDir + 8, 0x60000002u);
+    put16(pe, kBoundDir + 12, 48u);
+    put16(pe, kBoundDir + 14, 0x99u);
+    // Descriptor 1: USER32.DLL with 0 forwarder refs.
+    put32(pe, kBoundDir + 16, 0x60000003u);
+    put16(pe, kBoundDir + 20, 64u);
+    put16(pe, kBoundDir + 22, 0u);
+    // Terminator at +24 (already zero-filled).
+    put_ascii(pe, kBoundDir + 32, "KERNEL32.DLL");
+    put_ascii(pe, kBoundDir + 48, "NTDLL.DLL");
+    put_ascii(pe, kBoundDir + 64, "USER32.DLL");
+
+    auto parsed = peelf::parse_image(pe);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const auto& bound = (*parsed)->pe_bound_imports();
+    ASSERT_EQ(bound.size(), 2u);
+    EXPECT_EQ(bound[0].module_name, "KERNEL32.DLL");
+    EXPECT_EQ(bound[0].forwarder_ref_count, 1u);
+    EXPECT_EQ(bound[1].module_name, "USER32.DLL");
+    EXPECT_EQ(bound[1].forwarder_ref_count, 0u);
+}
+
+TEST(Fbf03aParserHardening, PeHeaderVaMappingAndRawSizeClamping) {
+    std::vector<std::uint8_t> pe(0x400, 0);
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    put32(pe, 0x3C, 0x80);
+    pe[0x80] = 'P';
+    pe[0x81] = 'E';
+
+    const std::size_t coff = 0x84;
+    put16(pe, coff + 0, 0x8664);
+    put16(pe, coff + 2, 1);
+    put16(pe, coff + 16, 0x00F0);
+    put16(pe, coff + 18, 0x0022);
+
+    constexpr std::uint64_t kBase = 0x140000000ULL;
+    const std::size_t opt = coff + 20;
+    put16(pe, opt + 0, 0x020B);
+    put32(pe, opt + 16, 0x1000);
+    put64(pe, opt + 24, kBase);
+    put32(pe, opt + 32, 0x1000);
+    put32(pe, opt + 36, 0x200);
+    put32(pe, opt + 56, 0x2000);
+    put32(pe, opt + 60, 0x200);  // SizeOfHeaders == 0x200
+
+    // .text has VirtualSize = 0x10 but SizeOfRawData = 0x200 (0x1F0 bytes of raw alignment padding).
+    const std::size_t sect = opt + 0xF0;
+    put_ascii(pe, sect, ".text");
+    put32(pe, sect + 8, 0x10);         // VirtualSize
+    put32(pe, sect + 12, 0x1000);      // VirtualAddress
+    put32(pe, sect + 16, 0x200);       // SizeOfRawData > VirtualSize
+    put32(pe, sect + 20, 0x200);       // PointerToRawData
+    put32(pe, sect + 36, 0x60000020);
+
+    std::fill_n(pe.begin() + 0x200, 0x10, std::uint8_t{0x90});
+    std::fill_n(pe.begin() + 0x210, 0x1F0, std::uint8_t{0xCC});
+
+    auto parsed = peelf::parse_image(pe);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const peelf::IBinaryImage& img = **parsed;
+
+    // Header RVAs in [0, SizeOfHeaders) map cleanly at ImageBase when no section covers RVA 0.
+    EXPECT_EQ(img.virtual_address_to_file_offset(kBase), 0u);
+    EXPECT_EQ(img.file_offset_to_virtual_address(0u), kBase);
+    EXPECT_EQ(img.virtual_address_to_file_offset(kBase + 0x200u), std::nullopt);
+    auto hdr_mz = img.read_bytes_at_va(kBase, 2u);
+    ASSERT_TRUE(hdr_mz.has_value()) << hdr_mz.error().message;
+    EXPECT_EQ((*hdr_mz)[0], 'M');
+    EXPECT_EQ((*hdr_mz)[1], 'Z');
+
+    // Trailing raw padding past VirtualSize (0x10..0x1FF) is clamped and never mapped.
+    EXPECT_EQ(img.virtual_address_to_file_offset(kBase + 0x100Fu), 0x20Fu);
+    EXPECT_EQ(img.virtual_address_to_file_offset(kBase + 0x1010u), std::nullopt);
+    EXPECT_EQ(img.file_offset_to_virtual_address(0x20Fu), kBase + 0x100Fu);
+    EXPECT_EQ(img.file_offset_to_virtual_address(0x210u), std::nullopt);
+    auto code = img.read_bytes_at_va(kBase + 0x1000u, 0x10u);
+    ASSERT_TRUE(code.has_value()) << code.error().message;
+    EXPECT_EQ(code->size(), 0x10u);
+    EXPECT_FALSE(img.read_bytes_at_va(kBase + 0x1000u, 0x11u).has_value());
+}
+
+TEST(Fbf03aParserHardening, ElfParseMappedRetainsBackingBytesAndDynamicImportsExports) {
+    constexpr std::uint64_t kLiveBase = 0x7f5500000000ULL;
+    std::vector<std::uint8_t> mapped(0x1000, 0);
+    mapped[0] = 0x7F;
+    mapped[1] = 'E';
+    mapped[2] = 'L';
+    mapped[3] = 'F';
+    mapped[4] = 2;  // ELFCLASS64
+    mapped[5] = 1;  // ELFDATA2LSB
+    mapped[6] = 1;  // EV_CURRENT
+    put16(mapped, 16, 3);     // ET_DYN
+    put16(mapped, 18, 62);    // EM_X86_64
+    put32(mapped, 20, 1);     // EV_CURRENT
+    put64(mapped, 24, 0x600); // e_entry
+    put64(mapped, 32, 0x40);  // e_phoff
+    put16(mapped, 52, 64);    // e_ehsize
+    put16(mapped, 54, 56);    // e_phentsize
+    put16(mapped, 56, 2);     // e_phnum (PT_LOAD + PT_DYNAMIC, no section headers)
+
+    // PT_LOAD[0] covering [0, 0x1000)
+    const std::size_t ph0 = 0x40;
+    put32(mapped, ph0 + 0, 1u);       // PT_LOAD
+    put32(mapped, ph0 + 4, 0x5u);     // PF_R | PF_X
+    put64(mapped, ph0 + 8, 0u);       // p_offset
+    put64(mapped, ph0 + 16, 0u);      // p_vaddr (PIE static base 0)
+    put64(mapped, ph0 + 24, 0u);      // p_paddr
+    put64(mapped, ph0 + 32, 0x1000u); // p_filesz
+    put64(mapped, ph0 + 40, 0x1000u); // p_memsz
+    put64(mapped, ph0 + 48, 0x1000u); // p_align
+
+    // PT_DYNAMIC at [0x200, 0x280)
+    const std::size_t ph1 = 0x40 + 56;
+    put32(mapped, ph1 + 0, 2u);     // PT_DYNAMIC
+    put32(mapped, ph1 + 4, 0x6u);   // PF_R | PF_W
+    put64(mapped, ph1 + 8, 0x200u);
+    put64(mapped, ph1 + 16, 0x200u);
+    put64(mapped, ph1 + 32, 0x80u);
+    put64(mapped, ph1 + 40, 0x80u);
+    put64(mapped, ph1 + 48, 8u);
+
+    // .dynstr at 0x500
+    put_ascii(mapped, 0x501, "libc.so.6");
+    put_ascii(mapped, 0x510, "puts");
+    put_ascii(mapped, 0x520, "exported_api");
+
+    // SysV DT_HASH at 0x380: nbucket = 1, nchain = 3 (STN_UNDEF + puts + exported_api)
+    put32(mapped, 0x380, 1u);
+    put32(mapped, 0x384, 3u);
+
+    // .dynsym at 0x400 (3 * 24-byte Elf64_Sym entries)
+    // Sym 1: undefined global function "puts" -> import
+    put32(mapped, 0x400 + 24 + 0, 0x10u);
+    mapped[0x400 + 24 + 4] = static_cast<std::uint8_t>((1u << 4u) | 2u); // STB_GLOBAL | STT_FUNC
+    put16(mapped, 0x400 + 24 + 6, 0u);                                   // SHN_UNDEF
+
+    // Sym 2: defined global function "exported_api" @ RVA 0x600 -> export
+    put32(mapped, 0x400 + 48 + 0, 0x20u);
+    mapped[0x400 + 48 + 4] = static_cast<std::uint8_t>((1u << 4u) | 2u); // STB_GLOBAL | STT_FUNC
+    put16(mapped, 0x400 + 48 + 6, 1u);                                   // defined section index
+    put64(mapped, 0x400 + 48 + 8, 0x600u);                               // st_value
+    put64(mapped, 0x400 + 48 + 16, 5u);                                  // st_size
+
+    // Code bytes at exported_api (offset 0x600)
+    const std::array<std::uint8_t, 5> kPrologue{0xF3, 0x0F, 0x1E, 0xFA, 0xC3};
+    std::ranges::copy(kPrologue, mapped.begin() + 0x600);
+
+    // PT_DYNAMIC entries with ld.so-relocated live pointers (kLiveBase + rva)
+    auto write_dyn = [&](std::size_t idx, std::uint64_t tag, std::uint64_t val) {
+        put64(mapped, 0x200 + idx * 16, tag);
+        put64(mapped, 0x200 + idx * 16 + 8, val);
+    };
+    write_dyn(0, 1u, 0x01u);               // DT_NEEDED -> "libc.so.6"
+    write_dyn(1, 5u, kLiveBase + 0x500u);  // DT_STRTAB (relocated in-place by ld.so)
+    write_dyn(2, 10u, 0x80u);              // DT_STRSZ
+    write_dyn(3, 6u, kLiveBase + 0x400u);  // DT_SYMTAB (relocated in-place by ld.so)
+    write_dyn(4, 11u, 24u);                // DT_SYMENT
+    write_dyn(5, 4u, kLiveBase + 0x380u);  // DT_HASH   (relocated in-place by ld.so)
+    write_dyn(6, 0u, 0u);                  // DT_NULL
+
+    auto parsed = peelf::parse_mapped_image(mapped, kLiveBase);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    const peelf::IBinaryImage& img = **parsed;
+
+    // Backing bytes are retained on mapped ELF snapshots for both offset and VA readers.
+    auto magic = img.read_bytes_at_offset(0u, 4u);
+    ASSERT_TRUE(magic.has_value()) << magic.error().message;
+    EXPECT_EQ((*magic)[0], 0x7Fu);
+    EXPECT_EQ((*magic)[1], 'E');
+
+    auto fn_bytes = img.read_bytes_at_va(kLiveBase + 0x600u, kPrologue.size());
+    ASSERT_TRUE(fn_bytes.has_value()) << fn_bytes.error().message;
+    EXPECT_TRUE(std::ranges::equal(*fn_bytes, kPrologue));
+
+    // Recovered dynamic table populates both imports() and rebased exports().
+    EXPECT_TRUE(std::ranges::any_of(img.imports(), [](const peelf::ImportEntry& imp) {
+        return imp.library == "libc.so.6";
+    }));
+    EXPECT_TRUE(std::ranges::any_of(img.imports(), [](const peelf::ImportEntry& imp) {
+        return imp.name == "puts";
+    }));
+    const auto exp_it = std::ranges::find_if(img.exports(), [](const peelf::ExportEntry& exp) {
+        return exp.name == "exported_api";
+    });
+    ASSERT_NE(exp_it, img.exports().end());
+    EXPECT_EQ(exp_it->virtual_address, kLiveBase + 0x600u);
+
+    // On a static unmapped file, DT_* pointers outside PT_LOAD p_vaddr ranges must NOT fall back
+    // to raw ptr - base arithmetic.
+    auto static_parsed = peelf::parse_image(mapped);
+    ASSERT_TRUE(static_parsed.has_value()) << static_parsed.error().message;
+    EXPECT_TRUE((*static_parsed)->imports().empty());
+    EXPECT_TRUE((*static_parsed)->exports().empty());
+}
+
+TEST(Fbf03aParserHardening, PeImportThunkDeduplicationAndRsrcDirectorySizeClamp) {
+    std::vector<std::uint8_t> pe(0x800, 0);
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    put32(pe, 0x3C, 0x80);
+    pe[0x80] = 'P';
+    pe[0x81] = 'E';
+
+    const std::size_t coff = 0x84;
+    put16(pe, coff + 0, 0x8664);
+    put16(pe, coff + 2, 2); // .idata + .rsrc
+    put16(pe, coff + 16, 0x00F0);
+    put16(pe, coff + 18, 0x0022);
+
+    const std::size_t opt = coff + 20;
+    put16(pe, opt + 0, 0x020B);
+    put32(pe, opt + 16, 0x1000);
+    put64(pe, opt + 24, 0x140000000ULL);
+    put32(pe, opt + 32, 0x1000);
+    put32(pe, opt + 36, 0x200);
+    put32(pe, opt + 56, 0x3000);
+    put32(pe, opt + 60, 0x400);
+    put32(pe, opt + 108, 16);
+
+    // DataDirectory[1] = Import Table at RVA 0x1000
+    put32(pe, opt + 112 + 1 * 8, 0x1000u);
+    put32(pe, opt + 112 + 1 * 8 + 4, 60u);
+    // DataDirectory[2] = Resource Table at RVA 0x2000, declared Size = 0x20 (smaller than section!)
+    put32(pe, opt + 112 + 2 * 8, 0x2000u);
+    put32(pe, opt + 112 + 2 * 8 + 4, 0x20u);
+
+    const std::size_t s0 = opt + 0xF0;
+    put_ascii(pe, s0, ".idata");
+    put32(pe, s0 + 8, 0x200);
+    put32(pe, s0 + 12, 0x1000);
+    put32(pe, s0 + 16, 0x200);
+    put32(pe, s0 + 20, 0x400);
+    put32(pe, s0 + 36, 0x40000040);
+
+    const std::size_t s1 = s0 + 40;
+    put_ascii(pe, s1, ".rsrc");
+    put32(pe, s1 + 8, 0x200);
+    put32(pe, s1 + 12, 0x2000);
+    put32(pe, s1 + 16, 0x200);
+    put32(pe, s1 + 20, 0x600);
+    put32(pe, s1 + 36, 0x40000040);
+
+    // Two import descriptors pointing at the EXACT SAME ILT (RVA 0x1080) and IAT (RVA 0x10A0).
+    for (std::size_t d = 0; d < 2; ++d) {
+        const std::size_t desc = 0x400 + d * 20;
+        put32(pe, desc + 0, 0x1080u);  // OriginalFirstThunk
+        put32(pe, desc + 12, 0x1100u); // Name -> "KERNEL32.DLL"
+        put32(pe, desc + 16, 0x10A0u); // FirstThunk
+    }
+    put64(pe, 0x480, 0x1120ULL); // ILT[0] -> Hint/Name @ RVA 0x1120
+    put64(pe, 0x4A0, 0x1120ULL); // IAT[0]
+    put_ascii(pe, 0x500, "KERNEL32.DLL");
+    put16(pe, 0x520, 7u);
+    put_ascii(pe, 0x522, "ExitProcess");
+
+    // Root IMAGE_RESOURCE_DIRECTORY at 0x600 with 1 ID entry pointing to offset 0x40
+    // (inside .rsrc section [0, 0x200), but OUTSIDE declared DataDirectory.Size == 0x20).
+    put16(pe, 0x600 + 14, 1u);             // NumberOfIdEntries = 1
+    put32(pe, 0x600 + 16, 10u);            // Type ID = RT_RCDATA
+    put32(pe, 0x600 + 20, 0x80000040u);    // Subdirectory @ +0x40 (beyond DataDirectory.Size 0x20)
+    put16(pe, 0x640 + 14, 1u);             // Would have been parsed if unclamped
+    put32(pe, 0x640 + 16, 1u);
+    put32(pe, 0x640 + 20, 0x60u);
+    put32(pe, 0x660 + 0, 0x2080u);
+    put32(pe, 0x660 + 4, 4u);
+
+    auto parsed = peelf::parse_image(pe);
+    ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
+    EXPECT_EQ((*parsed)->imports().size(), 1u);
+    EXPECT_TRUE((*parsed)->pe_resource_data_entries().empty());
+}

@@ -16,6 +16,8 @@ namespace peelf {
 namespace {
 
 using detail::align4;
+using detail::checked_add_u64;
+using detail::checked_mul_u64;
 using detail::fits_range;
 using detail::rd16;
 using detail::rd32;
@@ -24,6 +26,24 @@ using detail::read_c_string;
 using detail::wr16_endian;
 using detail::wr32_endian;
 using detail::wr64_endian;
+
+struct ElfParseBudget {
+    static constexpr std::size_t kMaxTotalSymbols = 262144u;
+    static constexpr std::size_t kMaxTotalRelocations = 262144u;
+    static constexpr std::size_t kMaxTotalNotes = 16384u;
+    static constexpr std::size_t kMaxTotalNoteBytes = 16u * 1024u * 1024u;
+    static constexpr std::size_t kMaxTotalDynamicEntries = 65536u;
+
+    std::size_t remaining_symbols = kMaxTotalSymbols;
+    std::size_t remaining_relocations = kMaxTotalRelocations;
+    std::size_t remaining_notes = kMaxTotalNotes;
+    std::size_t remaining_note_bytes = kMaxTotalNoteBytes;
+    std::size_t remaining_dynamic_entries = kMaxTotalDynamicEntries;
+    bool warned_symbols = false;
+    bool warned_relocations = false;
+    bool warned_notes = false;
+    bool warned_dynamic = false;
+};
 
 class ElfImage final : public detail::ImageBase {
 public:
@@ -62,11 +82,14 @@ public:
     void rebase_to_live_base(std::uint64_t live_base) override;
 
 private:
+    void append_symbol_imports_and_exports();
     void recover_dynamic_from_program_headers(std::span<const std::uint8_t> b,
                                               bool is64,
                                               bool big,
                                               std::uint64_t live_base,
-                                              std::uint64_t static_base);
+                                              std::uint64_t static_base,
+                                              ElfParseBudget& budget,
+                                              bool is_mapped);
 
     ElfHeader elf_header_;
     std::vector<ElfProgramHeader> program_headers_;
@@ -107,7 +130,8 @@ ImageKind elf_kind(std::uint16_t e_type) noexcept {
 void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t offset,
                      std::uint64_t size, bool from_program_header,
                      std::vector<ElfNote>& notes_out,
-                     std::vector<std::string>& warnings_out) {
+                     std::vector<std::string>& warnings_out,
+                     ElfParseBudget& budget) {
     if (size == 0) {
         return;
     }
@@ -123,7 +147,7 @@ void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t of
 
     const std::uint64_t end = offset + size;
     std::uint64_t cursor = offset;
-    while (cursor + 12u <= end) {
+    while (cursor <= end && (end - cursor) >= 12u) {
         const std::size_t off = static_cast<std::size_t>(cursor);
         const std::uint32_t name_size = rd32(b, off + 0x00, big);
         const std::uint32_t descriptor_size = rd32(b, off + 0x04, big);
@@ -149,10 +173,24 @@ void parse_elf_notes(std::span<const std::uint8_t> b, bool big, std::uint64_t of
         const std::uint64_t descriptor_offset = cursor;
         cursor += aligned_descriptor_size;
 
+        constexpr std::uint32_t kMaxNoteNameBytes = 4096u;
+        const std::uint32_t bounded_name_len = std::min(name_size, kMaxNoteNameBytes);
+        const std::uint64_t note_cost =
+            static_cast<std::uint64_t>(bounded_name_len) + static_cast<std::uint64_t>(descriptor_size);
+        if (budget.remaining_notes == 0u || note_cost > budget.remaining_note_bytes) {
+            if (!budget.warned_notes) {
+                warnings_out.push_back("ELF note parsing capped at aggregate budget");
+                budget.warned_notes = true;
+            }
+            return;
+        }
+        --budget.remaining_notes;
+        budget.remaining_note_bytes -= static_cast<std::size_t>(note_cost);
+
         ElfNote note;
         note.type = type;
         note.from_program_header = from_program_header;
-        for (std::uint32_t i = 0; i < name_size && name_offset + i < end; ++i) {
+        for (std::uint32_t i = 0; i < bounded_name_len && name_offset + i < end; ++i) {
             const std::uint8_t ch = b[static_cast<std::size_t>(name_offset + i)];
             if (ch == 0) {
                 break;
@@ -283,7 +321,8 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::uint32_t phnum, std::vector<ElfProgramHeader>& headers_out,
                         std::vector<Segment>& segments_out, std::string& interpreter_out,
                         std::vector<ElfNote>& notes_out,
-                        std::vector<std::string>& warnings_out) {
+                        std::vector<std::string>& warnings_out,
+                        ElfParseBudget& budget) {
     if (phoff == 0 && phnum == 0) {
         return;
     }
@@ -366,7 +405,7 @@ void parse_elf_segments(std::span<const std::uint8_t> b, bool is64, bool big,
             }
         }
         if (phdr.type == 4) {
-            parse_elf_notes(b, big, phdr.offset, phdr.file_size, true, notes_out, warnings_out);
+            parse_elf_notes(b, big, phdr.offset, phdr.file_size, true, notes_out, warnings_out, budget);
         }
     }
 }
@@ -385,7 +424,8 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                         std::vector<ElfSysvHashTable>& sysv_hash_tables_out,
                         std::vector<ElfGnuHashTable>& gnu_hash_tables_out,
                         std::vector<ImportEntry>& imports_out,
-                        std::vector<std::string>& warnings_out) {
+                        std::vector<std::string>& warnings_out,
+                        ElfParseBudget& budget) {
     if (shoff == 0 && shnum == 0) {
         return;
     }
@@ -564,12 +604,26 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
 
         const std::uint64_t count = eff_sym_bytes / entry_size;
         for (std::uint64_t i = 0; i < count; ++i) {
-            const std::uint64_t sym_off = sh.offset + i * entry_size;
-            if (!fits_range(sym_off, min_sym, static_cast<std::uint64_t>(b.size()))) {
+            if (budget.remaining_symbols == 0u) {
+                if (!budget.warned_symbols) {
+                    warnings_out.push_back(std::format(
+                        "ELF symbol parsing capped at {} aggregate entries",
+                        ElfParseBudget::kMaxTotalSymbols));
+                    budget.warned_symbols = true;
+                }
                 break;
             }
+            const auto rel_off = checked_mul_u64(i, entry_size);
+            const auto sym_off = rel_off.has_value()
+                ? checked_add_u64(sh.offset, *rel_off)
+                : std::nullopt;
+            if (!sym_off.has_value() ||
+                !fits_range(*sym_off, min_sym, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+            --budget.remaining_symbols;
 
-            const std::size_t off = static_cast<std::size_t>(sym_off);
+            const std::size_t off = static_cast<std::size_t>(*sym_off);
             ElfSymbol elf_symbol;
             std::uint8_t info = 0;
             std::uint8_t other = 0;
@@ -658,13 +712,29 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
 
         const std::uint64_t count = eff_dyn_bytes / entry_size;
         bool saw_dt_null = false;
+        bool capped_dynamic = false;
         for (std::uint64_t i = 0; i < count; ++i) {
-            const std::uint64_t dyn_off = sh.offset + i * entry_size;
-            if (!fits_range(dyn_off, min_dyn, static_cast<std::uint64_t>(b.size()))) {
+            if (budget.remaining_dynamic_entries == 0u) {
+                if (!budget.warned_dynamic) {
+                    warnings_out.push_back(std::format(
+                        "ELF dynamic table parsing capped at {} aggregate entries",
+                        ElfParseBudget::kMaxTotalDynamicEntries));
+                    budget.warned_dynamic = true;
+                }
+                capped_dynamic = true;
                 break;
             }
+            const auto rel_off = checked_mul_u64(i, entry_size);
+            const auto dyn_off = rel_off.has_value()
+                ? checked_add_u64(sh.offset, *rel_off)
+                : std::nullopt;
+            if (!dyn_off.has_value() ||
+                !fits_range(*dyn_off, min_dyn, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+            --budget.remaining_dynamic_entries;
 
-            const std::size_t off = static_cast<std::size_t>(dyn_off);
+            const std::size_t off = static_cast<std::size_t>(*dyn_off);
             const std::uint64_t tag = is64 ? rd64(b, off + 0x00, big)
                                            : static_cast<std::uint64_t>(rd32(b, off + 0x00, big));
             const std::uint64_t value = is64 ? rd64(b, off + 0x08, big)
@@ -691,7 +761,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                 imports_out.push_back(std::move(entry));
             }
         }
-        if (count > 0 && !saw_dt_null) {
+        if (count > 0 && !saw_dt_null && !capped_dynamic) {
             warnings_out.push_back(std::format(
                 "ELF dynamic section '{}' is missing DT_NULL terminator", sec_label));
         }
@@ -699,7 +769,7 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
 
     for (const auto& sh : headers) {
         if (sh.type == 7) {  // SHT_NOTE
-            parse_elf_notes(b, big, sh.offset, sh.size, false, notes_out, warnings_out);
+            parse_elf_notes(b, big, sh.offset, sh.size, false, notes_out, warnings_out, budget);
         }
     }
 
@@ -747,12 +817,26 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
 
         const std::uint64_t count = eff_rel_bytes / entry_size;
         for (std::uint64_t i = 0; i < count; ++i) {
-            const std::uint64_t reloc_off = sh.offset + i * entry_size;
-            if (!fits_range(reloc_off, min_reloc, static_cast<std::uint64_t>(b.size()))) {
+            if (budget.remaining_relocations == 0u) {
+                if (!budget.warned_relocations) {
+                    warnings_out.push_back(std::format(
+                        "ELF relocation parsing capped at {} aggregate entries",
+                        ElfParseBudget::kMaxTotalRelocations));
+                    budget.warned_relocations = true;
+                }
                 break;
             }
+            const auto rel_off = checked_mul_u64(i, entry_size);
+            const auto reloc_off = rel_off.has_value()
+                ? checked_add_u64(sh.offset, *rel_off)
+                : std::nullopt;
+            if (!reloc_off.has_value() ||
+                !fits_range(*reloc_off, min_reloc, static_cast<std::uint64_t>(b.size()))) {
+                break;
+            }
+            --budget.remaining_relocations;
 
-            const std::size_t off = static_cast<std::size_t>(reloc_off);
+            const std::size_t off = static_cast<std::size_t>(*reloc_off);
             ElfRelocation relocation;
             relocation.section_name = sh.name;
             relocation.has_addend = has_addend;
@@ -780,12 +864,21 @@ void parse_elf_sections(std::span<const std::uint8_t> b, bool is64, bool big,
                 if ((sym_sh.type == 2 || sym_sh.type == 11) && sym_ent_sz >= min_sym &&
                     sym_sh.link < headers.size() &&
                     relocation.symbol_index < (sym_sh.size / sym_ent_sz)) {
-                    const ElfSectionHeader& str_sh = headers[sym_sh.link];
-                    const std::uint64_t sym_off = sym_sh.offset + relocation.symbol_index * sym_ent_sz;
-                    if (fits_range(sym_off, 4u, static_cast<std::uint64_t>(b.size())) &&
-                        fits_range(str_sh.offset, str_sh.size, static_cast<std::uint64_t>(b.size()))) {
-                        const std::uint32_t name_off = rd32(b, static_cast<std::size_t>(sym_off), big);
-                        relocation.symbol_name = read_string(str_sh.offset, str_sh.size, name_off);
+                    const auto sym_rel_off = checked_mul_u64(relocation.symbol_index, sym_ent_sz);
+                    const auto sym_off = sym_rel_off.has_value()
+                        ? checked_add_u64(sym_sh.offset, *sym_rel_off)
+                        : std::nullopt;
+                    if (sym_off.has_value() &&
+                        fits_range(*sym_off, min_sym, static_cast<std::uint64_t>(b.size()))) {
+                        const ElfSectionHeader& str_sh = headers[sym_sh.link];
+                        std::uint64_t eff_str_sz = str_sh.size;
+                        if (!fits_range(str_sh.offset, str_sh.size, static_cast<std::uint64_t>(b.size()))) {
+                            eff_str_sz = str_sh.offset < b.size()
+                                ? (static_cast<std::uint64_t>(b.size()) - str_sh.offset)
+                                : 0u;
+                        }
+                        const std::uint32_t name_off = rd32(b, static_cast<std::size_t>(*sym_off), big);
+                        relocation.symbol_name = read_string(str_sh.offset, eff_str_sz, name_off);
                     }
                 }
             }
@@ -946,10 +1039,12 @@ Result<std::unique_ptr<ElfImage>> ElfImage::parse(std::span<const std::uint8_t> 
         .effective_shstrndx = eff_shstrndx,
     };
 
+    ElfParseBudget budget{};
+
     // Sections (P2-1), best-effort: identity above is already valid.
     parse_elf_segments(b, is64, big, e_phoff, e_phentsize, eff_phnum,
                        img->program_headers_, img->segments_, img->interpreter_, img->notes_,
-                       img->parse_warnings_);
+                       img->parse_warnings_, budget);
 
     // Determine static link-time load base from PT_LOAD segments (0 for PIE/ET_DYN, e.g. 0x400000 for ET_EXEC).
     bool found_zero_off_load = false;
@@ -978,27 +1073,15 @@ Result<std::unique_ptr<ElfImage>> ElfImage::parse(std::span<const std::uint8_t> 
     parse_elf_sections(b, is64, big, e_shoff, e_shentsize, eff_shnum, eff_shstrndx,
                        img->section_headers_, img->sections_, img->elf_symbols_, img->symbols_,
                        img->dynamic_entries_, img->relocations_, img->notes_, img->sysv_hash_tables_,
-                       img->gnu_hash_tables_, img->imports_, img->parse_warnings_);
+                       img->gnu_hash_tables_, img->imports_, img->parse_warnings_, budget);
     // Recover PT_DYNAMIC entries, DT_NEEDED dependencies, dynamic symbols, hash tables, and
     // dynamic relocations on sectionless / sstrip ELFs where the section header table is absent.
-    img->recover_dynamic_from_program_headers(b, is64, big, 0u, img->image_base_);
+    img->recover_dynamic_from_program_headers(b, is64, big, 0u, img->image_base_, budget, false);
     if (img->elf_header_.type == 3 &&
         (!img->interpreter_.empty() || std::any_of(img->dynamic_entries_.begin(), img->dynamic_entries_.end(),
             [](const auto& entry) { return entry.tag == 0x6ffffffb && (entry.value & 0x08000000u) != 0; })))
         img->kind_ = ImageKind::Executable;
-    for (const auto& symbol : img->elf_symbols_) {
-        if (!symbol.dynamic || symbol.name.empty() || (symbol.binding != 1 && symbol.binding != 2)) continue;
-        if (symbol.section_index == 0) {
-            ImportEntry entry;
-            entry.name = symbol.name;
-            img->imports_.push_back(std::move(entry));
-        } else if (symbol.visibility == 0 || symbol.visibility == 3) {
-            ExportEntry entry;
-            entry.name = symbol.name;
-            entry.virtual_address = symbol.value;
-            img->exports_.push_back(std::move(entry));
-        }
-    }
+    img->append_symbol_imports_and_exports();
     if (img->arch_ == Architecture::PowerPC64 && img->endian_ == Endianness::Big) {
         resolve_powerpc64_function_descriptors(b, big, img->section_headers_, img->symbols_);
     }
@@ -1204,23 +1287,64 @@ void ElfImage::rebase_to_live_base(std::uint64_t live_base) {
     }
 }
 
+void ElfImage::append_symbol_imports_and_exports() {
+    for (const auto& symbol : elf_symbols_) {
+        if (!symbol.dynamic || symbol.name.empty() ||
+            (symbol.binding != 1 && symbol.binding != 2)) {
+            continue;
+        }
+        if (symbol.section_index == 0) {
+            ImportEntry entry;
+            entry.name = symbol.name;
+            imports_.push_back(std::move(entry));
+        } else if (symbol.visibility == 0 || symbol.visibility == 3) {
+            ExportEntry entry;
+            entry.name = symbol.name;
+            entry.virtual_address = symbol.value;
+            exports_.push_back(std::move(entry));
+        }
+    }
+}
+
 void ElfImage::recover_dynamic_from_program_headers(
     std::span<const std::uint8_t> b,
     bool is64,
     bool big,
     std::uint64_t live_base,
-    std::uint64_t static_base) {
+    std::uint64_t static_base,
+    ElfParseBudget& budget,
+    bool is_mapped) {
     if (!dynamic_entries_.empty()) {
         return;
     }
+
+    auto translate_pt_load = [&](std::uint64_t va) -> std::optional<std::size_t> {
+        for (const ElfProgramHeader& load_ph : program_headers_) {
+            if (load_ph.type != 1u || va < load_ph.virtual_address) {
+                continue;
+            }
+            const std::uint64_t file_backed =
+                std::min(load_ph.file_size, load_ph.memory_size);
+            const std::uint64_t delta = va - load_ph.virtual_address;
+            if (delta < file_backed) {
+                const auto off = checked_add_u64(load_ph.offset, delta);
+                if (off.has_value() && *off < b.size()) {
+                    return static_cast<std::size_t>(*off);
+                }
+            }
+        }
+        return std::nullopt;
+    };
 
     auto resolve_ptr = [&](std::uint64_t val) -> std::optional<std::size_t> {
         if (val == 0u) {
             return std::nullopt;
         }
-        if (const auto off = virtual_address_to_file_offset(val);
-            off.has_value() && *off < b.size()) {
-            return static_cast<std::size_t>(*off);
+        if (const auto off = translate_pt_load(val)) {
+            return off;
+        }
+        if (!is_mapped) {
+            return std::nullopt;
         }
         return normalize_dynamic_ptr_to_offset(val, live_base, static_base, b.size());
     };
@@ -1263,6 +1387,16 @@ void ElfImage::recover_dynamic_from_program_headers(
         std::uint64_t pltrel_kind = is64 ? 7u : 17u; // DT_RELA (7) or DT_REL (17)
 
         for (std::size_t i = 0; i < count; ++i) {
+            if (budget.remaining_dynamic_entries == 0u) {
+                if (!budget.warned_dynamic) {
+                    add_warning(std::format(
+                        "ELF dynamic table parsing capped at {} aggregate entries",
+                        ElfParseBudget::kMaxTotalDynamicEntries));
+                    budget.warned_dynamic = true;
+                }
+                break;
+            }
+            --budget.remaining_dynamic_entries;
             const std::size_t off = static_cast<std::size_t>(ph.offset) + i * dyn_ent_sz;
             const std::int64_t tag =
                 is64 ? static_cast<std::int64_t>(rd64(b, off, big))
@@ -1369,17 +1503,27 @@ void ElfImage::recover_dynamic_from_program_headers(
                         (*strtab_off - *symtab_off) / static_cast<std::size_t>(syment_sz));
                 }
 
-                constexpr std::uint32_t kMaxSyms = 262144u;
-                sym_count = std::min(sym_count, kMaxSyms);
+                const std::size_t sym_cap = std::min<std::size_t>(
+                    static_cast<std::size_t>(sym_count),
+                    budget.remaining_symbols);
+                if (static_cast<std::size_t>(sym_count) > sym_cap && !budget.warned_symbols) {
+                    add_warning(std::format(
+                        "ELF symbol parsing capped at {} aggregate entries",
+                        ElfParseBudget::kMaxTotalSymbols));
+                    budget.warned_symbols = true;
+                }
                 // Include index 0 (STN_UNDEF) in elf_symbols_ so relocation symbol_index lookups align 1:1!
-                for (std::uint32_t idx = 0u; idx < sym_count; ++idx) {
-                    const std::uint64_t ent_off64 =
-                        static_cast<std::uint64_t>(*symtab_off) +
-                        static_cast<std::uint64_t>(idx) * syment_sz;
-                    if (!fits_range(ent_off64, syment_sz, static_cast<std::uint64_t>(b.size()))) {
+                for (std::uint32_t idx = 0u; idx < static_cast<std::uint32_t>(sym_cap); ++idx) {
+                    const auto sym_rel = checked_mul_u64(idx, syment_sz);
+                    const auto ent_off64 = sym_rel.has_value()
+                        ? checked_add_u64(static_cast<std::uint64_t>(*symtab_off), *sym_rel)
+                        : std::nullopt;
+                    if (!ent_off64.has_value() ||
+                        !fits_range(*ent_off64, syment_sz, static_cast<std::uint64_t>(b.size()))) {
                         break;
                     }
-                    const auto ent = static_cast<std::size_t>(ent_off64);
+                    --budget.remaining_symbols;
+                    const auto ent = static_cast<std::size_t>(*ent_off64);
                     std::uint32_t st_name = 0u;
                     std::uint8_t st_info = 0u;
                     std::uint8_t st_other = 0u;
@@ -1460,9 +1604,27 @@ void ElfImage::recover_dynamic_from_program_headers(
                     "ELF dynamic relocation table '{}' size ({}) is not a multiple of entry size ({})",
                     sec_label, table_sz, ent_sz));
             }
-            const std::uint64_t rel_count = std::min<std::uint64_t>(eff_table_sz / ent_sz, 262144ull);
+            const std::uint64_t rel_count = eff_table_sz / ent_sz;
             for (std::uint64_t i = 0u; i < rel_count; ++i) {
-                const auto roff = static_cast<std::size_t>(*table_off + i * ent_sz);
+                if (budget.remaining_relocations == 0u) {
+                    if (!budget.warned_relocations) {
+                        add_warning(std::format(
+                            "ELF relocation parsing capped at {} aggregate entries",
+                            ElfParseBudget::kMaxTotalRelocations));
+                        budget.warned_relocations = true;
+                    }
+                    break;
+                }
+                const auto rel_off = checked_mul_u64(i, ent_sz);
+                const auto roff64 = rel_off.has_value()
+                    ? checked_add_u64(static_cast<std::uint64_t>(*table_off), *rel_off)
+                    : std::nullopt;
+                if (!roff64.has_value() ||
+                    !fits_range(*roff64, min_ent, static_cast<std::uint64_t>(b.size()))) {
+                    break;
+                }
+                --budget.remaining_relocations;
+                const auto roff = static_cast<std::size_t>(*roff64);
                 ElfRelocation rel{};
                 rel.section_name = std::string(sec_label);
                 rel.has_addend = has_addend;
@@ -1637,10 +1799,32 @@ Result<std::unique_ptr<IBinaryImage>> ElfImage::parse_mapped(
     // recover_dynamic_from_program_headers with live_base resolves them cleanly.
     if (elf->elf_symbols_.empty()) {
         elf->dynamic_entries_.clear();
-        elf->recover_dynamic_from_program_headers(norm, is64, big, live_base, static_base);
+        elf->imports_.clear();
+        elf->exports_.clear();
+        ElfParseBudget mapped_budget{};
+        elf->recover_dynamic_from_program_headers(
+            norm, is64, big, live_base, static_base, mapped_budget, true);
+        elf->append_symbol_imports_and_exports();
     }
 
     elf->rebase_to_live_base(live_base);
+    elf->attach_raw_bytes(mapped_bytes);
+    for (Segment& seg : elf->segments_) {
+        if (seg.file_size != 0u) {
+            const std::uint64_t avail = seg.file_offset < mapped_bytes.size()
+                ? (static_cast<std::uint64_t>(mapped_bytes.size()) - seg.file_offset)
+                : 0u;
+            seg.file_size = std::min(seg.file_size, avail);
+        }
+    }
+    for (Section& sec : elf->sections_) {
+        if (sec.file_size != 0u) {
+            const std::uint64_t avail = sec.file_offset < mapped_bytes.size()
+                ? (static_cast<std::uint64_t>(mapped_bytes.size()) - sec.file_offset)
+                : 0u;
+            sec.file_size = std::min(sec.file_size, avail);
+        }
+    }
     elf->mapped_span_size_ =
         std::max<std::uint64_t>(elf->mapped_span_size_, static_cast<std::uint64_t>(mapped_bytes.size()));
     return std::unique_ptr<IBinaryImage>(std::move(*parsed));

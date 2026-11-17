@@ -5,6 +5,8 @@
 #ifndef PEELF_EXPLORER_PE_DEFINITIONS_H
 #define PEELF_EXPLORER_PE_DEFINITIONS_H
 
+#include <cstdint>
+
 struct PeSummary {
     std::uint16_t machine{};
     std::uint16_t number_of_sections{};

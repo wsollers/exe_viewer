@@ -100,6 +100,15 @@ constexpr void wr64_endian(std::vector<std::uint8_t>& b,
     return lhs + rhs;
 }
 
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_mul_u64(
+    std::uint64_t lhs,
+    std::uint64_t rhs) noexcept {
+    if (lhs != 0u && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+        return std::nullopt;
+    }
+    return lhs * rhs;
+}
+
 [[nodiscard]] constexpr std::uint64_t align4(std::uint64_t value) noexcept {
     return (value + 3u) & ~std::uint64_t{3u};
 }

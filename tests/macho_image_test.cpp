@@ -1418,7 +1418,195 @@ TEST(MachOImageTest, AdversarialMalformedThinAndUniversalInputsFailOrWarnSafely)
 
         EXPECT_EQ(peelf::detect_format(bad_align.bytes()), peelf::Format::Unknown);
         EXPECT_FALSE(peelf::inspect_binary_container(bad_align.bytes()).has_value());
+
+        // 5d. Polyglot Universal slice where outer fat_arch.cputype != inner mach_header.cputype
+        ByteWriter mismatched_cpu(true);
+        mismatched_cpu.u32_be(kFatMagic);
+        mismatched_cpu.u32_be(1u);
+        mismatched_cpu.u32_be(kCpuTypeArm64); // claims ARM64, but inner slice is PowerPC
+        mismatched_cpu.u32_be(0u);
+        mismatched_cpu.u32_be(0x100u);
+        mismatched_cpu.u32_be(static_cast<std::uint32_t>(thin.size()));
+        mismatched_cpu.u32_be(8u);
+        mismatched_cpu.pad_to(0x100u);
+        mismatched_cpu.raw(thin);
+
+        EXPECT_EQ(peelf::detect_format(mismatched_cpu.bytes()), peelf::Format::Unknown);
+        EXPECT_FALSE(peelf::inspect_binary_container(mismatched_cpu.bytes()).has_value());
+        EXPECT_FALSE(peelf::open_binary_image(mismatched_cpu.bytes()).has_value());
     }
+}
+
+TEST(MachOImageTest, PreservesAbsAndIndrSymbolsAcrossRebaseAndValidatesCodeDirectoryHashes) {
+    using namespace peelf::macho;
+
+    ByteWriter w(false);
+    w.u32(kMhMagic64);
+    w.u32(kCpuTypeX86_64);
+    w.u32(kCpuSubtypeX86_64All);
+    w.u32(kMhDylib);
+    w.u32(3u); // __TEXT + LC_SYMTAB + LC_CODE_SIGNATURE
+    w.u32(0u); // sizeofcmds patched below
+    w.u32(kMhPie);
+    w.u32(0u);
+
+    const std::size_t cmds_start = w.size();
+    // 1. LC_SEGMENT_64 __TEXT with filesize (0x1000) > vmsize (0x800) to also test VA read clamping
+    w.u32(kLcSegment64);
+    w.u32(72u + 80u);
+    w.fixed_str16("__TEXT");
+    w.u64(0x100000000ULL); // vmaddr
+    w.u64(0x800ULL);       // vmsize
+    w.u64(0ULL);           // fileoff
+    w.u64(0x1000ULL);      // filesize > vmsize
+    w.u32(0x5u);           // maxprot
+    w.u32(0x5u);           // initprot
+    w.u32(1u);             // nsects
+    w.u32(0u);
+    // __TEXT,__text covering [0x400, 0x410)
+    w.fixed_str16("__text");
+    w.fixed_str16("__TEXT");
+    w.u64(0x100000400ULL);
+    w.u64(0x10ULL);
+    w.u32(0x400u);
+    w.u32(4u);
+    w.u32(0u);
+    w.u32(0u);
+    w.u32(kSAttrPureInstructions | kSAttrSomeInstructions);
+    w.u32(0u);
+    w.u32(0u);
+    w.u32(0u);
+
+    // 2. LC_SYMTAB (patched below)
+    const std::size_t symtab_cmd_off = w.size();
+    w.u32(kLcSymtab);
+    w.u32(24u);
+    w.u32(0u);
+    w.u32(0u);
+    w.u32(0u);
+    w.u32(0u);
+
+    // 3. LC_CODE_SIGNATURE (patched below)
+    const std::size_t cs_cmd_off = w.size();
+    w.u32(kLcCodeSignature);
+    w.u32(16u);
+    w.u32(0u);
+    w.u32(0u);
+
+    w.put_u32(20u, static_cast<std::uint32_t>(w.size() - cmds_start));
+    w.pad_to(0x400u);
+    w.u8(0xC3u);
+    w.pad_to(0x1000u);
+
+    ByteWriter strtab(false);
+    strtab.u8(0u);
+    const auto str_sect = static_cast<std::uint32_t>(strtab.size());
+    strtab.cstr("_sect_export");
+    const auto str_abs = static_cast<std::uint32_t>(strtab.size());
+    strtab.cstr("_abs_constant");
+    const auto str_indr = static_cast<std::uint32_t>(strtab.size());
+    strtab.cstr("_indr_alias");
+    strtab.align_to(8u);
+
+    const auto symoff = static_cast<std::uint32_t>(w.size());
+    // N_SECT | N_EXT -> MUST slide on rebase
+    w.u32(str_sect);
+    w.u8(kNSect | kNExt);
+    w.u8(1u);
+    w.u16(0u);
+    w.u64(0x100000400ULL);
+    // N_ABS | N_EXT -> MUST NOT slide on rebase
+    w.u32(str_abs);
+    w.u8(kNAbs | kNExt);
+    w.u8(0u);
+    w.u16(0u);
+    w.u64(0xFEEDFACEULL);
+    // N_INDR | N_EXT -> MUST NOT slide on rebase (value is strtab index)
+    w.u32(str_indr);
+    w.u8(kNIndr | kNExt);
+    w.u8(0u);
+    w.u16(0u);
+    w.u64(str_sect);
+
+    const auto stroff = static_cast<std::uint32_t>(w.size());
+    w.raw(strtab.bytes());
+    w.put_u32(symtab_cmd_off + 8u, symoff);
+    w.put_u32(symtab_cmd_off + 12u, 3u);
+    w.put_u32(symtab_cmd_off + 16u, stroff);
+    w.put_u32(symtab_cmd_off + 20u, static_cast<std::uint32_t>(strtab.size()));
+
+    // Malformed CodeDirectory whose declared nCodeSlots * hashSize overflows sub-blob length.
+    w.align_to(16u);
+    const auto cs_off = static_cast<std::uint32_t>(w.size());
+    ByteWriter bad_cs(true);
+    bad_cs.u32_be(kCsMagicEmbeddedSignature);
+    bad_cs.u32_be(20u + 60u); // SuperBlob length
+    bad_cs.u32_be(1u);        // 1 blob
+    bad_cs.u32_be(kCsSlotCodeDirectory);
+    bad_cs.u32_be(20u);       // CodeDirectory @ +20
+    bad_cs.u32_be(kCsMagicCodeDirectory);
+    bad_cs.u32_be(60u);       // sub_len = 60
+    bad_cs.u32_be(0x20400u);  // version
+    bad_cs.u32_be(kCsAdhoc);
+    bad_cs.u32_be(56u);       // hashOffset
+    bad_cs.u32_be(52u);       // identOffset ("a\0" @ +52)
+    bad_cs.u32_be(0u);        // nSpecialSlots
+    bad_cs.u32_be(4u);        // nCodeSlots = 4 * 32 = 128 bytes > remaining 4 bytes!
+    bad_cs.u32_be(0x800u);    // codeLimit
+    bad_cs.u8(32u);           // hashSize
+    bad_cs.u8(2u);
+    bad_cs.u8(0u);
+    bad_cs.u8(12u);
+    bad_cs.u32_be(0u);
+    bad_cs.u32_be(0u);
+    bad_cs.u32_be(0u);
+    bad_cs.cstr("a");
+    bad_cs.pad_to(80u);
+    w.raw(bad_cs.bytes());
+    w.put_u32(cs_cmd_off + 8u, cs_off);
+    w.put_u32(cs_cmd_off + 12u, static_cast<std::uint32_t>(bad_cs.size()));
+
+    constexpr std::uint64_t kRebasedBase = 0x102000000ULL;
+    auto rebased = peelf::parse_rebased_image(w.bytes(), kRebasedBase);
+    ASSERT_TRUE(rebased.has_value()) << rebased.error().message;
+    const peelf::IBinaryImage& img = **rebased;
+
+    // Segment VA reads stop at vmsize (0x800) even when filesize is 0x1000.
+    EXPECT_TRUE(img.read_bytes_at_va(kRebasedBase + 0x7F0u, 0x10u).has_value());
+    EXPECT_FALSE(img.read_bytes_at_va(kRebasedBase + 0x7F0u, 0x20u).has_value());
+
+    // Malformed CodeDirectory hashes must NOT leave superblob_valid == true.
+    ASSERT_NE(img.macho_code_signature(), nullptr);
+    EXPECT_FALSE(img.macho_code_signature()->superblob_valid);
+    EXPECT_FALSE(img.macho_code_signature()->has_code_directory);
+
+    const auto find_sym = [&](std::string_view name) -> const peelf::Symbol* {
+        const auto it = std::ranges::find_if(img.symbols(), [&](const peelf::Symbol& s) {
+            return s.name == name;
+        });
+        return it != img.symbols().end() ? &*it : nullptr;
+    };
+    const auto find_exp = [&](std::string_view name) -> const peelf::ExportEntry* {
+        const auto it = std::ranges::find_if(img.exports(), [&](const peelf::ExportEntry& e) {
+            return e.name == name;
+        });
+        return it != img.exports().end() ? &*it : nullptr;
+    };
+
+    ASSERT_NE(find_sym("_sect_export"), nullptr);
+    ASSERT_NE(find_exp("_sect_export"), nullptr);
+    EXPECT_EQ(find_sym("_sect_export")->virtual_address, kRebasedBase + 0x400u);
+    EXPECT_EQ(find_exp("_sect_export")->virtual_address, kRebasedBase + 0x400u);
+
+    ASSERT_NE(find_sym("_abs_constant"), nullptr);
+    ASSERT_NE(find_exp("_abs_constant"), nullptr);
+    EXPECT_EQ(find_sym("_abs_constant")->virtual_address, 0xFEEDFACEULL);
+    EXPECT_EQ(find_exp("_abs_constant")->virtual_address, 0xFEEDFACEULL);
+
+    ASSERT_NE(find_sym("_indr_alias"), nullptr);
+    ASSERT_NE(find_exp("_indr_alias"), nullptr);
+    EXPECT_EQ(find_sym("_indr_alias")->virtual_address, str_sect);
+    EXPECT_EQ(find_exp("_indr_alias")->virtual_address, str_sect);
 }
 
 } // namespace

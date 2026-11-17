@@ -6,6 +6,45 @@ namespace peelf {
 
 namespace detail {
 
+namespace {
+
+[[nodiscard]] constexpr std::uint64_t section_mapped_size(const Section& section) noexcept {
+    return section.virtual_size != 0u ? section.virtual_size : section.file_size;
+}
+
+[[nodiscard]] constexpr std::uint64_t section_file_backed_size(const Section& section) noexcept {
+    return section.virtual_size != 0u
+        ? std::min(section.file_size, section.virtual_size)
+        : section.file_size;
+}
+
+[[nodiscard]] std::uint64_t pe_unsectioned_header_span(const ImageBase& image,
+                                                       const std::vector<Section>& sections,
+                                                       std::uint64_t image_base,
+                                                       std::size_t raw_file_size) noexcept {
+    if (image.format() != Format::PE) {
+        return 0u;
+    }
+    const PeHeader* hdr = image.pe_header();
+    if (hdr == nullptr || hdr->size_of_headers == 0u) {
+        return 0u;
+    }
+    for (const Section& sec : sections) {
+        const std::uint64_t mapped_size = section_mapped_size(sec);
+        if (mapped_size == 0u) {
+            continue;
+        }
+        if (sec.virtual_address <= image_base &&
+            (image_base - sec.virtual_address) < mapped_size) {
+            return 0u;
+        }
+    }
+    return std::min<std::uint64_t>(hdr->size_of_headers,
+                                   static_cast<std::uint64_t>(raw_file_size));
+}
+
+} // namespace
+
 std::string read_c_string(std::span<const std::uint8_t> b,
                           std::uint64_t offset,
                           std::uint64_t max_len) {
@@ -29,14 +68,13 @@ std::optional<std::uint64_t> pe_rva_to_file_offset(const std::vector<Section>& s
             continue;
         }
         const std::uint64_t section_rva = section.virtual_address - image_base;
-        const std::uint64_t mapped_size =
-            section.virtual_size != 0 ? section.virtual_size : section.file_size;
-        if (mapped_size == 0) {
+        const std::uint64_t mapped_size = section_mapped_size(section);
+        if (mapped_size == 0u) {
             continue;
         }
         if (rva >= section_rva && static_cast<std::uint64_t>(rva) - section_rva < mapped_size) {
             const std::uint64_t delta = static_cast<std::uint64_t>(rva) - section_rva;
-            if (delta >= section.file_size) {
+            if (delta >= section_file_backed_size(section)) {
                 return std::nullopt;
             }
             return checked_add_u64(section.file_offset, delta);
@@ -69,7 +107,8 @@ std::optional<std::uint64_t> ImageBase::file_offset_to_virtual_address(
         return std::nullopt;
     }
     for (const Section& section : sections_) {
-        if (section.file_size == 0) {
+        const std::uint64_t file_backed = section_file_backed_size(section);
+        if (file_backed == 0u) {
             continue;
         }
         if (format_ == Format::ELF && !section.readable && !section.writable &&
@@ -77,9 +116,14 @@ std::optional<std::uint64_t> ImageBase::file_offset_to_virtual_address(
             continue;
         }
         if (file_offset >= section.file_offset &&
-            file_offset - section.file_offset < section.file_size) {
+            file_offset - section.file_offset < file_backed) {
             return checked_add_u64(section.virtual_address, file_offset - section.file_offset);
         }
+    }
+    const std::uint64_t header_span =
+        pe_unsectioned_header_span(*this, sections_, image_base_, raw_bytes_.size());
+    if (header_span != 0u && file_offset < header_span) {
+        return checked_add_u64(image_base_, file_offset);
     }
     if (is_live_mapped_ && file_offset < mapped_span_size_) {
         return checked_add_u64(image_base_, file_offset);
@@ -105,19 +149,24 @@ std::optional<std::uint64_t> ImageBase::virtual_address_to_file_offset(
             !section.executable) {
             continue;
         }
-        const std::uint64_t mapped_size =
-            section.virtual_size != 0 ? section.virtual_size : section.file_size;
-        if (mapped_size == 0) {
+        const std::uint64_t mapped_size = section_mapped_size(section);
+        if (mapped_size == 0u) {
             continue;
         }
         if (virtual_address >= section.virtual_address &&
             virtual_address - section.virtual_address < mapped_size) {
             const std::uint64_t delta = virtual_address - section.virtual_address;
-            if (delta >= section.file_size) {
+            if (delta >= section_file_backed_size(section)) {
                 return std::nullopt;
             }
             return checked_add_u64(section.file_offset, delta);
         }
+    }
+    const std::uint64_t header_span =
+        pe_unsectioned_header_span(*this, sections_, image_base_, raw_bytes_.size());
+    if (header_span != 0u && virtual_address >= image_base_ &&
+        (virtual_address - image_base_) < header_span) {
+        return virtual_address - image_base_;
     }
     if (is_live_mapped_ && virtual_address >= image_base_ &&
         (virtual_address - image_base_) < mapped_span_size_) {
@@ -181,8 +230,9 @@ Result<std::vector<std::uint8_t>> ImageBase::read_bytes_at_va(
                 if (delta >= seg.virtual_size) {
                     continue;
                 }
-                if (delta < seg.file_size) {
-                    const std::uint64_t chunk = std::min(remaining, seg.file_size - delta);
+                const std::uint64_t file_backed = std::min(seg.file_size, seg.virtual_size);
+                if (delta < file_backed) {
+                    const std::uint64_t chunk = std::min(remaining, file_backed - delta);
                     const auto off = checked_add_u64(seg.file_offset, delta);
                     if (!off.has_value() ||
                         !fits_range(*off, chunk, static_cast<std::uint64_t>(raw_bytes_.size()))) {
@@ -204,8 +254,7 @@ Result<std::vector<std::uint8_t>> ImageBase::read_bytes_at_va(
                 if (format_ == Format::ELF && !sec.readable && !sec.writable && !sec.executable) {
                     continue;
                 }
-                const std::uint64_t mapped_size =
-                    sec.virtual_size != 0u ? sec.virtual_size : sec.file_size;
+                const std::uint64_t mapped_size = section_mapped_size(sec);
                 if (mapped_size == 0u || cur_va < sec.virtual_address) {
                     continue;
                 }
@@ -213,8 +262,9 @@ Result<std::vector<std::uint8_t>> ImageBase::read_bytes_at_va(
                 if (delta >= mapped_size) {
                     continue;
                 }
-                if (delta < sec.file_size) {
-                    const std::uint64_t chunk = std::min(remaining, sec.file_size - delta);
+                const std::uint64_t file_backed = section_file_backed_size(sec);
+                if (delta < file_backed) {
+                    const std::uint64_t chunk = std::min(remaining, file_backed - delta);
                     const auto off = checked_add_u64(sec.file_offset, delta);
                     if (!off.has_value() ||
                         !fits_range(*off, chunk, static_cast<std::uint64_t>(raw_bytes_.size()))) {
@@ -230,6 +280,33 @@ Result<std::vector<std::uint8_t>> ImageBase::read_bytes_at_va(
                 }
                 advanced = true;
                 break;
+            }
+        }
+
+        if (!advanced) {
+            const std::uint64_t header_span =
+                pe_unsectioned_header_span(*this, sections_, image_base_, raw_bytes_.size());
+            if (header_span != 0u && cur_va >= image_base_ &&
+                (cur_va - image_base_) < header_span) {
+                const std::uint64_t delta = cur_va - image_base_;
+                std::uint64_t max_header_end = header_span;
+                for (const Section& sec : sections_) {
+                    if (section_mapped_size(sec) != 0u && sec.virtual_address > cur_va) {
+                        const std::uint64_t sec_rva = sec.virtual_address - image_base_;
+                        if (sec_rva < max_header_end) {
+                            max_header_end = sec_rva;
+                        }
+                    }
+                }
+                const std::uint64_t chunk = std::min(remaining, max_header_end - delta);
+                if (!fits_range(delta, chunk, static_cast<std::uint64_t>(raw_bytes_.size()))) {
+                    return make_error("PE header backing exceeds image size");
+                }
+                const auto src_idx = static_cast<std::size_t>(delta);
+                const auto n = static_cast<std::size_t>(chunk);
+                std::copy_n(raw_bytes_.data() + src_idx, n, out.data() + written);
+                written += n;
+                advanced = true;
             }
         }
 

@@ -5,7 +5,7 @@
 #ifndef PEELF_EXPLORER_ELF_DEFINITIONS_H
 #define PEELF_EXPLORER_ELF_DEFINITIONS_H
 
-
+#include <cstdint>
 
 struct ElfSummary {
     std::uint8_t ei_class{};  // 1=32-bit, 2=64-bit

@@ -250,6 +250,21 @@ struct FatHeaderKind {
     return out;
 }
 
+[[nodiscard]] bool has_nul_terminated_blob_cstring(
+    std::span<const std::uint8_t> blob,
+    std::uint32_t rel_offset,
+    std::uint32_t min_offset) noexcept {
+    if (rel_offset < min_offset || rel_offset >= blob.size()) {
+        return false;
+    }
+    for (std::size_t p = static_cast<std::size_t>(rel_offset); p < blob.size(); ++p) {
+        if (blob[p] == 0u) {
+            return true;
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] std::string read_bounded_blob_cstring(
     std::span<const std::uint8_t> blob,
     std::uint32_t rel_offset) {
@@ -353,6 +368,12 @@ struct RawFatSliceRange {
         const std::uint64_t min_thin_hdr = tm.is_64 ? 32u : 28u;
         if (!tm.valid || s.size < min_thin_hdr) {
             set_reason("Universal Mach-O slice does not start with a valid thin Mach-O header");
+            return false;
+        }
+        const std::uint32_t hdr_cpu_type =
+            detail::rd32(bytes, static_cast<std::size_t>(s.offset) + 4u, tm.is_big);
+        if (hdr_cpu_type != s.cpu_type) {
+            set_reason("Universal Mach-O fat_arch cputype does not match inner thin mach_header cputype");
             return false;
         }
         s.thin_magic = tm;
@@ -493,9 +514,11 @@ Result<BinaryContainerInfo> MachOImage::inspect_container(std::span<const std::u
                 rs.offset,
                 rs.align_log2,
                 rs.thin_magic);
-            // Preserve the FAT directory's CPU metadata if consistent, while thin header provides truth.
-            desc.cpu_type    = rs.cpu_type != 0u ? rs.cpu_type : desc.cpu_type;
-            desc.cpu_subtype = rs.cpu_type != 0u ? rs.cpu_subtype : desc.cpu_subtype;
+            if (desc.cpu_type != rs.cpu_type) {
+                return make_error(
+                    "Mach-O: Universal fat_arch cputype does not match inner thin mach_header cputype");
+            }
+            desc.cpu_subtype = rs.cpu_subtype;
             desc.arch        = map_macho_cpu_to_arch(desc.cpu_type, rs.thin_magic.is_64);
             desc.arch_name   = format_macho_arch_name(
                 desc.cpu_type, desc.cpu_subtype, rs.thin_magic.is_64);
@@ -1141,19 +1164,38 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                     img->add_warning("Mach-O: truncated LC_DYLD_INFO(_ONLY) command");
                     break;
                 }
+                const std::uint32_t rebase_off     = *reader.read_u32(cmd_off + 8u);
+                const std::uint32_t rebase_size    = *reader.read_u32(cmd_off + 12u);
+                const std::uint32_t bind_off       = *reader.read_u32(cmd_off + 16u);
+                const std::uint32_t bind_size      = *reader.read_u32(cmd_off + 20u);
+                const std::uint32_t weak_bind_off  = *reader.read_u32(cmd_off + 24u);
+                const std::uint32_t weak_bind_size = *reader.read_u32(cmd_off + 28u);
+                const std::uint32_t lazy_bind_off  = *reader.read_u32(cmd_off + 32u);
+                const std::uint32_t lazy_bind_size = *reader.read_u32(cmd_off + 36u);
+                const std::uint32_t export_off     = *reader.read_u32(cmd_off + 40u);
+                const std::uint32_t export_size    = *reader.read_u32(cmd_off + 44u);
+                const auto slice_sz = static_cast<std::uint64_t>(slice.size());
+                if (!detail::fits_range(rebase_off, rebase_size, slice_sz) ||
+                    !detail::fits_range(bind_off, bind_size, slice_sz) ||
+                    !detail::fits_range(weak_bind_off, weak_bind_size, slice_sz) ||
+                    !detail::fits_range(lazy_bind_off, lazy_bind_size, slice_sz) ||
+                    !detail::fits_range(export_off, export_size, slice_sz)) {
+                    img->add_warning("Mach-O: LC_DYLD_INFO(_ONLY) sub-range out of slice bounds");
+                    break;
+                }
                 img->has_any_dyld_metadata_        = true;
                 img->dyld_info_.has_dyld_info      = true;
                 img->dyld_info_.dyld_info_only     = (cmd == macho::kLcDyldInfoOnly);
-                img->dyld_info_.rebase_off         = *reader.read_u32(cmd_off + 8u);
-                img->dyld_info_.rebase_size        = *reader.read_u32(cmd_off + 12u);
-                img->dyld_info_.bind_off           = *reader.read_u32(cmd_off + 16u);
-                img->dyld_info_.bind_size          = *reader.read_u32(cmd_off + 20u);
-                img->dyld_info_.weak_bind_off      = *reader.read_u32(cmd_off + 24u);
-                img->dyld_info_.weak_bind_size     = *reader.read_u32(cmd_off + 28u);
-                img->dyld_info_.lazy_bind_off      = *reader.read_u32(cmd_off + 32u);
-                img->dyld_info_.lazy_bind_size     = *reader.read_u32(cmd_off + 36u);
-                img->dyld_info_.export_off         = *reader.read_u32(cmd_off + 40u);
-                img->dyld_info_.export_size        = *reader.read_u32(cmd_off + 44u);
+                img->dyld_info_.rebase_off         = rebase_off;
+                img->dyld_info_.rebase_size        = rebase_size;
+                img->dyld_info_.bind_off           = bind_off;
+                img->dyld_info_.bind_size          = bind_size;
+                img->dyld_info_.weak_bind_off      = weak_bind_off;
+                img->dyld_info_.weak_bind_size     = weak_bind_size;
+                img->dyld_info_.lazy_bind_off      = lazy_bind_off;
+                img->dyld_info_.lazy_bind_size     = lazy_bind_size;
+                img->dyld_info_.export_off         = export_off;
+                img->dyld_info_.export_size        = export_size;
                 img->dyld_info_.container_rebase_off = detail::checked_add_u64(
                     container_offset, img->dyld_info_.rebase_off).value_or(0u);
                 img->dyld_info_.container_bind_off = detail::checked_add_u64(
@@ -1177,6 +1219,11 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                 }
                 const std::uint32_t dataoff  = *reader.read_u32(cmd_off + 8u);
                 const std::uint32_t datasize = *reader.read_u32(cmd_off + 12u);
+                if (!detail::fits_range(dataoff, datasize,
+                                        static_cast<std::uint64_t>(slice.size()))) {
+                    img->add_warning("Mach-O: linkedit_data_command payload out of slice bounds");
+                    break;
+                }
                 MachOLinkeditRange range{
                     .present          = true,
                     .cmd              = cmd,
@@ -1231,6 +1278,7 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                 img->code_signature_.superblob_length = sb_length;
                 img->code_signature_.blob_count       = sb_count;
 
+                const std::uint64_t sb_index_end = 12u + static_cast<std::uint64_t>(sb_count) * 8u;
                 if (sb_magic != macho::kCsMagicEmbeddedSignature ||
                     sb_length < 12u ||
                     sb_length > cs_span.size() ||
@@ -1238,20 +1286,23 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                     img->add_warning("Mach-O: malformed CS_SuperBlob header in LC_CODE_SIGNATURE");
                     break;
                 }
-                img->code_signature_.superblob_valid = true;
 
+                bool blobs_valid = true;
                 for (std::uint32_t bi = 0u; bi < sb_count; ++bi) {
                     const std::size_t idx_off = 12u + static_cast<std::size_t>(bi) * 8u;
                     const std::uint32_t slot_type   = *cs_be.read_u32(idx_off + 0u);
                     const std::uint32_t blob_offset = *cs_be.read_u32(idx_off + 4u);
-                    if (!detail::fits_range(blob_offset, 8u, sb_length)) {
+                    if (blob_offset < sb_index_end ||
+                        !detail::fits_range(blob_offset, 8u, sb_length)) {
                         img->add_warning("Mach-O: CS_BlobIndex offset out of SuperBlob bounds");
+                        blobs_valid = false;
                         continue;
                     }
                     const std::uint32_t sub_magic = *cs_be.read_u32(blob_offset + 0u);
                     const std::uint32_t sub_len   = *cs_be.read_u32(blob_offset + 4u);
                     if (sub_len < 8u || !detail::fits_range(blob_offset, sub_len, sb_length)) {
                         img->add_warning("Mach-O: CodeSignature sub-blob exceeds SuperBlob bounds");
+                        blobs_valid = false;
                         continue;
                     }
 
@@ -1260,25 +1311,76 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                         static_cast<std::size_t>(sub_len));
                     const EndianReader sub_be(sub_span, Endianness::Big, AddressWidth::Bits64);
 
-                    if ((slot_type == macho::kCsSlotCodeDirectory ||
+                    const bool is_cd_slot =
+                        (slot_type == macho::kCsSlotCodeDirectory ||
                          (!img->code_signature_.has_code_directory &&
-                          slot_type >= 0x1000u && slot_type <= 0x1005u)) &&
-                        sub_magic == macho::kCsMagicCodeDirectory && sub_len >= 44u) {
+                          slot_type >= 0x1000u && slot_type <= 0x1005u));
+                    if (is_cd_slot && sub_magic == macho::kCsMagicCodeDirectory) {
+                        if (sub_len < 44u) {
+                            img->add_warning("Mach-O: truncated CS_CodeDirectory header in LC_CODE_SIGNATURE");
+                            blobs_valid = false;
+                            continue;
+                        }
+                        const std::uint32_t cd_version   = *sub_be.read_u32(8u);
+                        const std::uint32_t min_cd_hdr   = cd_version >= 0x20200u
+                            ? 52u
+                            : (cd_version >= 0x20100u ? 48u : 44u);
+                        if (sub_len < min_cd_hdr) {
+                            img->add_warning("Mach-O: CS_CodeDirectory header smaller than version requires");
+                            blobs_valid = false;
+                            continue;
+                        }
+                        const std::uint32_t cd_flags     = *sub_be.read_u32(12u);
+                        const std::uint32_t hash_off     = *sub_be.read_u32(16u);
+                        const std::uint32_t ident_off    = *sub_be.read_u32(20u);
+                        const std::uint32_t n_special    = *sub_be.read_u32(24u);
+                        const std::uint32_t n_code       = *sub_be.read_u32(28u);
+                        const std::uint32_t code_limit   = *sub_be.read_u32(32u);
+                        const std::uint8_t  hash_sz      = *sub_be.read_u8(36u);
+                        const std::uint8_t  hash_type    = *sub_be.read_u8(37u);
+                        const std::uint8_t  platform     = *sub_be.read_u8(38u);
+                        const std::uint8_t  page_sz_log2 = *sub_be.read_u8(39u);
+                        const std::uint32_t team_off     = cd_version >= 0x20200u
+                            ? *sub_be.read_u32(48u)
+                            : 0u;
+
+                        const auto special_bytes = detail::checked_mul_u64(n_special, hash_sz);
+                        const auto total_slots   = detail::checked_add_u64(n_special, n_code);
+                        const auto total_hashes  = total_slots.has_value()
+                            ? detail::checked_mul_u64(*total_slots, hash_sz)
+                            : std::nullopt;
+                        const bool hashes_valid =
+                            ((n_special == 0u && n_code == 0u) || hash_sz > 0u) &&
+                            special_bytes.has_value() &&
+                            total_hashes.has_value() &&
+                            hash_off >= *special_bytes &&
+                            (hash_off - *special_bytes) >= min_cd_hdr &&
+                            detail::fits_range(hash_off - *special_bytes, *total_hashes, sub_len);
+                        const bool ident_valid =
+                            has_nul_terminated_blob_cstring(sub_span, ident_off, min_cd_hdr);
+                        const bool team_valid =
+                            (team_off == 0u) ||
+                            has_nul_terminated_blob_cstring(sub_span, team_off, min_cd_hdr);
+
+                        if (!hashes_valid || !ident_valid || !team_valid) {
+                            img->add_warning("Mach-O: malformed CS_CodeDirectory bounds in LC_CODE_SIGNATURE");
+                            blobs_valid = false;
+                            continue;
+                        }
+
                         img->code_signature_.has_code_directory = true;
-                        img->code_signature_.cd_version      = *sub_be.read_u32(8u);
-                        img->code_signature_.cd_flags        = *sub_be.read_u32(12u);
-                        const std::uint32_t ident_off        = *sub_be.read_u32(20u);
-                        img->code_signature_.n_special_slots = *sub_be.read_u32(24u);
-                        img->code_signature_.n_code_slots    = *sub_be.read_u32(28u);
-                        img->code_signature_.code_limit      = *sub_be.read_u32(32u);
-                        img->code_signature_.hash_size       = *sub_be.read_u8(36u);
-                        img->code_signature_.hash_type       = *sub_be.read_u8(37u);
-                        img->code_signature_.platform        = *sub_be.read_u8(38u);
-                        img->code_signature_.page_size_log2  = *sub_be.read_u8(39u);
+                        img->code_signature_.cd_version      = cd_version;
+                        img->code_signature_.cd_flags        = cd_flags;
+                        img->code_signature_.n_special_slots = n_special;
+                        img->code_signature_.n_code_slots    = n_code;
+                        img->code_signature_.code_limit      = code_limit;
+                        img->code_signature_.hash_size       = hash_sz;
+                        img->code_signature_.hash_type       = hash_type;
+                        img->code_signature_.platform        = platform;
+                        img->code_signature_.page_size_log2  = page_sz_log2;
                         img->code_signature_.identifier =
                             read_bounded_blob_cstring(sub_span, ident_off);
-                        if (img->code_signature_.cd_version >= 0x20200u && sub_len >= 52u) {
-                            const std::uint32_t team_off = *sub_be.read_u32(48u);
+                        if (team_off != 0u) {
                             img->code_signature_.team_id =
                                 read_bounded_blob_cstring(sub_span, team_off);
                         }
@@ -1299,6 +1401,7 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                         img->code_signature_.has_nonempty_cms_signature = (sub_len > 8u);
                     }
                 }
+                img->code_signature_.superblob_valid = blobs_valid;
                 break;
             }
 
@@ -1375,7 +1478,9 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                 img->add_warning("Mach-O: LC_SYMTAB symbol count capped at 500000 entries");
             }
 
-            img->macho_symbols_.reserve(sym_count);
+            constexpr std::size_t kMaxTotalSymbolStringBytes = 32u * 1024u * 1024u;
+            std::size_t used_symbol_string_bytes = 0u;
+            img->macho_symbols_.reserve(std::min<std::uint32_t>(sym_count, 16384u));
             for (std::uint32_t si = 0u; si < sym_count; ++si) {
                 const auto ent = static_cast<std::size_t>(
                     static_cast<std::uint64_t>(img->symtab_.symoff) +
@@ -1411,15 +1516,28 @@ Result<std::unique_ptr<MachOImage>> MachOImage::parse_thin_slice(
                                          ((ms.n_desc & macho::kNArmThumbDef) != 0u);
 
                 ms.library_ordinal = static_cast<std::uint8_t>((ms.n_desc >> 8u) & 0xFFu);
+                std::string_view resolved_lib{};
                 if (ms.is_undefined) {
                     if (ms.library_ordinal >= 1u &&
                         ms.library_ordinal <= img->dylibs_.size()) {
-                        ms.library_name = img->dylibs_[ms.library_ordinal - 1u].name;
+                        resolved_lib = img->dylibs_[ms.library_ordinal - 1u].name;
                     } else if (ms.library_ordinal == 0xFEu) {
-                        ms.library_name = "@dynamic_lookup";
+                        resolved_lib = "@dynamic_lookup";
                     } else if (ms.library_ordinal == 0xFFu) {
-                        ms.library_name = "@executable";
+                        resolved_lib = "@executable";
                     }
+                }
+
+                const std::size_t symbol_str_cost =
+                    ms.name.size() * 3u + resolved_lib.size() * 2u;
+                if (symbol_str_cost > kMaxTotalSymbolStringBytes - used_symbol_string_bytes) {
+                    img->add_warning(
+                        "Mach-O: aggregate symbol/dylib string budget exceeded; truncating symbol table");
+                    break;
+                }
+                used_symbol_string_bytes += symbol_str_cost;
+                if (!resolved_lib.empty()) {
+                    ms.library_name.assign(resolved_lib);
                 }
 
                 if (!ms.is_stab && !ms.name.empty()) {
@@ -1654,12 +1772,14 @@ Result<std::vector<std::uint8_t>> MachOImage::read_bytes_at_va(
             if (delta >= sec.virtual_size) {
                 continue;
             }
-            const std::uint64_t chunk = std::min(remaining, sec.virtual_size - delta);
-            if (sec.is_zerofill) {
-                // Zero-fill section (S_ZEROFILL / S_GB_ZEROFILL / S_THREAD_LOCAL_ZEROFILL):
+            const std::uint64_t file_backed = std::min(sec.file_size, sec.virtual_size);
+            if (sec.is_zerofill || delta >= file_backed) {
+                // Zero-fill section or zero-filled tail [file_size, virtual_size):
                 // `out` is already zero-initialized; advance without file backing.
+                const std::uint64_t chunk = std::min(remaining, sec.virtual_size - delta);
                 written += static_cast<std::size_t>(chunk);
             } else {
+                const std::uint64_t chunk = std::min(remaining, file_backed - delta);
                 const auto rel_off = detail::checked_add_u64(sec.slice_file_offset, delta);
                 if (!rel_off.has_value() ||
                     !detail::fits_range(*rel_off, chunk,
@@ -1685,8 +1805,9 @@ Result<std::vector<std::uint8_t>> MachOImage::read_bytes_at_va(
                 if (delta >= seg.virtual_size) {
                     continue;
                 }
-                if (delta < seg.file_size) {
-                    const std::uint64_t chunk = std::min(remaining, seg.file_size - delta);
+                const std::uint64_t file_backed = std::min(seg.file_size, seg.virtual_size);
+                if (delta < file_backed) {
+                    const std::uint64_t chunk = std::min(remaining, file_backed - delta);
                     const auto rel_off = detail::checked_add_u64(seg.slice_file_offset, delta);
                     if (!rel_off.has_value() ||
                         !detail::fits_range(*rel_off, chunk,
@@ -1742,19 +1863,30 @@ void MachOImage::rebase_to_live_base(std::uint64_t live_base) noexcept {
     for (Section& sec : sections_) {
         sec.virtual_address += slide;
     }
+    std::size_t export_idx = 0u;
     for (MachOSymbol& msym : macho_symbols_) {
-        if (!msym.is_stab && (msym.n_type & macho::kNType) == macho::kNSect && msym.value != 0u) {
+        const auto type_bits = static_cast<std::uint8_t>(msym.n_type & macho::kNType);
+        const bool is_export =
+            !msym.is_stab && !msym.name.empty() && !msym.is_undefined &&
+            msym.is_external && !msym.is_private_external &&
+            (type_bits == macho::kNSect ||
+             type_bits == macho::kNAbs ||
+             type_bits == macho::kNIndr);
+        if (!msym.is_stab && type_bits == macho::kNSect && msym.value != 0u) {
             msym.value += slide;
+        }
+        if (is_export && export_idx < exports_.size()) {
+            if (type_bits == macho::kNSect) {
+                exports_[export_idx].virtual_address = msym.value;
+            }
+            ++export_idx;
         }
     }
     for (Symbol& sym : symbols_) {
-        if ((sym.type & macho::kNType) == macho::kNSect && sym.virtual_address != 0u) {
+        if ((sym.type & macho::kNStab) == 0u &&
+            (sym.type & macho::kNType) == macho::kNSect &&
+            sym.virtual_address != 0u) {
             sym.virtual_address += slide;
-        }
-    }
-    for (ExportEntry& exp : exports_) {
-        if (exp.virtual_address != 0u) {
-            exp.virtual_address += slide;
         }
     }
 }
