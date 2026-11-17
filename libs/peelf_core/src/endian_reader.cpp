@@ -340,11 +340,14 @@ std::vector<std::uint8_t> encode_f64(double value, Endianness endianness) {
     return store_for_target<std::uint64_t>(std::bit_cast<std::uint64_t>(value), endianness);
 }
 
-std::vector<std::uint8_t> encode_pointer(std::uint64_t value, TargetLayout layout) {
+Result<std::vector<std::uint8_t>> encode_pointer(std::uint64_t value, TargetLayout layout) {
     if (layout.address_width == AddressWidth::Bits64) {
         return encode_u64(value, layout.endianness);
     }
-    return encode_u32(static_cast<std::uint32_t>(value & 0xFFFF'FFFFull), layout.endianness);
+    if (value > std::numeric_limits<std::uint32_t>::max()) {
+        return make_error("encode_pointer: value exceeds 32-bit address width");
+    }
+    return encode_u32(static_cast<std::uint32_t>(value), layout.endianness);
 }
 
 std::vector<std::uint8_t> encode_utf16(std::string_view utf8, Endianness endianness) {

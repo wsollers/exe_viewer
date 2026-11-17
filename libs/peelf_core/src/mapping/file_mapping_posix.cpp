@@ -3,7 +3,9 @@
 #include "mapping/file_mapping.hpp"
 
 #include <cerrno>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -20,9 +22,19 @@ std::error_code PosixFileMappingBackend::open_and_map(PosixFileMappingBackend& s
     *out_ptr = nullptr;
     *out_size = 0;
 
-    const int flags = (mode == MapMode::read_only) ? O_RDONLY : O_RDWR;
+    int flags = (mode == MapMode::read_only) ? O_RDONLY : O_RDWR;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
     const int fd = ::open(path.c_str(), flags);
     if (fd < 0) return make_error_code(MapErrc::open_failed);
+#ifndef O_CLOEXEC
+    const int fd_flags = ::fcntl(fd, F_GETFD);
+    if (fd_flags < 0 || ::fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+        ::close(fd);
+        return make_error_code(MapErrc::open_failed);
+    }
+#endif
 
     struct stat st {};
     if (::fstat(fd, &st) != 0) {
@@ -35,6 +47,11 @@ std::error_code PosixFileMappingBackend::open_and_map(PosixFileMappingBackend& s
         return make_error_code(MapErrc::size_zero);
     }
 
+    if (static_cast<std::uintmax_t>(st.st_size) >
+        static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
+        ::close(fd);
+        return make_error_code(MapErrc::stat_failed);
+    }
     const std::size_t size = static_cast<std::size_t>(st.st_size);
 
     const int prot = (mode == MapMode::read_only) ? PROT_READ : (PROT_READ | PROT_WRITE);

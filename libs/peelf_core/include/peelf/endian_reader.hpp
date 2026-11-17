@@ -3,13 +3,16 @@
 #include <peelf/binary_image.hpp>
 #include <peelf/error.hpp>
 
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 namespace peelf {
@@ -82,7 +85,7 @@ enum class AddressWidth : std::uint8_t {
     if (shift == 0u) {
         return value;
     }
-    if (shift >= 63u) {
+    if (shift >= 64u) {
         return value == 0 ? std::optional<std::int64_t>{0} : std::nullopt;
     }
     if (value >= 0) {
@@ -154,6 +157,20 @@ public:
                            AddressWidth address_width = AddressWidth::Bits64) noexcept
         : bytes_(bytes),
           layout_{Architecture::Unknown, address_width, endianness} {}
+
+    template <class R>
+        requires (!std::is_lvalue_reference_v<R> &&
+                  !std::same_as<std::remove_cvref_t<R>, EndianReader> &&
+                  !std::ranges::borrowed_range<std::remove_cvref_t<R>> &&
+                  std::convertible_to<R&&, std::span<const std::uint8_t>>)
+    EndianReader(R&&, TargetLayout) = delete;
+
+    template <class R>
+        requires (!std::is_lvalue_reference_v<R> &&
+                  !std::same_as<std::remove_cvref_t<R>, EndianReader> &&
+                  !std::ranges::borrowed_range<std::remove_cvref_t<R>> &&
+                  std::convertible_to<R&&, std::span<const std::uint8_t>>)
+    EndianReader(R&&, Endianness, AddressWidth = AddressWidth::Bits64) = delete;
 
     [[nodiscard]] constexpr std::span<const std::uint8_t> bytes() const noexcept { return bytes_; }
     [[nodiscard]] constexpr std::size_t size() const noexcept { return bytes_.size(); }
@@ -235,7 +252,8 @@ void append_utf8_codepoint(std::string& out, std::uint32_t codepoint);
 [[nodiscard]] std::vector<std::uint8_t> encode_i64(std::int64_t value, Endianness endianness);
 [[nodiscard]] std::vector<std::uint8_t> encode_f32(float value, Endianness endianness);
 [[nodiscard]] std::vector<std::uint8_t> encode_f64(double value, Endianness endianness);
-[[nodiscard]] std::vector<std::uint8_t> encode_pointer(std::uint64_t value, TargetLayout layout);
+[[nodiscard]] Result<std::vector<std::uint8_t>> encode_pointer(std::uint64_t value,
+                                                               TargetLayout layout);
 [[nodiscard]] std::vector<std::uint8_t> encode_utf16(std::string_view utf8, Endianness endianness);
 
 }  // namespace peelf

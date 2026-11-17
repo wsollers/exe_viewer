@@ -1,7 +1,9 @@
 #include <peelf/subprocess.hpp>
+#include <peelf/error.hpp>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -9,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <ratio>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -93,6 +96,42 @@ template <typename CharT>
 
     out.push_back(kQuote);
     return out;
+}
+
+[[nodiscard]] std::chrono::steady_clock::time_point compute_bounded_deadline(
+    std::chrono::steady_clock::time_point now,
+    std::chrono::milliseconds timeout) noexcept {
+    using Clock = std::chrono::steady_clock;
+    using ClockDur = Clock::duration;
+    static_assert(std::ratio_less_equal_v<Clock::period, std::milli>);
+
+    // Cap at ~10 years so conversion to steady_clock::duration (nanoseconds) and
+    // standard-library condition_variable::wait_until conversions to system_clock
+    // never overflow signed 64-bit representations.
+    constexpr std::chrono::milliseconds kMaxSafeTimeout{
+        10LL * 365 * 24 * 60 * 60 * 1000};
+
+    const auto effective_ms =
+        timeout > std::chrono::milliseconds::zero()
+            ? std::min(timeout, kMaxSafeTimeout)
+            : std::chrono::milliseconds{1};
+
+    const ClockDur max_headroom =
+        now.time_since_epoch() >= ClockDur::zero()
+            ? (Clock::time_point::max() - now)
+            : ClockDur::max();
+    if (max_headroom <= ClockDur::zero()) {
+        return Clock::time_point::max();
+    }
+
+    const auto max_headroom_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(max_headroom);
+    if (effective_ms >= max_headroom_ms) {
+        return now.time_since_epoch() >= ClockDur::zero()
+                   ? Clock::time_point::max()
+                   : (now + max_headroom);
+    }
+    return now + std::chrono::duration_cast<ClockDur>(effective_ms);
 }
 
 #if !defined(_WIN32)
@@ -320,54 +359,81 @@ class ScopedThreadSigpipeGuard {
 public:
     explicit ScopedThreadSigpipeGuard(int write_fd) noexcept {
 #if defined(F_SETNOSIGPIPE)
-        (void)::fcntl(write_fd, F_SETNOSIGPIPE, 1);
-#else
-        (void)write_fd;
-        struct sigaction sa{};
-        if (::sigaction(SIGPIPE, nullptr, &sa) == 0 && sa.sa_handler == SIG_IGN) {
+        if (write_fd >= 0 && ::fcntl(write_fd, F_SETNOSIGPIPE, 1) == 0) {
             return;
         }
+#else
+        (void)write_fd;
+#endif
+        struct sigaction sa{};
+        if (::sigaction(SIGPIPE, nullptr, &sa) == 0 &&
+            (sa.sa_flags & SA_SIGINFO) == 0 &&
+            sa.sa_handler == SIG_IGN) {
+            return;
+        }
+
+        sigset_t pending_before{};
+        sigemptyset(&pending_before);
+        const bool already_pending =
+            (::sigpending(&pending_before) == 0 &&
+             ::sigismember(&pending_before, SIGPIPE) == 1);
+
         sigemptyset(&pipe_set_);
         sigaddset(&pipe_set_, SIGPIPE);
         sigemptyset(&orig_set_);
-        if (::pthread_sigmask(SIG_BLOCK, nullptr, &orig_set_) == 0 &&
-            ::sigismember(&orig_set_, SIGPIPE) == 0) {
-            if (::pthread_sigmask(SIG_BLOCK, &pipe_set_, &orig_set_) == 0) {
-                blocked_here_ = true;
-            }
+        if (::pthread_sigmask(SIG_BLOCK, nullptr, &orig_set_) != 0) {
+            return;
         }
-#endif
+        if (::sigismember(&orig_set_, SIGPIPE) == 1) {
+            can_drain_ = !already_pending;
+            return;
+        }
+        if (::pthread_sigmask(SIG_BLOCK, &pipe_set_, &orig_set_) == 0) {
+            sigset_t pending_after_block{};
+            sigemptyset(&pending_after_block);
+            const bool pending_at_entry =
+                already_pending ||
+                (::sigpending(&pending_after_block) == 0 &&
+                 ::sigismember(&pending_after_block, SIGPIPE) == 1);
+            blocked_here_ = true;
+            can_drain_ = !pending_at_entry;
+        }
     }
 
     ~ScopedThreadSigpipeGuard() noexcept {
-#if !defined(F_SETNOSIGPIPE)
+        drain_pending();
         if (blocked_here_) {
-            drain_pending();
             (void)::pthread_sigmask(SIG_SETMASK, &orig_set_, nullptr);
         }
-#endif
     }
 
     ScopedThreadSigpipeGuard(const ScopedThreadSigpipeGuard&) = delete;
     ScopedThreadSigpipeGuard& operator=(const ScopedThreadSigpipeGuard&) = delete;
 
     void drain_pending() noexcept {
-#if defined(__linux__) && !defined(F_SETNOSIGPIPE)
-        if (!blocked_here_) {
+        if (!can_drain_) {
             return;
         }
+        sigset_t pend{};
+        sigemptyset(&pend);
+        if (::sigpending(&pend) != 0 || ::sigismember(&pend, SIGPIPE) != 1) {
+            return;
+        }
+#if defined(_POSIX_REALTIME_SIGNALS) && (_POSIX_REALTIME_SIGNALS > 0)
         timespec zero_ts{0, 0};
         while (::sigtimedwait(&pipe_set_, nullptr, &zero_ts) == SIGPIPE) {
         }
+#else
+        int sig = 0;
+        (void)::sigwait(&pipe_set_, &sig);
 #endif
     }
 
 private:
-#if !defined(F_SETNOSIGPIPE)
     sigset_t pipe_set_{};
     sigset_t orig_set_{};
     bool blocked_here_{false};
-#endif
+    bool can_drain_{false};
 };
 
 class ScopedPosixChild {
@@ -392,22 +458,34 @@ public:
         }
     }
 
-    [[nodiscard]] bool try_reap_nonblocking(int& status_out) noexcept {
-        if (pid_ <= 0 || reaped_) {
+    [[nodiscard]] Result<bool> try_reap_nonblocking(int& status_out) {
+        if (pid_ <= 0) {
+            return make_error("waitpid failed: invalid child pid");
+        }
+        if (reaped_) {
+            if (reap_errno_ != 0) {
+                return make_error(
+                    std::format("waitpid({}) failed: {}", pid_, std::strerror(reap_errno_)));
+            }
+            status_out = saved_status_;
             return true;
         }
         while (true) {
             const pid_t r = ::waitpid(pid_, &status_out, WNOHANG);
             if (r == pid_) {
                 reaped_ = true;
+                saved_status_ = status_out;
                 return true;
             }
             if (r == 0) {
                 return false;
             }
             if (errno != EINTR) {
+                const int err = errno;
                 reaped_ = true;
-                return true;
+                reap_errno_ = err;
+                return make_error(
+                    std::format("waitpid({}) failed: {}", pid_, std::strerror(err)));
             }
         }
     }
@@ -416,8 +494,14 @@ public:
         if (pid_ <= 0 || reaped_) {
             return;
         }
-        while (::waitpid(pid_, &status_out, 0) < 0) {
-            if (errno != EINTR) {
+        while (true) {
+            const pid_t r = ::waitpid(pid_, &status_out, 0);
+            if (r == pid_) {
+                saved_status_ = status_out;
+                break;
+            }
+            if (r < 0 && errno != EINTR) {
+                reap_errno_ = errno;
                 break;
             }
         }
@@ -434,6 +518,8 @@ public:
 
 private:
     pid_t pid_{-1};
+    int saved_status_{0};
+    int reap_errno_{0};
     bool reaped_{false};
 };
 #endif
@@ -556,11 +642,8 @@ SubprocessResult run_subprocess_bounded(
         return res;
     }
 
-    const auto effective_timeout =
-        options.timeout > std::chrono::milliseconds::zero()
-            ? options.timeout
-            : std::chrono::milliseconds{1};
-    const auto deadline = std::chrono::steady_clock::now() + effective_timeout;
+    const auto deadline =
+        compute_bounded_deadline(std::chrono::steady_clock::now(), options.timeout);
 
 #if defined(_WIN32)
     SECURITY_ATTRIBUTES sa{};
@@ -713,6 +796,8 @@ SubprocessResult run_subprocess_bounded(
     std::mutex io_mu;
     std::condition_variable io_cv;
     int active_io_threads = 3;
+    bool cancel_requested = false;
+    std::atomic<bool> io_worker_failed{false};
 
     auto finish_io_worker = [&]() noexcept {
         std::lock_guard<std::mutex> lk(io_mu);
@@ -723,56 +808,90 @@ SubprocessResult run_subprocess_bounded(
     const std::string_view stdin_payload = options.stdin_payload;
     const std::size_t max_output_bytes = options.max_output_bytes;
 
-    std::jthread stdin_writer([in_handle = std::move(stdin_wr), stdin_payload, &finish_io_worker]() mutable {
-        std::size_t offset = 0;
-        while (offset < stdin_payload.size()) {
-            const std::size_t rem = stdin_payload.size() - offset;
-            const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(rem, 65536u));
-            DWORD written = 0;
-            if (!::WriteFile(
-                    in_handle.get(), stdin_payload.data() + offset, chunk, &written, nullptr) ||
-                written == 0) {
-                break;
-            }
-            offset += static_cast<std::size_t>(written);
-        }
-        in_handle.reset();
-        finish_io_worker();
-    });
+    // Default-construct jthreads BEFORE ScopedJobCloser, then construct ScopedJobCloser BEFORE
+    // launching any jthread worker: on reverse stack unwinding (~ScopedJobCloser runs before
+    // ~stderr_drainer/~stdout_drainer/~stdin_writer), TerminateJobObject closes remote pipe
+    // ends before any active jthread destructor blocks in join(), even if the 2nd or 3rd
+    // jthread constructor throws.
+    std::jthread stdin_writer;
+    std::jthread stdout_drainer;
+    std::jthread stderr_drainer;
 
-    auto make_drainer = [&](ScopedWinHandle rd_handle, std::string& dst) {
-        return std::jthread([h = std::move(rd_handle), &dst, max_output_bytes, &finish_io_worker]() mutable {
-            std::array<char, 8192> buf{};
-            DWORD n = 0;
-            while (::ReadFile(h.get(), buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) &&
-                   n > 0) {
-                if (dst.size() < max_output_bytes) {
-                    const std::size_t keep = std::min<std::size_t>(
-                        static_cast<std::size_t>(n), max_output_bytes - dst.size());
-                    dst.append(buf.data(), keep);
-                }
-            }
-            h.reset();
-            finish_io_worker();
-        });
-    };
-
-    std::jthread stdout_drainer = make_drainer(std::move(stdout_rd), res.stdout_text);
-    std::jthread stderr_drainer = make_drainer(std::move(stderr_rd), res.stderr_text);
-
-    // Declared AFTER the jthreads so reverse stack unwinding always terminates/closes the
-    // Job Object (breaking remote pipe handles) BEFORE jthread destructors block in join().
     struct ScopedJobCloser {
-        ScopedWinHandle& job_ref;
+        explicit ScopedJobCloser(ScopedWinHandle& j) noexcept : job_ref(j) {}
+        ScopedJobCloser(const ScopedJobCloser&) = delete;
+        ScopedJobCloser& operator=(const ScopedJobCloser&) = delete;
+        ScopedJobCloser(ScopedJobCloser&&) = delete;
+        ScopedJobCloser& operator=(ScopedJobCloser&&) = delete;
         ~ScopedJobCloser() noexcept {
             if (job_ref.valid()) {
                 (void)::TerminateJobObject(job_ref.get(), 137u);
                 job_ref.reset();
             }
         }
+
+        ScopedWinHandle& job_ref;
     } job_closer{job};
 
+    stdin_writer = std::jthread([in_handle = std::move(stdin_wr),
+                                 stdin_payload,
+                                 &io_worker_failed,
+                                 &cancel_event,
+                                 &finish_io_worker]() mutable {
+        try {
+            std::size_t offset = 0;
+            while (offset < stdin_payload.size()) {
+                const std::size_t rem = stdin_payload.size() - offset;
+                const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(rem, 65536u));
+                DWORD written = 0;
+                if (!::WriteFile(
+                        in_handle.get(), stdin_payload.data() + offset, chunk, &written, nullptr) ||
+                    written == 0) {
+                    break;
+                }
+                offset += static_cast<std::size_t>(written);
+            }
+        } catch (...) {
+            io_worker_failed.store(true, std::memory_order_release);
+            (void)::SetEvent(cancel_event.get());
+        }
+        in_handle.reset();
+        finish_io_worker();
+    });
+
+    auto make_drainer = [&](ScopedWinHandle rd_handle, std::string& dst) {
+        return std::jthread([h = std::move(rd_handle),
+                             &dst,
+                             max_output_bytes,
+                             &io_worker_failed,
+                             &cancel_event,
+                             &finish_io_worker]() mutable {
+            try {
+                std::array<char, 8192> buf{};
+                DWORD n = 0;
+                while (::ReadFile(h.get(), buf.data(), static_cast<DWORD>(buf.size()), &n, nullptr) &&
+                       n > 0) {
+                    if (dst.size() < max_output_bytes) {
+                        const std::size_t keep = std::min<std::size_t>(
+                            static_cast<std::size_t>(n), max_output_bytes - dst.size());
+                        dst.append(buf.data(), keep);
+                    }
+                }
+            } catch (...) {
+                io_worker_failed.store(true, std::memory_order_release);
+                (void)::SetEvent(cancel_event.get());
+            }
+            h.reset();
+            finish_io_worker();
+        });
+    };
+
+    stdout_drainer = make_drainer(std::move(stdout_rd), res.stdout_text);
+    stderr_drainer = make_drainer(std::move(stderr_rd), res.stderr_text);
+
     auto on_stop = [&]() noexcept {
+        std::lock_guard<std::mutex> lk(io_mu);
+        cancel_requested = true;
         (void)::SetEvent(cancel_event.get());
         io_cv.notify_all();
     };
@@ -782,6 +901,9 @@ SubprocessResult run_subprocess_bounded(
     while (true) {
         if (options.stop_token.stop_requested()) {
             res.cancelled = true;
+            break;
+        }
+        if (io_worker_failed.load(std::memory_order_acquire)) {
             break;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -800,7 +922,9 @@ SubprocessResult run_subprocess_bounded(
             break;
         }
         if (wait_rc == WAIT_OBJECT_0 + 1u) {
-            res.cancelled = true;
+            if (options.stop_token.stop_requested()) {
+                res.cancelled = true;
+            }
             break;
         }
         if (wait_rc != WAIT_TIMEOUT) {
@@ -811,17 +935,20 @@ SubprocessResult run_subprocess_bounded(
 
     DWORD exit_code = 1;
     bool got_exit_code = false;
-    if (!res.timed_out && !res.cancelled) {
+    if (!res.timed_out && !res.cancelled && !io_worker_failed.load(std::memory_order_acquire)) {
         got_exit_code = ::GetExitCodeProcess(child.process.get(), &exit_code) != 0;
 
         // Bound pipe drainer completion by the same deadline + stop_token in case a spawned
         // grandchild is still alive holding inherited stdout/stderr handles open.
         std::unique_lock<std::mutex> lk(io_mu);
         const bool drained = io_cv.wait_until(lk, deadline, [&]() {
-            return active_io_threads == 0 || options.stop_token.stop_requested();
+            return active_io_threads == 0 ||
+                   cancel_requested ||
+                   options.stop_token.stop_requested() ||
+                   io_worker_failed.load(std::memory_order_acquire);
         });
-        if (active_io_threads > 0) {
-            if (options.stop_token.stop_requested()) {
+        if (active_io_threads > 0 && !io_worker_failed.load(std::memory_order_acquire)) {
+            if (cancel_requested || options.stop_token.stop_requested()) {
                 res.cancelled = true;
             } else if (!drained) {
                 res.timed_out = true;
@@ -829,11 +956,13 @@ SubprocessResult run_subprocess_bounded(
         }
     }
 
+    const bool worker_failed = io_worker_failed.load(std::memory_order_acquire);
+
     // Closing/terminating the Job Object kills any remaining primary or descendant processes
     // and closes their inherited pipe handles in the kernel, guaranteeing immediate EOF/broken-pipe
     // for all three I/O threads before join().
     if (job.valid()) {
-        if (res.timed_out || res.cancelled) {
+        if (res.timed_out || res.cancelled || worker_failed) {
             (void)::TerminateJobObject(job.get(), 137u);
         }
         job.reset();
@@ -846,6 +975,12 @@ SubprocessResult run_subprocess_bounded(
     stdin_writer.join();
     stdout_drainer.join();
     stderr_drainer.join();
+
+    if (io_worker_failed.load(std::memory_order_acquire)) {
+        res.exit_code = -1;
+        res.launch_error = "out of memory";
+        return res;
+    }
 
     if (res.timed_out || res.cancelled) {
         res.exit_code = -1;
@@ -863,7 +998,8 @@ SubprocessResult run_subprocess_bounded(
     if (!make_cloexec_pipe(in_rd, in_wr) ||
         !make_cloexec_pipe(out_rd, out_wr) ||
         !make_cloexec_pipe(err_rd, err_wr) ||
-        !make_cloexec_pipe(exec_rd, exec_wr)) {
+        !make_cloexec_pipe(exec_rd, exec_wr) ||
+        !set_nonblocking(exec_rd.get())) {
         res.launch_error = "pipe() failed";
         return res;
     }
@@ -934,14 +1070,95 @@ SubprocessResult run_subprocess_bounded(
     err_wr.reset();
     exec_wr.reset();
 
+    auto on_stop = [&]() noexcept {
+        if (cancel_wr.valid()) {
+            const char b = 1;
+            (void)::write(cancel_wr.get(), &b, 1);
+        }
+    };
+    std::stop_callback<decltype(on_stop)> stop_cb(options.stop_token, on_stop);
+
     int child_exec_errno = 0;
-    ssize_t exec_read = 0;
-    do {
-        exec_read = ::read(exec_rd.get(), &child_exec_errno, sizeof(child_exec_errno));
-    } while (exec_read < 0 && errno == EINTR);
+    std::size_t exec_bytes_read = 0;
+    auto* exec_errno_dst = reinterpret_cast<char*>(&child_exec_errno);
+    while (exec_rd.valid()) {
+        if (options.stop_token.stop_requested()) {
+            res.cancelled = true;
+            break;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            res.timed_out = true;
+            break;
+        }
+
+        const auto rem_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const int poll_ms = static_cast<int>(std::clamp<long long>(
+            rem_ms, 1LL, static_cast<long long>(std::numeric_limits<int>::max())));
+
+        std::array<pollfd, 2> exec_pfds{{
+            pollfd{.fd = exec_rd.get(), .events = POLLIN, .revents = 0},
+            pollfd{.fd = cancel_rd.get(), .events = POLLIN, .revents = 0},
+        }};
+
+        const int pr = ::poll(exec_pfds.data(), exec_pfds.size(), poll_ms);
+        if (pr < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            exec_rd.reset();
+            break;
+        }
+        if (pr == 0) {
+            continue;
+        }
+        if (exec_pfds[1].revents != 0 && options.stop_token.stop_requested()) {
+            res.cancelled = true;
+            break;
+        }
+        if (exec_pfds[0].revents != 0) {
+            while (exec_bytes_read < sizeof(child_exec_errno)) {
+                const ssize_t r = ::read(
+                    exec_rd.get(),
+                    exec_errno_dst + exec_bytes_read,
+                    sizeof(child_exec_errno) - exec_bytes_read);
+                if (r > 0) {
+                    exec_bytes_read += static_cast<std::size_t>(r);
+                    continue;
+                }
+                if (r == 0) {
+                    exec_rd.reset();
+                    break;
+                }
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                exec_rd.reset();
+                break;
+            }
+            if (exec_bytes_read >= sizeof(child_exec_errno)) {
+                exec_rd.reset();
+                break;
+            }
+        }
+    }
     exec_rd.reset();
 
-    if (exec_read > 0) {
+    if (res.timed_out || res.cancelled) {
+        in_wr.reset();
+        out_rd.reset();
+        err_rd.reset();
+        int status = 0;
+        child.terminate_and_reap(status);
+        res.exit_code = -1;
+        return res;
+    }
+
+    if (exec_bytes_read > 0) {
         in_wr.reset();
         out_rd.reset();
         err_rd.reset();
@@ -955,14 +1172,6 @@ SubprocessResult run_subprocess_bounded(
 
     res.launched = true;
 
-    auto on_stop = [&]() noexcept {
-        if (cancel_wr.valid()) {
-            const char b = 1;
-            (void)::write(cancel_wr.get(), &b, 1);
-        }
-    };
-    std::stop_callback<decltype(on_stop)> stop_cb(options.stop_token, on_stop);
-
     ScopedThreadSigpipeGuard sigpipe_guard(in_wr.get());
     if (options.stdin_payload.empty()) {
         in_wr.reset();
@@ -975,16 +1184,26 @@ SubprocessResult run_subprocess_bounded(
         return res;
     }
 
+    constexpr std::size_t kMaxBurstOpsPerTurn = 16u;
+    constexpr std::size_t kMaxBurstBytesPerTurn = 64u * 1024u;
+
     std::size_t stdin_offset = 0;
     std::array<char, 8192> buf{};
 
     auto drain_fd = [&](ScopedFd& fd, std::string& dst) {
-        while (fd.valid()) {
+        std::size_t reads_this_turn = 0;
+        std::size_t bytes_this_turn = 0;
+        while (fd.valid() &&
+               reads_this_turn < kMaxBurstOpsPerTurn &&
+               bytes_this_turn < kMaxBurstBytesPerTurn) {
             const ssize_t n = ::read(fd.get(), buf.data(), buf.size());
             if (n > 0) {
+                const auto got = static_cast<std::size_t>(n);
+                ++reads_this_turn;
+                bytes_this_turn += got;
                 if (dst.size() < options.max_output_bytes) {
-                    const std::size_t keep = std::min<std::size_t>(
-                        static_cast<std::size_t>(n), options.max_output_bytes - dst.size());
+                    const std::size_t keep =
+                        std::min<std::size_t>(got, options.max_output_bytes - dst.size());
                     dst.append(buf.data(), keep);
                 }
                 continue;
@@ -1049,13 +1268,20 @@ SubprocessResult run_subprocess_bounded(
             drain_fd(err_rd, res.stderr_text);
         }
         if (pfds[0].revents != 0 && in_wr.valid()) {
-            while (stdin_offset < options.stdin_payload.size()) {
+            std::size_t writes_this_turn = 0;
+            std::size_t written_this_turn = 0;
+            while (stdin_offset < options.stdin_payload.size() &&
+                   writes_this_turn < kMaxBurstOpsPerTurn &&
+                   written_this_turn < kMaxBurstBytesPerTurn) {
                 const std::size_t chunk = std::min<std::size_t>(
                     options.stdin_payload.size() - stdin_offset, 65536u);
                 const ssize_t w = ::write(
                     in_wr.get(), options.stdin_payload.data() + stdin_offset, chunk);
                 if (w > 0) {
-                    stdin_offset += static_cast<std::size_t>(w);
+                    const auto put = static_cast<std::size_t>(w);
+                    stdin_offset += put;
+                    ++writes_this_turn;
+                    written_this_turn += put;
                     continue;
                 }
                 if (w < 0 && errno == EINTR) {
@@ -1102,7 +1328,16 @@ SubprocessResult run_subprocess_bounded(
     out_rd.reset();
     err_rd.reset();
 
-    while (!child.try_reap_nonblocking(status)) {
+    while (true) {
+        auto reap_res = child.try_reap_nonblocking(status);
+        if (!reap_res.has_value()) {
+            res.exit_code = -1;
+            res.launch_error = reap_res.error().message;
+            return res;
+        }
+        if (*reap_res) {
+            break;
+        }
         if (options.stop_token.stop_requested()) {
             res.cancelled = true;
             child.terminate_and_reap(status);

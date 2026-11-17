@@ -71,9 +71,12 @@ namespace peelf {
 // FileMapping<T>
 // -------------------------
 template <class T, class Backend>
+    requires (std::is_trivially_copyable_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>)
 class FileMapping {
     static_assert(std::is_trivially_copyable_v<T>,
                   "FileMapping<T>: T must be trivially copyable for safe mmap semantics.");
+    static_assert(!std::is_same_v<std::remove_cv_t<T>, bool>,
+                  "FileMapping<T>: bool cannot safely alias arbitrary mapped byte values.");
 
 public:
     using value_type = T;
@@ -160,20 +163,22 @@ public:
     [[nodiscard]] std::size_t size_bytes() const noexcept { return byte_size_; }
     [[nodiscard]] std::size_t size() const noexcept { return byte_size_ / sizeof(T); }
 
-    [[nodiscard]] std::span<const T> view() const noexcept
+    [[nodiscard]] std::span<const T> view() const& noexcept
     {
         return {data_, size()};
     }
+    std::span<const T> view() const&& = delete;
 
-    [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept
+    [[nodiscard]] std::span<const std::uint8_t> bytes() const& noexcept
     {
         if (!data_) {
             return {};
         }
         return {reinterpret_cast<const std::uint8_t*>(data_), byte_size_};
     }
+    std::span<const std::uint8_t> bytes() const&& = delete;
 
-    [[nodiscard]] Result<std::span<T>> writable_span()
+    [[nodiscard]] Result<std::span<T>> writable_span() &
     {
         if (!is_open()) {
             return make_error("FileMapping is not open");
@@ -183,6 +188,8 @@ public:
         }
         return std::span<T>{data_, size()};
     }
+    Result<std::span<T>> writable_span() && = delete;
+    Result<std::span<T>> writable_span() const&& = delete;
 
     // Optional: flush to disk (only meaningful for read_write)
     std::error_code flush() noexcept

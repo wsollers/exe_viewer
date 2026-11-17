@@ -222,7 +222,153 @@ TEST(SubprocessRunnerTest, DefaultProcessRunnerEnforcesTimeoutAndExecutesWithout
     }
 }
 
+TEST(SubprocessRunnerTest, ClampsMaxMillisecondsTimeoutWithoutOverflow) {
+    const std::filesystem::path fixture(PEELF_BACKEND_FIXTURE);
+    ASSERT_TRUE(std::filesystem::exists(fixture));
+
+    {
+        const std::array<std::string, 2> args{"echo-stdio", "err-ok"};
+        const peelf::SubprocessResult res = peelf::run_subprocess_bounded(
+            fixture, args, "in-ok", std::chrono::milliseconds::max());
+        EXPECT_TRUE(res.launched);
+        EXPECT_FALSE(res.timed_out);
+        EXPECT_FALSE(res.cancelled);
+        EXPECT_EQ(res.exit_code, 0);
+        EXPECT_EQ(res.stdout_text, "OUT:in-ok");
+        EXPECT_EQ(res.stderr_text, "ERR:err-ok");
+    }
+
+    {
+        std::stop_source stop_src;
+        std::jthread canceller([&stop_src]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds{80});
+            stop_src.request_stop();
+        });
+        const std::array<std::string, 1> args{"sleep"};
+        const auto t0 = std::chrono::steady_clock::now();
+        const peelf::SubprocessResult res = peelf::run_subprocess_bounded(
+            fixture, args, "", std::chrono::milliseconds::max(), stop_src.get_token());
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - t0)
+                                    .count();
+        EXPECT_TRUE(res.launched);
+        EXPECT_TRUE(res.cancelled);
+        EXPECT_EQ(res.exit_code, -1);
+        EXPECT_LT(elapsed_ms, 4000);
+    }
+}
+
+TEST(SubprocessRunnerTest, ContinuousStdoutFloodRespectsDeadline) {
+    peelf::SubprocessOptions opts{};
+    opts.timeout = std::chrono::milliseconds{200};
+    opts.search_path = true;
+    opts.max_output_bytes = 64u * 1024u;
+
+#if defined(_WIN32)
+    const std::filesystem::path exe{"cmd.exe"};
+    const std::array<std::string, 2> args{
+        "/c", "for /L %i in (1,0,2) do @echo continuous_stdout_flood_0123456789abcdef"};
+#else
+    const std::filesystem::path exe{"yes"};
+    const std::array<std::string, 1> args{"continuous_stdout_flood_0123456789abcdef"};
+#endif
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const peelf::SubprocessResult res = peelf::run_subprocess_bounded(exe, args, opts);
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+
+    if (!res.launched) {
+        GTEST_SKIP() << "stream generator unavailable in PATH: " << res.launch_error;
+    }
+    EXPECT_TRUE(res.timed_out);
+    EXPECT_FALSE(res.cancelled);
+    EXPECT_EQ(res.exit_code, -1);
+    EXPECT_FALSE(res.stdout_text.empty());
+    EXPECT_LE(res.stdout_text.size(), opts.max_output_bytes);
+    EXPECT_LT(elapsed_ms, 4000);
+}
+
 #if !defined(_WIN32)
+TEST(PosixChildStdioTest, WaitpidEchildFailurePropagatesExplicitErrorInsteadOfZeroExit) {
+    const std::filesystem::path fixture(PEELF_BACKEND_FIXTURE);
+    ASSERT_TRUE(std::filesystem::exists(fixture));
+
+    const pid_t helper = ::fork();
+    ASSERT_GE(helper, 0);
+    if (helper == 0) {
+        struct sigaction sa{};
+        sa.sa_handler = SIG_IGN;
+        sa.sa_flags = SA_NOCLDWAIT;
+        sigemptyset(&sa.sa_mask);
+        if (::sigaction(SIGCHLD, &sa, nullptr) != 0) {
+            _exit(30);
+        }
+
+        const std::array<std::string, 1> args{"early-exit"};
+        const peelf::SubprocessResult sub = peelf::run_subprocess_bounded(
+            fixture, args, "", std::chrono::milliseconds{5000});
+        if (sub.exit_code == 0 || sub.exit_code != -1 ||
+            sub.launch_error.find("waitpid") == std::string::npos) {
+            _exit(31);
+        }
+        _exit(0);
+    }
+
+    int wstatus = 0;
+    ASSERT_EQ(::waitpid(helper, &wstatus, 0), helper);
+    ASSERT_TRUE(WIFEXITED(wstatus));
+    EXPECT_EQ(WEXITSTATUS(wstatus), 0);
+}
+
+TEST(PosixChildStdioTest, PreservesPreExistingPendingSigpipeAcrossBrokenStdinWrite) {
+    const std::filesystem::path fixture(PEELF_BACKEND_FIXTURE);
+    ASSERT_TRUE(std::filesystem::exists(fixture));
+
+    const pid_t helper = ::fork();
+    ASSERT_GE(helper, 0);
+    if (helper == 0) {
+        sigset_t set{};
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        if (::pthread_sigmask(SIG_BLOCK, &set, nullptr) != 0) {
+            _exit(40);
+        }
+        if (::kill(::getpid(), SIGPIPE) != 0) {
+            _exit(41);
+        }
+
+        sigset_t pend{};
+        sigemptyset(&pend);
+        if (::sigpending(&pend) != 0 || ::sigismember(&pend, SIGPIPE) != 1) {
+            _exit(42);
+        }
+
+        const std::string big_stdin(1024u * 1024u, 'S');
+        const std::array<std::string, 1> args{"early-exit"};
+        const peelf::SubprocessResult sub = peelf::run_subprocess_bounded(
+            fixture, args, big_stdin, std::chrono::milliseconds{5000});
+        if (!sub.launched || sub.exit_code != 42) {
+            _exit(43);
+        }
+
+        sigemptyset(&pend);
+        if (::sigpending(&pend) != 0 || ::sigismember(&pend, SIGPIPE) != 1) {
+            _exit(44);
+        }
+
+        int sig = 0;
+        (void)::sigwait(&set, &sig);
+        _exit(0);
+    }
+
+    int wstatus = 0;
+    ASSERT_EQ(::waitpid(helper, &wstatus, 0), helper);
+    ASSERT_TRUE(WIFEXITED(wstatus));
+    EXPECT_EQ(WEXITSTATUS(wstatus), 0);
+}
+
 TEST(PosixChildStdioTest, PrepareChildStdioSafelyRelocatesScrambledLowDescriptors) {
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
@@ -360,7 +506,11 @@ TEST(PosixChildStdioTest, RunSubprocessBoundedWorksWhenParentStdioDescriptorsAre
 
 #if defined(__linux__)
 struct ScopedReapChild {
-    pid_t pid{-1};
+    explicit ScopedReapChild(pid_t child_pid) noexcept : pid(child_pid) {}
+    ScopedReapChild(const ScopedReapChild&) = delete;
+    ScopedReapChild& operator=(const ScopedReapChild&) = delete;
+    ScopedReapChild(ScopedReapChild&&) = delete;
+    ScopedReapChild& operator=(ScopedReapChild&&) = delete;
     ~ScopedReapChild() noexcept {
         if (pid > 0) {
             (void)::kill(pid, SIGKILL);
@@ -368,6 +518,8 @@ struct ScopedReapChild {
             (void)::waitpid(pid, &st, 0);
         }
     }
+
+    pid_t pid{-1};
 };
 
 TEST(ProcessResumeFailureTest, RetainsFailedThreadInSuspendedSetAndClearsOnRetry) {
@@ -416,7 +568,13 @@ TEST(ProcessResumeFailureTest, RetainsFailedThreadInSuspendedSetAndClearsOnRetry
     bool ptrace_permitted = false;
     if (::ptrace(PTRACE_SEIZE, static_cast<pid_t>(leader_tid), nullptr, nullptr) == 0) {
         ptrace_permitted = true;
-        (void)::ptrace(PTRACE_DETACH, static_cast<pid_t>(leader_tid), nullptr, nullptr);
+        if (::ptrace(PTRACE_INTERRUPT, static_cast<pid_t>(leader_tid), nullptr, nullptr) == 0) {
+            int probe_status = 0;
+            while (::waitpid(static_cast<pid_t>(leader_tid), &probe_status, __WALL) < 0 &&
+                   errno == EINTR) {
+            }
+        }
+        EXPECT_EQ(::ptrace(PTRACE_DETACH, static_cast<pid_t>(leader_tid), nullptr, nullptr), 0);
     }
     if (!ptrace_permitted) {
         // Still verify clean suspend + resume round-trip under SIGSTOP fallback.
@@ -433,15 +591,34 @@ TEST(ProcessResumeFailureTest, RetainsFailedThreadInSuspendedSetAndClearsOnRetry
     peelf::Result<void> aux_suspend_res{};
     peelf::Result<void> aux_retry_resume_res{};
 
-    std::jthread aux_tracer([&]() {
+    std::jthread aux_tracer([&](std::stop_token st) {
         aux_suspend_res = session.suspend_thread(worker_tid);
         phase.store(1, std::memory_order_release);
-        while (phase.load(std::memory_order_acquire) < 2) {
+        while (!st.stop_requested() && phase.load(std::memory_order_acquire) < 2) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         aux_retry_resume_res = session.resume();
         phase.store(3, std::memory_order_release);
     });
+
+    struct ScopedAuxTracerCleanup {
+        ScopedAuxTracerCleanup(std::jthread& t, std::atomic<int>& p) noexcept
+            : tracer(t), phase_ref(p) {}
+        ScopedAuxTracerCleanup(const ScopedAuxTracerCleanup&) = delete;
+        ScopedAuxTracerCleanup& operator=(const ScopedAuxTracerCleanup&) = delete;
+        ScopedAuxTracerCleanup(ScopedAuxTracerCleanup&&) = delete;
+        ScopedAuxTracerCleanup& operator=(ScopedAuxTracerCleanup&&) = delete;
+        ~ScopedAuxTracerCleanup() noexcept {
+            phase_ref.store(2, std::memory_order_release);
+            tracer.request_stop();
+            if (tracer.joinable()) {
+                tracer.join();
+            }
+        }
+
+        std::jthread& tracer;
+        std::atomic<int>& phase_ref;
+    } aux_cleanup{aux_tracer, phase};
 
     while (phase.load(std::memory_order_acquire) < 1) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));

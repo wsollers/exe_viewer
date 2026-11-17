@@ -8,11 +8,28 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <system_error>
+#include <type_traits>
 #include <utility>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 #include <mapping/file_mapping.hpp>
 
@@ -27,6 +44,70 @@ std::filesystem::path fixture_path(const char* name) {
 }
 
 using ByteMapping = peelf::FileMapping<std::uint8_t, peelf::NativeFileMappingBackend>;
+
+template <class U>
+concept ValidFileMappingElement =
+    requires { typename peelf::FileMapping<U, peelf::NativeFileMappingBackend>; };
+
+static_assert(ValidFileMappingElement<std::uint8_t>);
+static_assert(ValidFileMappingElement<std::uint32_t>);
+static_assert(!ValidFileMappingElement<bool>);
+static_assert(!ValidFileMappingElement<const bool>);
+
+template <class M>
+concept CanViewRvalue = requires(M m) { std::move(m).view(); };
+
+template <class M>
+concept CanBytesRvalue = requires(M m) { std::move(m).bytes(); };
+
+template <class M>
+concept CanWritableSpanRvalue = requires(M m) { std::move(m).writable_span(); };
+
+static_assert(requires(ByteMapping& m, const ByteMapping& cm) {
+    m.view();
+    cm.view();
+    m.bytes();
+    cm.bytes();
+    m.writable_span();
+});
+static_assert(!CanViewRvalue<ByteMapping>);
+static_assert(!CanViewRvalue<const ByteMapping>);
+static_assert(!CanBytesRvalue<ByteMapping>);
+static_assert(!CanBytesRvalue<const ByteMapping>);
+static_assert(!CanWritableSpanRvalue<ByteMapping>);
+
+class ScopedTempDir {
+public:
+    ScopedTempDir() {
+        static std::atomic<std::uint64_t> seq{0};
+#if defined(_WIN32)
+        const auto pid = static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+        const auto pid = static_cast<std::uint64_t>(::getpid());
+#endif
+        const auto ticks = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto id = seq.fetch_add(1u, std::memory_order_relaxed);
+        dir_ = std::filesystem::temp_directory_path() /
+               std::format("peelf_file_mapping_test_{}_{}_{}", pid, ticks, id);
+        std::filesystem::create_directories(dir_);
+    }
+
+    ~ScopedTempDir() noexcept {
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+    }
+
+    ScopedTempDir(const ScopedTempDir&) = delete;
+    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
+    ScopedTempDir(ScopedTempDir&&) = delete;
+    ScopedTempDir& operator=(ScopedTempDir&&) = delete;
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return dir_; }
+
+private:
+    std::filesystem::path dir_;
+};
 
 }  // namespace
 
@@ -74,21 +155,25 @@ TEST(FileMapping, MoveTransfersOwnership) {
     EXPECT_TRUE(dst.is_open());
     EXPECT_EQ(dst.size(), original_size);
     // Moved-from object is intentionally inspected: it must release ownership.
-    EXPECT_FALSE(src.is_open());
+    EXPECT_FALSE(src.is_open());  // NOLINT(bugprone-use-after-move)
 }
 
 TEST(FileMapping, UnicodePathRoundTrips) {
-    const auto path = std::filesystem::temp_directory_path() / std::filesystem::path(u8"peelf_\u65e5\u672c_\u00e9.bin");
+    const ScopedTempDir temp_dir;
+    const auto path = temp_dir.path() / std::filesystem::path(u8"peelf_\u65e5\u672c_\u00e9.bin");
     { std::ofstream file(path, std::ios::binary); file << "mapped"; }
     {
         ByteMapping map(path);
         ASSERT_EQ(map.size(), 6u);
         EXPECT_EQ(map.view()[0], 'm');
         const auto utf8 = path.u8string();
+        std::string utf8_str(utf8.size(), '\0');
+        for (std::size_t i = 0; i < utf8.size(); ++i) {
+            utf8_str[i] = static_cast<char>(utf8[i]);
+        }
         ByteMapping second;
-        EXPECT_FALSE(second.open(std::string(reinterpret_cast<const char*>(utf8.data()), utf8.size())));
+        EXPECT_FALSE(second.open(std::move(utf8_str)));
     }
-    std::filesystem::remove(path);
 }
 
 namespace {
@@ -154,7 +239,8 @@ TEST(FileMapping, AlignmentAndZeroSizeFailuresUnmapWithoutLeakingView) {
 }
 
 TEST(FileMapping, EnforcesReadOnlyConstnessAndReadWriteWritableSpan) {
-    const auto path = std::filesystem::temp_directory_path() / "peelf_mapping_constness_test.bin";
+    const ScopedTempDir temp_dir;
+    const auto path = temp_dir.path() / "peelf_mapping_constness_test.bin";
     {
         std::ofstream file(path, std::ios::binary | std::ios::trunc);
         file.write("ABCDEFGH", 8);
@@ -188,6 +274,33 @@ TEST(FileMapping, EnforcesReadOnlyConstnessAndReadWriteWritableSpan) {
         ASSERT_EQ(verify_map.bytes().size(), 8u);
         EXPECT_EQ(verify_map.bytes()[0], static_cast<std::uint8_t>('Z'));
     }
-
-    std::filesystem::remove(path);
 }
+
+#ifndef _WIN32
+TEST(FileMapping, PosixBackendSetsCloseOnExecFlag) {
+    const ScopedTempDir temp_dir;
+    const auto path = temp_dir.path() / "cloexec_check.bin";
+    {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write("CLOEXEC!", 8);
+    }
+
+    peelf::PosixFileMappingBackend backend{};
+    void* ptr = nullptr;
+    std::size_t mapped_bytes = 0;
+    const std::error_code ec = peelf::PosixFileMappingBackend::open_and_map(
+        backend, path.string(), peelf::MapMode::read_only, &ptr, &mapped_bytes);
+    ASSERT_FALSE(static_cast<bool>(ec)) << ec.message();
+    ASSERT_GE(backend.fd, 0);
+
+    const int fd_flags = ::fcntl(backend.fd, F_GETFD);
+    EXPECT_GE(fd_flags, 0);
+    if (fd_flags >= 0) {
+        EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
+    }
+
+    EXPECT_FALSE(static_cast<bool>(
+        peelf::PosixFileMappingBackend::unmap_and_close(backend, ptr, mapped_bytes)));
+    EXPECT_EQ(backend.fd, -1);
+}
+#endif
