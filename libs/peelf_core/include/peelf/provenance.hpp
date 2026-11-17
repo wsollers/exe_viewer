@@ -178,11 +178,19 @@ struct CaptureStamp {
     std::uint64_t monotonic_ns{0};
     bool target_paused{false};
     CaptureAvailability availability{CaptureAvailability::Unavailable};
+    std::uint64_t capture_started_unix_ms{0};
+    std::uint64_t capture_started_monotonic_ns{0};
+    std::uint64_t capture_completed_unix_ms{0};
+    std::uint64_t capture_completed_monotonic_ns{0};
 
     [[nodiscard]] static CaptureStamp capture_now(
         const TargetInstanceId& target,
         std::uint64_t revision,
         bool paused,
+        CaptureAvailability avail = CaptureAvailability::Complete);
+
+    [[nodiscard]] static CaptureStamp capture_interval(
+        const CaptureStamp& started,
         CaptureAvailability avail = CaptureAvailability::Complete);
 
     [[nodiscard]] static CaptureStamp unavailable_for(
@@ -191,6 +199,12 @@ struct CaptureStamp {
         st.target_id = target;
         st.availability = CaptureAvailability::Unavailable;
         return st;
+    }
+
+    [[nodiscard]] constexpr std::uint64_t capture_duration_ns() const noexcept {
+        return capture_completed_monotonic_ns >= capture_started_monotonic_ns
+                   ? (capture_completed_monotonic_ns - capture_started_monotonic_ns)
+                   : 0u;
     }
 
     [[nodiscard]] constexpr bool has_capture() const noexcept {

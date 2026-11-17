@@ -1,9 +1,12 @@
 #include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
 
+#include <capstone/capstone.h>
+
 #include <algorithm>
 #include <array>
 #include <format>
+#include <limits>
 
 namespace peelf::debugger {
 
@@ -80,6 +83,47 @@ namespace {
         {"V", 28, ((pstate >> 28u) & 1u) != 0u, "Overflow Condition Flag"},
     };
 }
+
+class ScopedCapstoneHandle {
+public:
+    ScopedCapstoneHandle() noexcept = default;
+    ~ScopedCapstoneHandle() noexcept {
+        if (handle_ != 0) {
+            cs_close(&handle_);
+        }
+    }
+
+    ScopedCapstoneHandle(const ScopedCapstoneHandle&) = delete;
+    ScopedCapstoneHandle& operator=(const ScopedCapstoneHandle&) = delete;
+    ScopedCapstoneHandle(ScopedCapstoneHandle&&) = delete;
+    ScopedCapstoneHandle& operator=(ScopedCapstoneHandle&&) = delete;
+
+    [[nodiscard]] csh* put() noexcept { return &handle_; }
+    [[nodiscard]] csh get() const noexcept { return handle_; }
+
+private:
+    csh handle_{0};
+};
+
+class ScopedCapstoneInsn {
+public:
+    ScopedCapstoneInsn(cs_insn* insn, std::size_t count) noexcept
+        : insn_(insn), count_(count) {}
+    ~ScopedCapstoneInsn() noexcept {
+        if (insn_ != nullptr) {
+            cs_free(insn_, count_);
+        }
+    }
+
+    ScopedCapstoneInsn(const ScopedCapstoneInsn&) = delete;
+    ScopedCapstoneInsn& operator=(const ScopedCapstoneInsn&) = delete;
+    ScopedCapstoneInsn(ScopedCapstoneInsn&&) = delete;
+    ScopedCapstoneInsn& operator=(ScopedCapstoneInsn&&) = delete;
+
+private:
+    cs_insn* insn_{nullptr};
+    std::size_t count_{0};
+};
 
 } // namespace
 namespace {
@@ -273,8 +317,38 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
         return std::nullopt;
     }
 
+    const auto checked_ip_plus = [](std::uint64_t base_pc, std::size_t insn_len) noexcept
+        -> std::optional<std::uint64_t> {
+        const auto len_u64 = static_cast<std::uint64_t>(insn_len);
+        if (len_u64 == 0u || base_pc > std::numeric_limits<std::uint64_t>::max() - len_u64) {
+            return std::nullopt;
+        }
+        return base_pc + len_u64;
+    };
+
     if (arch == Architecture::X86 || arch == Architecture::X86_64) {
         const bool is_64 = (arch == Architecture::X86_64);
+
+        // Use Capstone's active-architecture instruction decoder as the authoritative
+        // source of x86/x86-64 CALL recognition and exact instruction length (including
+        // 66 E8 operand-size overrides, REX/VEX/segment/address-size prefixes, SIB + disp).
+        ScopedCapstoneHandle cs_handle;
+        const cs_mode mode = is_64 ? CS_MODE_64 : CS_MODE_32;
+        if (cs_open(CS_ARCH_X86, mode, cs_handle.put()) == CS_ERR_OK &&
+            cs_option(cs_handle.get(), CS_OPT_DETAIL, CS_OPT_ON) == CS_ERR_OK) {
+            cs_insn* insn = nullptr;
+            const std::size_t count = cs_disasm(
+                cs_handle.get(), insn_bytes.data(), insn_bytes.size(), instruction_pointer, 1u, &insn);
+            const ScopedCapstoneInsn insn_guard(insn, count);
+            if (count == 1u && insn != nullptr) {
+                if (cs_insn_group(cs_handle.get(), &insn[0], CS_GRP_CALL)) {
+                    return checked_ip_plus(instruction_pointer, insn[0].size);
+                }
+                return std::nullopt;
+            }
+            return std::nullopt;
+        }
+
         bool operand_size_override = false;
         bool address_size_override = false;
         std::size_t idx = 0u;
@@ -298,9 +372,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
         }
 
         // Optional REX prefix in 64-bit mode (`0x40..0x4F`)
-        bool rex_w = false;
         if (is_64 && idx < insn_bytes.size() && (insn_bytes[idx] & 0xF0u) == 0x40u) {
-            rex_w = (insn_bytes[idx] & 0x08u) != 0u;
             ++idx;
         }
 
@@ -310,11 +382,11 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
 
         const std::uint8_t opcode = insn_bytes[idx++];
 
-        // `E8 rel16/rel32` — near direct CALL
+        // `E8 rel16/rel32` — near direct CALL (AMD64 uses rel32; 32-bit 66 E8 uses rel16)
         if (opcode == 0xE8u) {
-            const std::size_t disp_len = (!rex_w && operand_size_override) ? 2u : 4u;
+            const std::size_t disp_len = (!is_64 && operand_size_override) ? 2u : 4u;
             if (idx + disp_len <= insn_bytes.size()) {
-                return instruction_pointer + idx + disp_len;
+                return checked_ip_plus(instruction_pointer, idx + disp_len);
             }
             return std::nullopt;
         }
@@ -323,7 +395,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
         if (!is_64 && opcode == 0x9Au) {
             const std::size_t ptr_len = operand_size_override ? 4u : 6u;
             if (idx + ptr_len <= insn_bytes.size()) {
-                return instruction_pointer + idx + ptr_len;
+                return checked_ip_plus(instruction_pointer, idx + ptr_len);
             }
             return std::nullopt;
         }
@@ -334,7 +406,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
             if (reg_op == 2u || reg_op == 3u) {
                 const bool addr16 = !is_64 && address_size_override;
                 if (const auto modrm_len = decode_x86_modrm_length(insn_bytes, idx, addr16)) {
-                    return instruction_pointer + idx + *modrm_len;
+                    return checked_ip_plus(instruction_pointer, idx + *modrm_len);
                 }
             }
         }
@@ -351,7 +423,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
         }
         // `BL imm26` (`100101...`) or `BLR Rn` (`1101011 0001 11111 000000 Rn 00000`)
         if ((*w & 0xFC000000u) == 0x94000000u || (*w & 0xFFFFFC1Fu) == 0xD63F0000u) {
-            return instruction_pointer + 4u;
+            return checked_ip_plus(instruction_pointer, 4u);
         }
         return std::nullopt;
     }
@@ -365,12 +437,12 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
             }
             // 16-bit Thumb `BLX Rm`: `010001 11 1 Rm 000`
             if ((*hw0 & 0xFF87u) == 0x4780u) {
-                return clean_pc + 2u;
+                return checked_ip_plus(clean_pc, 2u);
             }
             // 32-bit Thumb-2 `BL` / `BLX imm`: `11110 S imm10` followed by `11 J1 1/0 J2 imm11`
             if ((*hw0 & 0xF800u) == 0xF000u) {
                 if (const auto hw1 = rd.read_u16(2u); hw1.has_value() && (*hw1 & 0xC000u) == 0xC000u) {
-                    return clean_pc + 4u;
+                    return checked_ip_plus(clean_pc, 4u);
                 }
             }
             return std::nullopt;
@@ -384,7 +456,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
         if ((*w & 0x0F000000u) == 0x0B000000u ||
             (*w & 0xFE000000u) == 0xFA000000u ||
             (*w & 0x0FFFFFF0u) == 0x012FFF30u) {
-            return instruction_pointer + 4u;
+            return checked_ip_plus(instruction_pointer, 4u);
         }
         return std::nullopt;
     }
@@ -398,7 +470,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
             // 16-bit compressed `C.JALR rs1` (`1001 rs1!=0 00000 10`) or RV32 `C.JAL` (`001 ... 01`)
             if (((*hw0 & 0xF07Fu) == 0x9002u && ((*hw0 >> 7u) & 0x1Fu) != 0u) ||
                 (arch == Architecture::RISCV32 && (*hw0 & 0xE003u) == 0x2001u)) {
-                return instruction_pointer + 2u;
+                return checked_ip_plus(instruction_pointer, 2u);
             }
             return std::nullopt;
         }
@@ -407,7 +479,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
             const std::uint32_t rd_reg = (*w >> 7u) & 0x1Fu;
             // `JAL` (`0x6F`) or `JALR` (`0x67`) writing a link register (`rd != x0`)
             if ((opcode == 0x6Fu || opcode == 0x67u) && rd_reg != 0u) {
-                return instruction_pointer + 4u;
+                return checked_ip_plus(instruction_pointer, 4u);
             }
         }
         return std::nullopt;
@@ -419,7 +491,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
             const std::uint32_t opcd = (*w >> 26u) & 0x3Fu;
             const bool lk = (*w & 1u) != 0u;
             if (lk && (opcd == 18u || opcd == 19u)) {
-                return instruction_pointer + 4u;
+                return checked_ip_plus(instruction_pointer, 4u);
             }
         }
         return std::nullopt;
@@ -431,7 +503,7 @@ std::optional<std::uint64_t> compute_step_over_fallthrough(
             const std::uint32_t funct = *w & 0x3Fu;
             // `JAL` (`opcd == 3`) or `JALR` (`opcd == 0 && funct == 9`): +8 skips branch delay slot
             if (opcd == 3u || (opcd == 0u && funct == 9u)) {
-                return instruction_pointer + 8u;
+                return checked_ip_plus(instruction_pointer, 8u);
             }
         }
         return std::nullopt;

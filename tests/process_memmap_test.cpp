@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <span>
@@ -673,4 +674,76 @@ TEST(LiveCallGraph, BuildsSymbolFanoutGraphFromRebasedLiveModuleViaReader) {
     EXPECT_GT(graph.nodes.size(), 1u);
     EXPECT_FALSE(graph.edges.empty());
 #endif
+}
+
+TEST(LiveProcessMemMap, OverflowSafeVaContainmentAndTolerantReadNearUint64Max) {
+    constexpr std::uint64_t kMaxVa = std::numeric_limits<std::uint64_t>::max();
+
+    const peelf::MemoryRegion high_region{
+        .start_address = kMaxVa - 0xFFFu,
+        .end_address = kMaxVa,
+        .protection = {.readable = true},
+    };
+    EXPECT_TRUE(high_region.contains(kMaxVa - 0xFFFu));
+    EXPECT_TRUE(high_region.contains(kMaxVa - 1u));
+    EXPECT_FALSE(high_region.contains(kMaxVa));
+    EXPECT_FALSE(high_region.contains(0u));
+
+    const peelf::MemoryRegion inverted_region{
+        .start_address = 0x5000u,
+        .end_address = 0x4000u,
+        .protection = {.readable = true},
+    };
+    EXPECT_FALSE(inverted_region.contains(0x4500u));
+    EXPECT_FALSE(inverted_region.contains(0x5000u));
+
+    // ModuleInfo whose base_address + size wraps 64-bit unsigned addition to 0:
+    const peelf::ModuleInfo wrapping_mod{
+        .base_address = kMaxVa - 0xFFu,
+        .size = 0x100u,
+    };
+    EXPECT_TRUE(wrapping_mod.contains(kMaxVa - 0xFFu));
+    EXPECT_TRUE(wrapping_mod.contains(kMaxVa));
+    EXPECT_FALSE(wrapping_mod.contains(0u));
+
+    peelf::ProcessInfo pinfo{
+        .pid = 7070,
+        .name = "high_va_target",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::Accessible,
+    };
+    FakeProcessSession sess(pinfo);
+    sess.add_mapped_span(
+        peelf::MemoryRegion{
+            .start_address = 0u,
+            .end_address = 16u,
+            .protection = {.readable = true},
+        },
+        std::vector<std::uint8_t>(16u, 0xAAu));
+    sess.add_mapped_span(
+        peelf::MemoryRegion{
+            .start_address = kMaxVa - 7u,
+            .end_address = kMaxVa,
+            .protection = {.readable = true},
+        },
+        std::vector<std::uint8_t>{0x11u, 0x22u, 0x33u, 0x44u, 0x55u, 0x66u, 0x77u});
+
+    const auto regions_res = sess.memory_regions();
+    ASSERT_TRUE(regions_res.has_value()) << regions_res.error().message;
+    const peelf::MemorySample sample =
+        peelf::read_memory_tolerant(sess, *regions_res, kMaxVa - 7u, 64u);
+    ASSERT_EQ(sample.bytes.size(), 64u);
+    ASSERT_EQ(sample.valid.size(), 64u);
+    EXPECT_EQ(sample.readable_count, 7u);
+
+    for (std::size_t i = 0u; i < 7u; ++i) {
+        EXPECT_EQ(sample.valid[i], 1u);
+        EXPECT_EQ(sample.bytes[i], static_cast<std::uint8_t>((i + 1u) * 0x11u));
+    }
+    // Must never wrap past UINT64_MAX into [0x0, 0x10] (0xAA bytes):
+    for (std::size_t i = 7u; i < 64u; ++i) {
+        EXPECT_EQ(sample.valid[i], 0u);
+        EXPECT_EQ(sample.bytes[i], 0u);
+    }
 }

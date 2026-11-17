@@ -773,24 +773,64 @@ public:
             return {};
         }
 
-        const std::vector<ThreadId> tids = enumerate_process_tids();
-        if (tids.empty()) {
-            return make_error("no threads found for process");
-        }
+        constexpr int kMaxConvergencePasses = 8;
+        bool converged = false;
+        std::string last_err = "no threads found for process";
 
-        // Pre-reserve tracking capacity before suspending OS threads so push_back cannot throw.
-        suspended_tids_.reserve(suspended_tids_.size() + tids.size());
+        for (int pass = 0; pass < kMaxConvergencePasses; ++pass) {
+            const std::vector<ThreadId> tids = enumerate_process_tids();
+            if (tids.empty()) {
+                if (pass == 0 && suspended_tids_.empty()) {
+                    return make_error(last_err);
+                }
+                converged = !suspended_tids_.empty();
+                break;
+            }
 
-        std::size_t count = 0;
-        for (const ThreadId tid : tids) {
-            if (suspend_thread(tid)) {
-                ++count;
+            // Pre-reserve tracking capacity before suspending OS threads so push_back cannot throw.
+            suspended_tids_.reserve(suspended_tids_.size() + tids.size());
+
+            bool newly_stopped_in_pass = false;
+            for (const ThreadId tid : tids) {
+                if (std::ranges::find(suspended_tids_, tid) != suspended_tids_.end()) {
+                    continue;
+                }
+                if (!is_process_thread_alive(tid)) {
+                    continue;
+                }
+                auto res = suspend_thread(tid);
+                if (res.has_value()) {
+                    newly_stopped_in_pass = true;
+                } else if (is_process_thread_alive(tid)) {
+                    last_err = res.error().message;
+                    (void)resume();
+                    return make_error(
+                        std::format("failed to suspend thread {}: {}", tid, last_err));
+                }
+            }
+            if (!newly_stopped_in_pass) {
+                converged = true;
+                break;
             }
         }
-        if (count == 0 && suspended_tids_.empty()) {
-            return make_error("failed to suspend any threads in target process");
+
+        if (!converged) {
+            const std::vector<ThreadId> final_tids = enumerate_process_tids();
+            const bool all_stopped = std::ranges::all_of(final_tids, [this](ThreadId tid) {
+                return std::ranges::find(suspended_tids_, tid) != suspended_tids_.end() ||
+                       !is_process_thread_alive(tid);
+            });
+            if (!all_stopped) {
+                (void)resume();
+                return make_error(
+                    "failed to converge on suspending all spawned threads within retry limit");
+            }
         }
-        suspended_ = !suspended_tids_.empty();
+
+        if (suspended_tids_.empty()) {
+            return make_error("failed to suspend any threads in target process: " + last_err);
+        }
+        suspended_ = true;
         return {};
     }
 
@@ -822,8 +862,14 @@ public:
     }
 
     [[nodiscard]] Result<void> suspend_thread(ThreadId tid) override {
+        if (tid == 0u) {
+            return make_error("invalid argument: thread ID must be non-zero");
+        }
         if (info_.pid == current_process_id()) {
             return make_error("cannot suspend the inspector process itself");
+        }
+        if (std::ranges::find(suspended_tids_, tid) != suspended_tids_.end()) {
+            return {};
         }
         // Pre-reserve before invoking SuspendThread so tracking cannot fail with bad_alloc.
         suspended_tids_.reserve(suspended_tids_.size() + 1u);
@@ -833,6 +879,10 @@ public:
                                         static_cast<DWORD>(tid)));
         if (!th.valid()) {
             return make_error("OpenThread(THREAD_SUSPEND_RESUME) failed");
+        }
+        if (!thread_handle_belongs_to_pid(th.get(), info_.pid)) {
+            return make_error(std::format(
+                "invalid argument: thread {} does not belong to target process {}", tid, info_.pid));
         }
         const DWORD prev =
 #if defined(_M_X64) || defined(__x86_64__)
@@ -848,8 +898,20 @@ public:
     }
 
     [[nodiscard]] Result<void> resume_thread(ThreadId tid) override {
+        if (tid == 0u) {
+            return make_error("invalid argument: thread ID must be non-zero");
+        }
         const auto it = std::ranges::find(suspended_tids_, tid);
         if (it == suspended_tids_.end()) {
+            if (!is_alive()) {
+                return make_error("target process is no longer running");
+            }
+            ScopedWinHandle th(
+                ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid)));
+            if (!th.valid() || !thread_handle_belongs_to_pid(th.get(), info_.pid)) {
+                return make_error(std::format(
+                    "invalid argument: thread {} not found in target process {}", tid, info_.pid));
+            }
             return {};
         }
         if (auto r = resume_os_thread(tid); !r.has_value()) {
@@ -947,6 +1009,12 @@ public:
         ctx.tid = tid;
         ctx.layout = target_layout();
 
+        if (tid == 0u) {
+            ctx.status = SubsystemStatus::unavailable(
+                "invalid_argument", "thread ID must be non-zero");
+            return ctx;
+        }
+
         ScopedWinHandle th(::OpenThread(
             THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
             FALSE,
@@ -963,6 +1031,12 @@ public:
                 "OpenThread", "permission denied opening thread for THREAD_GET_CONTEXT");
             return ctx;
         }
+        if (!thread_handle_belongs_to_pid(th.get(), info_.pid)) {
+            ctx.status = SubsystemStatus::unavailable(
+                "invalid_argument",
+                std::format("thread {} does not belong to target process {}", tid, info_.pid));
+            return ctx;
+        }
 
         ctx.teb_address = query_win32_thread_teb(th.get(), info_.is_64bit);
         ctx.tls_pointer = ctx.teb_address;
@@ -973,16 +1047,25 @@ public:
             std::ranges::find(suspended_tids_, tid) != suspended_tids_.end();
 
         bool transiently_paused = false;
-        if (can_suspend && !is_self && !already_paused) {
+        if (!is_self && !already_paused) {
+            if (!can_suspend) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "SuspendThread",
+                    "cannot safely read GetThreadContext without THREAD_SUSPEND_RESUME on a running thread");
+                return ctx;
+            }
             const DWORD prev =
 #if defined(_M_X64) || defined(__x86_64__)
                 (!info_.is_64bit) ? ::Wow64SuspendThread(th.get()) : ::SuspendThread(th.get());
 #else
                 ::SuspendThread(th.get());
 #endif
-            if (prev != static_cast<DWORD>(-1)) {
-                transiently_paused = true;
+            if (prev == static_cast<DWORD>(-1)) {
+                ctx.status = SubsystemStatus::unavailable(
+                    "SuspendThread", "failed to suspend running target thread before GetThreadContext");
+                return ctx;
             }
+            transiently_paused = true;
         }
         struct ScopedThreadResume {
             HANDLE h;
@@ -1194,9 +1277,32 @@ private:
         return tids;
     }
 
-    [[nodiscard]] Result<void> resume_os_thread(ThreadId tid) {
+    [[nodiscard]] static bool thread_handle_belongs_to_pid(HANDLE th, ProcessId pid) noexcept {
+        return th != nullptr && pid != 0u &&
+               ::GetProcessIdOfThread(th) == static_cast<DWORD>(pid);
+    }
+
+    [[nodiscard]] bool is_process_thread_alive(ThreadId tid) const noexcept {
+        if (tid == 0u || info_.pid == 0u) {
+            return false;
+        }
         ScopedWinHandle th(
-            ::OpenThread(THREAD_SUSPEND_RESUME, FALSE, static_cast<DWORD>(tid)));
+            ::OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(tid)));
+        if (!th.valid() || !thread_handle_belongs_to_pid(th.get(), info_.pid)) {
+            return false;
+        }
+        DWORD exit_code = 0;
+        if (::GetExitCodeThread(th.get(), &exit_code) == 0) {
+            return true;
+        }
+        return exit_code == STILL_ACTIVE;
+    }
+
+    [[nodiscard]] Result<void> resume_os_thread(ThreadId tid) {
+        ScopedWinHandle th(::OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            static_cast<DWORD>(tid)));
         if (!th.valid()) {
             const DWORD err = ::GetLastError();
             if (err == ERROR_INVALID_PARAMETER && !is_alive()) {
@@ -1204,6 +1310,13 @@ private:
             }
             return make_error(
                 std::format("OpenThread(THREAD_SUSPEND_RESUME) failed (Win32 error {})", err));
+        }
+        if (!thread_handle_belongs_to_pid(th.get(), info_.pid)) {
+            if (!is_alive()) {
+                return {};
+            }
+            return make_error(std::format(
+                "invalid argument: thread {} does not belong to target process {}", tid, info_.pid));
         }
         if (::ResumeThread(th.get()) == static_cast<DWORD>(-1)) {
             const DWORD err = ::GetLastError();

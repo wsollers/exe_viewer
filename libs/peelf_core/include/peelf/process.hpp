@@ -263,7 +263,8 @@ struct MemoryRegion {
     }
 
     [[nodiscard]] constexpr bool contains(std::uint64_t address) const noexcept {
-        return address >= start_address && address < end_address;
+        return end_address > start_address && address >= start_address &&
+               (address - start_address) < (end_address - start_address);
     }
 
     auto operator<=>(const MemoryRegion&) const = default;

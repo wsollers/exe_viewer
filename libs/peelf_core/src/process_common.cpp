@@ -224,9 +224,10 @@ void probe_module_format_and_entry(ModuleInfo& mod, IProcessSession* probe_sessi
                 const std::uint16_t e_type = rd16(16);
                 const std::uint64_t e_entry = is_64 ? rd64(24) : static_cast<std::uint64_t>(rd32(24));
                 if (e_entry != 0) {
-                    if (e_type == 3 && e_entry < mod.size) {
+                    if (e_type == 3 && e_entry < mod.size &&
+                        e_entry <= (std::numeric_limits<std::uint64_t>::max() - mod.base_address)) {
                         mod.entry_point = mod.base_address + e_entry;
-                    } else {
+                    } else if (e_type != 3) {
                         mod.entry_point = e_entry;
                     }
                 }
@@ -245,7 +246,9 @@ void probe_module_format_and_entry(ModuleInfo& mod, IProcessSession* probe_sessi
                         (static_cast<std::uint32_t>(header[opt + 17]) << 8) |
                         (static_cast<std::uint32_t>(header[opt + 18]) << 16) |
                         (static_cast<std::uint32_t>(header[opt + 19]) << 24);
-                    if (entry_rva != 0) {
+                    if (entry_rva != 0 &&
+                        static_cast<std::uint64_t>(entry_rva) <=
+                            (std::numeric_limits<std::uint64_t>::max() - mod.base_address)) {
                         mod.entry_point = mod.base_address + entry_rva;
                     }
                 }
@@ -1453,7 +1456,23 @@ MemorySample read_memory_tolerant(IProcessSession& session,
     constexpr std::size_t kMaxChunk = 65536;
     constexpr std::uint64_t kPageSize = 4096;
 
+    // Clamp readable span to the non-wrapping 64-bit VA domain [address, UINT64_MAX] so
+    // `address + rel_offset` and `chunk_va + cursor` never wrap around near UINT64_MAX.
+    const std::uint64_t max_va_offset = std::numeric_limits<std::uint64_t>::max() - address;
+    const std::size_t non_wrapping_size =
+        (static_cast<std::uint64_t>(size - 1u) > max_va_offset)
+            ? static_cast<std::size_t>(max_va_offset + 1u)
+            : size;
+
     const auto read_chunk_with_page_fallback = [&](std::size_t rel_offset, std::size_t len) {
+        if (len == 0u || static_cast<std::uint64_t>(rel_offset) > max_va_offset) {
+            return;
+        }
+        const std::uint64_t max_chunk_rem = max_va_offset - static_cast<std::uint64_t>(rel_offset);
+        if (static_cast<std::uint64_t>(len - 1u) > max_chunk_rem) {
+            len = static_cast<std::size_t>(max_chunk_rem + 1u);
+        }
+
         const std::uint64_t chunk_va = address + static_cast<std::uint64_t>(rel_offset);
         auto out_span = std::span<std::uint8_t>(sample.bytes.data() + rel_offset, len);
         auto fast = session.read_memory(chunk_va, out_span);
@@ -1500,30 +1519,30 @@ MemorySample read_memory_tolerant(IProcessSession& session,
 
     if (regions.empty()) {
         std::size_t offset = 0;
-        while (offset < size) {
-            const std::size_t step = std::min(kMaxChunk, size - offset);
+        while (offset < non_wrapping_size) {
+            const std::size_t step = std::min(kMaxChunk, non_wrapping_size - offset);
             read_chunk_with_page_fallback(offset, step);
             offset += step;
         }
         return sample;
     }
 
-    const std::uint64_t end_address =
-        (address > std::numeric_limits<std::uint64_t>::max() - static_cast<std::uint64_t>(size))
-            ? std::numeric_limits<std::uint64_t>::max()
-            : (address + static_cast<std::uint64_t>(size));
-
     for (const MemoryRegion& reg : regions) {
-        if (reg.end_address <= address || reg.start_address >= end_address) {
+        if (reg.end_address <= reg.start_address || reg.end_address <= address) {
+            continue;
+        }
+        if (reg.start_address > address &&
+            (reg.start_address - address) >= static_cast<std::uint64_t>(non_wrapping_size)) {
             continue;
         }
         if (!reg.protection.readable || reg.protection.guarded) {
             continue;
         }
         const std::uint64_t overlap_begin = std::max(address, reg.start_address);
-        const std::uint64_t overlap_end = std::min(end_address, reg.end_address);
         std::size_t rel = static_cast<std::size_t>(overlap_begin - address);
-        std::size_t rem = static_cast<std::size_t>(overlap_end - overlap_begin);
+        const std::uint64_t reg_rem = reg.end_address - overlap_begin;
+        const std::uint64_t req_rem = static_cast<std::uint64_t>(non_wrapping_size - rel);
+        std::size_t rem = static_cast<std::size_t>(std::min<std::uint64_t>(reg_rem, req_rem));
         while (rem > 0) {
             const std::size_t step = std::min(kMaxChunk, rem);
             read_chunk_with_page_fallback(rel, step);

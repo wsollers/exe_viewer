@@ -92,7 +92,41 @@ CaptureStamp CaptureStamp::capture_now(
     stamp.monotonic_ns = mono_ns;
     stamp.target_paused = paused;
     stamp.availability = avail;
+    stamp.capture_started_unix_ms = unix_ms;
+    stamp.capture_started_monotonic_ns = mono_ns;
+    stamp.capture_completed_unix_ms = unix_ms;
+    stamp.capture_completed_monotonic_ns = mono_ns;
     return stamp;
+}
+
+CaptureStamp CaptureStamp::capture_interval(
+    const CaptureStamp& started,
+    CaptureAvailability avail) {
+    CaptureStamp completed = capture_now(
+        started.target_id,
+        started.snapshot_revision,
+        started.target_paused,
+        avail);
+    const std::uint64_t start_unix =
+        started.capture_started_unix_ms != 0u
+            ? started.capture_started_unix_ms
+            : started.captured_unix_ms;
+    const std::uint64_t start_mono =
+        started.capture_started_monotonic_ns != 0u
+            ? started.capture_started_monotonic_ns
+            : started.monotonic_ns;
+    completed.capture_started_unix_ms = start_unix;
+    completed.capture_started_monotonic_ns = start_mono;
+    if (completed.capture_completed_unix_ms < start_unix) {
+        completed.capture_completed_unix_ms = start_unix;
+        completed.captured_unix_ms = start_unix;
+        completed.captured_at_utc = format_utc_iso8601_ms(start_unix);
+    }
+    if (completed.capture_completed_monotonic_ns < start_mono) {
+        completed.capture_completed_monotonic_ns = start_mono;
+        completed.monotonic_ns = start_mono;
+    }
+    return completed;
 }
 
 std::optional<std::uint64_t> parse_linux_proc_stat_starttime(

@@ -22,6 +22,7 @@
 #include <format>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -123,6 +124,7 @@ struct ProcReadResult {
     std::vector<std::uint8_t> bytes;
     int err{0};
     bool ok{false};
+    bool truncated{false};
 };
 
 [[nodiscard]] ProcReadResult read_proc_binary(const std::filesystem::path& path,
@@ -154,16 +156,44 @@ struct ProcReadResult {
                          chunk.begin() + static_cast<std::ptrdiff_t>(got));
     }
 
+    if (res.bytes.size() == max_bytes) {
+        std::uint8_t probe_byte = 0;
+        for (;;) {
+            const ssize_t probe = ::read(fd.fd, &probe_byte, 1u);
+            if (probe < 0 && errno == EINTR) {
+                continue;
+            }
+            if (probe > 0) {
+                res.truncated = true;
+            }
+            break;
+        }
+    }
+
     res.ok = true;
     return res;
 }
 
-[[nodiscard]] std::string read_text_file(const std::filesystem::path& path) {
-    const ProcReadResult raw = read_proc_binary(path, 256u * 1024u);
+[[nodiscard]] constexpr std::string_view strip_incomplete_trailing_line(
+    std::string_view text) noexcept {
+    const std::size_t nl = text.rfind('\n');
+    if (nl == std::string_view::npos) {
+        return {};
+    }
+    return text.substr(0u, nl + 1u);
+}
+
+[[nodiscard]] std::string read_text_file(const std::filesystem::path& path,
+                                         std::size_t max_bytes = 1024u * 1024u) {
+    const ProcReadResult raw = read_proc_binary(path, max_bytes);
     if (!raw.ok) {
         return {};
     }
-    return std::string(reinterpret_cast<const char*>(raw.bytes.data()), raw.bytes.size());
+    std::string_view view(reinterpret_cast<const char*>(raw.bytes.data()), raw.bytes.size());
+    if (raw.truncated) {
+        view = strip_incomplete_trailing_line(view);
+    }
+    return std::string(view);
 }
 
 [[nodiscard]] std::optional<std::filesystem::path> read_proc_symlink(
@@ -1015,6 +1045,7 @@ public:
             } catch (...) {
             }
         }
+        std::lock_guard<std::mutex> lk(mem_fd_mutex_);
         if (mem_read_fd_ >= 0) {
             ::close(mem_read_fd_);
             mem_read_fd_ = -1;
@@ -1026,6 +1057,18 @@ public:
 
     [[nodiscard]] const ProcessInfo& info() const noexcept override { return info_; }
     [[nodiscard]] bool is_read_only() const noexcept override { return true; }
+
+    [[nodiscard]] SubsystemStatus memory_regions_status() const override {
+        return last_memmap_status_.source.empty()
+                   ? SubsystemStatus::available("/proc/<pid>/smaps")
+                   : last_memmap_status_;
+    }
+
+    [[nodiscard]] SubsystemStatus modules_status() const override {
+        return last_modules_status_.source.empty()
+                   ? SubsystemStatus::available("/proc/<pid>/maps")
+                   : last_modules_status_;
+    }
 
     [[nodiscard]] bool is_alive() const noexcept override {
         if (::kill(static_cast<pid_t>(info_.pid), 0) == 0) {
@@ -1041,32 +1084,59 @@ public:
         const std::filesystem::path proc_dir =
             std::filesystem::path("/proc") / std::to_string(info_.pid);
 
+        constexpr std::size_t kMaxSmapsBytes = 64u * 1024u * 1024u;
+        constexpr std::size_t kMaxMapsBytes = 32u * 1024u * 1024u;
+
         Result<std::vector<MemoryRegion>> parsed = make_error("uninitialized");
-        const ProcReadResult smaps_raw = read_proc_binary(proc_dir / "smaps", 32u * 1024u * 1024u);
+        bool smaps_was_truncated = false;
+        const ProcReadResult smaps_raw = read_proc_binary(proc_dir / "smaps", kMaxSmapsBytes);
         if (smaps_raw.ok && !smaps_raw.bytes.empty()) {
-            const std::string_view smaps_text(
-                reinterpret_cast<const char*>(smaps_raw.bytes.data()), smaps_raw.bytes.size());
-            parsed = parse_proc_smaps(smaps_text, info_.executable_path.string());
-            if (parsed) {
-                last_memmap_status_ = SubsystemStatus::available(
-                    "/proc/<pid>/smaps",
-                    std::to_string(parsed->size()) + " regions with RSS/PSS telemetry");
+            if (smaps_raw.truncated) {
+                smaps_was_truncated = true;
+            } else {
+                const std::string_view smaps_text(
+                    reinterpret_cast<const char*>(smaps_raw.bytes.data()), smaps_raw.bytes.size());
+                parsed = parse_proc_smaps(smaps_text, info_.executable_path.string());
+                if (parsed) {
+                    last_memmap_status_ = SubsystemStatus::available(
+                        "/proc/<pid>/smaps",
+                        std::to_string(parsed->size()) + " regions with RSS/PSS telemetry");
+                }
             }
         }
 
         if (!parsed) {
-            const std::string maps_text = read_text_file(proc_dir / "maps");
-            if (maps_text.empty()) {
+            const ProcReadResult maps_raw = read_proc_binary(proc_dir / "maps", kMaxMapsBytes);
+            if (!maps_raw.ok || maps_raw.bytes.empty()) {
                 return make_error(
                     "failed to open /proc/<pid>/maps (permission denied or process exited)");
             }
-            parsed = parse_proc_maps(maps_text, info_.executable_path.string());
+            std::string_view maps_view(
+                reinterpret_cast<const char*>(maps_raw.bytes.data()), maps_raw.bytes.size());
+            if (maps_raw.truncated) {
+                maps_view = strip_incomplete_trailing_line(maps_view);
+                if (maps_view.empty()) {
+                    return make_error(
+                        "/proc/<pid>/maps read hit size cap before a complete mapping line");
+                }
+            }
+            parsed = parse_proc_maps(maps_view, info_.executable_path.string());
             if (!parsed) {
                 return std::unexpected(parsed.error());
             }
-            last_memmap_status_ = SubsystemStatus::partial(
-                "/proc/<pid>/maps",
-                "/proc/<pid>/smaps unreadable; physical RSS/PSS unavailable");
+            if (maps_raw.truncated) {
+                last_memmap_status_ = SubsystemStatus::partial(
+                    "/proc/<pid>/maps",
+                    "/proc/<pid>/maps truncated at 32 MiB read cap; incomplete trailing line discarded");
+            } else if (smaps_was_truncated) {
+                last_memmap_status_ = SubsystemStatus::partial(
+                    "/proc/<pid>/maps",
+                    "/proc/<pid>/smaps exceeded 64 MiB read cap; fell back to /proc/<pid>/maps");
+            } else {
+                last_memmap_status_ = SubsystemStatus::partial(
+                    "/proc/<pid>/maps",
+                    "/proc/<pid>/smaps unreadable; physical RSS/PSS unavailable");
+            }
         }
 
         (void)derive_modules_from_regions(*parsed, info_.executable_path.string(), this);
@@ -1095,8 +1165,12 @@ public:
         std::string rollup_text;
         const ProcReadResult rollup_raw = read_proc_binary(rollup_path, 64u * 1024u);
         if (rollup_raw.ok && !rollup_raw.bytes.empty()) {
-            rollup_text.assign(reinterpret_cast<const char*>(rollup_raw.bytes.data()),
-                               rollup_raw.bytes.size());
+            std::string_view rollup_view(
+                reinterpret_cast<const char*>(rollup_raw.bytes.data()), rollup_raw.bytes.size());
+            if (rollup_raw.truncated) {
+                rollup_view = strip_incomplete_trailing_line(rollup_view);
+            }
+            rollup_text.assign(rollup_view.data(), rollup_view.size());
         }
         ProcessMemorySummary sum = summarize_process_memory(regions, rollup_text);
         SubsystemStatus st = last_memmap_status_;
@@ -1117,17 +1191,41 @@ public:
         if (!is_alive()) {
             return make_error("target process is no longer running");
         }
+        constexpr std::size_t kMaxMapsBytes = 32u * 1024u * 1024u;
         const std::filesystem::path maps_path =
             std::filesystem::path("/proc") / std::to_string(info_.pid) / "maps";
-        const std::string maps_text = read_text_file(maps_path);
-        if (maps_text.empty()) {
+        const ProcReadResult maps_raw = read_proc_binary(maps_path, kMaxMapsBytes);
+        if (!maps_raw.ok || maps_raw.bytes.empty()) {
+            last_modules_status_ = SubsystemStatus::unavailable(
+                "/proc/<pid>/maps", "failed to open /proc/<pid>/maps");
             return make_error("failed to open /proc/<pid>/maps");
         }
-        auto parsed = parse_proc_maps(maps_text, info_.executable_path.string());
+        std::string_view maps_view(
+            reinterpret_cast<const char*>(maps_raw.bytes.data()), maps_raw.bytes.size());
+        if (maps_raw.truncated) {
+            maps_view = strip_incomplete_trailing_line(maps_view);
+            if (maps_view.empty()) {
+                last_modules_status_ = SubsystemStatus::unavailable(
+                    "/proc/<pid>/maps", "/proc/<pid>/maps truncated before a complete line");
+                return make_error("/proc/<pid>/maps truncated before a complete mapping line");
+            }
+        }
+        auto parsed = parse_proc_maps(maps_view, info_.executable_path.string());
         if (!parsed) {
+            last_modules_status_ =
+                SubsystemStatus::unavailable("/proc/<pid>/maps", parsed.error().message);
             return std::unexpected(parsed.error());
         }
-        return derive_modules_from_regions(*parsed, info_.executable_path.string(), this);
+        auto derived = derive_modules_from_regions(*parsed, info_.executable_path.string(), this);
+        last_modules_status_ =
+            maps_raw.truncated
+                ? SubsystemStatus::partial(
+                      "/proc/<pid>/maps",
+                      "/proc/<pid>/maps truncated at 32 MiB read cap; trailing modules may be omitted")
+                : SubsystemStatus::available(
+                      "/proc/<pid>/maps",
+                      std::to_string(derived.size()) + " modules derived");
+        return derived;
     }
 
     [[nodiscard]] Result<std::size_t> read_memory(std::uint64_t address,
@@ -1152,20 +1250,31 @@ public:
             }
         }
 
-        // Strictly read-only fallback via /proc/<pid>/mem pread (O_RDONLY | O_CLOEXEC).
+        // Strictly read-only fallback via /proc/<pid>/mem pread (O_RDONLY | O_CLOEXEC),
+        // synchronized against concurrent background diff/UI readers and session teardown.
         if (address > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
             return make_error("virtual address is outside readable /proc/<pid>/mem range");
         }
-        const int fd = ensure_mem_read_fd();
-        if (fd < 0) {
-            return make_error("failed to open /proc/<pid>/mem for reading");
+        ssize_t got = -1;
+        int saved_errno = 0;
+        {
+            std::lock_guard<std::mutex> lk(mem_fd_mutex_);
+            const int fd = ensure_mem_read_fd_locked();
+            if (fd < 0) {
+                return make_error("failed to open /proc/<pid>/mem for reading");
+            }
+            for (;;) {
+                got = ::pread(fd, buffer.data(), buffer.size(), static_cast<off_t>(address));
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                saved_errno = errno;
+                break;
+            }
         }
-
-        const ssize_t got =
-            ::pread(fd, buffer.data(), buffer.size(), static_cast<off_t>(address));
         if (got <= 0) {
             return make_error(std::string("failed to read process memory: ") +
-                              std::strerror(errno));
+                              std::strerror(saved_errno));
         }
         return static_cast<std::size_t>(got);
     }
@@ -1189,41 +1298,67 @@ public:
             return {};
         }
 
+        had_pre_existing_job_stop_ = (read_process_state_char() == 'T');
         std::string last_err = "no threads found in /proc/<pid>/task";
-        std::size_t stopped_count = 0;
+        constexpr int kMaxConvergencePasses = 8;
+        bool converged = false;
 
-        // Two passes catch threads spawned concurrently while the initial set is seizing.
-        for (int pass = 0; pass < 2; ++pass) {
+        // Converge across newly spawned threads in /proc/<pid>/task up to a bounded retry count.
+        for (int pass = 0; pass < kMaxConvergencePasses; ++pass) {
             const std::vector<ThreadId> tids = list_task_tids();
-            if (tids.empty() && pass == 0) {
-                return make_error(last_err);
+            if (tids.empty()) {
+                if (pass == 0 && suspended_tids_.empty()) {
+                    had_pre_existing_job_stop_ = false;
+                    return make_error(last_err);
+                }
+                converged = !suspended_tids_.empty();
+                break;
             }
             // Pre-reserve contiguous tracking capacity before invoking ptrace/tgkill so recording
             // a stopped thread can never fail with std::bad_alloc.
             suspended_tids_.reserve(suspended_tids_.size() + tids.size());
 
-            bool added_in_pass = false;
+            bool newly_stopped_in_pass = false;
             for (const ThreadId tid : tids) {
                 if (has_suspended_tid(tid)) {
                     continue;
                 }
+                if (!is_thread_still_present(tid)) {
+                    continue;
+                }
                 auto res = stop_single_thread(tid);
-                if (res) {
-                    ++stopped_count;
-                    added_in_pass = true;
-                } else {
+                if (res.has_value()) {
+                    newly_stopped_in_pass = true;
+                } else if (is_thread_still_present(tid)) {
                     last_err = res.error().message;
+                    (void)resume();
+                    return make_error(
+                        std::format("failed to suspend thread {}: {}", tid, last_err));
                 }
             }
-            if (!added_in_pass) {
+            if (!newly_stopped_in_pass) {
+                converged = true;
                 break;
             }
         }
 
-        if (stopped_count == 0 && suspended_tids_.empty()) {
+        if (!converged) {
+            const std::vector<ThreadId> final_tids = list_task_tids();
+            const bool all_stopped = std::ranges::all_of(final_tids, [this](ThreadId tid) {
+                return has_suspended_tid(tid) || !is_thread_still_present(tid);
+            });
+            if (!all_stopped) {
+                (void)resume();
+                return make_error(
+                    "failed to converge on stopping all spawned threads within retry limit");
+            }
+        }
+
+        if (suspended_tids_.empty()) {
+            had_pre_existing_job_stop_ = false;
             return make_error("failed to suspend process: " + last_err);
         }
-        suspended_ = !suspended_tids_.empty();
+        suspended_ = true;
         return {};
     }
 
@@ -1251,8 +1386,10 @@ public:
                 suspended_tids_, [](const SuspendedThreadEntry& e) {
                     return e.mechanism == StopMechanism::SigStop;
                 });
-            if (::kill(static_cast<pid_t>(info_.pid), SIGCONT) == 0 ||
-                (errno == ESRCH && !is_alive())) {
+            if (had_pre_existing_job_stop_) {
+                process_sigstopped_ = any_sigstop_left;
+            } else if (::kill(static_cast<pid_t>(info_.pid), SIGCONT) == 0 ||
+                       (errno == ESRCH && !is_alive())) {
                 process_sigstopped_ = any_sigstop_left;
             } else {
                 const int err = errno;
@@ -1268,6 +1405,9 @@ public:
         }
 
         suspended_ = !suspended_tids_.empty() || process_sigstopped_;
+        if (!suspended_) {
+            had_pre_existing_job_stop_ = false;
+        }
         if (failed_count > 0) {
             return make_error(
                 std::format("failed to resume {} target(s): {}", failed_count, detail));
@@ -1276,28 +1416,45 @@ public:
     }
 
     [[nodiscard]] Result<void> suspend_thread(ThreadId tid) override {
+        if (tid == 0u) {
+            return make_error("invalid argument: thread ID must be non-zero");
+        }
         if (info_.pid == current_process_id()) {
             return make_error("cannot suspend the inspector process itself");
         }
         if (!is_alive()) {
             return make_error("target process is no longer running");
         }
+        if (!thread_belongs_to_process(tid)) {
+            return make_error(std::format(
+                "invalid argument: thread {} not found in target process {}", tid, info_.pid));
+        }
         return stop_single_thread(tid);
     }
 
     [[nodiscard]] Result<void> resume_thread(ThreadId tid) override {
+        if (tid == 0u) {
+            return make_error("invalid argument: thread ID must be non-zero");
+        }
         const auto it = find_suspended_tid(tid);
         if (it == suspended_tids_.end()) {
+            if (!is_alive()) {
+                return make_error("target process is no longer running");
+            }
+            if (!thread_belongs_to_process(tid)) {
+                return make_error(std::format(
+                    "invalid argument: thread {} not found in target process {}", tid, info_.pid));
+            }
             return {};
         }
         const StopMechanism mech = it->mechanism;
         if (auto r = resume_single_entry(*it); !r.has_value()) {
             return r;
         }
-        if (mech == StopMechanism::PtraceSeize) {
+        if (mech == StopMechanism::PtraceSeize || mech == StopMechanism::PreExistingJobStop) {
             suspended_tids_.erase(it);
         } else {
-            if (process_sigstopped_) {
+            if (process_sigstopped_ && !had_pre_existing_job_stop_) {
                 if (::kill(static_cast<pid_t>(info_.pid), SIGCONT) == 0 ||
                     (errno == ESRCH && !is_alive())) {
                     process_sigstopped_ = false;
@@ -1306,12 +1463,17 @@ public:
                     return make_error(
                         std::format("kill(SIGCONT) failed: {}", std::strerror(err)));
                 }
+            } else {
+                process_sigstopped_ = false;
             }
             std::erase_if(suspended_tids_, [](const SuspendedThreadEntry& e) {
                 return e.mechanism == StopMechanism::SigStop;
             });
         }
         suspended_ = !suspended_tids_.empty() || process_sigstopped_;
+        if (!suspended_) {
+            had_pre_existing_job_stop_ = false;
+        }
         return {};
     }
 
@@ -1466,6 +1628,13 @@ public:
             return ctx;
         }
 
+        if (tid == 0u || !thread_belongs_to_process(tid)) {
+            ctx.status = SubsystemStatus::unavailable(
+                "invalid_argument",
+                std::format("thread {} not found in target process {}", tid, info_.pid));
+            return ctx;
+        }
+
         // Cooperative self-thread snapshot when inspecting our own process (ptrace cannot attach to self).
         if (info_.pid == current_process_id()) {
             if (tid == current_thread_id()) {
@@ -1538,6 +1707,13 @@ public:
             return {std::move(r.bytes),
                     SubsystemStatus::partial("/proc/<pid>/auxv", "auxv readable but empty")};
         }
+        if (r.truncated) {
+            const std::size_t entry_sz = info_.is_64bit ? 16u : 8u;
+            r.bytes.resize((r.bytes.size() / entry_sz) * entry_sz);
+            return {std::move(r.bytes),
+                    SubsystemStatus::partial("/proc/<pid>/auxv",
+                                             "auxv truncated at 64 KiB read cap")};
+        }
         const std::string det = std::to_string(r.bytes.size()) + " bytes";
         return {std::move(r.bytes), SubsystemStatus::available("/proc/<pid>/auxv", det)};
     }
@@ -1550,7 +1726,15 @@ public:
             return {std::nullopt,
                     SubsystemStatus::unavailable("/proc/<pid>/status", std::strerror(r.err))};
         }
-        std::string text(reinterpret_cast<const char*>(r.bytes.data()), r.bytes.size());
+        std::string_view view(reinterpret_cast<const char*>(r.bytes.data()), r.bytes.size());
+        if (r.truncated) {
+            view = strip_incomplete_trailing_line(view);
+            std::string text(view);
+            return {std::move(text),
+                    SubsystemStatus::partial("/proc/<pid>/status",
+                                             "status truncated at 256 KiB read cap")};
+        }
+        std::string text(view);
         return {std::move(text),
                 SubsystemStatus::available("/proc/<pid>/status",
                                            std::to_string(r.bytes.size()) + " bytes")};
@@ -1559,7 +1743,7 @@ public:
     [[nodiscard]] ForgivingValue<std::vector<std::string>> environment_variables() override {
         const std::filesystem::path p =
             std::filesystem::path("/proc") / std::to_string(info_.pid) / "environ";
-        const ProcReadResult r = read_proc_binary(p, 256u * 1024u);
+        const ProcReadResult r = read_proc_binary(p, 1024u * 1024u);
         if (!r.ok) {
             return {std::nullopt,
                     SubsystemStatus::unavailable("/proc/<pid>/environ", std::strerror(r.err))};
@@ -1568,10 +1752,13 @@ public:
         constexpr std::size_t kMaxEnvEntries = 512u;
         std::vector<std::string> entries;
         std::size_t start = 0;
-        bool truncated = false;
+        bool truncated = r.truncated;
         const std::string_view raw(reinterpret_cast<const char*>(r.bytes.data()), r.bytes.size());
         while (start < raw.size()) {
             const std::size_t nul = raw.find('\0', start);
+            if (nul == std::string_view::npos && r.truncated) {
+                break;
+            }
             const std::string_view item =
                 (nul == std::string_view::npos) ? raw.substr(start) : raw.substr(start, nul - start);
             if (!item.empty()) {
@@ -1589,8 +1776,10 @@ public:
 
         if (truncated) {
             return {std::move(entries),
-                    SubsystemStatus::partial("/proc/<pid>/environ",
-                                             "capped at 512 environment variables")};
+                    SubsystemStatus::partial(
+                        "/proc/<pid>/environ",
+                        r.truncated ? "/proc/<pid>/environ truncated at 1 MiB read cap"
+                                    : "capped at 512 environment variables")};
         }
         const std::string det = std::to_string(entries.size()) + " entries";
         return {std::move(entries), SubsystemStatus::available("/proc/<pid>/environ", det)};
@@ -1600,11 +1789,13 @@ private:
     enum class StopMechanism : std::uint8_t {
         PtraceSeize,
         SigStop,
+        PreExistingJobStop,
     };
 
     SubsystemStatus last_memmap_status_{};
+    SubsystemStatus last_modules_status_{};
 
-    int ensure_mem_read_fd() {
+    int ensure_mem_read_fd_locked() {
         if (mem_read_fd_ >= 0) {
             return mem_read_fd_;
         }
@@ -1612,6 +1803,35 @@ private:
             (std::filesystem::path("/proc") / std::to_string(info_.pid) / "mem").string();
         mem_read_fd_ = ::open(mem_path.c_str(), O_RDONLY | O_CLOEXEC);
         return mem_read_fd_;
+    }
+
+    [[nodiscard]] bool thread_belongs_to_process(ThreadId tid) const noexcept {
+        if (tid == 0u || info_.pid == 0u) {
+            return false;
+        }
+        std::array<char, 96> path_buf{};
+        const auto fmt_res =
+            std::format_to_n(path_buf.data(), path_buf.size() - 1u, "/proc/{}/task/{}", info_.pid, tid);
+        if (fmt_res.size < 0 || static_cast<std::size_t>(fmt_res.size) >= path_buf.size()) {
+            return false;
+        }
+        *fmt_res.out = '\0';
+        return ::access(path_buf.data(), F_OK) == 0;
+    }
+
+    [[nodiscard]] char read_process_state_char() const {
+        const std::filesystem::path stat_path =
+            std::filesystem::path("/proc") / std::to_string(info_.pid) / "stat";
+        const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path, 8192u));
+        return st.valid ? st.state_char : '\0';
+    }
+
+    [[nodiscard]] char read_task_state_char(ThreadId tid) const {
+        const std::filesystem::path stat_path = std::filesystem::path("/proc") /
+                                                std::to_string(info_.pid) / "task" /
+                                                std::to_string(tid) / "stat";
+        const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path, 8192u));
+        return st.valid ? st.state_char : '\0';
     }
 
     [[nodiscard]] std::vector<ThreadId> list_task_tids() const {
@@ -1652,19 +1872,22 @@ private:
         return false;
     }
 
-    void wait_for_proc_stop_state(ThreadId tid, int timeout_ms) const {
+    [[nodiscard]] bool wait_for_proc_stop_state(ThreadId tid, int timeout_ms) const {
         const std::filesystem::path stat_path = std::filesystem::path("/proc") /
                                                 std::to_string(info_.pid) / "task" /
                                                 std::to_string(tid) / "stat";
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
-            const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path));
+            const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path, 8192u));
             if (!st.valid || st.state_char == 'T' || st.state_char == 't' || st.state_char == 'Z') {
-                return;
+                return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
+        const ProcTaskStatInfo final_st = parse_proc_task_stat(read_text_file(stat_path, 8192u));
+        return !final_st.valid || final_st.state_char == 'T' || final_st.state_char == 't' ||
+               final_st.state_char == 'Z';
     }
 
     struct SuspendedThreadEntry {
@@ -1690,7 +1913,7 @@ private:
         const std::filesystem::path stat_path = std::filesystem::path("/proc") /
                                                 std::to_string(info_.pid) / "task" /
                                                 std::to_string(tid) / "stat";
-        const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path));
+        const ProcTaskStatInfo st = parse_proc_task_stat(read_text_file(stat_path, 8192u));
         if (!st.valid) {
             return false;
         }
@@ -1698,6 +1921,9 @@ private:
     }
 
     [[nodiscard]] Result<void> resume_single_entry(const SuspendedThreadEntry& entry) {
+        if (entry.mechanism == StopMechanism::PreExistingJobStop) {
+            return {};
+        }
         if (entry.mechanism == StopMechanism::PtraceSeize) {
             if (::ptrace(PTRACE_DETACH, static_cast<pid_t>(entry.tid), nullptr, nullptr) == 0) {
                 return {};
@@ -1710,6 +1936,9 @@ private:
                 std::format("ptrace(PTRACE_DETACH) failed: {}", std::strerror(err)));
         }
 
+        if (had_pre_existing_job_stop_) {
+            return {};
+        }
         if (::syscall(
                 SYS_tgkill, static_cast<pid_t>(info_.pid), static_cast<pid_t>(entry.tid), SIGCONT) ==
             0) {
@@ -1723,6 +1952,10 @@ private:
     }
 
     [[nodiscard]] Result<void> stop_single_thread(ThreadId tid) {
+        if (tid == 0u || !thread_belongs_to_process(tid)) {
+            return make_error(std::format(
+                "invalid argument: thread {} not found in target process {}", tid, info_.pid));
+        }
         if (has_suspended_tid(tid)) {
             return {};
         }
@@ -1741,11 +1974,20 @@ private:
             return make_error("thread has already exited");
         }
 
+        // Preserve pre-existing job-control stops (`T`) without sending SIGSTOP or SIGCONT on resume.
+        if (read_task_state_char(tid) == 'T' || had_pre_existing_job_stop_) {
+            suspended_tids_.push_back(
+                SuspendedThreadEntry{tid, StopMechanism::PreExistingJobStop});
+            return {};
+        }
+
         // Fallback to SIGSTOP when ptrace is restricted (e.g. yama/ptrace_scope >= 1).
         if (::syscall(SYS_tgkill, static_cast<pid_t>(info_.pid), static_cast<pid_t>(tid), SIGSTOP) ==
                 0 ||
             ::kill(static_cast<pid_t>(info_.pid), SIGSTOP) == 0) {
-            wait_for_proc_stop_state(tid, 250);
+            if (!wait_for_proc_stop_state(tid, 250) && is_thread_still_present(tid)) {
+                return make_error("timed out waiting for thread to enter stopped state");
+            }
             suspended_tids_.push_back(SuspendedThreadEntry{tid, StopMechanism::SigStop});
             process_sigstopped_ = true;
             return {};
@@ -1901,9 +2143,11 @@ private:
     }
 
     ProcessInfo info_;
+    mutable std::mutex mem_fd_mutex_;
     int mem_read_fd_{-1};
     std::vector<SuspendedThreadEntry> suspended_tids_;
     bool process_sigstopped_{false};
+    bool had_pre_existing_job_stop_{false};
     bool suspended_{false};
 };
 

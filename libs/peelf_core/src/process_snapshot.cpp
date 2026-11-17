@@ -95,16 +95,21 @@ std::atomic<std::uint64_t> g_next_snapshot_revision{1u};
 }
 
 [[nodiscard]] std::string normalize_module_identity_key(const ModuleInfo& mod) {
+    const bool is_pe =
+        (mod.format == Format::PE) ||
+        (mod.format == Format::Unknown &&
+         (looks_like_pe_module_path(mod.path.generic_string()) ||
+          looks_like_pe_module_path(mod.name)));
     const std::string raw_path = mod.path.generic_string();
     const std::string_view cleaned_path = strip_deleted_view(raw_path);
     if (!cleaned_path.empty()) {
-        if (looks_like_pe_module_path(cleaned_path)) {
+        if (is_pe) {
             return ascii_lower_copy(cleaned_path);
         }
         return std::string(cleaned_path);
     }
     const std::string_view cleaned_name = strip_deleted_view(mod.name);
-    if (looks_like_pe_module_path(cleaned_name)) {
+    if (is_pe) {
         return ascii_lower_copy(cleaned_name);
     }
     return std::string(cleaned_name);
@@ -143,11 +148,17 @@ std::atomic<std::uint64_t> g_next_snapshot_revision{1u};
 [[nodiscard]] TargetInstanceId derive_session_target_id(const IProcessSession& session) {
     TargetInstanceId tid{};
     const bool is_gdb_remote = (dynamic_cast<const IGdbRemoteSession*>(&session) != nullptr);
-    if (session.is_crash_dump()) {
-        const std::string lower_exe = ascii_lower_copy(session.info().executable_path.generic_string());
-        tid.backend = lower_exe.ends_with(".dmp") || lower_exe.ends_with(".mdmp")
+    if (const auto* dump_session = dynamic_cast<const ICrashDumpSession*>(&session);
+        dump_session != nullptr) {
+        const CrashDumpSummary& cs = dump_session->crash_summary();
+        tid.backend = (cs.kind == CrashDumpKind::WindowsMinidump)
                           ? BackendKind::CrashDumpMinidump
                           : BackendKind::CrashDumpElfCore;
+        if (!cs.sha256.empty() && tid.image_sha256.empty()) {
+            tid.image_sha256 = cs.sha256;
+        }
+    } else if (session.is_crash_dump()) {
+        tid.backend = BackendKind::CrashDumpElfCore;
     } else if (is_gdb_remote) {
         tid.backend = BackendKind::GdbRemote;
     } else if (!session.is_read_only()) {
@@ -1338,8 +1349,9 @@ ProcessStateSnapshot capture_process_snapshot(
     }
     const bool paused = session.is_suspended() || session.is_crash_dump();
     snapshot.paused_during_capture = paused;
-    snapshot.snapshot_stamp = CaptureStamp::capture_now(
+    const CaptureStamp snapshot_start_stamp = CaptureStamp::capture_now(
         snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Complete);
+    snapshot.snapshot_stamp = snapshot_start_stamp;
 
     const ProvenanceTag os_prov =
         session.is_crash_dump() ? ProvenanceTag::CrashDump : ProvenanceTag::ProcOrOsApi;
@@ -1348,8 +1360,8 @@ ProcessStateSnapshot capture_process_snapshot(
 
     if (!session.is_alive()) {
         const auto unavail_stamp = [&]() {
-            return CaptureStamp::capture_now(
-                snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
+            return CaptureStamp::capture_interval(
+                snapshot_start_stamp, CaptureAvailability::Unavailable);
         };
         snapshot.snapshot_stamp = unavail_stamp();
         snapshot.regions = Observed<std::vector<MemoryRegion>>::unavailable(
@@ -1371,40 +1383,43 @@ ProcessStateSnapshot capture_process_snapshot(
 
     // 1. Regions
     bool any_core_stream_degraded = false;
-    if (auto regs_res = session.memory_regions(); regs_res.has_value()) {
-        const SubsystemStatus reg_st = session.memory_regions_status();
-        const bool session_reg_partial =
-            reg_st.availability == Availability::Partial ||
-            reg_st.availability == Availability::Unavailable;
-        if (session_reg_partial) {
-            any_core_stream_degraded = true;
-        }
-        const CaptureAvailability reg_avail =
-            (regs_res->empty() || session_reg_partial)
-                ? CaptureAvailability::Partial
-                : CaptureAvailability::Complete;
-        const CaptureStamp reg_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, reg_avail);
-        if (reg_avail == CaptureAvailability::Complete) {
-            snapshot.regions = Observed<std::vector<MemoryRegion>>::complete(
-                std::move(*regs_res), os_prov, reg_stamp);
+    {
+        const CaptureStamp reg_start = CaptureStamp::capture_now(
+            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Complete);
+        if (auto regs_res = session.memory_regions(); regs_res.has_value()) {
+            const SubsystemStatus reg_st = session.memory_regions_status();
+            const bool session_reg_partial =
+                reg_st.availability == Availability::Partial ||
+                reg_st.availability == Availability::Unavailable;
+            if (session_reg_partial) {
+                any_core_stream_degraded = true;
+            }
+            const CaptureAvailability reg_avail =
+                (regs_res->empty() || session_reg_partial)
+                    ? CaptureAvailability::Partial
+                    : CaptureAvailability::Complete;
+            const CaptureStamp reg_stamp = CaptureStamp::capture_interval(reg_start, reg_avail);
+            if (reg_avail == CaptureAvailability::Complete) {
+                snapshot.regions = Observed<std::vector<MemoryRegion>>::complete(
+                    std::move(*regs_res), os_prov, reg_stamp);
+            } else {
+                const std::string detail =
+                    (session_reg_partial && !reg_st.detail.empty())
+                        ? reg_st.detail
+                        : std::string("Memory region query succeeded but returned zero regions.");
+                snapshot.regions = Observed<std::vector<MemoryRegion>>::partial(
+                    std::move(*regs_res),
+                    os_prov,
+                    detail,
+                    reg_stamp);
+            }
         } else {
-            const std::string detail =
-                (session_reg_partial && !reg_st.detail.empty())
-                    ? reg_st.detail
-                    : std::string("Memory region query succeeded but returned zero regions.");
-            snapshot.regions = Observed<std::vector<MemoryRegion>>::partial(
-                std::move(*regs_res),
-                os_prov,
-                detail,
-                reg_stamp);
+            any_core_stream_degraded = true;
+            const CaptureStamp reg_stamp =
+                CaptureStamp::capture_interval(reg_start, CaptureAvailability::Unavailable);
+            snapshot.regions = Observed<std::vector<MemoryRegion>>::unavailable(
+                os_prov, regs_res.error().message, reg_stamp);
         }
-    } else {
-        any_core_stream_degraded = true;
-        const CaptureStamp reg_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
-        snapshot.regions = Observed<std::vector<MemoryRegion>>::unavailable(
-            os_prov, regs_res.error().message, reg_stamp);
     }
 
     const std::span<const MemoryRegion> regions_span =
@@ -1413,70 +1428,74 @@ ProcessStateSnapshot capture_process_snapshot(
             : std::span<const MemoryRegion>{};
 
     // 2. Modules (+ optional bounded header identity probe)
-    if (auto mods_res = session.modules(); mods_res.has_value()) {
-        const SubsystemStatus mod_st = session.modules_status();
-        const bool session_mod_partial =
-            mod_st.availability == Availability::Partial ||
-            mod_st.availability == Availability::Unavailable;
-        if (session_mod_partial) {
-            any_core_stream_degraded = true;
-        }
-        bool has_image_regions = false;
-        for (const MemoryRegion& reg : regions_span) {
-            if (reg.kind == MemoryRegionKind::Image) {
-                has_image_regions = true;
-                break;
+    {
+        const CaptureStamp mod_start = CaptureStamp::capture_now(
+            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Complete);
+        if (auto mods_res = session.modules(); mods_res.has_value()) {
+            const SubsystemStatus mod_st = session.modules_status();
+            const bool session_mod_partial =
+                mod_st.availability == Availability::Partial ||
+                mod_st.availability == Availability::Unavailable;
+            if (session_mod_partial) {
+                any_core_stream_degraded = true;
             }
-        }
-        const CaptureAvailability mod_avail =
-            ((mods_res->empty() && has_image_regions) || session_mod_partial)
-                ? CaptureAvailability::Partial
-                : CaptureAvailability::Complete;
-        const CaptureStamp mod_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, mod_avail);
-        if (mod_avail == CaptureAvailability::Complete) {
-            snapshot.modules = Observed<std::vector<ModuleInfo>>::complete(
-                std::move(*mods_res), os_prov, mod_stamp);
-        } else {
-            const std::string detail =
-                (session_mod_partial && !mod_st.detail.empty())
-                    ? mod_st.detail
-                    : std::string("Module query returned empty despite mapped image regions.");
-            snapshot.modules = Observed<std::vector<ModuleInfo>>::partial(
-                std::move(*mods_res),
-                os_prov,
-                detail,
-                mod_stamp);
-        }
+            bool has_image_regions = false;
+            for (const MemoryRegion& reg : regions_span) {
+                if (reg.kind == MemoryRegionKind::Image) {
+                    has_image_regions = true;
+                    break;
+                }
+            }
+            const CaptureAvailability mod_avail =
+                ((mods_res->empty() && has_image_regions) || session_mod_partial)
+                    ? CaptureAvailability::Partial
+                    : CaptureAvailability::Complete;
 
-        if (options.probe_module_identities && snapshot.modules.has_value()) {
-            constexpr std::uint64_t kMaxHeaderProbeBytes = 64ull * 1024ull;
-            for (const ModuleInfo& mod : *snapshot.modules.value) {
-                if (mod.base_address == 0u) {
-                    continue;
-                }
-                const auto probe_len = static_cast<std::size_t>(std::min<std::uint64_t>(
-                    mod.size > 0u ? mod.size : kMaxHeaderProbeBytes,
-                    kMaxHeaderProbeBytes));
-                const MemorySample hdr_sample =
-                    read_memory_tolerant(session, regions_span, mod.base_address, probe_len);
-                if (hdr_sample.readable_count < 64u) {
-                    continue;
-                }
-                if (auto live_parsed = parse_mapped_image(hdr_sample.bytes, mod.base_address);
-                    live_parsed.has_value() && *live_parsed != nullptr) {
-                    BackingImageIdentity id = extract_backing_image_identity(**live_parsed);
-                    if (id.format != Format::Unknown) {
-                        snapshot.module_identities.emplace_back(mod.base_address, std::move(id));
+            if (options.probe_module_identities) {
+                constexpr std::uint64_t kMaxHeaderProbeBytes = 64ull * 1024ull;
+                for (const ModuleInfo& mod : *mods_res) {
+                    if (mod.base_address == 0u) {
+                        continue;
+                    }
+                    const auto probe_len = static_cast<std::size_t>(std::min<std::uint64_t>(
+                        mod.size > 0u ? mod.size : kMaxHeaderProbeBytes,
+                        kMaxHeaderProbeBytes));
+                    const MemorySample hdr_sample =
+                        read_memory_tolerant(session, regions_span, mod.base_address, probe_len);
+                    if (hdr_sample.readable_count < 64u) {
+                        continue;
+                    }
+                    if (auto live_parsed = parse_mapped_image(hdr_sample.bytes, mod.base_address);
+                        live_parsed.has_value() && *live_parsed != nullptr) {
+                        BackingImageIdentity id = extract_backing_image_identity(**live_parsed);
+                        if (id.format != Format::Unknown) {
+                            snapshot.module_identities.emplace_back(mod.base_address, std::move(id));
+                        }
                     }
                 }
             }
+
+            const CaptureStamp mod_stamp = CaptureStamp::capture_interval(mod_start, mod_avail);
+            if (mod_avail == CaptureAvailability::Complete) {
+                snapshot.modules = Observed<std::vector<ModuleInfo>>::complete(
+                    std::move(*mods_res), os_prov, mod_stamp);
+            } else {
+                const std::string detail =
+                    (session_mod_partial && !mod_st.detail.empty())
+                        ? mod_st.detail
+                        : std::string("Module query returned empty despite mapped image regions.");
+                snapshot.modules = Observed<std::vector<ModuleInfo>>::partial(
+                    std::move(*mods_res),
+                    os_prov,
+                    detail,
+                    mod_stamp);
+            }
+        } else {
+            const CaptureStamp mod_stamp =
+                CaptureStamp::capture_interval(mod_start, CaptureAvailability::Unavailable);
+            snapshot.modules = Observed<std::vector<ModuleInfo>>::unavailable(
+                os_prov, mods_res.error().message, mod_stamp);
         }
-    } else {
-        const CaptureStamp mod_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
-        snapshot.modules = Observed<std::vector<ModuleInfo>>::unavailable(
-            os_prov, mods_res.error().message, mod_stamp);
     }
 
     const std::span<const ModuleInfo> modules_span =
@@ -1485,153 +1504,160 @@ ProcessStateSnapshot capture_process_snapshot(
             : std::span<const ModuleInfo>{};
 
     // 3. Threads (with per-thread creation identity, context, bounded stack bytes & top frames)
-    if (auto threads_res = session.threads(); threads_res.has_value()) {
-        std::vector<ThreadSnapshot> thread_snaps;
-        thread_snaps.reserve(threads_res->size());
-        bool any_partial_thread_entry = false;
+    {
+        const CaptureStamp th_start = CaptureStamp::capture_now(
+            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Complete);
+        if (auto threads_res = session.threads(); threads_res.has_value()) {
+            std::vector<ThreadSnapshot> thread_snaps;
+            thread_snaps.reserve(threads_res->size());
+            bool any_partial_thread_entry = false;
 
-        for (const ThreadInfo& th : *threads_res) {
-            if (th.status.availability == Availability::Partial ||
-                th.status.availability == Availability::Unavailable) {
-                any_partial_thread_entry = true;
-            }
-            ThreadSnapshot ts{};
-            ts.info = th;
-            if (!session.is_crash_dump() &&
-                dynamic_cast<const IGdbRemoteSession*>(&session) == nullptr) {
-                ts.creation_identity = query_thread_creation_identity(session.pid(), th.tid);
-            }
+            for (const ThreadInfo& th : *threads_res) {
+                if (th.status.availability == Availability::Partial ||
+                    th.status.availability == Availability::Unavailable) {
+                    any_partial_thread_entry = true;
+                }
+                ThreadSnapshot ts{};
+                ts.info = th;
+                if (!session.is_crash_dump() &&
+                    dynamic_cast<const IGdbRemoteSession*>(&session) == nullptr) {
+                    ts.creation_identity = query_thread_creation_identity(session.pid(), th.tid);
+                }
 
-            if (options.capture_thread_contexts) {
-                ThreadContext ctx = session.thread_context(th.tid);
-                const CaptureAvailability ctx_avail =
-                    map_subsystem_availability(ctx.status.availability);
-                const CaptureStamp ctx_stamp = CaptureStamp::capture_now(
-                    snapshot.target_id, snapshot.snapshot_revision, paused, ctx_avail);
-                if (ctx_avail == CaptureAvailability::Unavailable) {
-                    ts.context = Observed<ThreadContext>::unavailable(
-                        os_prov, ctx.status.detail, ctx_stamp);
-                } else {
-                    if (!ts.info.instruction_pointer.has_value() && ctx.instruction_pointer != 0u) {
-                        ts.info.instruction_pointer = ctx.instruction_pointer;
-                    }
-                    if (!ts.info.stack_pointer.has_value() && ctx.stack_pointer != 0u) {
-                        ts.info.stack_pointer = ctx.stack_pointer;
-                    }
-                    if (ctx_avail == CaptureAvailability::Complete) {
-                        ts.context = Observed<ThreadContext>::complete(
-                            std::move(ctx), os_prov, ctx_stamp);
+                if (options.capture_thread_contexts) {
+                    const CaptureStamp ctx_start = CaptureStamp::capture_now(
+                        snapshot.target_id,
+                        snapshot.snapshot_revision,
+                        paused,
+                        CaptureAvailability::Complete);
+                    ThreadContext ctx = session.thread_context(th.tid);
+                    const CaptureAvailability ctx_avail =
+                        map_subsystem_availability(ctx.status.availability);
+                    const CaptureStamp ctx_stamp =
+                        CaptureStamp::capture_interval(ctx_start, ctx_avail);
+                    if (ctx_avail == CaptureAvailability::Unavailable) {
+                        ts.context = Observed<ThreadContext>::unavailable(
+                            os_prov, ctx.status.detail, ctx_stamp);
                     } else {
-                        const std::string detail = ctx.status.detail;
-                        ts.context = Observed<ThreadContext>::partial(
-                            std::move(ctx), os_prov, detail, ctx_stamp);
+                        if (!ts.info.instruction_pointer.has_value() && ctx.instruction_pointer != 0u) {
+                            ts.info.instruction_pointer = ctx.instruction_pointer;
+                        }
+                        if (!ts.info.stack_pointer.has_value() && ctx.stack_pointer != 0u) {
+                            ts.info.stack_pointer = ctx.stack_pointer;
+                        }
+                        if (ctx_avail == CaptureAvailability::Complete) {
+                            ts.context = Observed<ThreadContext>::complete(
+                                std::move(ctx), os_prov, ctx_stamp);
+                        } else {
+                            const std::string detail = ctx.status.detail;
+                            ts.context = Observed<ThreadContext>::partial(
+                                std::move(ctx), os_prov, detail, ctx_stamp);
+                        }
                     }
+                } else {
+                    const CaptureStamp ctx_stamp = CaptureStamp::capture_now(
+                        snapshot.target_id,
+                        snapshot.snapshot_revision,
+                        paused,
+                        CaptureAvailability::Unavailable);
+                    ts.context = Observed<ThreadContext>::unavailable(
+                        os_prov, "Thread register capture disabled by CaptureOptions.", ctx_stamp);
                 }
-            } else {
-                const CaptureStamp ctx_stamp = CaptureStamp::capture_now(
-                    snapshot.target_id,
-                    snapshot.snapshot_revision,
-                    paused,
-                    CaptureAvailability::Unavailable);
-                ts.context = Observed<ThreadContext>::unavailable(
-                    os_prov, "Thread register capture disabled by CaptureOptions.", ctx_stamp);
-            }
 
-            const std::uint64_t sp = effective_thread_sp(ts).value_or(0u);
-            if (options.capture_thread_stacks && options.max_stack_bytes_per_thread > 0u && sp != 0u) {
-                const std::uint64_t max_no_wrap = std::numeric_limits<std::uint64_t>::max() - sp;
-                std::uint64_t req_bytes = std::min<std::uint64_t>(
-                    static_cast<std::uint64_t>(options.max_stack_bytes_per_thread), max_no_wrap);
-                for (const MemoryRegion& reg : regions_span) {
-                    if (reg.contains(sp) && reg.end_address > sp) {
-                        req_bytes = std::min<std::uint64_t>(req_bytes, reg.end_address - sp);
-                        break;
+                const std::uint64_t sp = effective_thread_sp(ts).value_or(0u);
+                if (options.capture_thread_stacks && options.max_stack_bytes_per_thread > 0u && sp != 0u) {
+                    const std::uint64_t max_no_wrap = std::numeric_limits<std::uint64_t>::max() - sp;
+                    std::uint64_t req_bytes = std::min<std::uint64_t>(
+                        static_cast<std::uint64_t>(options.max_stack_bytes_per_thread), max_no_wrap);
+                    for (const MemoryRegion& reg : regions_span) {
+                        if (reg.contains(sp) && reg.end_address > sp) {
+                            req_bytes = std::min<std::uint64_t>(req_bytes, reg.end_address - sp);
+                            break;
+                        }
+                    }
+                    if (req_bytes > 0u) {
+                        ts.stack_capture_address = sp;
+                        ts.stack_bytes = read_memory_tolerant(
+                            session,
+                            regions_span,
+                            sp,
+                            static_cast<std::size_t>(req_bytes));
                     }
                 }
-                if (req_bytes > 0u) {
-                    ts.stack_capture_address = sp;
-                    ts.stack_bytes = read_memory_tolerant(
+
+                if (options.unwind_top_frames && options.max_unwind_frames > 0u &&
+                    ts.context.has_value() && !ts.context.is_unavailable()) {
+                    ThreadStackSnapshot unwound = unwind_and_inspect_stack(
                         session,
+                        *ts.context.value,
                         regions_span,
-                        sp,
-                        static_cast<std::size_t>(req_bytes));
+                        modules_span,
+                        nullptr,
+                        {},
+                        options.max_unwind_frames,
+                        0u);
+                    ts.top_frames = std::move(unwound.frames);
                 }
+
+                thread_snaps.push_back(std::move(ts));
             }
 
-            if (options.unwind_top_frames && options.max_unwind_frames > 0u &&
-                ts.context.has_value() && !ts.context.is_unavailable()) {
-                ThreadStackSnapshot unwound = unwind_and_inspect_stack(
-                    session,
-                    *ts.context.value,
-                    regions_span,
-                    modules_span,
-                    nullptr,
-                    {},
-                    options.max_unwind_frames,
-                    0u);
-                ts.top_frames = std::move(unwound.frames);
+            const SubsystemStatus th_st = session.threads_status();
+            const bool session_th_partial =
+                th_st.availability == Availability::Partial ||
+                th_st.availability == Availability::Unavailable;
+            if (session_th_partial) {
+                any_core_stream_degraded = true;
             }
-
-            thread_snaps.push_back(std::move(ts));
-        }
-
-        const SubsystemStatus th_st = session.threads_status();
-        const bool session_th_partial =
-            th_st.availability == Availability::Partial ||
-            th_st.availability == Availability::Unavailable;
-        if (session_th_partial) {
-            any_core_stream_degraded = true;
-        }
-        const CaptureAvailability th_avail =
-            (any_partial_thread_entry || session_th_partial)
-                ? CaptureAvailability::Partial
-                : CaptureAvailability::Complete;
-        const CaptureStamp th_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, th_avail);
-        if (th_avail == CaptureAvailability::Complete) {
-            snapshot.threads = Observed<std::vector<ThreadSnapshot>>::complete(
-                std::move(thread_snaps), os_prov, th_stamp);
+            const CaptureAvailability th_avail =
+                (any_partial_thread_entry || session_th_partial)
+                    ? CaptureAvailability::Partial
+                    : CaptureAvailability::Complete;
+            const CaptureStamp th_stamp = CaptureStamp::capture_interval(th_start, th_avail);
+            if (th_avail == CaptureAvailability::Complete) {
+                snapshot.threads = Observed<std::vector<ThreadSnapshot>>::complete(
+                    std::move(thread_snaps), os_prov, th_stamp);
+            } else {
+                const std::string detail =
+                    (session_th_partial && !th_st.detail.empty())
+                        ? th_st.detail
+                        : std::string("One or more thread entries reported partial metadata.");
+                snapshot.threads = Observed<std::vector<ThreadSnapshot>>::partial(
+                    std::move(thread_snaps),
+                    os_prov,
+                    detail,
+                    th_stamp);
+            }
         } else {
-            const std::string detail =
-                (session_th_partial && !th_st.detail.empty())
-                    ? th_st.detail
-                    : std::string("One or more thread entries reported partial metadata.");
-            snapshot.threads = Observed<std::vector<ThreadSnapshot>>::partial(
-                std::move(thread_snaps),
-                os_prov,
-                detail,
-                th_stamp);
+            any_core_stream_degraded = true;
+            const CaptureStamp th_stamp =
+                CaptureStamp::capture_interval(th_start, CaptureAvailability::Unavailable);
+            snapshot.threads = Observed<std::vector<ThreadSnapshot>>::unavailable(
+                os_prov, threads_res.error().message, th_stamp);
         }
-    } else {
-        any_core_stream_degraded = true;
-        const CaptureStamp th_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
-        snapshot.threads = Observed<std::vector<ThreadSnapshot>>::unavailable(
-            os_prov, threads_res.error().message, th_stamp);
     }
 
     // 4. Handles, sockets & security profile
     if (options.capture_handles_and_sockets) {
+        const CaptureStamp internals_start = CaptureStamp::capture_now(
+            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Complete);
         ProcessInternalsSnapshot internals = inspect_process_internals(session);
 
         const CaptureAvailability h_avail =
             map_subsystem_availability(internals.handles.status.availability);
-        const CaptureStamp h_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, h_avail);
+        const CaptureStamp h_stamp = CaptureStamp::capture_interval(internals_start, h_avail);
         snapshot.handles = Observed<std::vector<ProcessHandleEntry>>::from_forgiving(
             std::move(internals.handles), os_prov, h_stamp);
 
         const CaptureAvailability s_avail =
             map_subsystem_availability(internals.sockets.status.availability);
-        const CaptureStamp s_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, s_avail);
+        const CaptureStamp s_stamp = CaptureStamp::capture_interval(internals_start, s_avail);
         snapshot.sockets = Observed<std::vector<ProcessSocketEntry>>::from_forgiving(
             std::move(internals.sockets), os_prov, s_stamp);
 
         const CaptureAvailability sec_avail =
             map_subsystem_availability(internals.security.status.availability);
-        const CaptureStamp sec_stamp = CaptureStamp::capture_now(
-            snapshot.target_id, snapshot.snapshot_revision, paused, sec_avail);
+        const CaptureStamp sec_stamp = CaptureStamp::capture_interval(internals_start, sec_avail);
         snapshot.security = Observed<ProcessSecurityProfile>::from_forgiving(
             std::move(internals.security), os_prov, sec_stamp);
     } else {
@@ -1659,6 +1685,8 @@ ProcessStateSnapshot capture_process_snapshot(
             "GDB RSP read-only session does not expose remote OS launch environment.",
             env_stamp);
     } else if (options.capture_environment) {
+        const CaptureStamp env_start = CaptureStamp::capture_now(
+            snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Complete);
         RuntimeSettingsOptions rt_opts{};
         rt_opts.redaction_policy = options.environment_redaction_policy;
         rt_opts.launched_by_session = options.launched_by_session;
@@ -1670,6 +1698,8 @@ ProcessStateSnapshot capture_process_snapshot(
             rt_opts,
             &snapshot.security,
             nullptr);
+        snapshot.launch_environment.stamp = CaptureStamp::capture_interval(
+            env_start, snapshot.launch_environment.availability);
     } else {
         const CaptureStamp env_stamp = CaptureStamp::capture_now(
             snapshot.target_id, snapshot.snapshot_revision, paused, CaptureAvailability::Unavailable);
@@ -1682,9 +1712,10 @@ ProcessStateSnapshot capture_process_snapshot(
         dump_session->crash_summary().status.availability != Availability::Available) {
         any_core_stream_degraded = true;
     }
-    if (any_core_stream_degraded) {
-        snapshot.snapshot_stamp.availability = CaptureAvailability::Partial;
-    }
+    const CaptureAvailability final_snap_avail =
+        any_core_stream_degraded ? CaptureAvailability::Partial : CaptureAvailability::Complete;
+    snapshot.snapshot_stamp =
+        CaptureStamp::capture_interval(snapshot_start_stamp, final_snap_avail);
 
     (void)mem_prov;
     return snapshot;

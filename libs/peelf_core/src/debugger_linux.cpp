@@ -871,8 +871,9 @@ private:
     }
 
     void disarm_temp_step_bp_locked() noexcept {
+        // Preserve temp_step_bp_ tracking state if restoring original_bytes fails
+        // so a live trap instruction in target memory is never orphaned.
         (void)try_disarm_temp_step_bp_locked();
-        temp_step_bp_.reset();
     }
 
     [[nodiscard]] Result<void> sync_hardware_breakpoints_locked() {
@@ -909,33 +910,220 @@ private:
         return {};
     }
 
+    enum class StepOffOutcome : std::uint8_t {
+        SteppedCleanly = 0,
+        StoppedOnSignal,
+        ProcessExited,
+    };
+
+    void record_clone_event_from_stop_locked(ThreadId parent_tid, int wstatus) {
+        if (!WIFSTOPPED(wstatus) || WSTOPSIG(wstatus) != SIGTRAP) {
+            return;
+        }
+        const unsigned int ptrace_ev = (static_cast<unsigned int>(wstatus) >> 16u) & 0xFFFFu;
+        if (ptrace_ev != PTRACE_EVENT_CLONE) {
+            return;
+        }
+        unsigned long new_tid = 0UL;
+        if (::ptrace(PTRACE_GETEVENTMSG, static_cast<pid_t>(parent_tid), nullptr, &new_tid) == 0L &&
+            new_tid > 0UL) {
+            const auto cloned_tid = static_cast<ThreadId>(new_tid);
+            traced_tids_.insert(cloned_tid);
+            if (hw_plan_.dr7 != 0u) {
+                (void)apply_x86_debug_registers(cloned_tid, hw_plan_);
+            }
+            DebugEvent ev{};
+            ev.kind = DebugEventKind::ThreadCreated;
+            ev.tid = cloned_tid;
+            ev.summary = std::format("Thread {} created", cloned_tid);
+            push_event_locked(std::move(ev));
+        }
+    }
+
+    void stop_all_sibling_threads_locked(ThreadId already_stopped_tid) {
+        if (pid_ == 0u || traced_tids_.size() <= 1u) {
+            return;
+        }
+
+        std::vector<ThreadId> pending;
+        pending.reserve(traced_tids_.size());
+        const std::vector<ThreadId> initial_siblings(traced_tids_.begin(), traced_tids_.end());
+
+        for (ThreadId sib : initial_siblings) {
+            if (sib == already_stopped_tid) {
+                continue;
+            }
+            int sw = 0;
+            const pid_t got = ::waitpid(static_cast<pid_t>(sib), &sw, __WALL | WNOHANG);
+            if (got == static_cast<pid_t>(sib)) {
+                if (WIFEXITED(sw) || WIFSIGNALED(sw)) {
+                    traced_tids_.erase(sib);
+                } else {
+                    record_clone_event_from_stop_locked(sib, sw);
+                }
+                continue;
+            }
+            if (got < 0 && errno != EINTR) {
+                traced_tids_.erase(sib);
+                continue;
+            }
+            if (::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(sib), SIGSTOP) == 0 ||
+                errno != ESRCH) {
+                pending.push_back(sib);
+            } else {
+                traced_tids_.erase(sib);
+            }
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
+        while (!pending.empty() && std::chrono::steady_clock::now() < deadline) {
+            std::size_t idx = 0u;
+            while (idx < pending.size()) {
+                const ThreadId sib = pending[idx];
+                int sw = 0;
+                const pid_t got = ::waitpid(static_cast<pid_t>(sib), &sw, __WALL | WNOHANG);
+                if (got == static_cast<pid_t>(sib)) {
+                    if (WIFEXITED(sw) || WIFSIGNALED(sw)) {
+                        traced_tids_.erase(sib);
+                    } else {
+                        const std::size_t before_sz = traced_tids_.size();
+                        record_clone_event_from_stop_locked(sib, sw);
+                        if (traced_tids_.size() > before_sz) {
+                            for (ThreadId t : traced_tids_) {
+                                if (t != already_stopped_tid && t != sib &&
+                                    std::ranges::find(pending, t) == pending.end()) {
+                                    (void)::syscall(
+                                        SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(t), SIGSTOP);
+                                    pending.push_back(t);
+                                }
+                            }
+                        }
+                    }
+                    pending[idx] = pending.back();
+                    pending.pop_back();
+                    continue;
+                }
+                if (got < 0 && errno != EINTR) {
+                    traced_tids_.erase(sib);
+                    pending[idx] = pending.back();
+                    pending.pop_back();
+                    continue;
+                }
+                ++idx;
+            }
+            if (!pending.empty()) {
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }
+    }
+
+    [[nodiscard]] pid_t poll_tracee_wait_event_locked(int& out_wstatus) {
+        if (traced_tids_.empty()) {
+            errno = ECHILD;
+            return -1;
+        }
+
+        const std::vector<ThreadId> snapshot(traced_tids_.begin(), traced_tids_.end());
+        const std::size_t n = snapshot.size();
+        const std::size_t start = wait_poll_cursor_ % n;
+        ++wait_poll_cursor_;
+
+        std::size_t echild_count = 0u;
+        for (std::size_t step = 0u; step < n; ++step) {
+            const ThreadId tid = snapshot[(start + step) % n];
+            const pid_t got = ::waitpid(static_cast<pid_t>(tid), &out_wstatus, __WALL | WNOHANG);
+            if (got > 0) {
+                return got;
+            }
+            if (got < 0 && errno == ECHILD) {
+                ++echild_count;
+            }
+        }
+
+        for (ThreadId proc_tid : list_proc_tids(pid_)) {
+            if (traced_tids_.contains(proc_tid)) {
+                continue;
+            }
+            const pid_t got = ::waitpid(static_cast<pid_t>(proc_tid), &out_wstatus, __WALL | WNOHANG);
+            if (got > 0) {
+                traced_tids_.insert(proc_tid);
+                return got;
+            }
+        }
+
+        if (echild_count == n) {
+            errno = ECHILD;
+            return -1;
+        }
+        return 0;
+    }
+
     /// Steps `tid` across an armed software breakpoint currently sitting at `ip`, restoring
     /// original bytes -> `PTRACE_SINGLESTEP` -> re-arming the software trap!
-    /// Returns `true` if the process exited during that single instruction.
-    [[nodiscard]] Result<bool> step_past_breakpoint_at_ip_locked(ThreadId tid, BreakpointDescriptor& bp) {
+    /// If the stepped instruction raises a synchronous fault/signal instead of `SIGTRAP`,
+    /// re-inserts the breakpoint byte and reports that signal event immediately.
+    [[nodiscard]] Result<StepOffOutcome> step_past_breakpoint_at_ip_locked(ThreadId tid,
+                                                                           BreakpointDescriptor& bp) {
         if (auto dr = disarm_software_bp_locked(bp); !dr.has_value()) {
             return std::unexpected(dr.error());
         }
 
         if (::ptrace(PTRACE_SINGLESTEP, static_cast<pid_t>(tid), nullptr, reinterpret_cast<void*>(0L)) == -1L) {
-            (void)arm_software_bp_locked(bp);
-            return make_error(std::format("PTRACE_SINGLESTEP failed on TID {}: {}", tid, std::strerror(errno)));
+            const int err = errno;
+            if (bp.enabled) {
+                (void)arm_software_bp_locked(bp);
+            }
+            return make_error(std::format("PTRACE_SINGLESTEP failed on TID {}: {}", tid, std::strerror(err)));
         }
 
         int wstatus = 0;
-        if (::waitpid(static_cast<pid_t>(tid), &wstatus, __WALL) < 0) {
-            return make_error(std::format("waitpid after single-step failed: {}", std::strerror(errno)));
+        pid_t got = 0;
+        do {
+            got = ::waitpid(static_cast<pid_t>(tid), &wstatus, __WALL);
+        } while (got < 0 && errno == EINTR);
+        if (got < 0) {
+            const int err = errno;
+            if (bp.enabled) {
+                (void)arm_software_bp_locked(bp);
+            }
+            return make_error(std::format("waitpid after single-step failed: {}", std::strerror(err)));
         }
 
         if (WIFEXITED(wstatus) || WIFSIGNALED(wstatus)) {
             handle_process_exit_locked(wstatus);
-            return true;
+            return StepOffOutcome::ProcessExited;
         }
 
         if (bp.enabled) {
             (void)arm_software_bp_locked(bp);
         }
-        return false;
+
+        if (WIFSTOPPED(wstatus)) {
+            const int sig = WSTOPSIG(wstatus);
+            if (sig != SIGTRAP) {
+                disarm_temp_step_bp_locked();
+                stop_all_sibling_threads_locked(tid);
+                active_tid_ = tid;
+                last_stop_signal_ = (sig != SIGSTOP) ? sig : 0;
+                refresh_paused_snapshot_locked();
+                DebugEvent ev{};
+                ev.kind = DebugEventKind::ExceptionOrSignal;
+                ev.tid = tid;
+                ev.address = stop_status_.instruction_pointer;
+                ev.signal_or_exception_code = sig;
+                ev.summary = std::format(
+                    "Signal {} ({}) raised while stepping off breakpoint #{} at 0x{:X}",
+                    signal_short_name(sig),
+                    sig,
+                    bp.id,
+                    stop_status_.instruction_pointer);
+                push_event_locked(std::move(ev));
+                state_.store(DebugSessionState::Paused, std::memory_order_release);
+                state_cv_.notify_all();
+                return StepOffOutcome::StoppedOnSignal;
+            }
+        }
+        return StepOffOutcome::SteppedCleanly;
     }
 
     void handle_process_exit_locked(int wstatus) {
@@ -985,10 +1173,14 @@ private:
         if (sig == SIGTRAP && ptrace_ev == PTRACE_EVENT_CLONE) {
             unsigned long new_tid = 0UL;
             if (::ptrace(PTRACE_GETEVENTMSG, static_cast<pid_t>(stopped_tid), nullptr, &new_tid) == 0L && new_tid > 0UL) {
-                traced_tids_.insert(static_cast<ThreadId>(new_tid));
+                const auto cloned_tid = static_cast<ThreadId>(new_tid);
+                traced_tids_.insert(cloned_tid);
+                if (hw_plan_.dr7 != 0u) {
+                    (void)apply_x86_debug_registers(cloned_tid, hw_plan_);
+                }
                 DebugEvent ev{};
                 ev.kind = DebugEventKind::ThreadCreated;
-                ev.tid = static_cast<ThreadId>(new_tid);
+                ev.tid = cloned_tid;
                 ev.summary = std::format("Thread {} created", new_tid);
                 push_event_locked(std::move(ev));
             }
@@ -1006,6 +1198,7 @@ private:
             return;
         }
 
+        stop_all_sibling_threads_locked(stopped_tid);
         last_stop_signal_ = 0;
 
         auto ctx_res = read_ptrace_thread_context(stopped_tid);
@@ -1140,8 +1333,8 @@ private:
                 if (!stepped.has_value()) {
                     return std::unexpected(stepped.error());
                 }
-                if (*stepped) {
-                    return {};  // Exited during single instruction
+                if (*stepped != StepOffOutcome::SteppedCleanly) {
+                    return {};
                 }
             }
         }
@@ -1174,10 +1367,15 @@ private:
         }
 
         const ThreadId target_tid = active_tid_ != 0u ? active_tid_ : pid_;
-        (void)::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(target_tid), SIGSTOP);
+        if (::syscall(SYS_tgkill, static_cast<pid_t>(pid_), static_cast<pid_t>(target_tid), SIGSTOP) != 0) {
+            return make_error(std::format("tgkill(SIGSTOP) failed: {}", std::strerror(errno)));
+        }
 
         int wstatus = 0;
-        const pid_t got = ::waitpid(static_cast<pid_t>(target_tid), &wstatus, __WALL);
+        pid_t got = 0;
+        do {
+            got = ::waitpid(static_cast<pid_t>(target_tid), &wstatus, __WALL);
+        } while (got < 0 && errno == EINTR);
         if (got < 0) {
             return make_error(std::format("waitpid during pause failed: {}", std::strerror(errno)));
         }
@@ -1187,6 +1385,7 @@ private:
             return {};
         }
 
+        stop_all_sibling_threads_locked(static_cast<ThreadId>(got));
         disarm_temp_step_bp_locked();
         active_tid_ = static_cast<ThreadId>(got);
         last_stop_signal_ = 0;
@@ -1222,7 +1421,7 @@ private:
             if (!stepped.has_value()) {
                 return std::unexpected(stepped.error());
             }
-            if (*stepped) {
+            if (*stepped != StepOffOutcome::SteppedCleanly) {
                 return {};
             }
         } else {
@@ -1285,7 +1484,9 @@ private:
 
     [[nodiscard]] Result<void> arm_temp_breakpoint_and_continue_locked(ThreadId tid,
                                                                        std::uint64_t target_va) {
-        disarm_temp_step_bp_locked();
+        if (auto dr = try_disarm_temp_step_bp_locked(); !dr.has_value()) {
+            return dr;
+        }
 
         // Only inject temp trap if no user software breakpoint is already armed at `target_va`.
         if (find_armed_software_bp_locked(target_va) == nullptr) {
@@ -1316,7 +1517,7 @@ private:
                     disarm_temp_step_bp_locked();
                     return std::unexpected(stepped.error());
                 }
-                if (*stepped) {
+                if (*stepped != StepOffOutcome::SteppedCleanly) {
                     return {};
                 }
                 // Check if that single instruction already reached `target_va`!
@@ -1541,7 +1742,9 @@ private:
         }
         const bool was_hw = is_hardware_breakpoint(it->kind);
         if (!was_hw) {
-            (void)disarm_software_bp_locked(*it);
+            if (auto dr = disarm_software_bp_locked(*it); !dr.has_value()) {
+                return dr;
+            }
         }
         breakpoints_.erase(it);
         if (was_hw) {
@@ -1564,11 +1767,26 @@ private:
         if (it->enabled == enabled) {
             return {};
         }
-        it->enabled = enabled;
         if (is_hardware_breakpoint(it->kind)) {
-            return sync_hardware_breakpoints_locked();
+            it->enabled = enabled;
+            if (auto sr = sync_hardware_breakpoints_locked(); !sr.has_value()) {
+                it->enabled = !enabled;
+                return sr;
+            }
+            return {};
         }
-        return enabled ? arm_software_bp_locked(*it) : disarm_software_bp_locked(*it);
+        if (enabled) {
+            if (auto ar = arm_software_bp_locked(*it); !ar.has_value()) {
+                return ar;
+            }
+            it->enabled = true;
+            return {};
+        }
+        if (auto dr = disarm_software_bp_locked(*it); !dr.has_value()) {
+            return dr;
+        }
+        it->enabled = false;
+        return {};
     }
 
     [[nodiscard]] Result<void> tracer_write_register(
@@ -1981,7 +2199,7 @@ private:
                     // Non-blocking poll for tracee stops + adaptive wait so step/breakpoint hits
                     // complete in microseconds while steady-state running uses ~0% CPU!
                     int wstatus = 0;
-                    const pid_t stopped = ::waitpid(-1, &wstatus, __WALL | WNOHANG);
+                    const pid_t stopped = poll_tracee_wait_event_locked(wstatus);
                     if (stopped > 0) {
                         handle_wait_event_locked(static_cast<ThreadId>(stopped), wstatus);
                         continue;
@@ -2043,6 +2261,7 @@ private:
     ProcessInfo fallback_info_{};
     std::unique_ptr<IProcessSession> inner_session_{};
     std::set<ThreadId> traced_tids_{};
+    std::size_t wait_poll_cursor_{0};
     std::unordered_map<ThreadId, ThreadContext> paused_contexts_{};
     std::vector<ThreadInfo> paused_threads_{};
 

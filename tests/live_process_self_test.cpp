@@ -11,7 +11,11 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <csignal>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -135,5 +139,103 @@ TEST(LiveSelfProcess, ReadsAnonymousReadExecuteRegionAndEnforcesReadOnly) {
     EXPECT_EQ(reinterpret_cast<const volatile std::uint8_t*>(page)[0], 0x90u);
 
     ::munmap(page, static_cast<std::size_t>(page_sz));
+}
+
+TEST(LiveSelfProcess, RejectsForeignThreadIdAndPreservesPreExistingJobControlStop) {
+    int hold_pipe[2]{-1, -1};
+    int ready_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(hold_pipe), 0);
+    ASSERT_EQ(::pipe(ready_pipe), 0);
+
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(hold_pipe[1]);
+        ::close(ready_pipe[0]);
+#ifdef PR_SET_PTRACER
+        (void)::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
+        const char r = 'R';
+        (void)::write(ready_pipe[1], &r, 1);
+        ::close(ready_pipe[1]);
+
+        char ch = 0;
+        (void)::read(hold_pipe[0], &ch, 1);
+        ::close(hold_pipe[0]);
+        ::_exit(0);
+    }
+
+    ::close(hold_pipe[0]);
+    ::close(ready_pipe[1]);
+
+    struct ScopedHelperChild {
+        pid_t pid{-1};
+        int hold_fd{-1};
+
+        ScopedHelperChild(pid_t p, int fd) noexcept : pid(p), hold_fd(fd) {}
+        ScopedHelperChild(const ScopedHelperChild&) = delete;
+        ScopedHelperChild& operator=(const ScopedHelperChild&) = delete;
+        ScopedHelperChild(ScopedHelperChild&&) = delete;
+        ScopedHelperChild& operator=(ScopedHelperChild&&) = delete;
+
+        ~ScopedHelperChild() {
+            if (hold_fd >= 0) {
+                ::close(hold_fd);
+            }
+            if (pid > 0) {
+                (void)::kill(pid, SIGCONT);
+                (void)::kill(pid, SIGKILL);
+                int st = 0;
+                (void)::waitpid(pid, &st, 0);
+            }
+        }
+    } guard{child, hold_pipe[1]};
+
+    char ready_ch = 0;
+    ASSERT_EQ(::read(ready_pipe[0], &ready_ch, 1), 1);
+    ::close(ready_pipe[0]);
+
+    auto backend = peelf::create_native_process_backend();
+    auto opened = backend->open_process(static_cast<peelf::ProcessId>(child));
+    ASSERT_TRUE(opened.has_value()) << opened.error().message;
+    peelf::IProcessSession& sess = **opened;
+
+    // Our own thread ID is a real OS TID, but does NOT belong to `child` (`pid_`):
+    const auto foreign_tid = static_cast<peelf::ThreadId>(::syscall(SYS_gettid));
+    ASSERT_NE(foreign_tid, static_cast<peelf::ThreadId>(child));
+
+    const auto bad_suspend = sess.suspend_thread(foreign_tid);
+    ASSERT_FALSE(bad_suspend.has_value());
+    EXPECT_NE(bad_suspend.error().message.find("not found in target process"), std::string::npos)
+        << bad_suspend.error().message;
+
+    const auto bad_resume = sess.resume_thread(foreign_tid);
+    ASSERT_FALSE(bad_resume.has_value());
+    EXPECT_NE(bad_resume.error().message.find("not found in target process"), std::string::npos)
+        << bad_resume.error().message;
+
+    const peelf::ThreadContext bad_ctx = sess.thread_context(foreign_tid);
+    EXPECT_FALSE(bad_ctx.status.ok());
+
+    // Place `child` into job-control stop ('T') BEFORE pause/suspend, then verify
+    // suspend() + resume() does NOT send SIGCONT to wake it prematurely.
+    ASSERT_EQ(::kill(child, SIGSTOP), 0);
+    int stop_st = 0;
+    ASSERT_EQ(::waitpid(child, &stop_st, WUNTRACED), child);
+    ASSERT_TRUE(WIFSTOPPED(stop_st));
+
+    if (auto sr = sess.suspend(); sr.has_value()) {
+        ASSERT_TRUE(sess.resume().has_value());
+        int cont_st = 0;
+        EXPECT_EQ(::waitpid(child, &cont_st, WNOHANG | WCONTINUED), 0);
+    }
+
+    ASSERT_EQ(::kill(child, SIGCONT), 0);
+    ::close(guard.hold_fd);
+    guard.hold_fd = -1;
+    int exit_st = 0;
+    ASSERT_EQ(::waitpid(child, &exit_st, 0), child);
+    guard.pid = -1;
+    EXPECT_TRUE(WIFEXITED(exit_st));
 }
 #endif

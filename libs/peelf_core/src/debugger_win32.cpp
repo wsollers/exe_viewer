@@ -453,7 +453,220 @@ private:
         return ht;
     }
 
+    HANDLE register_debug_thread_handle_locked(ThreadId tid, HANDLE raw_event_handle) {
+        if (const auto it = thread_handles_.find(tid);
+            it != thread_handles_.end() && it->second != nullptr) {
+            return it->second;
+        }
+        if (raw_event_handle != nullptr) {
+            HANDLE dup = nullptr;
+            if (::DuplicateHandle(::GetCurrentProcess(),
+                                  raw_event_handle,
+                                  ::GetCurrentProcess(),
+                                  &dup,
+                                  THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
+                                      THREAD_SUSPEND_RESUME | THREAD_QUERY_INFORMATION,
+                                  FALSE,
+                                  0) &&
+                dup != nullptr) {
+                thread_handles_[tid] = dup;
+                return dup;
+            }
+        }
+        return open_or_find_thread_locked(tid);
+    }
+
 #if defined(_M_X64) || defined(__x86_64__)
+    [[nodiscard]] Result<void> apply_win_hw_plan_to_thread_locked(ThreadId tid, HANDLE ht) {
+        if (ht == nullptr) {
+            return make_error(std::format("Null thread handle for TID {}", tid));
+        }
+        DWORD exit_code = 0;
+        if (::GetExitCodeThread(ht, &exit_code) && exit_code != STILL_ACTIVE) {
+            return {};
+        }
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!::GetThreadContext(ht, &ctx)) {
+            return make_error(std::format("GetThreadContext(TID {}) failed (Win32 error {})",
+                                          tid,
+                                          ::GetLastError()));
+        }
+        ctx.Dr0 = hw_plan_.slot_used[0] ? hw_plan_.dr_address[0] : 0ULL;
+        ctx.Dr1 = hw_plan_.slot_used[1] ? hw_plan_.dr_address[1] : 0ULL;
+        ctx.Dr2 = hw_plan_.slot_used[2] ? hw_plan_.dr_address[2] : 0ULL;
+        ctx.Dr3 = hw_plan_.slot_used[3] ? hw_plan_.dr_address[3] : 0ULL;
+        ctx.Dr6 = 0ULL;
+        ctx.Dr7 = hw_plan_.dr7;
+        if (!::SetThreadContext(ht, &ctx)) {
+            return make_error(std::format("SetThreadContext(TID {}) failed (Win32 error {})",
+                                          tid,
+                                          ::GetLastError()));
+        }
+        return {};
+    }
+
+    [[nodiscard]] std::optional<std::uint8_t> consume_win_hw_triggered_slot_locked(ThreadId tid) {
+        if (hw_plan_.dr7 == 0u) {
+            return std::nullopt;
+        }
+        HANDLE ht = open_or_find_thread_locked(tid);
+        if (ht == nullptr) {
+            return std::nullopt;
+        }
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+        if (!::GetThreadContext(ht, &ctx)) {
+            return std::nullopt;
+        }
+        const auto slot = match_x86_dr6_triggered_slot(ctx.Dr6, hw_plan_);
+        if (slot.has_value()) {
+            ctx.Dr6 = 0ULL;
+            (void)::SetThreadContext(ht, &ctx);
+        }
+        return slot;
+    }
+
+    [[nodiscard]] bool is_win_executable_va_locked(std::uint64_t va) const noexcept {
+        if (process_handle_ == nullptr || va == 0u) {
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION mbi{};
+        const SIZE_T got = ::VirtualQueryEx(
+            process_handle_,
+            reinterpret_cast<LPCVOID>(static_cast<std::uintptr_t>(va)),
+            &mbi,
+            sizeof(mbi));
+        if (got == 0u || mbi.State != MEM_COMMIT) {
+            return false;
+        }
+        const DWORD p = mbi.Protect & 0xFFu;
+        return p == PAGE_EXECUTE || p == PAGE_EXECUTE_READ ||
+               p == PAGE_EXECUTE_READWRITE || p == PAGE_EXECUTE_WRITECOPY;
+    }
+
+    [[nodiscard]] Result<std::uint64_t> resolve_win_caller_return_va_locked(ThreadId tid) {
+        HANDLE ht = open_or_find_thread_locked(tid);
+        if (ht == nullptr) {
+            return make_error(std::format("OpenThread(TID {}) failed for step_out", tid));
+        }
+
+        const bool is_wow64_32 = (target_arch_ == Architecture::X86);
+        if (is_wow64_32) {
+            WOW64_CONTEXT wctx{};
+            wctx.ContextFlags = WOW64_CONTEXT_CONTROL;
+            if (!::Wow64GetThreadContext(ht, &wctx)) {
+                return make_error(std::format("Wow64GetThreadContext failed (Win32 error {})",
+                                              ::GetLastError()));
+            }
+            auto read_u32_va = [this](std::uint64_t addr) -> std::uint64_t {
+                std::array<std::uint8_t, 4> buf{};
+                if (!win32_read_process_bytes(process_handle_, addr, buf).has_value()) {
+                    return 0u;
+                }
+                const EndianReader rd(buf, Endianness::Little, AddressWidth::Bits32);
+                return rd.read_u32(0u).value_or(0u);
+            };
+
+            if (wctx.Ebp != 0u && wctx.Ebp >= wctx.Esp &&
+                (wctx.Ebp - wctx.Esp) <= (1u << 20u)) {
+                const std::uint64_t fp_ret = read_u32_va(static_cast<std::uint64_t>(wctx.Ebp) + 4u);
+                if (is_win_executable_va_locked(fp_ret)) {
+                    return fp_ret;
+                }
+            }
+            if (wctx.Esp != 0u) {
+                const std::uint64_t sp_ret = read_u32_va(wctx.Esp);
+                if (is_win_executable_va_locked(sp_ret)) {
+                    return sp_ret;
+                }
+            }
+            return make_error("Unable to determine 32-bit caller return address for step_out");
+        }
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        if (!::GetThreadContext(ht, &ctx)) {
+            return make_error(std::format("GetThreadContext failed (Win32 error {})",
+                                          ::GetLastError()));
+        }
+
+        auto read_u64_va = [this](std::uint64_t addr) -> std::uint64_t {
+            std::array<std::uint8_t, 8> buf{};
+            if (!win32_read_process_bytes(process_handle_, addr, buf).has_value()) {
+                return 0u;
+            }
+            const EndianReader rd(buf, Endianness::Little, AddressWidth::Bits64);
+            return rd.read_u64(0u).value_or(0u);
+        };
+
+        auto is_after_call_va = [this](std::uint64_t cand) -> bool {
+            if (!is_win_executable_va_locked(cand) || cand < 2u) {
+                return false;
+            }
+            // Check preceding 2..7 bytes for a decoded CALL ending exactly at `cand`.
+            for (std::size_t back = 2u; back <= 7u && back <= cand; ++back) {
+                std::array<std::uint8_t, 8> prev{};
+                const std::uint64_t call_va = cand - back;
+                if (!win32_read_process_bytes(
+                         process_handle_, call_va, std::span<std::uint8_t>(prev.data(), back))
+                         .has_value()) {
+                    continue;
+                }
+                apply_software_breakpoint_shadow_filter(
+                    call_va, std::span<std::uint8_t>(prev.data(), back), breakpoints_);
+                const auto ft = compute_step_over_fallthrough(
+                    Architecture::X86_64,
+                    Endianness::Little,
+                    call_va,
+                    std::span<const std::uint8_t>(prev.data(), back),
+                    false);
+                if (ft.has_value() && *ft == cand) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // 1. At function entry / leaf function, [Rsp] holds the immediate return address.
+        if (ctx.Rsp != 0u) {
+            const std::uint64_t top_ret = read_u64_va(ctx.Rsp);
+            if (is_after_call_va(top_ret)) {
+                return top_ret;
+            }
+        }
+
+        // 2. Frame-pointer chain ([Rbp + 8]) when Rbp lies within the active stack window.
+        if (ctx.Rbp != 0u && ctx.Rbp >= ctx.Rsp &&
+            (ctx.Rbp - ctx.Rsp) <= (1ULL << 20u) && (ctx.Rbp & 0x7ULL) == 0ULL &&
+            ctx.Rbp <= std::numeric_limits<std::uint64_t>::max() - 8ULL) {
+            const std::uint64_t fp_ret = read_u64_va(ctx.Rbp + 8ULL);
+            if (is_win_executable_va_locked(fp_ret)) {
+                return fp_ret;
+            }
+        }
+
+        // 3. Frame-pointer-omitted Win64 frames: scan aligned stack slots for a CALL return site.
+        if (ctx.Rsp != 0u) {
+            for (std::size_t slot = 1u; slot <= 64u; ++slot) {
+                const std::uint64_t off = static_cast<std::uint64_t>(slot) * 8ULL;
+                if (ctx.Rsp > std::numeric_limits<std::uint64_t>::max() - off) {
+                    break;
+                }
+                const std::uint64_t cand = read_u64_va(ctx.Rsp + off);
+                if (is_after_call_va(cand)) {
+                    return cand;
+                }
+            }
+            const std::uint64_t top_fallback = read_u64_va(ctx.Rsp);
+            if (is_win_executable_va_locked(top_fallback)) {
+                return top_fallback;
+            }
+        }
+
+        return make_error("Unable to determine caller return address for step_out");
+    }
+
     [[nodiscard]] std::uint64_t read_win_ip_locked(ThreadId tid) {
         HANDLE ht = open_or_find_thread_locked(tid);
         if (ht == nullptr) return 0u;
@@ -488,20 +701,22 @@ private:
         hw_plan_ = *plan.value;
         for (auto& [tid, ht] : thread_handles_) {
             if (ht == nullptr) continue;
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (!::GetThreadContext(ht, &ctx)) continue;
-            ctx.Dr0 = hw_plan_.slot_used[0] ? hw_plan_.dr_address[0] : 0ULL;
-            ctx.Dr1 = hw_plan_.slot_used[1] ? hw_plan_.dr_address[1] : 0ULL;
-            ctx.Dr2 = hw_plan_.slot_used[2] ? hw_plan_.dr_address[2] : 0ULL;
-            ctx.Dr3 = hw_plan_.slot_used[3] ? hw_plan_.dr_address[3] : 0ULL;
-            ctx.Dr6 = 0ULL;
-            ctx.Dr7 = hw_plan_.dr7;
-            (void)::SetThreadContext(ht, &ctx);
+            if (auto r = apply_win_hw_plan_to_thread_locked(tid, ht); !r.has_value()) {
+                return r;
+            }
         }
         return {};
     }
 #else
+    [[nodiscard]] Result<void> apply_win_hw_plan_to_thread_locked(ThreadId, HANDLE) {
+        return make_error("Hardware breakpoints unsupported on non-x64 Win32 build");
+    }
+    [[nodiscard]] std::optional<std::uint8_t> consume_win_hw_triggered_slot_locked(ThreadId) {
+        return std::nullopt;
+    }
+    [[nodiscard]] Result<std::uint64_t> resolve_win_caller_return_va_locked(ThreadId) {
+        return make_error("step_out unsupported on non-x64 Win32 build");
+    }
     [[nodiscard]] std::uint64_t read_win_ip_locked(ThreadId) { return 0u; }
     [[nodiscard]] Result<void> set_win_ip_and_tf_locked(ThreadId, std::optional<std::uint64_t>, bool) {
         return make_error("Unsupported Win32 host CPU architecture");
@@ -607,8 +822,9 @@ private:
     }
 
     void disarm_temp_bp_locked() noexcept {
+        // Preserve temp_step_bp_ tracking if restoring original_bytes fails so a live
+        // trap byte in target memory is never orphaned.
         (void)try_disarm_temp_bp_locked();
-        temp_step_bp_.reset();
     }
 
     [[nodiscard]] Result<void> loop_continue(bool pass_exception) {
@@ -697,29 +913,54 @@ private:
         }
 
         std::lock_guard<std::mutex> lk(mutex_);
-        disarm_temp_bp_locked();
-        if (find_armed_sw_bp_locked(*fallthrough) == nullptr) {
-            if (const auto trap = select_software_trap(target_arch_, Endianness::Little, false); trap.has_value()) {
-                InternalTempBp tmp{};
-                tmp.address = *fallthrough;
-                tmp.trap = *trap;
-                tmp.original_bytes.resize(trap->size);
-                if (win32_read_process_bytes(process_handle_, *fallthrough, tmp.original_bytes).has_value() &&
-                    win32_write_process_bytes(process_handle_, *fallthrough, trap->span()).has_value()) {
-                    tmp.armed = true;
-                    temp_step_bp_ = std::move(tmp);
-                }
+        return arm_temp_bp_and_continue_win_locked(tid, ip, *fallthrough);
+    }
+
+    [[nodiscard]] Result<void> arm_temp_bp_and_continue_win_locked(ThreadId tid,
+                                                                   std::uint64_t ip,
+                                                                   std::uint64_t target_va) {
+        if (auto dr = try_disarm_temp_bp_locked(); !dr.has_value()) {
+            return dr;
+        }
+        if (find_armed_sw_bp_locked(target_va) == nullptr) {
+            const auto trap = select_software_trap(target_arch_, Endianness::Little, false);
+            if (!trap.has_value()) {
+                return std::unexpected(trap.error());
             }
+            InternalTempBp tmp{};
+            tmp.address = target_va;
+            tmp.trap = *trap;
+            tmp.original_bytes.resize(trap->size);
+            if (auto rr = win32_read_process_bytes(process_handle_, target_va, tmp.original_bytes);
+                !rr.has_value()) {
+                return rr;
+            }
+            if (auto wr = win32_write_process_bytes(process_handle_, target_va, trap->span());
+                !wr.has_value()) {
+                return wr;
+            }
+            tmp.armed = true;
+            temp_step_bp_ = std::move(tmp);
         }
         if (BreakpointDescriptor* bp = find_armed_sw_bp_locked(ip); bp != nullptr) {
-            (void)disarm_sw_bp_locked(*bp);
-            (void)set_win_ip_and_tf_locked(tid, std::nullopt, true);
+            if (auto dr = disarm_sw_bp_locked(*bp); !dr.has_value()) {
+                disarm_temp_bp_locked();
+                return dr;
+            }
+            if (auto sr = set_win_ip_and_tf_locked(tid, std::nullopt, true); !sr.has_value()) {
+                if (bp->enabled) {
+                    (void)arm_sw_bp_locked(*bp);
+                }
+                disarm_temp_bp_locked();
+                return sr;
+            }
             rearm_bp_id_after_step_ = bp->id;
             stop_after_rearm_step_ = false;
         }
         if (!::ContinueDebugEvent(static_cast<DWORD>(pid_), static_cast<DWORD>(tid), DBG_CONTINUE)) {
+            const DWORD err = ::GetLastError();
             disarm_temp_bp_locked();
-            return make_error("ContinueDebugEvent failed");
+            return make_error(std::format("ContinueDebugEvent failed (Win32 error {})", err));
         }
         state_.store(DebugSessionState::Running, std::memory_order_release);
         state_cv_.notify_all();
@@ -727,7 +968,18 @@ private:
     }
 
     [[nodiscard]] Result<void> loop_step_out(std::optional<ThreadId> req_tid) {
-        return loop_step_over(req_tid);
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (state_.load(std::memory_order_acquire) != DebugSessionState::Paused) {
+            return make_error("step_out requires Paused state");
+        }
+        const ThreadId tid = req_tid.value_or(active_tid_);
+        active_tid_ = tid;
+        const std::uint64_t ip = read_win_ip_locked(tid);
+        const auto return_va = resolve_win_caller_return_va_locked(tid);
+        if (!return_va.has_value()) {
+            return std::unexpected(return_va.error());
+        }
+        return arm_temp_bp_and_continue_win_locked(tid, ip, *return_va);
     }
 
     [[nodiscard]] Result<BreakpointDescriptor> loop_add_software_bp(
@@ -737,6 +989,11 @@ private:
         std::lock_guard<std::mutex> lk(mutex_);
         if (state_.load(std::memory_order_acquire) != DebugSessionState::Paused) {
             return make_error("Pause debuggee before adding software breakpoint");
+        }
+        for (const BreakpointDescriptor& existing : breakpoints_) {
+            if (existing.kind == BreakpointKind::Software && existing.address == address) {
+                return existing;
+            }
         }
         const auto trap = select_software_trap(target_arch_, Endianness::Little, thumb_mode);
         if (!trap.has_value()) return std::unexpected(trap.error());
@@ -789,21 +1046,45 @@ private:
 
     [[nodiscard]] Result<void> loop_remove_bp(BreakpointId id) {
         std::lock_guard<std::mutex> lk(mutex_);
+        if (state_.load(std::memory_order_acquire) != DebugSessionState::Paused) {
+            return make_error("Pause debuggee before removing breakpoint");
+        }
         const auto it = std::ranges::find_if(breakpoints_, [id](const BreakpointDescriptor& b) { return b.id == id; });
         if (it == breakpoints_.end()) return make_error("Breakpoint not found");
         const bool hw = is_hardware_breakpoint(it->kind);
-        if (!hw) (void)disarm_sw_bp_locked(*it);
+        if (!hw) {
+            if (auto dr = disarm_sw_bp_locked(*it); !dr.has_value()) {
+                return dr;
+            }
+        }
         breakpoints_.erase(it);
         return hw ? apply_win_hw_plan_locked() : Result<void>{};
     }
 
     [[nodiscard]] Result<void> loop_enable_bp(BreakpointId id, bool enabled) {
         std::lock_guard<std::mutex> lk(mutex_);
+        if (state_.load(std::memory_order_acquire) != DebugSessionState::Paused) {
+            return make_error("Pause debuggee before toggling breakpoint");
+        }
         const auto it = std::ranges::find_if(breakpoints_, [id](const BreakpointDescriptor& b) { return b.id == id; });
         if (it == breakpoints_.end()) return make_error("Breakpoint not found");
-        it->enabled = enabled;
-        if (is_hardware_breakpoint(it->kind)) return apply_win_hw_plan_locked();
-        return enabled ? arm_sw_bp_locked(*it) : disarm_sw_bp_locked(*it);
+        if (it->enabled == enabled) return {};
+        if (is_hardware_breakpoint(it->kind)) {
+            it->enabled = enabled;
+            if (auto r = apply_win_hw_plan_locked(); !r.has_value()) {
+                it->enabled = !enabled;
+                return r;
+            }
+            return {};
+        }
+        if (enabled) {
+            if (auto r = arm_sw_bp_locked(*it); !r.has_value()) return r;
+            it->enabled = true;
+            return {};
+        }
+        if (auto r = disarm_sw_bp_locked(*it); !r.has_value()) return r;
+        it->enabled = false;
+        return {};
     }
 
     [[nodiscard]] Result<void> loop_write_register(ThreadId tid,
@@ -1101,6 +1382,11 @@ private:
                 if (dev.u.CreateProcessInfo.hFile != nullptr) {
                     ::CloseHandle(dev.u.CreateProcessInfo.hFile);
                 }
+                HANDLE ht = register_debug_thread_handle_locked(
+                    dev.dwThreadId, dev.u.CreateProcessInfo.hThread);
+                if (ht != nullptr && hw_plan_.dr7 != 0u) {
+                    (void)apply_win_hw_plan_to_thread_locked(dev.dwThreadId, ht);
+                }
                 ::ContinueDebugEvent(dev.dwProcessId, dev.dwThreadId, DBG_CONTINUE);
                 continue;
             }
@@ -1131,6 +1417,11 @@ private:
             }
 
             if (dev.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
+                HANDLE ht = register_debug_thread_handle_locked(
+                    dev.dwThreadId, dev.u.CreateThread.hThread);
+                if (ht != nullptr && hw_plan_.dr7 != 0u) {
+                    (void)apply_win_hw_plan_to_thread_locked(dev.dwThreadId, ht);
+                }
                 DebugEvent ev{};
                 ev.kind = DebugEventKind::ThreadCreated;
                 ev.tid = dev.dwThreadId;
@@ -1210,17 +1501,57 @@ private:
                     continue;
                 }
 
-                if ((code == EXCEPTION_SINGLE_STEP || code == kStatusWx86SingleStep) &&
-                    rearm_bp_id_after_step_.has_value()) {
+                const bool is_single_step_exc =
+                    (code == EXCEPTION_SINGLE_STEP || code == kStatusWx86SingleStep);
+                bool was_internal_rearm_step = false;
+                if (rearm_bp_id_after_step_.has_value()) {
                     const BreakpointId bid = *rearm_bp_id_after_step_;
                     rearm_bp_id_after_step_.reset();
+                    was_internal_rearm_step = !stop_after_rearm_step_;
+                    stop_after_rearm_step_ = false;
                     for (BreakpointDescriptor& bp : breakpoints_) {
                         if (bp.id == bid && bp.enabled) {
                             (void)arm_sw_bp_locked(bp);
                             break;
                         }
                     }
-                    if (!stop_after_rearm_step_) {
+                }
+
+                if (is_single_step_exc) {
+                    if (const auto hw_slot = consume_win_hw_triggered_slot_locked(active_tid_);
+                        hw_slot.has_value()) {
+                        disarm_temp_bp_locked();
+                        const BreakpointId owner_id = hw_plan_.slot_owner_id[*hw_slot];
+                        const std::uint64_t cur_ip = read_win_ip_locked(active_tid_);
+                        for (BreakpointDescriptor& bp : breakpoints_) {
+                            if (bp.id == owner_id) {
+                                ++bp.hit_count;
+                                DebugEvent ev{};
+                                ev.kind = DebugEventKind::BreakpointHit;
+                                ev.tid = active_tid_;
+                                ev.address = bp.address;
+                                ev.breakpoint_id = bp.id;
+                                ev.summary = std::format(
+                                    "Hit {} breakpoint #{} (DR{}) at 0x{:X} (IP 0x{:X}, hits: {})",
+                                    to_string(bp.kind),
+                                    bp.id,
+                                    *hw_slot,
+                                    bp.address,
+                                    cur_ip,
+                                    bp.hit_count);
+                                push_event_locked(std::move(ev));
+                                break;
+                            }
+                        }
+                        stop_status_.active_tid = active_tid_;
+                        stop_status_.instruction_pointer = cur_ip;
+                        ++stop_status_.stop_revision;
+                        state_.store(DebugSessionState::Paused, std::memory_order_release);
+                        state_cv_.notify_all();
+                        continue;
+                    }
+
+                    if (was_internal_rearm_step) {
                         ::ContinueDebugEvent(dev.dwProcessId, dev.dwThreadId, DBG_CONTINUE);
                         continue;
                     }

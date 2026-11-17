@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -255,6 +256,35 @@ TEST(DebuggerCoreUnit, StepOverCallFallthroughDecoding) {
     const std::array<std::uint8_t, 4> a64_bl{0x08, 0x00, 0x00, 0x94};
     EXPECT_EQ(compute_step_over_fallthrough(Architecture::ARM64, Endianness::Little, 0x500000, a64_bl),
               std::optional<std::uint64_t>{0x500004});
+
+    // 32-bit x86 `66 E8 rel16` (operand-size override near call -> 4 bytes)
+    const std::array<std::uint8_t, 6> call_66_e8{0x66, 0xE8, 0x10, 0x00, 0x00, 0x00};
+    EXPECT_EQ(compute_step_over_fallthrough(Architecture::X86, Endianness::Little, 0x401000, call_66_e8),
+              std::optional<std::uint64_t>{0x401004});
+
+    // 64-bit x86_64 `66 E8 ...` and multi-prefix `2E 66 E8 ...` + `48 E8 rel32` + `66 48 E8 rel32`
+    const auto x64_66_e8 = compute_step_over_fallthrough(
+        Architecture::X86_64, Endianness::Little, 0x401000, call_66_e8);
+    ASSERT_TRUE(x64_66_e8.has_value());
+    const std::array<std::uint8_t, 7> seg_66_e8{0x2E, 0x66, 0xE8, 0x10, 0x00, 0x00, 0x00};
+    EXPECT_EQ(compute_step_over_fallthrough(Architecture::X86_64, Endianness::Little, 0x401000, seg_66_e8),
+              std::optional<std::uint64_t>{*x64_66_e8 + 1u});
+
+    const std::array<std::uint8_t, 6> rex_w_call{0x48, 0xE8, 0x10, 0x00, 0x00, 0x00};
+    EXPECT_EQ(compute_step_over_fallthrough(Architecture::X86_64, Endianness::Little, 0x401000, rex_w_call),
+              std::optional<std::uint64_t>{0x401006});
+
+    const std::array<std::uint8_t, 7> p66_rex_w_call{0x66, 0x48, 0xE8, 0x10, 0x00, 0x00, 0x00};
+    EXPECT_EQ(compute_step_over_fallthrough(Architecture::X86_64, Endianness::Little, 0x401000, p66_rex_w_call),
+              std::optional<std::uint64_t>{0x401007});
+
+    // Overflow guard near UINT64_MAX: must return nullopt rather than wrapping past 0
+    EXPECT_EQ(compute_step_over_fallthrough(
+                  Architecture::X86_64,
+                  Endianness::Little,
+                  std::numeric_limits<std::uint64_t>::max() - 2u,
+                  rel_call),
+              std::nullopt);
 }
 
 #if defined(__linux__) && defined(__x86_64__)
@@ -302,6 +332,12 @@ struct ScopedDebugChildGuard {
     pid_t pid{-1};
     int go_write_fd{-1};
 
+    ScopedDebugChildGuard(pid_t p, int fd) noexcept : pid(p), go_write_fd(fd) {}
+    ScopedDebugChildGuard(const ScopedDebugChildGuard&) = delete;
+    ScopedDebugChildGuard& operator=(const ScopedDebugChildGuard&) = delete;
+    ScopedDebugChildGuard(ScopedDebugChildGuard&&) = delete;
+    ScopedDebugChildGuard& operator=(ScopedDebugChildGuard&&) = delete;
+
     ~ScopedDebugChildGuard() {
         if (go_write_fd >= 0) {
             ::close(go_write_fd);
@@ -328,7 +364,7 @@ TEST(DebuggerLinuxLiveTest, DefaultProcessAttachRemainsStrictlyReadOnly) {
         ::execv("/bin/sleep", argv);
         ::_exit(127);
     }
-    ScopedDebugChildGuard guard{.pid = sleep_child, .go_write_fd = -1};
+    ScopedDebugChildGuard guard{sleep_child, -1};
     // Wait briefly for execv("/bin/sleep") to settle so BinaryModel hydrates tiny /bin/sleep (~35 KB)
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
 
@@ -382,7 +418,7 @@ TEST(DebuggerLinuxLiveTest, BreakpointHitRipRewindShadowReadStepIntoStepOverWrit
 
     ::close(ready_pipe[1]);
     ::close(go_pipe[0]);
-    ScopedDebugChildGuard guard{.pid = child, .go_write_fd = go_pipe[1]};
+    ScopedDebugChildGuard guard{child, go_pipe[1]};
 
     DebugChildAnchors anchors{};
     ASSERT_EQ(::read(ready_pipe[0], &anchors, sizeof(anchors)), static_cast<ssize_t>(sizeof(anchors)));
@@ -523,6 +559,124 @@ TEST(DebuggerLinuxLiveTest, LaunchExecutableStopsAtInitialTrapStepsAndDetachesCl
     int wstatus = 0;
     ASSERT_EQ(::waitpid(static_cast<pid_t>(child_pid), &wstatus, 0), static_cast<pid_t>(child_pid));
     EXPECT_TRUE(WIFEXITED(wstatus));
+}
+
+extern "C" void peelf_dbg_fault_sequence();
+extern "C" const std::uint8_t peelf_dbg_fault_insn[];
+
+asm(
+    ".text\n"
+    ".globl peelf_dbg_fault_sequence\n"
+    ".globl peelf_dbg_fault_insn\n"
+    ".type peelf_dbg_fault_sequence, @function\n"
+    "peelf_dbg_fault_sequence:\n"
+    "    xor %eax, %eax\n"
+    "peelf_dbg_fault_insn:\n"
+    "    mov (%rax), %ecx\n"
+    "    ret\n"
+    ".size peelf_dbg_fault_sequence, .-peelf_dbg_fault_sequence\n"
+);
+
+TEST(DebuggerLinuxLiveTest, StepOffBreakpointOnFaultingInstructionReportsSigsegvWithoutReapingSiblingChild) {
+    // Spawn an unrelated exited child process BEFORE running the debugger event loop;
+    // LinuxDebugSession must NEVER steal its exit status via waitpid(-1, ...).
+    const pid_t unrelated_child = ::fork();
+    ASSERT_GE(unrelated_child, 0);
+    if (unrelated_child == 0) {
+        ::_exit(42);
+    }
+    ScopedDebugChildGuard unrelated_guard{unrelated_child, -1};
+
+    int ready_pipe[2]{-1, -1};
+    int go_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(ready_pipe), 0);
+    ASSERT_EQ(::pipe(go_pipe), 0);
+
+    const pid_t child = ::fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        ::close(ready_pipe[0]);
+        ::close(go_pipe[1]);
+#ifdef PR_SET_PTRACER
+        (void)::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
+        const auto fault_va = reinterpret_cast<std::uint64_t>(peelf_dbg_fault_insn);
+        (void)::write(ready_pipe[1], &fault_va, sizeof(fault_va));
+        ::close(ready_pipe[1]);
+
+        char go = 0;
+        if (::read(go_pipe[0], &go, 1) != 1) {
+            ::_exit(2);
+        }
+        ::close(go_pipe[0]);
+        peelf_dbg_fault_sequence();
+        ::_exit(0);
+    }
+
+    ::close(ready_pipe[1]);
+    ::close(go_pipe[0]);
+    ScopedDebugChildGuard guard{child, go_pipe[1]};
+
+    std::uint64_t fault_va = 0u;
+    ASSERT_EQ(::read(ready_pipe[0], &fault_va, sizeof(fault_va)), static_cast<ssize_t>(sizeof(fault_va)));
+    ::close(ready_pipe[0]);
+
+    auto backend = create_native_debug_backend();
+    auto attached = backend->attach(static_cast<ProcessId>(child));
+    ASSERT_TRUE(attached.has_value()) << attached.error().message;
+    IDebugSession* dbg = attached->get();
+    ASSERT_NE(dbg, nullptr);
+
+    auto bp_res = dbg->add_software_breakpoint(fault_va, "fault_mov");
+    ASSERT_TRUE(bp_res.has_value()) << bp_res.error().message;
+    ASSERT_EQ(bp_res->original_bytes.size(), 1u);
+    EXPECT_EQ(bp_res->original_bytes[0], 0x8Bu);
+
+    const char go_byte = 'G';
+    ASSERT_EQ(::write(guard.go_write_fd, &go_byte, 1), 1);
+    ::close(guard.go_write_fd);
+    guard.go_write_fd = -1;
+
+    ASSERT_TRUE(dbg->continue_execution(false).has_value());
+    auto bp_stop = dbg->wait_for_stop(std::chrono::milliseconds(4000));
+    ASSERT_TRUE(bp_stop.has_value()) << bp_stop.error().message;
+    ASSERT_TRUE(bp_stop->last_event.has_value());
+    EXPECT_EQ(bp_stop->last_event->kind, DebugEventKind::BreakpointHit);
+    EXPECT_EQ(bp_stop->instruction_pointer, fault_va);
+
+    // Stepping off the software breakpoint executes `mov (%rax), %ecx` with RAX=0,
+    // which faults with SIGSEGV: debugger must re-arm the breakpoint and report SIGSEGV!
+    ASSERT_TRUE(dbg->step_into().has_value());
+    auto fault_stop = dbg->wait_for_stop(std::chrono::milliseconds(4000));
+    ASSERT_TRUE(fault_stop.has_value()) << fault_stop.error().message;
+    EXPECT_EQ(fault_stop->state, DebugSessionState::Paused);
+    EXPECT_EQ(fault_stop->instruction_pointer, fault_va);
+    ASSERT_TRUE(fault_stop->last_event.has_value());
+    EXPECT_EQ(fault_stop->last_event->kind, DebugEventKind::ExceptionOrSignal);
+    EXPECT_EQ(fault_stop->last_event->signal_or_exception_code, std::optional<std::int64_t>{SIGSEGV});
+    ASSERT_FALSE(dbg->breakpoints().empty());
+    EXPECT_TRUE(dbg->breakpoints().front().armed_in_target);
+
+    // Continuing again (suppressing prior signal) steps off the re-armed breakpoint and
+    // must report SIGSEGV again rather than swallowing the fault!
+    ASSERT_TRUE(dbg->continue_execution(false).has_value());
+    auto fault_stop2 = dbg->wait_for_stop(std::chrono::milliseconds(4000));
+    ASSERT_TRUE(fault_stop2.has_value()) << fault_stop2.error().message;
+    ASSERT_TRUE(fault_stop2->last_event.has_value());
+    EXPECT_EQ(fault_stop2->last_event->kind, DebugEventKind::ExceptionOrSignal);
+    EXPECT_EQ(fault_stop2->last_event->signal_or_exception_code, std::optional<std::int64_t>{SIGSEGV});
+
+    ASSERT_TRUE(dbg->terminate().has_value());
+    int child_st = 0;
+    (void)::waitpid(child, &child_st, 0);
+    guard.pid = -1;
+
+    // Verify the unrelated sibling child was NOT reaped by LinuxDebugSession!
+    int unrelated_st = 0;
+    ASSERT_EQ(::waitpid(unrelated_child, &unrelated_st, 0), unrelated_child);
+    unrelated_guard.pid = -1;
+    ASSERT_TRUE(WIFEXITED(unrelated_st));
+    EXPECT_EQ(WEXITSTATUS(unrelated_st), 42);
 }
 
 #endif  // defined(__linux__) && defined(__x86_64__)
