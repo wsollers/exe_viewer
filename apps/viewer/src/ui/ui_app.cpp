@@ -106,6 +106,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
           [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); })
     , timeline_panel_(
           model,
+          vulkan,
           [this](const peelf::TimelineNavigationTarget& target) {
               const peelf::TimelineNavigationTarget nav = target;
               pending_navigations_.enqueue_custom([this, nav]() {
@@ -628,6 +629,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     model_.set_session_teardown_hook([this]() noexcept {
         memory_heatmap_panel_.cancel_and_reset();
         byte_viz_panel_.cancel_and_reset();
+        timeline_panel_.cancel_and_reset();
         reference_scanner_.cancel(&reference_index_);
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
@@ -635,6 +637,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     register_pre_pass_recorder([this](VkCommandBuffer cmd, std::size_t frame_index) {
         memory_heatmap_panel_.record_pre_pass(cmd, frame_index);
         byte_viz_panel_.record_pre_pass(cmd, frame_index);
+        timeline_panel_.record_pre_pass(cmd, frame_index);
     });
     register_workspace_settings_handler();
 }
@@ -645,6 +648,7 @@ UiApp::~UiApp() {
     annotations_.set_on_changed({});
     memory_heatmap_panel_.shutdown();
     byte_viz_panel_.shutdown();
+    timeline_panel_.shutdown();
     reference_scanner_.cancel(&reference_index_);
     binary_diff_panel_.invalidate();
     decompile_controller_.shutdown();
@@ -1201,7 +1205,7 @@ void UiApp::process_deferred_gpu_work() {
         memory_heatmap_panel_.cancel_and_reset();
         byte_viz_panel_.cancel_and_reset();
         memory_search_panel_.reset_for_new_target();
-        timeline_panel_.reset_for_new_target();
+        timeline_panel_.cancel_and_reset();
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
         decompile_cache_.clear();

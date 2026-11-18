@@ -62,6 +62,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/scripting.cpp
   src/memory_heatmap.cpp
   src/byte_viz.cpp
+  src/timeline_viewport.cpp
   include/elf/elf_definitions.h
   include/pe/pe_definitions.h
   include/peelf/peelf.hpp
@@ -79,6 +80,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/scripting.hpp
   include/peelf/memory_heatmap.hpp
   include/peelf/byte_viz.hpp
+  include/peelf/timeline_viewport.hpp
   include/peelf/endian_reader.hpp
   include/peelf/binary_image.hpp
   include/peelf/macho_image.hpp

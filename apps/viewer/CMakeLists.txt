@@ -106,6 +106,7 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_settings_overview.cpp
         src/ui/ui_panels_timeline.hpp
         src/ui/ui_panels_timeline.cpp
+        src/vulkan/shaders/timeline_span_spirv.hpp
         src/ui/ui_panels_scripting.hpp
         src/ui/ui_panels_scripting.cpp
         src/ui/ui_panels_memory_heatmap.hpp

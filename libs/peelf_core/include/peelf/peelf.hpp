@@ -15,6 +15,7 @@
 #include <peelf/patching.hpp>
 #include <peelf/memory_heatmap.hpp>
 #include <peelf/byte_viz.hpp>
+#include <peelf/timeline_viewport.hpp>
 
 #include <pe/pe_definitions.h>
 #include <elf/elf_definitions.h>
