@@ -1,15 +1,13 @@
 #include "peelf/patching.hpp"
+#include "test_temp_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <array>
-#include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <format>
 #include <fstream>
 #include <optional>
 #include <span>
@@ -17,34 +15,14 @@
 #include <utility>
 #include <vector>
 
-namespace {
-
-[[nodiscard]] std::filesystem::path write_temp_binary(std::vector<std::uint8_t> bytes) {
-    static std::atomic<std::uint64_t> counter{0};
-    const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
-    const std::string test_name = info != nullptr ? info->name() : "case";
-    const auto nonce = static_cast<std::uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
-    const auto path = std::filesystem::temp_directory_path() /
-                      std::filesystem::path(std::format(
-                          "peelf_patching_{}_{}_{}.bin",
-                          test_name,
-                          nonce,
-                          counter.fetch_add(1, std::memory_order_relaxed)));
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return path;
-}
-
-} // namespace
-
 TEST(PagedBinaryImage, ReadsAcrossPageBoundariesFromDisk) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     std::vector<std::uint8_t> bytes(32);
     for (std::uint8_t i = 0; i < bytes.size(); ++i) {
         bytes[i] = i;
     }
 
-    auto image = peelf::PagedBinaryImage::open(write_temp_binary(bytes), 8);
+    auto image = peelf::PagedBinaryImage::open(tmp.write_bytes("input.bin", bytes), 8);
     ASSERT_TRUE(image.has_value()) << image.error().message;
 
     auto read = image->read_effective(6, 8);
@@ -53,12 +31,13 @@ TEST(PagedBinaryImage, ReadsAcrossPageBoundariesFromDisk) {
 }
 
 TEST(PagedBinaryImage, AppliesTransactionAcrossPageBoundaryAndUndoRedo) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     std::vector<std::uint8_t> bytes(32);
     for (std::uint8_t i = 0; i < bytes.size(); ++i) {
         bytes[i] = i;
     }
 
-    auto image = peelf::PagedBinaryImage::open(write_temp_binary(bytes), 8);
+    auto image = peelf::PagedBinaryImage::open(tmp.write_bytes("input.bin", bytes), 8);
     ASSERT_TRUE(image.has_value()) << image.error().message;
 
     auto tx = image->begin_transaction("patch across page");
@@ -86,12 +65,13 @@ TEST(PagedBinaryImage, AppliesTransactionAcrossPageBoundaryAndUndoRedo) {
 }
 
 TEST(PagedBinaryImage, NormalizesOverlappingPatchesAndTracksOriginalBytes) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     std::vector<std::uint8_t> bytes(32);
     for (std::uint8_t i = 0; i < bytes.size(); ++i) {
         bytes[i] = i;
     }
 
-    auto image = peelf::PagedBinaryImage::open(write_temp_binary(bytes), 8);
+    auto image = peelf::PagedBinaryImage::open(tmp.write_bytes("input.bin", bytes), 8);
     ASSERT_TRUE(image.has_value()) << image.error().message;
 
     ASSERT_TRUE(image->apply_patch(4, std::vector<std::uint8_t>{0xA0, 0xA1, 0xA2, 0xA3}, "first")
@@ -116,12 +96,13 @@ TEST(PagedBinaryImage, NormalizesOverlappingPatchesAndTracksOriginalBytes) {
 }
 
 TEST(PagedBinaryImage, RevertingBytesRemovesCleanIntervals) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     std::vector<std::uint8_t> bytes(16);
     for (std::uint8_t i = 0; i < bytes.size(); ++i) {
         bytes[i] = i;
     }
 
-    auto image = peelf::PagedBinaryImage::open(write_temp_binary(bytes), 4);
+    auto image = peelf::PagedBinaryImage::open(tmp.write_bytes("input.bin", bytes), 4);
     ASSERT_TRUE(image.has_value()) << image.error().message;
 
     ASSERT_TRUE(image->apply_patch(4, std::vector<std::uint8_t>{0xFE, 0xED}, "patch").has_value());
@@ -133,12 +114,13 @@ TEST(PagedBinaryImage, RevertingBytesRemovesCleanIntervals) {
 }
 
 TEST(PagedBinaryImage, CoalescesAdjacentPatches) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     std::vector<std::uint8_t> bytes(16);
     for (std::uint8_t i = 0; i < bytes.size(); ++i) {
         bytes[i] = i;
     }
 
-    auto image = peelf::PagedBinaryImage::open(write_temp_binary(bytes), 4);
+    auto image = peelf::PagedBinaryImage::open(tmp.write_bytes("input.bin", bytes), 4);
     ASSERT_TRUE(image.has_value()) << image.error().message;
 
     ASSERT_TRUE(image->apply_patch(4, std::vector<std::uint8_t>{0xA0, 0xA1}, "left").has_value());
@@ -152,14 +134,13 @@ TEST(PagedBinaryImage, CoalescesAdjacentPatches) {
 }
 
 TEST(PagedBinaryImage, WritesEffectiveBytesToNewFileWithoutMutatingOriginal) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     std::vector<std::uint8_t> bytes(16);
     for (std::uint8_t i = 0; i < bytes.size(); ++i) {
         bytes[i] = i;
     }
-    const std::filesystem::path input_path = write_temp_binary(bytes);
-    const std::filesystem::path output_path =
-        std::filesystem::temp_directory_path() / "peelf_patching_test_output.bin";
-    std::filesystem::remove(output_path);
+    const std::filesystem::path input_path = tmp.write_bytes("input.bin", bytes);
+    const std::filesystem::path output_path = tmp / "output.bin";
 
     auto image = peelf::PagedBinaryImage::open(input_path, 4);
     ASSERT_TRUE(image.has_value()) << image.error().message;
@@ -181,14 +162,11 @@ TEST(PagedBinaryImage, WritesEffectiveBytesToNewFileWithoutMutatingOriginal) {
 }
 
 TEST(PagedBinaryImage, RefusesToOverwriteExistingOutputByDefault) {
-    const std::filesystem::path input_path = write_temp_binary({0, 1, 2, 3});
-    const std::filesystem::path output_path =
-        std::filesystem::temp_directory_path() / "peelf_patching_existing_output.bin";
-    {
-        std::ofstream file(output_path, std::ios::binary | std::ios::trunc);
-        const std::uint8_t marker = 0xFE;
-        file.write(reinterpret_cast<const char*>(&marker), 1);
-    }
+    peelf_test::ScopedTempDir tmp("peelf_patching");
+    const std::array<std::uint8_t, 4> input_bytes{0, 1, 2, 3};
+    const std::array<std::uint8_t, 1> existing_marker{0xFEu};
+    const std::filesystem::path input_path = tmp.write_bytes("input.bin", input_bytes);
+    const std::filesystem::path output_path = tmp.write_bytes("existing_output.bin", existing_marker);
 
     auto image = peelf::PagedBinaryImage::open(input_path, 4);
     ASSERT_TRUE(image.has_value()) << image.error().message;
@@ -203,7 +181,9 @@ TEST(PagedBinaryImage, RefusesToOverwriteExistingOutputByDefault) {
 }
 
 TEST(PagedBinaryImage, SparseAndOverlappingTransactionUndoRedo) {
-    const auto path = write_temp_binary({0});
+    peelf_test::ScopedTempDir tmp("peelf_patching_sparse");
+    const std::array<std::uint8_t, 1> seed{0};
+    const auto path = tmp.write_bytes("sparse_256mb.bin", seed);
     constexpr std::uint64_t distant = 256ull * 1024 * 1024;
     { std::ofstream file(path, std::ios::binary | std::ios::in | std::ios::out);
       file.seekp(distant); file.put(0); }
@@ -224,7 +204,8 @@ TEST(PagedBinaryImage, SparseAndOverlappingTransactionUndoRedo) {
 }
 
 TEST(PagedBinaryImage, FailedCommitRestoresPatchesAndHistory) {
-    const auto path = write_temp_binary(std::vector<std::uint8_t>(16384));
+    peelf_test::ScopedTempDir tmp("peelf_patching");
+    const auto path = tmp.write_bytes("commit_fail.bin", std::vector<std::uint8_t>(16384));
     auto image = peelf::PagedBinaryImage::open(path);
     ASSERT_TRUE(image);
     ASSERT_TRUE(image->apply_patch(0, std::vector<std::uint8_t>{7}, "prior"));
@@ -241,6 +222,7 @@ TEST(PagedBinaryImage, FailedCommitRestoresPatchesAndHistory) {
 }
 
 TEST(PagedBinaryImage, SameFileSaveAsOverwritePreservesUncachedPagesAndReopensCleanly) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     constexpr std::uint64_t kPageSize = 64;
     constexpr std::size_t kTotalSize = 8 * static_cast<std::size_t>(kPageSize); // 8 pages
     std::vector<std::uint8_t> initial(kTotalSize);
@@ -248,7 +230,7 @@ TEST(PagedBinaryImage, SameFileSaveAsOverwritePreservesUncachedPagesAndReopensCl
         initial[i] = static_cast<std::uint8_t>((i * 37u + 0x5Au) & 0xFFu);
     }
 
-    const std::filesystem::path input_path = write_temp_binary(initial);
+    const std::filesystem::path input_path = tmp.write_bytes("same_file.bin", initial);
     {
         auto image = peelf::PagedBinaryImage::open(input_path, kPageSize);
         ASSERT_TRUE(image.has_value()) << image.error().message;
@@ -291,9 +273,6 @@ TEST(PagedBinaryImage, SameFileSaveAsOverwritePreservesUncachedPagesAndReopensCl
                 << "Leftover temp file: " << entry.path().string();
         }
     }
-
-    std::error_code ec;
-    std::filesystem::remove(input_path, ec);
 }
 
 TEST(LiveMemoryPatchSpace, TransactionalRollbackPreservesStateOnReadOrWriteFailure) {
@@ -393,26 +372,12 @@ TEST(LiveMemoryPatchSpace, TransactionalRollbackPreservesStateOnReadOrWriteFailu
 }
 
 TEST(PagedBinaryImage, NonDestructiveSavePreservesExistingTargetAndSelfOverwriteRebasesUndo) {
+    peelf_test::ScopedTempDir tmp("peelf_patching");
     const std::vector<std::uint8_t> initial_src{0x10u, 0x20u, 0x30u, 0x40u, 0x50u, 0x60u, 0x70u, 0x80u};
     const std::vector<std::uint8_t> existing_dest{0xDEu, 0xADu, 0xBEu, 0xEFu, 0xCAu, 0xFEu};
 
-    const std::filesystem::path src_path = write_temp_binary(initial_src);
-    const std::filesystem::path dest_path = write_temp_binary(existing_dest);
-    struct CleanupGuard {
-        std::filesystem::path a;
-        std::filesystem::path b;
-        CleanupGuard(std::filesystem::path first, std::filesystem::path second)
-            : a(std::move(first)), b(std::move(second)) {}
-        CleanupGuard(const CleanupGuard&) = delete;
-        CleanupGuard& operator=(const CleanupGuard&) = delete;
-        CleanupGuard(CleanupGuard&&) = delete;
-        CleanupGuard& operator=(CleanupGuard&&) = delete;
-        ~CleanupGuard() {
-            std::error_code ec;
-            std::filesystem::remove(a, ec);
-            std::filesystem::remove(b, ec);
-        }
-    } guard{src_path, dest_path};
+    const std::filesystem::path src_path = tmp.write_bytes("src.bin", initial_src);
+    const std::filesystem::path dest_path = tmp.write_bytes("dest.bin", existing_dest);
 
     auto image = peelf::PagedBinaryImage::open(src_path, 4u);
     ASSERT_TRUE(image.has_value()) << image.error().message;

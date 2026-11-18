@@ -11,6 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "model/binary_model.hpp"
+#include "test_temp_dir.hpp"
 
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
@@ -146,28 +147,6 @@ public:
 private:
     bool big_{false};
     std::vector<std::uint8_t> buf_{};
-};
-
-struct TempTestDir {
-    std::filesystem::path dir{};
-
-    TempTestDir() {
-        static std::atomic<std::uint64_t> seq{1u};
-        const auto id = seq.fetch_add(1u, std::memory_order_relaxed);
-        dir = std::filesystem::temp_directory_path() /
-              std::format("peelf_wu26b_test_{}", id);
-        std::error_code ec;
-        std::filesystem::remove_all(dir, ec);
-        std::filesystem::create_directories(dir, ec);
-    }
-
-    ~TempTestDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(dir, ec);
-    }
-
-    TempTestDir(const TempTestDir&) = delete;
-    TempTestDir& operator=(const TempTestDir&) = delete;
 };
 
 void write_bytes_to_disk(const std::filesystem::path& path, std::span<const std::uint8_t> bytes) {
@@ -809,7 +788,7 @@ TEST(MachOAuditIntegrationTest, VulnerableMachOPostureTriggersExpectedSeverities
 }
 
 TEST(MachOAuditIntegrationTest, HeadlessCliUniversalSliceSelectionJsonAndSarifParity) {
-    TempTestDir tmp;
+    peelf_test::ScopedTempDir tmp("peelf_wu26b");
 
     // Build a 3-slice Universal binary:
     //   slice 0: insecure x86_64 (missing MH_PIE / __PAGEZERO -> MACHO4001 Error)
@@ -834,7 +813,7 @@ TEST(MachOAuditIntegrationTest, HeadlessCliUniversalSliceSelectionJsonAndSarifPa
         FatSliceInput{s2_arm64e.cpu_type, s2_arm64e.cpu_subtype, build_synthetic_macho64(s2_arm64e)},
     };
     const std::vector<std::uint8_t> fat_bytes = build_universal_fat32(fat_inputs);
-    const std::filesystem::path fat_path = tmp.dir / "universal_app";
+    const std::filesystem::path fat_path = tmp / "universal_app";
     write_bytes_to_disk(fat_path, fat_bytes);
     const std::string fat_arg = fat_path.string();
 
@@ -944,9 +923,9 @@ TEST(MachOAuditIntegrationTest, MachOExecutableSettingsAndProvenanceExtraction) 
 }
 
 TEST(MachOAuditIntegrationTest, MachODependenciesExpandRpathReexportsAndClassifySharedCache) {
-    TempTestDir tmp;
-    const std::filesystem::path macos_dir = tmp.dir / "Sample.app" / "Contents" / "MacOS";
-    const std::filesystem::path fw_dir = tmp.dir / "Sample.app" / "Contents" / "Frameworks";
+    peelf_test::ScopedTempDir tmp("peelf_wu26b");
+    const std::filesystem::path macos_dir = tmp.path() / "Sample.app" / "Contents" / "MacOS";
+    const std::filesystem::path fw_dir = tmp.path() / "Sample.app" / "Contents" / "Frameworks";
 
     // 1. SubCore.dylib (thin arm64e dylib exporting `_subcore_api`)
     SyntheticMachOSpec subcore_spec{};
@@ -1120,7 +1099,7 @@ TEST(MachOAuditIntegrationTest, UniversalMachOBinaryDiffMatchesArchitectureSlice
 }
 
 TEST(MachOAuditIntegrationTest, BinaryModelSelectContainerSliceSwitchesUniversalArchitectureCleanly) {
-    TempTestDir tmp;
+    peelf_test::ScopedTempDir tmp("peelf_wu26b");
 
     SyntheticMachOSpec x64_slice{};
     x64_slice.cpu_type = peelf::macho::kCpuTypeX86_64;
@@ -1137,7 +1116,7 @@ TEST(MachOAuditIntegrationTest, BinaryModelSelectContainerSliceSwitchesUniversal
         FatSliceInput{
             arm64e_slice.cpu_type, arm64e_slice.cpu_subtype, build_synthetic_macho64(arm64e_slice)},
     };
-    const std::filesystem::path fat_path = tmp.dir / "viewer_universal_fixture";
+    const std::filesystem::path fat_path = tmp / "viewer_universal_fixture";
     write_bytes_to_disk(fat_path, build_universal_fat32(slices));
 
     viewer::BinaryModel model;

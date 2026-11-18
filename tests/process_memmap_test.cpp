@@ -7,6 +7,7 @@
 #include "navigation/viewer_navigation.hpp"
 #include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
+#include "test_temp_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -324,17 +325,11 @@ TEST(ProcessMapsParser, ParsesLinuxProcMapsAndDerivesModules) {
 }
 
 TEST(PagedBinaryImageSparse, MultiSpanDisjointTransactionAvoidsBoundingBoxAndUndoesCleanly) {
+    peelf_test::ScopedTempDir temp_dir("peelf_sparse_tx");
     // 64 KiB file where two writes in one transaction sit 60 KiB apart.
-    std::vector<std::uint8_t> bytes(65536, 0x11);
-    const std::filesystem::path tmp =
-        std::filesystem::temp_directory_path() / "peelf_sparse_tx_test.bin";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(bytes.data()),
-                  static_cast<std::streamsize>(bytes.size()));
-    }
+    const std::vector<std::uint8_t> bytes(65536, 0x11);
+    const std::filesystem::path tmp = temp_dir.write_bytes("peelf_sparse_tx_test.bin", bytes);
 
-    { // Release the retained input stream before removing the file on Windows.
     auto img = peelf::PagedBinaryImage::open(tmp, 4096);
     ASSERT_TRUE(img.has_value()) << img.error().message;
 
@@ -354,8 +349,6 @@ TEST(PagedBinaryImageSparse, MultiSpanDisjointTransactionAvoidsBoundingBoxAndUnd
 
     ASSERT_TRUE(img->redo().has_value());
     EXPECT_EQ(img->changed_intervals().size(), 2u);
-    }
-    std::filesystem::remove(tmp);
 }
 
 TEST(LiveModuleRebasing, RebasesElfWithSymtabAndSupportsPureRamFallback) {

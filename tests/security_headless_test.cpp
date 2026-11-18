@@ -57,6 +57,14 @@ const peelf::SecurityFinding* find_rule(const peelf::SecurityAuditReport& r, std
     return nullptr;
 }
 
+void assert_rule_severity(const peelf::SecurityAuditReport& r,
+                          std::string_view rule_id,
+                          peelf::SecuritySeverity expected) {
+    const peelf::SecurityFinding* finding = find_rule(r, rule_id);
+    ASSERT_NE(finding, nullptr) << "Missing security finding for rule " << rule_id;
+    EXPECT_EQ(finding->severity, expected) << rule_id << ": " << finding->summary;
+}
+
 enum class PeCertFixtureMode : std::uint8_t {
     Unsigned,
     MalformedDummyCert,
@@ -560,12 +568,12 @@ TEST(SecurityAuditTest, VulnerablePe32TriggersExpectedRuleViolations) {
     const peelf::SecurityAuditReport audit = peelf::audit_security(**parsed, raw);
     ASSERT_EQ(audit.findings.size(), 8u);
 
-    EXPECT_EQ(find_rule(audit, "PE1001")->severity, peelf::SecuritySeverity::Error);   // No DYNAMIC_BASE
-    EXPECT_EQ(find_rule(audit, "PE1002")->severity, peelf::SecuritySeverity::Error);   // No NX_COMPAT
-    EXPECT_EQ(find_rule(audit, "PE1003")->severity, peelf::SecuritySeverity::Warning); // No GUARD_CF
-    EXPECT_EQ(find_rule(audit, "PE1004")->severity, peelf::SecuritySeverity::Error);   // x86 PE32 missing SafeSEH & NO_SEH
-    EXPECT_EQ(find_rule(audit, "PE1005")->severity, peelf::SecuritySeverity::Error);   // FORCE_INTEGRITY=1 with 0 certs
-    EXPECT_EQ(find_rule(audit, "PE1006")->severity, peelf::SecuritySeverity::Note);    // Missing CET debug entry
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(audit, "PE1001", peelf::SecuritySeverity::Error));   // No DYNAMIC_BASE
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(audit, "PE1002", peelf::SecuritySeverity::Error));   // No NX_COMPAT
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(audit, "PE1003", peelf::SecuritySeverity::Warning)); // No GUARD_CF
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(audit, "PE1004", peelf::SecuritySeverity::Error));   // x86 PE32 missing SafeSEH & NO_SEH
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(audit, "PE1005", peelf::SecuritySeverity::Error));   // FORCE_INTEGRITY=1 with 0 certs
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(audit, "PE1006", peelf::SecuritySeverity::Note));    // Missing CET debug entry
 
     const auto* pe1007 = find_rule(audit, "PE1007");
     ASSERT_NE(pe1007, nullptr);
@@ -616,14 +624,14 @@ TEST(SecurityAuditTest, HardenedAndVulnerableElf64CoverAllElfRules) {
     ASSERT_TRUE(bad_img.has_value()) << bad_img.error().message;
 
     const peelf::SecurityAuditReport vuln = peelf::audit_security(**bad_img, bad_raw);
-    EXPECT_EQ(find_rule(vuln, "ELF2001")->severity, peelf::SecuritySeverity::Error);   // Non-PIE ET_EXEC
-    EXPECT_EQ(find_rule(vuln, "ELF2002")->severity, peelf::SecuritySeverity::Error);   // PF_X stack
-    EXPECT_EQ(find_rule(vuln, "ELF2003")->severity, peelf::SecuritySeverity::Warning); // Partial RELRO
-    EXPECT_EQ(find_rule(vuln, "ELF2004")->severity, peelf::SecuritySeverity::Warning); // No stack canary
-    EXPECT_EQ(find_rule(vuln, "ELF2005")->severity, peelf::SecuritySeverity::Warning); // Unfortified strcpy
-    EXPECT_EQ(find_rule(vuln, "ELF2006")->severity, peelf::SecuritySeverity::Error);   // RWX PT_LOAD
-    EXPECT_EQ(find_rule(vuln, "ELF2007")->severity, peelf::SecuritySeverity::Error);   // '.' & '/tmp' DT_RPATH
-    EXPECT_EQ(find_rule(vuln, "ELF2008")->severity, peelf::SecuritySeverity::Note);    // Missing CET GNU property
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2001", peelf::SecuritySeverity::Error));   // Non-PIE ET_EXEC
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2002", peelf::SecuritySeverity::Error));   // PF_X stack
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2003", peelf::SecuritySeverity::Warning)); // Partial RELRO
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2004", peelf::SecuritySeverity::Warning)); // No stack canary
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2005", peelf::SecuritySeverity::Warning)); // Unfortified strcpy
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2006", peelf::SecuritySeverity::Error));   // RWX PT_LOAD
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2007", peelf::SecuritySeverity::Error));   // '.' & '/tmp' DT_RPATH
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(vuln, "ELF2008", peelf::SecuritySeverity::Note));    // Missing CET GNU property
 }
 
 TEST(SecurityAuditTest, LiveProcessRulesDetectRwxUnbackedExecAndDisabledMitigations) {
@@ -656,9 +664,9 @@ TEST(SecurityAuditTest, LiveProcessRulesDetectRwxUnbackedExecAndDisabledMitigati
     clean_prof.mitigations.push_back({"ASLR", "Enabled", true, ""});
 
     const auto clean_live = peelf::audit_live_process_security(clean_sess, &clean_prof);
-    EXPECT_EQ(find_rule(clean_live, "LIVE3001")->severity, peelf::SecuritySeverity::Pass);
-    EXPECT_EQ(find_rule(clean_live, "LIVE3002")->severity, peelf::SecuritySeverity::Pass);
-    EXPECT_EQ(find_rule(clean_live, "LIVE3003")->severity, peelf::SecuritySeverity::Pass);
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(clean_live, "LIVE3001", peelf::SecuritySeverity::Pass));
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(clean_live, "LIVE3002", peelf::SecuritySeverity::Pass));
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(clean_live, "LIVE3003", peelf::SecuritySeverity::Pass));
 
     // Vulnerable live session: RWX stack + unbacked anonymous RX shellcode + disabled DEP
     std::vector<peelf::MemoryRegion> bad_regions = clean_regions;
@@ -681,8 +689,8 @@ TEST(SecurityAuditTest, LiveProcessRulesDetectRwxUnbackedExecAndDisabledMitigati
     EXPECT_EQ(l3001->severity, peelf::SecuritySeverity::Error);
     EXPECT_EQ(l3001->virtual_address, 0x7ffffffde000ull);
 
-    EXPECT_EQ(find_rule(bad_live, "LIVE3002")->severity, peelf::SecuritySeverity::Warning);
-    EXPECT_EQ(find_rule(bad_live, "LIVE3003")->severity, peelf::SecuritySeverity::Error);
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(bad_live, "LIVE3002", peelf::SecuritySeverity::Warning));
+    ASSERT_NO_FATAL_FAILURE(assert_rule_severity(bad_live, "LIVE3003", peelf::SecuritySeverity::Error));
 
     // Indeterminate live profile: empty ProcessSecurityProfile (no observed telemetry) must report Note, not Pass!
     peelf::ProcessSecurityProfile empty_prof{};

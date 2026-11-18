@@ -21,6 +21,7 @@
 
 #include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
+#include "test_temp_dir.hpp"
 #include <peelf/binary_image.hpp>
 
 namespace {
@@ -166,10 +167,11 @@ TEST(DebugSymbols, DiscoversMissingCodeViewPdbAndReportsMissingExplicitPath) {
 }
 
 TEST(DebugSymbols, RejectsInvalidPdbBeforeDia) {
+    peelf_test::ScopedTempDir temp_dir("peelf_invalid_pdb");
     const std::unique_ptr<peelf::IBinaryImage> image = parse_fixture("known-win-x64.exe");
     ASSERT_NE(image, nullptr);
 
-    const std::filesystem::path pdb_path = std::filesystem::temp_directory_path() / "peelf_invalid_debug_symbols.pdb";
+    const std::filesystem::path pdb_path = temp_dir / "peelf_invalid_debug_symbols.pdb";
     {
         std::ofstream out(pdb_path, std::ios::binary);
         ASSERT_TRUE(out) << pdb_path.string();
@@ -177,7 +179,6 @@ TEST(DebugSymbols, RejectsInvalidPdbBeforeDia) {
     }
 
     const viewer::DebugSymbolLoadResult result = viewer::load_pdb_debug_symbols(pdb_path, *image);
-    std::filesystem::remove(pdb_path);
 
     EXPECT_EQ(result.status, viewer::DebugSymbolLoadStatus::UnsupportedFormat);
 }
@@ -387,11 +388,8 @@ std::vector<std::uint8_t> make_msf7_pdb(const std::array<std::uint8_t, 16>& guid
 } // namespace
 
 TEST(DebugSymbols, LocalCodeViewPdbVerifiesMsf7GuidAndAge) {
-    const auto temp_root =
-        std::filesystem::temp_directory_path() / "peelf_msf7_pdb_verify_test";
-    std::error_code ec;
-    std::filesystem::remove_all(temp_root, ec);
-    std::filesystem::create_directories(temp_root, ec);
+    peelf_test::ScopedTempDir temp_dir("peelf_msf7_pdb_verify");
+    const auto& temp_root = temp_dir.path();
 
     const std::array<std::uint8_t, 16> guid{
         0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
@@ -441,8 +439,6 @@ TEST(DebugSymbols, LocalCodeViewPdbVerifiesMsf7GuidAndAge) {
     const auto stale_age_res = viewer::load_pdb_debug_symbols(pdb_path, **image);
     EXPECT_EQ(stale_age_res.status, viewer::DebugSymbolLoadStatus::BackendError);
     EXPECT_NE(stale_age_res.diagnostic.find("RSDS"), std::string::npos);
-
-    std::filesystem::remove_all(temp_root, ec);
 }
 
 TEST(SymbolIndex, ContainsAddressAtUint64MaxWithoutOverflow) {

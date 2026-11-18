@@ -7,6 +7,7 @@
 #include "analysis/patch_preview.hpp"
 #include "model/binary_model.hpp"
 #include "symbols/symbol_index.hpp"
+#include "test_temp_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -27,32 +28,6 @@ namespace {
 [[nodiscard]] std::filesystem::path fixture_pe64_path() {
     return std::filesystem::path(PEELF_TEST_FIXTURES_DIR) / "known-win-x64.exe";
 }
-
-struct ScopedTempDir {
-    std::filesystem::path path;
-
-    ScopedTempDir() {
-#if defined(__linux__)
-        path = std::filesystem::path("/tmp") /
-               ("peelf_wu11_test_" + std::to_string(static_cast<unsigned long>(::getpid())) +
-                "_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)));
-#else
-        path = std::filesystem::temp_directory_path() /
-               ("peelf_wu11_test_" + std::to_string(reinterpret_cast<std::uintptr_t>(this)));
-#endif
-        std::filesystem::create_directories(path);
-    }
-
-    ScopedTempDir(const ScopedTempDir&) = delete;
-    ScopedTempDir& operator=(const ScopedTempDir&) = delete;
-    ScopedTempDir(ScopedTempDir&&) = delete;
-    ScopedTempDir& operator=(ScopedTempDir&&) = delete;
-
-    ~ScopedTempDir() {
-        std::error_code ec;
-        std::filesystem::remove_all(path, ec);
-    }
-};
 
 class DummyReadOnlyLiveSession final : public peelf::IProcessSession {
 public:
@@ -192,7 +167,7 @@ TEST(AssemblerProviderTest, AsmTkReportsLineNumberedSyntaxAndUnboundLabelDiagnos
         .source_text = "nop\ninvalid_mnemonic_xyz rax, 1\nret\n",
     };
     auto bad_res = provider.assemble(bad_syntax);
-    EXPECT_FALSE(bad_res.has_value());
+    ASSERT_FALSE(bad_res.has_value());
     EXPECT_NE(bad_res.error().message.find("Line 2"), std::string::npos)
         << bad_res.error().message;
 
@@ -204,7 +179,7 @@ TEST(AssemblerProviderTest, AsmTkReportsLineNumberedSyntaxAndUnboundLabelDiagnos
         .source_text = "nop\nret\njmp missing_target_label\n",
     };
     auto unbound_res = provider.assemble(unbound);
-    EXPECT_FALSE(unbound_res.has_value());
+    ASSERT_FALSE(unbound_res.has_value());
     EXPECT_NE(unbound_res.error().message.find("missing_target_label"), std::string::npos)
         << unbound_res.error().message;
     EXPECT_NE(unbound_res.error().message.find("Line 3"), std::string::npos)
@@ -254,7 +229,7 @@ TEST(AssemblerProviderTest, LlvmMcTriplesAndShowEncodingParserCoverMultiArchAndE
     // Parse line:col diagnostics from llvm-mc stderr
     const char* err_stderr = "<stdin>:4:9: error: invalid operand for instruction\n";
     auto err_res = peelf::parse_llvm_mc_show_encoding_output("", err_stderr, 0x400000);
-    EXPECT_FALSE(err_res.has_value());
+    ASSERT_FALSE(err_res.has_value());
     EXPECT_NE(err_res.error().message.find("Line 4"), std::string::npos) << err_res.error().message;
 
     // Explicit missing binary reports Unavailable cleanly
@@ -264,8 +239,8 @@ TEST(AssemblerProviderTest, LlvmMcTriplesAndShowEncodingParserCoverMultiArchAndE
 
 #if defined(__linux__)
     // Verify safe argv subprocess invocation against a mock llvm-mc executable in /tmp
-    ScopedTempDir tmp;
-    const std::filesystem::path fake_mc = tmp.path / "fake-llvm-mc";
+    peelf_test::ScopedTempDir tmp("peelf_wu11");
+    const std::filesystem::path fake_mc = tmp / "fake-llvm-mc";
     {
         std::ofstream script(fake_mc, std::ios::binary | std::ios::trunc);
         script << "#!/bin/sh\n"
@@ -357,8 +332,8 @@ TEST(AssemblyPatchPreviewTest, DetectsOverwrittenInstructionSlackAndSupportsNopP
 #endif
 
 TEST(PatchBundleTest, JsonRoundTripConflictDetectionAndAtomicTransactionalRollback) {
-    ScopedTempDir tmp;
-    const std::filesystem::path copy_path = tmp.path / "sample.exe";
+    peelf_test::ScopedTempDir tmp("peelf_wu11");
+    const std::filesystem::path copy_path = tmp / "sample.exe";
     std::filesystem::copy_file(fixture_pe64_path(), copy_path);
 
     auto img_a = peelf::PagedBinaryImage::open(copy_path);
@@ -378,7 +353,7 @@ TEST(PatchBundleTest, JsonRoundTripConflictDetectionAndAtomicTransactionalRollba
     exported->target_format = peelf::Format::PE;
     exported->target_arch = peelf::Architecture::X86_64;
 
-    const std::filesystem::path bundle_file = tmp.path / "test.pepatch.json";
+    const std::filesystem::path bundle_file = tmp / "test.pepatch.json";
     ASSERT_TRUE(peelf::save_patch_bundle_file(*exported, bundle_file).has_value());
 
     auto reloaded = peelf::load_patch_bundle_file(bundle_file);
@@ -468,8 +443,8 @@ TEST(PatchBundleTest, StrictlyRejectsReadOnlyLiveProcessSessions) {
     // Core overloads reject live sessions immediately
     EXPECT_FALSE(peelf::apply_patch_bundle(bundle, live_proc).has_value());
 
-    ScopedTempDir tmp;
-    const std::filesystem::path copy_path = tmp.path / "sample.exe";
+    peelf_test::ScopedTempDir tmp("peelf_wu11");
+    const std::filesystem::path copy_path = tmp / "sample.exe";
     std::filesystem::copy_file(fixture_pe64_path(), copy_path);
     auto img = peelf::PagedBinaryImage::open(copy_path);
     ASSERT_TRUE(img.has_value());
@@ -489,8 +464,8 @@ TEST(PatchBundleTest, StrictlyRejectsReadOnlyLiveProcessSessions) {
 }
 
 TEST(PatchBundleTest, DecodesSurrogatePairsValidatesExpectedSha256AndSweepsNestedOverlaps) {
-    ScopedTempDir tmp;
-    const std::filesystem::path copy_path = tmp.path / "sample.exe";
+    peelf_test::ScopedTempDir tmp("peelf_wu11");
+    const std::filesystem::path copy_path = tmp / "sample.exe";
     std::filesystem::copy_file(fixture_pe64_path(), copy_path);
     auto img = peelf::PagedBinaryImage::open(copy_path);
     ASSERT_TRUE(img.has_value()) << img.error().message;

@@ -3,6 +3,7 @@
 #include "decompile/structured_decompiler.hpp"
 #include "graph/call_graph.hpp"
 #include "symbols/symbol_index.hpp"
+#include "test_temp_dir.hpp"
 
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
@@ -556,24 +557,9 @@ TEST(ReviewBugsRegression, AsyncBinaryDifferSupportsCompletionRevisionGatingAndC
     auto rhs_pe = lhs_pe;
     rhs_pe[0x200u] = 0x90u; // mutate entry byte (.text)
 
-    const std::filesystem::path temp_dir =
-        std::filesystem::temp_directory_path() /
-        ("peelf-async-diff-test-" + std::to_string(
-#ifdef _WIN32
-             7777
-#else
-             static_cast<int>(::getpid())
-#endif
-             ));
-    std::error_code ec;
-    std::filesystem::create_directories(temp_dir, ec);
-    const std::filesystem::path rhs_path = temp_dir / "rhs_modified.exe";
-    {
-        std::ofstream ofs(rhs_path, std::ios::binary | std::ios::trunc);
-        ASSERT_TRUE(static_cast<bool>(ofs));
-        ofs.write(reinterpret_cast<const char*>(rhs_pe.data()),
-                  static_cast<std::streamsize>(rhs_pe.size()));
-    }
+    peelf_test::ScopedTempDir temp_dir("peelf_async_diff_test");
+    const std::filesystem::path rhs_path = temp_dir.write_bytes("rhs_modified.exe", rhs_pe);
+    ASSERT_TRUE(std::filesystem::exists(rhs_path));
 
     // 1. Background file diff succeeds when active revision matches.
     {
@@ -627,8 +613,6 @@ TEST(ReviewBugsRegression, AsyncBinaryDifferSupportsCompletionRevisionGatingAndC
         EXPECT_EQ(cancelled->status, viewer::AsyncDiffStatus::Cancelled);
         EXPECT_FALSE(cancelled->live_report.has_value());
     }
-
-    std::filesystem::remove_all(temp_dir, ec);
 }
 
 // CA-04 (A01): FunctionIndex::upsert_function uses try_emplace so duplicate-VA merges preserve
@@ -684,24 +668,9 @@ TEST(ReviewBugsRegression, FunctionIndexDuplicateVaMergePreservesRichFieldsViaTr
 // exceptions without std::terminate or wait_for_idle() deadlock.
 TEST(ReviewBugsRegression, AsyncBinaryDifferWorkerContainsExceptionsWithoutTerminate) {
     const auto lhs_pe = make_minimal_pe64_with_cert(0x30u);
-    const std::filesystem::path temp_dir =
-        std::filesystem::temp_directory_path() /
-        ("peelf-async-diff-exc-test-" + std::to_string(
-#ifdef _WIN32
-             7778
-#else
-             static_cast<int>(::getpid())
-#endif
-             ));
-    std::error_code ec;
-    std::filesystem::create_directories(temp_dir, ec);
-    const std::filesystem::path rhs_path = temp_dir / "rhs.exe";
-    {
-        std::ofstream ofs(rhs_path, std::ios::binary | std::ios::trunc);
-        ASSERT_TRUE(static_cast<bool>(ofs));
-        ofs.write(reinterpret_cast<const char*>(lhs_pe.data()),
-                  static_cast<std::streamsize>(lhs_pe.size()));
-    }
+    peelf_test::ScopedTempDir temp_dir("peelf_async_diff_exc_test");
+    const std::filesystem::path rhs_path = temp_dir.write_bytes("rhs.exe", lhs_pe);
+    ASSERT_TRUE(std::filesystem::exists(rhs_path));
 
     // 1. std::runtime_error inside worker progress callback -> structured Failed outcome.
     {
@@ -760,8 +729,6 @@ TEST(ReviewBugsRegression, AsyncBinaryDifferWorkerContainsExceptionsWithoutTermi
         EXPECT_EQ(done->status, viewer::AsyncDiffStatus::Failed);
         EXPECT_NE(done->error_message.find("Unhandled exception"), std::string::npos);
     }
-
-    std::filesystem::remove_all(temp_dir, ec);
 }
 
 TEST(ReviewBugsRegressionTest, Int64MinImmediateParsingAndHighVaSignedDisplacementBoundaries) {

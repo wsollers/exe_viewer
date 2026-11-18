@@ -1156,8 +1156,17 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
 #ifdef _WIN32
     WSADATA wsa{};
     ASSERT_EQ(::WSAStartup(MAKEWORD(2, 2), &wsa), 0);
+    struct WsaGuard {
+        WsaGuard() = default;
+        WsaGuard(const WsaGuard&) = delete;
+        WsaGuard& operator=(const WsaGuard&) = delete;
+        WsaGuard(WsaGuard&&) = delete;
+        WsaGuard& operator=(WsaGuard&&) = delete;
+        ~WsaGuard() noexcept { ::WSACleanup(); }
+    } wsa_guard;
     using SockType = SOCKET;
     constexpr SockType kBadSock = INVALID_SOCKET;
+    constexpr int kShutBoth = SD_BOTH;
     const auto close_sock = [](SockType s) noexcept {
         if (s != INVALID_SOCKET) {
             ::closesocket(s);
@@ -1166,6 +1175,7 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
 #else
     using SockType = int;
     constexpr SockType kBadSock = -1;
+    constexpr int kShutBoth = SHUT_RDWR;
     const auto close_sock = [](SockType s) noexcept {
         if (s >= 0) {
             ::close(s);
@@ -1173,16 +1183,66 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
     };
 #endif
 
-    const SockType listen_sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    ASSERT_NE(listen_sock, kBadSock);
+    struct LoopbackServerGuard {
+        std::mutex sock_mu{};
+        SockType listen_sock{kBadSock};
+        SockType client_sock{kBadSock};
+        std::jthread worker{};
+
+        explicit LoopbackServerGuard(SockType ls) noexcept : listen_sock(ls) {}
+        LoopbackServerGuard(const LoopbackServerGuard&) = delete;
+        LoopbackServerGuard& operator=(const LoopbackServerGuard&) = delete;
+        LoopbackServerGuard(LoopbackServerGuard&&) = delete;
+        LoopbackServerGuard& operator=(LoopbackServerGuard&&) = delete;
+
+        ~LoopbackServerGuard() noexcept {
+            {
+                std::lock_guard<std::mutex> lk(sock_mu);
+                if (listen_sock != kBadSock) {
+                    (void)::shutdown(listen_sock, kShutBoth);
+#ifdef _WIN32
+                    ::closesocket(listen_sock);
+                    listen_sock = kBadSock;
+#endif
+                }
+                if (client_sock != kBadSock) {
+                    (void)::shutdown(client_sock, kShutBoth);
+                }
+            }
+            if (worker.joinable()) {
+                worker.join();
+            }
+            std::lock_guard<std::mutex> lk(sock_mu);
+            if (client_sock != kBadSock) {
+#ifdef _WIN32
+                ::closesocket(client_sock);
+#else
+                ::close(client_sock);
+#endif
+                client_sock = kBadSock;
+            }
+            if (listen_sock != kBadSock) {
+#ifdef _WIN32
+                ::closesocket(listen_sock);
+#else
+                ::close(listen_sock);
+#endif
+                listen_sock = kBadSock;
+            }
+        }
+    };
+
+    const SockType raw_listen = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    ASSERT_NE(raw_listen, kBadSock);
+    LoopbackServerGuard server(raw_listen);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = 0;
 
-    ASSERT_EQ(::bind(listen_sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
-    ASSERT_EQ(::listen(listen_sock, 1), 0);
+    ASSERT_EQ(::bind(server.listen_sock, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)), 0);
+    ASSERT_EQ(::listen(server.listen_sock, 1), 0);
 
     sockaddr_in bound{};
 #ifdef _WIN32
@@ -1190,7 +1250,7 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
 #else
     socklen_t bound_len = sizeof(bound);
 #endif
-    ASSERT_EQ(::getsockname(listen_sock, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
+    ASSERT_EQ(::getsockname(server.listen_sock, reinterpret_cast<sockaddr*>(&bound), &bound_len), 0);
     const std::uint16_t port = ntohs(bound.sin_port);
     ASSERT_NE(port, 0u);
 
@@ -1208,19 +1268,30 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
     stub->g_replies_by_thread["p7.11"] = le_hex_u64(0x7fff'8800ULL) + le_hex_u64(0x0040'2000ULL);
     stub->memory_segments[0x0040'2000ULL] = {0x55u, 0x48u, 0x89u, 0xE5u};
 
-    std::thread server_thread([listen_sock, stub, close_sock]() {
-        const SockType client_sock = ::accept(listen_sock, nullptr, nullptr);
-        close_sock(listen_sock);
-        if (client_sock == kBadSock) {
+    server.worker = std::jthread([&server, stub, close_sock]() {
+        SockType ls = kBadSock;
+        {
+            std::lock_guard<std::mutex> lk(server.sock_mu);
+            ls = server.listen_sock;
+        }
+        if (ls == kBadSock) {
             return;
+        }
+        const SockType accepted = ::accept(ls, nullptr, nullptr);
+        if (accepted == kBadSock) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(server.sock_mu);
+            server.client_sock = accepted;
         }
         std::array<std::uint8_t, 512> rx{};
         for (;;) {
 #ifdef _WIN32
-            const int n = ::recv(client_sock, reinterpret_cast<char*>(rx.data()),
+            const int n = ::recv(accepted, reinterpret_cast<char*>(rx.data()),
                                  static_cast<int>(rx.size()), 0);
 #else
-            const ssize_t n = ::recv(client_sock, rx.data(), rx.size(), 0);
+            const ssize_t n = ::recv(accepted, rx.data(), rx.size(), 0);
 #endif
             if (n <= 0) {
                 break;
@@ -1232,14 +1303,18 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
                     stub->tx_to_client.begin(), stub->tx_to_client.end());
                 stub->tx_to_client.clear();
 #ifdef _WIN32
-                (void)::send(client_sock, reinterpret_cast<const char*>(out.data()),
+                (void)::send(accepted, reinterpret_cast<const char*>(out.data()),
                              static_cast<int>(out.size()), 0);
 #else
-                (void)::send(client_sock, out.data(), out.size(), 0);
+                (void)::send(accepted, out.data(), out.size(), 0);
 #endif
             }
         }
-        close_sock(client_sock);
+        std::lock_guard<std::mutex> lk(server.sock_mu);
+        if (server.client_sock != kBadSock) {
+            close_sock(server.client_sock);
+            server.client_sock = kBadSock;
+        }
     });
 
     {
@@ -1261,8 +1336,6 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
         const ThreadContext ctx = (*session_res)->thread_context(0x11u);
         EXPECT_EQ(ctx.instruction_pointer, 0x0040'2000ULL);
     }
-
-    server_thread.join();
 }
 
 TEST(GdbRemoteRspTest, UppercaseHexMemoryReadDisambiguatesFromExxErrorsAndClampsTinyPacketSize) {

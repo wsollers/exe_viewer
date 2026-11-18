@@ -8,6 +8,7 @@
 #include "model/binary_model.hpp"
 #include "navigation/byte_range.hpp"
 #include "disasm/disassembler.hpp"
+#include "test_temp_dir.hpp"
 
 #include <gtest/gtest.h>
 
@@ -47,24 +48,13 @@ void PrintTo(const InstructionPatchCase& value, std::ostream* stream) {
 }
 
 class InstructionPatchRoundTrip : public testing::TestWithParam<InstructionPatchCase> {};
-
-struct TemporaryExport {
-    std::filesystem::path path;
-    explicit TemporaryExport(std::filesystem::path target_path) : path(std::move(target_path)) {}
-    TemporaryExport(const TemporaryExport&) = delete;
-    TemporaryExport& operator=(const TemporaryExport&) = delete;
-    TemporaryExport(TemporaryExport&&) = delete;
-    TemporaryExport& operator=(TemporaryExport&&) = delete;
-    ~TemporaryExport() { std::error_code error; std::filesystem::remove(path, error); }
-};
 }
 
 TEST_P(InstructionPatchRoundTrip, DecodeUndoRedoExportReopenPreservesOriginal) {
     const auto& test = GetParam();
     const auto source = fixture_path(test.fixture);
-    TemporaryExport output{std::filesystem::temp_directory_path() /
-        (std::string("peelf-roundtrip-") + std::to_string(
-            std::chrono::steady_clock::now().time_since_epoch().count()) + "-" + test.fixture)};
+    peelf_test::ScopedTempDir temp_dir("peelf_roundtrip");
+    const std::filesystem::path output_path = temp_dir / test.fixture;
     viewer::BinaryModel model;
     ASSERT_TRUE(model.load_file(source.string()));
     const auto original_file = model.bytes();
@@ -103,10 +93,10 @@ TEST_P(InstructionPatchRoundTrip, DecodeUndoRedoExportReopenPreservesOriginal) {
     ASSERT_FALSE(decode(model).empty());
     EXPECT_EQ(decode(model).front().mnemonic, test.mnemonic);
     EXPECT_FALSE(model.save_patched_as(source));
-    ASSERT_TRUE(model.save_patched_as(output.path));
-    EXPECT_FALSE(model.save_patched_as(output.path));
+    ASSERT_TRUE(model.save_patched_as(output_path));
+    EXPECT_FALSE(model.save_patched_as(output_path));
     viewer::BinaryModel reopened;
-    ASSERT_TRUE(reopened.load_file(output.path.string()));
+    ASSERT_TRUE(reopened.load_file(output_path.string()));
     ASSERT_NE(reopened.image(), nullptr);
     EXPECT_EQ(reopened.image()->architecture(), model.image()->architecture());
     EXPECT_EQ(reopened.image()->entry_point(), address);
@@ -258,13 +248,12 @@ TEST(BinaryModelPatching, AppliesPatchWithoutMutatingOriginalBytesVector) {
 }
 
 TEST(BinaryModelPatching, SavesPatchedImageToNewFile) {
+    peelf_test::ScopedTempDir temp_dir("peelf_binary_model_patch");
     viewer::BinaryModel model;
     ASSERT_TRUE(model.load_file(fixture_path("hello.elf").string()));
     ASSERT_GE(model.bytes().size(), 8u);
 
-    const std::filesystem::path output_path =
-        std::filesystem::temp_directory_path() / "peelf_binary_model_patched_output.bin";
-    std::filesystem::remove(output_path);
+    const std::filesystem::path output_path = temp_dir / "peelf_binary_model_patched_output.bin";
 
     const std::vector<std::uint8_t> replacement{0xDE, 0xAD, 0xBE, 0xEF};
     ASSERT_TRUE(model.apply_patch_bytes(4, replacement, "model export patch").has_value());

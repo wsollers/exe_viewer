@@ -224,11 +224,12 @@ TEST(ExecutionTimelineTest, BoundedRingBufferDroppedEventsAccounting) {
     }
 
     // Capacity is 4: front slot holds the explicit DroppedEvents marker for sequences [1..7],
-    // followed by retained events [8, 9, 10].
+    // followed by retained events [8, 9, 10]. Synthetic eviction markers do not inflate emitted
+    // event counts; total_emitted_events() == sum of emitted per-kind counts.
     ASSERT_EQ(timeline.size(), 4u);
     EXPECT_EQ(timeline.total_emitted_events(), 10u);
     EXPECT_EQ(timeline.total_dropped_events(), 7u);
-    EXPECT_EQ(timeline.event_kind_count(TimelineEventKind::DroppedEvents), 10u != 0u ? timeline.event_kind_count(TimelineEventKind::DroppedEvents) : 0u);
+    EXPECT_EQ(timeline.event_kind_count(TimelineEventKind::DroppedEvents), 0u);
     EXPECT_EQ(timeline.event_kind_count(TimelineEventKind::DebuggerEvent), 10u);
 
     const auto& head = timeline.events().front();

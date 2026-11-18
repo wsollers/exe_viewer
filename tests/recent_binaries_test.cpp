@@ -1,4 +1,5 @@
 #include "model/recent_binaries.hpp"
+#include "test_temp_dir.hpp"
 #include <gtest/gtest.h>
 
 TEST(RecentBinaries, KeepsFiveMostRecentAndPromotesDuplicates) {
@@ -17,8 +18,8 @@ TEST(RecentBinaries, KeepsFiveMostRecentAndPromotesDuplicates) {
 #endif
 }
 TEST(RecentBinaries, PersistsUtf8PathsAndSeedsOnlyEmptyHistory) {
-    const auto storage=std::filesystem::temp_directory_path()/"peelf-recent-binaries-test.ini";
-    std::filesystem::remove(storage);
+    peelf_test::ScopedTempDir temp_dir("peelf_recent_binaries");
+    const auto storage = temp_dir / "peelf-recent-binaries-test.ini";
     viewer::RecentBinaries history;
     history.load(storage,"debug/peelf_viewer.exe");
     ASSERT_EQ(history.paths().size(),1);
@@ -32,5 +33,4 @@ TEST(RecentBinaries, PersistsUtf8PathsAndSeedsOnlyEmptyHistory) {
     restored.load(storage,"debug/peelf_viewer.exe");
     ASSERT_EQ(restored.paths().size(),1);
     EXPECT_EQ(restored.paths().front().filename(),"peelf_viewer.exe");
-    std::filesystem::remove(storage);
 }

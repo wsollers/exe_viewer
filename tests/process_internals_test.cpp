@@ -245,17 +245,74 @@ TEST(ProcessInternalsTest, ParsesTaskStatTimesAndComputesThreadCpuDeltas) {
 
 #if defined(__linux__)
 TEST(ProcessInternalsTest, LiveForkChildHandlesSocketsSecurityAndThreadTelemetry) {
-    int ready_pipe[2]{-1, -1};
-    int hold_pipe[2]{-1, -1};
-    ASSERT_EQ(::pipe(ready_pipe), 0);
-    ASSERT_EQ(::pipe(hold_pipe), 0);
+    struct ScopedFd {
+        int fd{-1};
+        explicit ScopedFd(int f = -1) noexcept : fd(f) {}
+        ScopedFd(const ScopedFd&) = delete;
+        ScopedFd& operator=(const ScopedFd&) = delete;
+        ScopedFd(ScopedFd&&) = delete;
+        ScopedFd& operator=(ScopedFd&&) = delete;
+        ~ScopedFd() noexcept { reset(); }
+        void reset() noexcept {
+            if (fd >= 0) {
+                ::close(fd);
+                fd = -1;
+            }
+        }
+        [[nodiscard]] int release() noexcept {
+            const int out = fd;
+            fd = -1;
+            return out;
+        }
+    };
+
+    struct ChildGuard {
+        pid_t pid{-1};
+        int wake_fd{-1};
+
+        ChildGuard(pid_t p, int fd) noexcept : pid(p), wake_fd(fd) {}
+        ChildGuard(const ChildGuard&) = delete;
+        ChildGuard& operator=(const ChildGuard&) = delete;
+        ChildGuard(ChildGuard&&) = delete;
+        ChildGuard& operator=(ChildGuard&&) = delete;
+
+        ~ChildGuard() noexcept {
+            if (wake_fd >= 0) {
+                const char done = 'x';
+                (void)::write(wake_fd, &done, 1);
+                ::close(wake_fd);
+                wake_fd = -1;
+            }
+            if (pid > 0) {
+                int status = 0;
+                const pid_t polled = ::waitpid(pid, &status, WNOHANG);
+                if (polled == 0 || (polled < 0 && errno == EINTR)) {
+                    (void)::kill(pid, SIGKILL);
+                    (void)::kill(pid, SIGCONT);
+                    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                    }
+                }
+                pid = -1;
+            }
+        }
+    };
+
+    int raw_ready_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_ready_pipe), 0);
+    ScopedFd ready_r(raw_ready_pipe[0]);
+    ScopedFd ready_w(raw_ready_pipe[1]);
+
+    int raw_hold_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_hold_pipe), 0);
+    ScopedFd hold_r(raw_hold_pipe[0]);
+    ScopedFd hold_w(raw_hold_pipe[1]);
 
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
 
     if (child == 0) {
-        ::close(ready_pipe[0]);
-        ::close(hold_pipe[1]);
+        ready_r.reset();
+        hold_w.reset();
 
         const int listen_fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
         std::uint16_t bound_port = 0;
@@ -274,11 +331,11 @@ TEST(ProcessInternalsTest, LiveForkChildHandlesSocketsSecurityAndThreadTelemetry
         }
 
         const int devnull_fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
-        (void)::write(ready_pipe[1], &bound_port, sizeof(bound_port));
-        ::close(ready_pipe[1]);
+        (void)::write(ready_w.fd, &bound_port, sizeof(bound_port));
+        ready_w.reset();
 
         char ch = 0;
-        (void)::read(hold_pipe[0], &ch, 1);
+        (void)::read(hold_r.fd, &ch, 1);
 
         if (devnull_fd >= 0) {
             ::close(devnull_fd);
@@ -286,31 +343,18 @@ TEST(ProcessInternalsTest, LiveForkChildHandlesSocketsSecurityAndThreadTelemetry
         if (listen_fd >= 0) {
             ::close(listen_fd);
         }
-        ::close(hold_pipe[0]);
+        hold_r.reset();
         _exit(0);
     }
 
-    ::close(ready_pipe[1]);
-    ::close(hold_pipe[0]);
+    ready_w.reset();
+    hold_r.reset();
+    ChildGuard guard{child, hold_w.release()};
 
     std::uint16_t child_port = 0;
-    ASSERT_EQ(::read(ready_pipe[0], &child_port, sizeof(child_port)),
+    ASSERT_EQ(::read(ready_r.fd, &child_port, sizeof(child_port)),
               static_cast<ssize_t>(sizeof(child_port)));
-    ::close(ready_pipe[0]);
-
-    struct ChildGuard {
-        pid_t pid;
-        int wake_fd;
-        ~ChildGuard() {
-            if (wake_fd >= 0) {
-                char done = 'x';
-                (void)::write(wake_fd, &done, 1);
-                ::close(wake_fd);
-            }
-            int status = 0;
-            (void)::waitpid(pid, &status, 0);
-        }
-    } guard{child, hold_pipe[1]};
+    ready_r.reset();
 
     viewer::BinaryModel model;
     ASSERT_TRUE(model.attach_process(static_cast<peelf::ProcessId>(child)).has_value());

@@ -34,18 +34,24 @@ struct ChildSharedAnchors {
     std::uint64_t leaf_fn_va{0};
 };
 
-extern "C" void peelf_child_atexit_handler() {}
-extern "C" void peelf_child_sigusr1_handler(int /*sig*/) {}
+extern "C" {
 
-#if defined(__clang__) || defined(__GNUC__)
-#define PEELF_NOINLINE_FRAME __attribute__((noinline, optnone))
+void peelf_child_atexit_handler() {}
+void peelf_child_sigusr1_handler(int /*sig*/) {}
+
+#if defined(__clang__)
+#define PEELF_NOINLINE_FRAME [[clang::optnone, gnu::noinline]]
+#elif defined(__GNUC__)
+#define PEELF_NOINLINE_FRAME __attribute__((noinline, optimize("O0")))
+#elif defined(_MSC_VER)
+#define PEELF_NOINLINE_FRAME __declspec(noinline)
 #else
 #define PEELF_NOINLINE_FRAME
 #endif
 
-extern "C" PEELF_NOINLINE_FRAME int peelf_child_leaf_wait(int ready_write_fd,
-                                                          int hold_read_fd,
-                                                          const ChildSharedAnchors* anchors) {
+PEELF_NOINLINE_FRAME int peelf_child_leaf_wait(int ready_write_fd,
+                                               int hold_read_fd,
+                                               const ChildSharedAnchors* anchors) {
     volatile std::uint64_t local_marker = 0xAABBCCDDEEFF0011ull;
     (void)local_marker;
 
@@ -57,27 +63,67 @@ extern "C" PEELF_NOINLINE_FRAME int peelf_child_leaf_wait(int ready_write_fd,
     return rd == 1 ? static_cast<int>(token) : 0;
 }
 
-extern "C" PEELF_NOINLINE_FRAME int peelf_child_middle_frame(int ready_write_fd,
-                                                             int hold_read_fd,
-                                                             const ChildSharedAnchors* anchors,
-                                                             int factor) {
+PEELF_NOINLINE_FRAME int peelf_child_middle_frame(int ready_write_fd,
+                                                  int hold_read_fd,
+                                                  const ChildSharedAnchors* anchors,
+                                                  int factor) {
     if (factor > 10) {
         return peelf_child_leaf_wait(ready_write_fd, hold_read_fd, anchors) + factor;
     }
     return factor - 1;
 }
 
-extern "C" PEELF_NOINLINE_FRAME int peelf_child_outer_frame(int ready_write_fd,
-                                                            int hold_read_fd,
-                                                            const ChildSharedAnchors* anchors) {
+PEELF_NOINLINE_FRAME int peelf_child_outer_frame(int ready_write_fd,
+                                                 int hold_read_fd,
+                                                 const ChildSharedAnchors* anchors) {
     return peelf_child_middle_frame(ready_write_fd, hold_read_fd, anchors, 42);
 }
+
+}  // extern "C"
+
+struct ScopedFd {
+    int fd{-1};
+
+    ScopedFd() noexcept = default;
+    explicit ScopedFd(int f) noexcept : fd(f) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept : fd(other.fd) { other.fd = -1; }
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd = other.fd;
+            other.fd = -1;
+        }
+        return *this;
+    }
+    ~ScopedFd() noexcept { reset(); }
+
+    void reset(int new_fd = -1) noexcept {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        fd = new_fd;
+    }
+
+    [[nodiscard]] int release() noexcept {
+        const int out = fd;
+        fd = -1;
+        return out;
+    }
+};
 
 struct ScopedChildReaper {
     pid_t pid{-1};
     int hold_write_fd{-1};
 
-    ~ScopedChildReaper() {
+    ScopedChildReaper(pid_t p, int fd) noexcept : pid(p), hold_write_fd(fd) {}
+    ScopedChildReaper(const ScopedChildReaper&) = delete;
+    ScopedChildReaper& operator=(const ScopedChildReaper&) = delete;
+    ScopedChildReaper(ScopedChildReaper&&) = delete;
+    ScopedChildReaper& operator=(ScopedChildReaper&&) = delete;
+
+    ~ScopedChildReaper() noexcept {
         if (hold_write_fd >= 0) {
             const char done = 'Q';
             (void)::write(hold_write_fd, &done, 1);
@@ -86,10 +132,12 @@ struct ScopedChildReaper {
         }
         if (pid > 0) {
             int status = 0;
-            if (::waitpid(pid, &status, WNOHANG) == 0) {
-                (void)::kill(pid, SIGCONT);
+            const pid_t polled = ::waitpid(pid, &status, WNOHANG);
+            if (polled == 0 || (polled < 0 && errno == EINTR)) {
                 (void)::kill(pid, SIGKILL);
-                (void)::waitpid(pid, &status, 0);
+                (void)::kill(pid, SIGCONT);
+                while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+                }
             }
             pid = -1;
         }
@@ -99,17 +147,22 @@ struct ScopedChildReaper {
 }  // namespace
 
 TEST(LiveChildProcessInspection, AttachesReadOnlyPausesUnwindsStackInspectsTlsSearchesHeapAndDecompiles) {
-    int ready_pipe[2]{-1, -1};
-    int hold_pipe[2]{-1, -1};
-    ASSERT_EQ(::pipe(ready_pipe), 0);
-    ASSERT_EQ(::pipe(hold_pipe), 0);
+    int raw_ready_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_ready_pipe), 0);
+    ScopedFd ready_r(raw_ready_pipe[0]);
+    ScopedFd ready_w(raw_ready_pipe[1]);
+
+    int raw_hold_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_hold_pipe), 0);
+    ScopedFd hold_r(raw_hold_pipe[0]);
+    ScopedFd hold_w(raw_hold_pipe[1]);
 
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
 
     if (child == 0) {
-        ::close(ready_pipe[0]);
-        ::close(hold_pipe[1]);
+        ready_r.reset();
+        hold_w.reset();
 
         (void)std::atexit(&peelf_child_atexit_handler);
         (void)std::signal(SIGUSR1, &peelf_child_sigusr1_handler);
@@ -141,19 +194,19 @@ TEST(LiveChildProcessInspection, AttachesReadOnlyPausesUnwindsStackInspectsTlsSe
             .leaf_fn_va = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&peelf_child_leaf_wait)),
         };
 
-        const int rc = peelf_child_outer_frame(ready_pipe[1], hold_pipe[0], &anchors);
-        ::close(ready_pipe[1]);
-        ::close(hold_pipe[0]);
+        const int rc = peelf_child_outer_frame(ready_w.fd, hold_r.fd, &anchors);
+        ready_w.reset();
+        hold_r.reset();
         std::_Exit(rc & 0x7F);
     }
 
-    ::close(ready_pipe[1]);
-    ::close(hold_pipe[0]);
-    ScopedChildReaper reaper{.pid = child, .hold_write_fd = hold_pipe[1]};
+    ready_w.reset();
+    hold_r.reset();
+    ScopedChildReaper reaper(child, hold_w.release());
 
     ChildSharedAnchors anchors{};
-    const ssize_t got = ::read(ready_pipe[0], &anchors, sizeof(anchors));
-    ::close(ready_pipe[0]);
+    const ssize_t got = ::read(ready_r.fd, &anchors, sizeof(anchors));
+    ready_r.reset();
     ASSERT_EQ(got, static_cast<ssize_t>(sizeof(anchors)));
 
     viewer::BinaryModel model;

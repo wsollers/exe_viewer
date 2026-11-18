@@ -75,7 +75,7 @@ public:
         return *this;
     }
 
-    ~TempFileGuard() { cleanup(); }
+    ~TempFileGuard() noexcept { cleanup(); }
 
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
 
@@ -336,19 +336,20 @@ struct LoadedStaticFixture {
     peelf::PagedBinaryImage paged;
     peelf::ProjectWorkspace workspace;
 
-    static LoadedStaticFixture from_bytes(std::vector<std::uint8_t> bytes) {
+    static void load_from_bytes(std::vector<std::uint8_t> bytes,
+                                std::optional<LoadedStaticFixture>& out) {
         TempFileGuard guard(bytes);
         auto parsed = peelf::parse_image(bytes);
-        EXPECT_TRUE(parsed.has_value());
+        ASSERT_TRUE(parsed.has_value()) << parsed.error().message;
         auto paged_res = peelf::PagedBinaryImage::open(guard.path(), 64u);
-        EXPECT_TRUE(paged_res.has_value()) << paged_res.error().message;
-        return LoadedStaticFixture{
+        ASSERT_TRUE(paged_res.has_value()) << paged_res.error().message;
+        out.emplace(LoadedStaticFixture{
             .raw_bytes = std::move(bytes),
             .temp_file = std::move(guard),
             .image = std::move(*parsed),
             .paged = std::move(*paged_res),
             .workspace = peelf::ProjectWorkspace{},
-        };
+        });
     }
 
     [[nodiscard]] peelf::ScriptContext make_context(bool allow_mutations = true) noexcept {
@@ -379,7 +380,10 @@ TEST(ScriptingTest, InspectsElfTargetMetadataSymbolsStringsDisasmAndAudit) {
         std::filesystem::path(PEELF_BIN_MATRIX_DIR) / "elf-linux-x86_64-64-le-callgraph.so";
     ASSERT_TRUE(std::filesystem::exists(elf_path)) << elf_path.string();
 
-    auto fixture = LoadedStaticFixture::from_bytes(read_all_bytes(elf_path));
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(read_all_bytes(elf_path), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     constexpr std::string_view kScript = R"lua(
@@ -456,7 +460,10 @@ TEST(ScriptingTest, InspectsPeTargetMetadataExportsDisassemblyAndAudit) {
         std::filesystem::path(PEELF_BIN_MATRIX_DIR) / "pe-windows-x86_64-64-le-callgraph.dll";
     ASSERT_TRUE(std::filesystem::exists(pe_path)) << pe_path.string();
 
-    auto fixture = LoadedStaticFixture::from_bytes(read_all_bytes(pe_path));
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(read_all_bytes(pe_path), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     constexpr std::string_view kScript = R"lua(
@@ -507,7 +514,10 @@ TEST(ScriptingTest, InspectsPeTargetMetadataExportsDisassemblyAndAudit) {
 }
 
 TEST(ScriptingTest, InspectsMachOTargetMetadataSymbolsStringsDisassemblyAndAudit) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     constexpr std::string_view kScript = R"lua(
@@ -551,7 +561,10 @@ TEST(ScriptingTest, InspectsMachOTargetMetadataSymbolsStringsDisassemblyAndAudit
 }
 
 TEST(ScriptingTest, HermeticSandboxStripsUnsafeLibrariesAndBlocksBinaryBytecode) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     constexpr std::string_view kSandboxCheck = R"lua(
@@ -600,7 +613,10 @@ TEST(ScriptingTest, HermeticSandboxStripsUnsafeLibrariesAndBlocksBinaryBytecode)
 }
 
 TEST(ScriptingTest, EnforcesMaxInstructionsIncludingPcallSwallowAttempts) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     peelf::ScriptLimits limits{};
@@ -625,7 +641,10 @@ TEST(ScriptingTest, EnforcesMaxInstructionsIncludingPcallSwallowAttempts) {
 }
 
 TEST(ScriptingTest, EnforcesMaxMemoryBytesOnAllocationBombCleanly) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     peelf::ScriptLimits limits{};
@@ -653,7 +672,10 @@ TEST(ScriptingTest, EnforcesMaxMemoryBytesOnAllocationBombCleanly) {
 }
 
 TEST(ScriptingTest, EnforcesCooperativeCancellationAndWallClockTimeout) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     // 1. Cooperative cancellation via std::stop_source from a worker thread.
@@ -691,7 +713,10 @@ TEST(ScriptingTest, EnforcesCooperativeCancellationAndWallClockTimeout) {
 }
 
 TEST(ScriptingTest, EnforcesMaxOutputBytesCapAcrossPrintAndLog) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     peelf::ScriptLimits limits{};
@@ -712,7 +737,10 @@ TEST(ScriptingTest, EnforcesMaxOutputBytesCapAcrossPrintAndLog) {
 }
 
 TEST(ScriptingTest, TransactionalReadYourWritesDryRunLeavesHostUntouched) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     constexpr std::string_view kDryRunScript = R"lua(
@@ -770,7 +798,10 @@ TEST(ScriptingTest, TransactionalReadYourWritesDryRunLeavesHostUntouched) {
 }
 
 TEST(ScriptingTest, RuntimeErrorOrExplicitRollbackAfterCommitDiscardsMutations) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     fixture.workspace.set_label(0x100000C00ULL, "existing_label");
     auto ctx = fixture.make_context();
 
@@ -816,7 +847,10 @@ TEST(ScriptingTest, RuntimeErrorOrExplicitRollbackAfterCommitDiscardsMutations) 
 }
 
 TEST(ScriptingTest, ExplicitCommitAtomicallyAppliesWorkspaceAndUndoableImagePatches) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     fixture.workspace.set_label(0x100000C04ULL, "obsolete_label");
     auto ctx = fixture.make_context();
 
@@ -861,7 +895,10 @@ TEST(ScriptingTest, ExplicitCommitAtomicallyAppliesWorkspaceAndUndoableImagePatc
 }
 
 TEST(ScriptingTest, RejectsMutationsOnReadOnlyTargetsAndUnmappedAddresses) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
 
     // 1. Explicit allow_mutations == false
     {
@@ -916,7 +953,10 @@ TEST(ScriptingTest, RejectsMutationsOnReadOnlyTargetsAndUnmappedAddresses) {
 }
 
 TEST(ScriptingTest, SandboxLoadReraisesMemoryQuotaErrorsAndRefusesCommit) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     fixture.workspace.set_label(0x100000C00ULL, "baseline_entry");
     auto ctx = fixture.make_context();
 
@@ -965,7 +1005,10 @@ TEST(ScriptingTest, HostStagedMemoryQuotaEnforcedAtomicallyWithoutTornPatches) {
     patch_u64_le(152u, 0x4000ULL);
     patch_u64_le(216u, 0x2000ULL);
 
-    auto fixture = LoadedStaticFixture::from_bytes(std::move(big_macho));
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(std::move(big_macho), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     auto ctx = fixture.make_context();
 
     peelf::ScriptLimits limits{};
@@ -992,7 +1035,10 @@ TEST(ScriptingTest, HostStagedMemoryQuotaEnforcedAtomicallyWithoutTornPatches) {
 }
 
 TEST(ScriptingTest, HostCommitIsAllOrNothingAcrossWorkspaceAndPagedBinaryImage) {
-    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    std::optional<LoadedStaticFixture> fixture_opt;
+    ASSERT_NO_FATAL_FAILURE(LoadedStaticFixture::load_from_bytes(make_synthetic_x86_64_macho(), fixture_opt));
+    ASSERT_TRUE(fixture_opt.has_value());
+    auto& fixture = *fixture_opt;
     fixture.workspace.set_label(0x100000C00ULL, "seed_label");
     fixture.workspace.set_comment(0x100000C00ULL, "seed_comment");
     fixture.workspace.add_bookmark(0x100000C04ULL, "SeedBM");

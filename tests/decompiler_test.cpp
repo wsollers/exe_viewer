@@ -1,6 +1,7 @@
 #include "decompile/decompile_controller.hpp"
 #include "decompile/decompiler.hpp"
 #include "decompile/structured_decompiler.hpp"
+#include "test_temp_dir.hpp"
 #include <peelf/sha256.hpp>
 #include <gtest/gtest.h>
 #include <atomic>
@@ -163,6 +164,7 @@ const auto* const g_isolated_ghidra_cache_env = static_cast<IsolatedGhidraCacheE
 TEST(Decompiler, MappedRangesAndStructuresRoundTrip) {
     const auto unit=parse_decompiler_output("PEELF_DECOMPILE 3 ready \"C\" 2 0 \"{\" 2 4096 3 4102 5 \"  return count;\" 1 \"Packet\" 16 0 1 8 8 \"weight\" \"double\"");
     ASSERT_EQ(unit.status,viewer::DecompileStatus::Ready);
+    ASSERT_GE(unit.lines.size(),2u);
     EXPECT_FALSE(unit.lines[0].address);
     ASSERT_EQ(unit.lines[1].ranges.size(),2);
     EXPECT_EQ(unit.lines[1].address,4096);
@@ -192,7 +194,8 @@ TEST(Decompiler, AnnotatedFallbackIsExplicitAndCancellable) {
     DecompileRequest request;
     request.fallback_graph.nodes.push_back({.id="bb0",.label="entry",.instructions={{0x1000,"ret",""}}});
     auto result=AnnotatedCodeDecompiler{}.decompile(request);
-    EXPECT_EQ(result.status,DecompileStatus::Ready); EXPECT_NE(result.provider.find("not decompiled"),std::string::npos);
+    ASSERT_EQ(result.status,DecompileStatus::Ready); EXPECT_NE(result.provider.find("not decompiled"),std::string::npos);
+    ASSERT_GE(result.lines.size(),2u);
     EXPECT_EQ(result.lines[1].address,0x1000);
     std::stop_source stop; stop.request_stop(); EXPECT_EQ(AnnotatedCodeDecompiler{}.decompile(request,stop.get_token()).status,DecompileStatus::Cancelled);
 }
@@ -202,14 +205,19 @@ public:
     BackendProcessResult response{};
     std::string output;
     BackendProcessResult run(const std::filesystem::path&,const std::vector<std::string>& args,std::chrono::milliseconds timeout,std::stop_token) const override {
-        EXPECT_EQ(timeout,std::chrono::seconds(60)); EXPECT_TRUE(std::filesystem::exists(args[1]));
-        if (!output.empty()) { std::ofstream file(args[2]); file<<output; }
+        EXPECT_EQ(timeout,std::chrono::seconds(60));
+        [&]() {
+            ASSERT_GE(args.size(),3u);
+            ASSERT_TRUE(std::filesystem::exists(args[1]));
+        }();
+        if (args.size() >= 3u && !output.empty()) { std::ofstream file(args[2]); file<<output; }
         return response;
     }
 };
 }
 TEST(Decompiler, BackendAdapterHandlesTimeoutCancellationUnavailableAndSuccess) {
-    const auto bridge=std::filesystem::temp_directory_path()/"peelf-fake-bridge.py"; {std::ofstream file(bridge); file<<"# fixture";}
+    peelf_test::ScopedTempDir temp_dir("peelf_fake_bridge");
+    const auto bridge=temp_dir/"peelf-fake-bridge.py"; {std::ofstream file(bridge); file<<"# fixture";}
     FakeRunner runner; DecompileRequest request; request.architecture=peelf::Architecture::X86_64; request.image_bytes={1,2,3};
     BinaryNinjaDecompiler backend("python",bridge,runner);
     runner.response={-1,true,false}; EXPECT_EQ(backend.decompile(request).status,DecompileStatus::Timeout);
@@ -217,12 +225,12 @@ TEST(Decompiler, BackendAdapterHandlesTimeoutCancellationUnavailableAndSuccess) 
     runner.response={-1,false,false}; EXPECT_EQ(backend.decompile(request).status,DecompileStatus::Unavailable);
     runner.response={0}; runner.output="PEELF_DECOMPILE 1 ready \"HLIL\" 1 4096 \"return 0;\"";
     EXPECT_EQ(backend.decompile(request).status,DecompileStatus::Ready);
-    std::filesystem::remove(bridge);
 }
 
 TEST(Decompiler, OptionalMappingsAndMalformedAddresses) {
     const auto unit = parse_decompiler_output("PEELF_DECOMPILE 2 ready \"C\" 2 - \"{\" 4096 \"return 42;\"");
     ASSERT_EQ(unit.status, DecompileStatus::Ready);
+    ASSERT_GE(unit.lines.size(), 2u);
     EXPECT_FALSE(unit.lines[0].address);
     EXPECT_EQ(unit.lines[1].address, 4096);
     for (const auto* address : {"-1", "18446744073709551616", "4096junk"})
@@ -231,12 +239,13 @@ TEST(Decompiler, OptionalMappingsAndMalformedAddresses) {
 }
 
 TEST(Decompiler, RealProcessTimeoutCancellationAndArgumentBoundaries) {
+    peelf_test::ScopedTempDir temp_dir("peelf_backend_runner");
     BackendRunner runner;
-    auto path=std::filesystem::temp_directory_path()/"peelf space & dollar $ argument.txt";
+    auto path=temp_dir/"peelf space & dollar $ argument.txt";
     auto result=runner.run(PEELF_BACKEND_FIXTURE,{"echo",path.string()},std::chrono::seconds(5),{});
     ASSERT_EQ(result.exit_code,0);
     std::ifstream file(path); const std::string text{std::istreambuf_iterator<char>(file),{}};
-    EXPECT_EQ(text,path.string()); file.close(); std::filesystem::remove(path);
+    EXPECT_EQ(text,path.string()); file.close();
     EXPECT_EQ(runner.run(PEELF_BACKEND_FIXTURE,{},std::chrono::seconds(5),{}).exit_code,7);
     result=runner.run(PEELF_BACKEND_FIXTURE,{"sleep"},std::chrono::milliseconds(100),{});
     EXPECT_TRUE(result.timed_out); EXPECT_FALSE(result.cancelled);
@@ -247,7 +256,8 @@ TEST(Decompiler, RealProcessTimeoutCancellationAndArgumentBoundaries) {
 }
 
 TEST(Decompiler, SettingsRoundTripAndValidation) {
-    auto path = std::filesystem::temp_directory_path()/"peelf-decompiler-settings-test.ini";
+    peelf_test::ScopedTempDir temp_dir("peelf_decompiler_settings");
+    auto path = temp_dir/"peelf-decompiler-settings-test.ini";
     DecompilerSettings settings;
     settings.provider = DecompilerProvider::RetDec;
     settings.ghidra_home = "path with spaces";
@@ -292,11 +302,11 @@ TEST(Decompiler, SettingsRoundTripAndValidation) {
     EXPECT_FALSE(read_decompiler_settings(path));
     { std::ofstream file(path, std::ios::trunc); file << "PEELF_DECOMPILER 2 0 \"\" \"java\" \"python\" \"retdec\" 20 \"\" 0 1"; }
     EXPECT_FALSE(read_decompiler_settings(path));
-    std::filesystem::remove(path);
 }
 
 TEST(Decompiler, GhidraAdapterUsesSnapshotAndHandlesFailures) {
-    const auto home=std::filesystem::temp_directory_path()/"peelf ghidra adapter test";
+    peelf_test::ScopedTempDir temp_dir("peelf_ghidra_adapter");
+    const auto home=temp_dir/"peelf ghidra adapter test";
     std::filesystem::create_directories(home/"Ghidra/Framework/Utility/lib");
     { std::ofstream file(home/"Ghidra/Framework/Utility/lib/Utility.jar"); }
     { std::ofstream file(home/"PeelfDecompile.java"); }
@@ -306,11 +316,21 @@ TEST(Decompiler, GhidraAdapterUsesSnapshotAndHandlesFailures) {
         BackendProcessResult run(const std::filesystem::path&,const std::vector<std::string>& args,std::chrono::milliseconds timeout,std::stop_token) const override {
             EXPECT_EQ(timeout,std::chrono::seconds(180));
             auto imported=std::ranges::find(args,"-import");
-            EXPECT_NE(imported,args.end());
+            auto script=std::ranges::find(args,"-postScript");
+            bool valid_args = false;
+            [&]() {
+                ASSERT_NE(imported,args.end());
+                ASSERT_NE(std::next(imported),args.end());
+                ASSERT_NE(script,args.end());
+                ASSERT_GE(std::distance(script,args.end()),4);
+                valid_args = true;
+            }();
+            if (!valid_args) {
+                return result;
+            }
             std::ifstream input(*std::next(imported),std::ios::binary);
             const std::string bytes{std::istreambuf_iterator<char>(input),{}};
             EXPECT_EQ(bytes,"patched snapshot");
-            auto script=std::ranges::find(args,"-postScript");
             const auto output=std::filesystem::path(*std::next(script,3)); workspace=output.parent_path();
             { std::ofstream file(output); file<<"PEELF_DECOMPILE 2 ready \"C\" 1 4096 \"return 42;\""; }
             return result;
@@ -558,23 +578,11 @@ TEST(Decompiler, DecompileCacheHitInvalidationAndLruEviction) {
 }
 
 TEST(Decompiler, GhidraWorkspaceColdImportThenWarmProcessReuseAndInvalidation) {
-    struct TempDir {
-        std::filesystem::path path;
-        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
-        TempDir(const TempDir&) = delete;
-        TempDir& operator=(const TempDir&) = delete;
-        TempDir(TempDir&&) = delete;
-        TempDir& operator=(TempDir&&) = delete;
-        ~TempDir() {
-            std::error_code ec;
-            std::filesystem::remove_all(path, ec);
-        }
-    } temp{std::filesystem::temp_directory_path() / "peelf-ghidra-wu02-reuse-test"};
-    std::filesystem::remove_all(temp.path);
+    peelf_test::ScopedTempDir temp_dir("peelf_ghidra_wu02_reuse");
 
-    const auto ghidra_home = temp.path / "ghidra_install";
-    const auto scripts_dir = temp.path / "scripts";
-    const auto cache_dir = temp.path / "cache";
+    const auto ghidra_home = temp_dir / "ghidra_install";
+    const auto scripts_dir = temp_dir / "scripts";
+    const auto cache_dir = temp_dir / "cache";
     std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
     std::filesystem::create_directories(scripts_dir);
     std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
@@ -719,23 +727,11 @@ TEST(Decompiler, GhidraWorkspaceColdImportThenWarmProcessReuseAndInvalidation) {
 }
 
 TEST(Decompiler, GhidraWarmFailureRecoversViaCleanColdReimport) {
-    struct TempDir {
-        std::filesystem::path path;
-        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
-        TempDir(const TempDir&) = delete;
-        TempDir& operator=(const TempDir&) = delete;
-        TempDir(TempDir&&) = delete;
-        TempDir& operator=(TempDir&&) = delete;
-        ~TempDir() {
-            std::error_code ec;
-            std::filesystem::remove_all(path, ec);
-        }
-    } temp{std::filesystem::temp_directory_path() / "peelf-ghidra-wu02-recovery-test"};
-    std::filesystem::remove_all(temp.path);
+    peelf_test::ScopedTempDir temp_dir("peelf_ghidra_wu02_recovery");
 
-    const auto ghidra_home = temp.path / "ghidra_install";
-    const auto scripts_dir = temp.path / "scripts";
-    const auto cache_dir = temp.path / "cache";
+    const auto ghidra_home = temp_dir / "ghidra_install";
+    const auto scripts_dir = temp_dir / "scripts";
+    const auto cache_dir = temp_dir / "cache";
     std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
     std::filesystem::create_directories(scripts_dir);
     std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
@@ -798,23 +794,11 @@ TEST(Decompiler, GhidraWorkspaceLruEvictionAndCacheRootOffMntC) {
     EXPECT_FALSE(lowered == "/mnt/c" || lowered.starts_with("/mnt/c/")) << default_root;
 #endif
 
-    struct TempDir {
-        std::filesystem::path path;
-        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
-        TempDir(const TempDir&) = delete;
-        TempDir& operator=(const TempDir&) = delete;
-        TempDir(TempDir&&) = delete;
-        TempDir& operator=(TempDir&&) = delete;
-        ~TempDir() {
-            std::error_code ec;
-            std::filesystem::remove_all(path, ec);
-        }
-    } temp{std::filesystem::temp_directory_path() / "peelf-ghidra-wu02-lru-test"};
-    std::filesystem::remove_all(temp.path);
+    peelf_test::ScopedTempDir temp_dir("peelf_ghidra_wu02_lru");
 
-    const auto ghidra_home = temp.path / "ghidra_install";
-    const auto scripts_dir = temp.path / "scripts";
-    const auto cache_dir = temp.path / "cache";
+    const auto ghidra_home = temp_dir / "ghidra_install";
+    const auto scripts_dir = temp_dir / "scripts";
+    const auto cache_dir = temp_dir / "cache";
     std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
     std::filesystem::create_directories(scripts_dir);
     std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
@@ -1220,23 +1204,11 @@ TEST(Decompiler, DefaultGhidraCacheIsIsolatedInTestProcessAndEnforcesPrivatePerm
     const auto resolved_default = default_ghidra_cache_directory();
     EXPECT_EQ(resolved_default, g_isolated_ghidra_cache_env->isolated_dir() / "ghidra");
 
-    struct TempDir {
-        std::filesystem::path path;
-        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
-        TempDir(const TempDir&) = delete;
-        TempDir& operator=(const TempDir&) = delete;
-        TempDir(TempDir&&) = delete;
-        TempDir& operator=(TempDir&&) = delete;
-        ~TempDir() noexcept {
-            std::error_code ec;
-            std::filesystem::remove_all(path, ec);
-        }
-    } temp{safe_test_temp_root() / std::format("peelf-ghidra-fbf05b-perm-{}", current_test_pid())};
-    std::filesystem::remove_all(temp.path);
+    peelf_test::ScopedTempDir temp_dir("peelf_ghidra_fbf05b_perm");
 
-    const auto ghidra_home = temp.path / "ghidra_install";
-    const auto scripts_dir = temp.path / "scripts";
-    const auto cache_dir = temp.path / "cache";
+    const auto ghidra_home = temp_dir / "ghidra_install";
+    const auto scripts_dir = temp_dir / "scripts";
+    const auto cache_dir = temp_dir / "cache";
     std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
     std::filesystem::create_directories(scripts_dir);
     std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');

@@ -209,7 +209,32 @@ TEST(VmMapExplorerTest, LiveSelfSmapsAndWorkerStackAttribution) {
     peelf::ThreadId worker_tid = 0;
     volatile std::uint64_t stack_anchor = 0;
 
-    std::thread worker([&]() {
+    struct ScopedWorkerGuard {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& finish;
+        std::jthread worker;
+
+        ScopedWorkerGuard(std::mutex& m, std::condition_variable& c, bool& f, std::jthread w) noexcept
+            : mu(m), cv(c), finish(f), worker(std::move(w)) {}
+        ScopedWorkerGuard(const ScopedWorkerGuard&) = delete;
+        ScopedWorkerGuard& operator=(const ScopedWorkerGuard&) = delete;
+        ScopedWorkerGuard(ScopedWorkerGuard&&) = delete;
+        ScopedWorkerGuard& operator=(ScopedWorkerGuard&&) = delete;
+
+        ~ScopedWorkerGuard() noexcept {
+            if (worker.joinable()) {
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    finish = true;
+                }
+                cv.notify_all();
+                worker.join();
+            }
+        }
+    };
+
+    ScopedWorkerGuard worker_guard(mu, cv, finish, std::jthread([&]() {
         volatile std::uint64_t local_var = 0xDEADBEEFCAFEBABEull;
         stack_anchor = reinterpret_cast<std::uint64_t>(const_cast<std::uint64_t*>(&local_var));
         const long tid = ::syscall(SYS_gettid);
@@ -221,7 +246,7 @@ TEST(VmMapExplorerTest, LiveSelfSmapsAndWorkerStackAttribution) {
         cv.notify_all();
         std::unique_lock<std::mutex> lk(mu);
         cv.wait_for(lk, std::chrono::seconds(5), [&]() { return finish; });
-    });
+    }));
 
     {
         std::unique_lock<std::mutex> lk(mu);
@@ -260,13 +285,6 @@ TEST(VmMapExplorerTest, LiveSelfSmapsAndWorkerStackAttribution) {
         }
     }
     EXPECT_TRUE(found_worker_vma);
-
-    {
-        std::lock_guard<std::mutex> lk(mu);
-        finish = true;
-    }
-    cv.notify_all();
-    worker.join();
 }
 #endif
 

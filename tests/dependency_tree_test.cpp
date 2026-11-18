@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include "test_temp_dir.hpp"
+
 #include <peelf/dependency_tree.hpp>
 #include <peelf/process.hpp>
 
@@ -499,9 +501,8 @@ TEST(DependencyTreeTest, ExpandElfDynamicTokensAndParseSearchRoots) {
 }
 
 TEST(DependencyTreeTest, ElfOriginRunpathDiamondAndMissingDependencyProvenance) {
-    const fs::path scratch = fs::temp_directory_path() / "peelf-wu10-elf-diamond";
-    std::error_code ec;
-    fs::remove_all(scratch, ec);
+    peelf_test::ScopedTempDir temp_dir("peelf_wu10_elf_diamond");
+    const fs::path& scratch = temp_dir.path();
 
     const fs::path bin_dir = scratch / "app" / "bin";
     const fs::path lib_dir = scratch / "app" / "lib";
@@ -583,14 +584,11 @@ TEST(DependencyTreeTest, ElfOriginRunpathDiamondAndMissingDependencyProvenance) 
     EXPECT_EQ(fn_a_bind->status, peelf::ImportedSymbolStatus::BoundExport);
     EXPECT_EQ(fn_a_bind->call_site_va, 0x404018u);
     EXPECT_EQ(fn_a_bind->resolved_export_va, 0x1100u);
-
-    fs::remove_all(scratch, ec);
 }
 
 TEST(DependencyTreeTest, ElfCycleGuardAndMissingExportedSymbolDetection) {
-    const fs::path scratch = fs::temp_directory_path() / "peelf-wu10-elf-cycle";
-    std::error_code ec;
-    fs::remove_all(scratch, ec);
+    peelf_test::ScopedTempDir temp_dir("peelf_wu10_elf_cycle");
+    const fs::path& scratch = temp_dir.path();
 
     write_bytes(scratch / "libalpha.so", build_synthetic_elf(SynthElfSpec{
         .soname = "libalpha.so",
@@ -631,14 +629,11 @@ TEST(DependencyTreeTest, ElfCycleGuardAndMissingExportedSymbolDetection) {
     ASSERT_EQ(g.nodes[0].unresolved_symbols.size(), 1u);
     EXPECT_EQ(g.nodes[0].unresolved_symbols[0].name, "missing_strong_sym");
     EXPECT_EQ(g.nodes[0].unresolved_symbols[0].call_site_va, 0x500010u);
-
-    fs::remove_all(scratch, ec);
 }
 
 TEST(DependencyTreeTest, DetectsElf32VsElf64ArchitectureMismatch) {
-    const fs::path scratch = fs::temp_directory_path() / "peelf-wu10-arch-mismatch";
-    std::error_code ec;
-    fs::remove_all(scratch, ec);
+    peelf_test::ScopedTempDir temp_dir("peelf_wu10_arch_mismatch");
+    const fs::path& scratch = temp_dir.path();
 
     // 32-bit X86 library placed on search path for a 64-bit X86_64 binary
     write_bytes(scratch / "lib32" / "libwrong.so", build_synthetic_elf(SynthElfSpec{
@@ -665,14 +660,11 @@ TEST(DependencyTreeTest, DetectsElf32VsElf64ArchitectureMismatch) {
     ASSERT_EQ(g.edges.size(), 1u);
     EXPECT_EQ(g.edges[0].resolution_status, peelf::DependencyResolutionStatus::ArchitectureMismatch);
     EXPECT_NE(g.edges[0].resolution_reason.find("Architecture mismatch"), std::string::npos);
-
-    fs::remove_all(scratch, ec);
 }
 
 TEST(DependencyTreeTest, PeVirtualApiSetForwardedExportsDelayLoadAndMissingExports) {
-    const fs::path scratch = fs::temp_directory_path() / "peelf-wu10-pe-tree";
-    std::error_code ec;
-    fs::remove_all(scratch, ec);
+    peelf_test::ScopedTempDir temp_dir("peelf_wu10_pe_tree");
+    const fs::path& scratch = temp_dir.path();
 
     write_bytes(scratch / "back.dll", build_synthetic_pe64(
         {},
@@ -753,8 +745,6 @@ TEST(DependencyTreeTest, PeVirtualApiSetForwardedExportsDelayLoadAndMissingExpor
     ASSERT_EQ(fwd_edge->symbol_bindings.size(), 1u);
     EXPECT_EQ(fwd_edge->symbol_bindings[0].name, "RealImpl");
     EXPECT_EQ(fwd_edge->symbol_bindings[0].status, peelf::ImportedSymbolStatus::BoundExport);
-
-    fs::remove_all(scratch, ec);
 }
 
 #ifdef __linux__
@@ -783,9 +773,9 @@ TEST(DependencyTreeTest, LiveProcessDependencyResolutionMarksLoadedModules) {
 #endif
 
 TEST(DependencyTreeTest, ShortestDepthBfsDiamondExpansionAndNonThrowingDirectoryProbe) {
-    const fs::path scratch = fs::temp_directory_path() / "peelf-fbf03b-bfs-diamond";
+    peelf_test::ScopedTempDir temp_dir("peelf_fbf03b_bfs_diamond");
+    const fs::path& scratch = temp_dir.path();
     std::error_code ec;
-    fs::remove_all(scratch, ec);
 
     const fs::path bin_dir = scratch / "bin";
     const fs::path lib_dir = scratch / "lib";
@@ -840,7 +830,6 @@ TEST(DependencyTreeTest, ShortestDepthBfsDiamondExpansionAndNonThrowingDirectory
 
     auto graph_res = peelf::build_dependency_graph_from_file(main_path, opts);
     fs::permissions(locked_subdir, fs::perms::owner_all, ec);
-    fs::remove_all(scratch, ec);
 
     ASSERT_TRUE(graph_res.has_value()) << graph_res.error().message;
     const peelf::DependencyGraph& g = *graph_res;

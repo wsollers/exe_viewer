@@ -328,6 +328,38 @@ struct DebugChildAnchors {
     std::uint64_t after_call_va{0};
 };
 
+struct ScopedFd {
+    int fd{-1};
+
+    ScopedFd() noexcept = default;
+    explicit ScopedFd(int f) noexcept : fd(f) {}
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    ScopedFd(ScopedFd&& other) noexcept : fd(other.fd) { other.fd = -1; }
+    ScopedFd& operator=(ScopedFd&& other) noexcept {
+        if (this != &other) {
+            reset();
+            fd = other.fd;
+            other.fd = -1;
+        }
+        return *this;
+    }
+    ~ScopedFd() noexcept { reset(); }
+
+    void reset(int new_fd = -1) noexcept {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        fd = new_fd;
+    }
+
+    [[nodiscard]] int release() noexcept {
+        const int out = fd;
+        fd = -1;
+        return out;
+    }
+};
+
 struct ScopedDebugChildGuard {
     pid_t pid{-1};
     int go_write_fd{-1};
@@ -338,16 +370,19 @@ struct ScopedDebugChildGuard {
     ScopedDebugChildGuard(ScopedDebugChildGuard&&) = delete;
     ScopedDebugChildGuard& operator=(ScopedDebugChildGuard&&) = delete;
 
-    ~ScopedDebugChildGuard() {
+    ~ScopedDebugChildGuard() noexcept {
         if (go_write_fd >= 0) {
             ::close(go_write_fd);
             go_write_fd = -1;
         }
         if (pid > 0) {
             int st = 0;
-            if (::waitpid(pid, &st, WNOHANG) == 0) {
+            const pid_t polled = ::waitpid(pid, &st, WNOHANG);
+            if (polled == 0 || (polled < 0 && errno == EINTR)) {
                 (void)::kill(pid, SIGKILL);
-                (void)::waitpid(pid, &st, 0);
+                (void)::kill(pid, SIGCONT);
+                while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {
+                }
             }
             pid = -1;
         }
@@ -377,17 +412,22 @@ TEST(DebuggerLinuxLiveTest, DefaultProcessAttachRemainsStrictlyReadOnly) {
 }
 
 TEST(DebuggerLinuxLiveTest, BreakpointHitRipRewindShadowReadStepIntoStepOverWriteRegAndCleanDetach) {
-    int ready_pipe[2]{-1, -1};
-    int go_pipe[2]{-1, -1};
-    ASSERT_EQ(::pipe(ready_pipe), 0);
-    ASSERT_EQ(::pipe(go_pipe), 0);
+    int raw_ready_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_ready_pipe), 0);
+    ScopedFd ready_r(raw_ready_pipe[0]);
+    ScopedFd ready_w(raw_ready_pipe[1]);
+
+    int raw_go_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_go_pipe), 0);
+    ScopedFd go_r(raw_go_pipe[0]);
+    ScopedFd go_w(raw_go_pipe[1]);
 
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
 
     if (child == 0) {
-        ::close(ready_pipe[0]);
-        ::close(go_pipe[1]);
+        ready_r.reset();
+        go_w.reset();
         // Allow our parent process to PTRACE_ATTACH even when Yama ptrace_scope == 1.
 #ifdef PR_SET_PTRACER
         (void)::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
@@ -397,14 +437,14 @@ TEST(DebuggerLinuxLiveTest, BreakpointHitRipRewindShadowReadStepIntoStepOverWrit
             .call_site_va = reinterpret_cast<std::uint64_t>(peelf_dbg_call_site),
             .after_call_va = reinterpret_cast<std::uint64_t>(peelf_dbg_after_call),
         };
-        (void)::write(ready_pipe[1], &anchors, sizeof(anchors));
-        ::close(ready_pipe[1]);
+        (void)::write(ready_w.fd, &anchors, sizeof(anchors));
+        ready_w.reset();
 
         char go = 0;
-        if (::read(go_pipe[0], &go, 1) != 1) {
+        if (::read(go_r.fd, &go, 1) != 1) {
             ::_exit(2);
         }
-        ::close(go_pipe[0]);
+        go_r.reset();
 
         // First call hits our software breakpoint, steps through, and receives modified RAX!
         const std::uint64_t first = peelf_dbg_test_sequence();
@@ -416,13 +456,13 @@ TEST(DebuggerLinuxLiveTest, BreakpointHitRipRewindShadowReadStepIntoStepOverWrit
         ::_exit(3);
     }
 
-    ::close(ready_pipe[1]);
-    ::close(go_pipe[0]);
-    ScopedDebugChildGuard guard{child, go_pipe[1]};
+    ready_w.reset();
+    go_r.reset();
+    ScopedDebugChildGuard guard{child, go_w.release()};
 
     DebugChildAnchors anchors{};
-    ASSERT_EQ(::read(ready_pipe[0], &anchors, sizeof(anchors)), static_cast<ssize_t>(sizeof(anchors)));
-    ::close(ready_pipe[0]);
+    ASSERT_EQ(::read(ready_r.fd, &anchors, sizeof(anchors)), static_cast<ssize_t>(sizeof(anchors)));
+    ready_r.reset();
 
     ASSERT_EQ(anchors.call_site_va, anchors.bp_entry_va + 1u);
     ASSERT_EQ(anchors.after_call_va, anchors.call_site_va + 5u);
@@ -520,6 +560,7 @@ TEST(DebuggerLinuxLiveTest, LaunchExecutableStopsAtInitialTrapStepsAndDetachesCl
     const std::filesystem::path fixture_exe(PEELF_CALLGRAPH_FIXTURE_EXE);
     ASSERT_TRUE(std::filesystem::exists(fixture_exe));
 
+    ScopedDebugChildGuard child_guard{-1, -1};
     viewer::BinaryModel model;
     auto launched = model.launch_debug_process(fixture_exe);
     ASSERT_TRUE(launched.has_value()) << launched.error().message;
@@ -530,7 +571,8 @@ TEST(DebuggerLinuxLiveTest, LaunchExecutableStopsAtInitialTrapStepsAndDetachesCl
 
     EXPECT_EQ(dbg.state(), DebugSessionState::Paused);
     const ProcessId child_pid = dbg.session().pid();
-    EXPECT_GT(child_pid, 0u);
+    ASSERT_GT(child_pid, 0u);
+    child_guard.pid = static_cast<pid_t>(child_pid);
     EXPECT_NE(dbg.stop_status().instruction_pointer, 0u);
     ASSERT_TRUE(dbg.stop_status().last_event.has_value());
     EXPECT_EQ(dbg.stop_status().last_event->kind, DebugEventKind::ProcessStarted);
@@ -558,6 +600,7 @@ TEST(DebuggerLinuxLiveTest, LaunchExecutableStopsAtInitialTrapStepsAndDetachesCl
     model.detach_process();
     int wstatus = 0;
     ASSERT_EQ(::waitpid(static_cast<pid_t>(child_pid), &wstatus, 0), static_cast<pid_t>(child_pid));
+    child_guard.pid = -1;
     EXPECT_TRUE(WIFEXITED(wstatus));
 }
 
@@ -587,39 +630,44 @@ TEST(DebuggerLinuxLiveTest, StepOffBreakpointOnFaultingInstructionReportsSigsegv
     }
     ScopedDebugChildGuard unrelated_guard{unrelated_child, -1};
 
-    int ready_pipe[2]{-1, -1};
-    int go_pipe[2]{-1, -1};
-    ASSERT_EQ(::pipe(ready_pipe), 0);
-    ASSERT_EQ(::pipe(go_pipe), 0);
+    int raw_ready_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_ready_pipe), 0);
+    ScopedFd ready_r(raw_ready_pipe[0]);
+    ScopedFd ready_w(raw_ready_pipe[1]);
+
+    int raw_go_pipe[2]{-1, -1};
+    ASSERT_EQ(::pipe(raw_go_pipe), 0);
+    ScopedFd go_r(raw_go_pipe[0]);
+    ScopedFd go_w(raw_go_pipe[1]);
 
     const pid_t child = ::fork();
     ASSERT_GE(child, 0);
     if (child == 0) {
-        ::close(ready_pipe[0]);
-        ::close(go_pipe[1]);
+        ready_r.reset();
+        go_w.reset();
 #ifdef PR_SET_PTRACER
         (void)::prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
 #endif
         const auto fault_va = reinterpret_cast<std::uint64_t>(peelf_dbg_fault_insn);
-        (void)::write(ready_pipe[1], &fault_va, sizeof(fault_va));
-        ::close(ready_pipe[1]);
+        (void)::write(ready_w.fd, &fault_va, sizeof(fault_va));
+        ready_w.reset();
 
         char go = 0;
-        if (::read(go_pipe[0], &go, 1) != 1) {
+        if (::read(go_r.fd, &go, 1) != 1) {
             ::_exit(2);
         }
-        ::close(go_pipe[0]);
+        go_r.reset();
         peelf_dbg_fault_sequence();
         ::_exit(0);
     }
 
-    ::close(ready_pipe[1]);
-    ::close(go_pipe[0]);
-    ScopedDebugChildGuard guard{child, go_pipe[1]};
+    ready_w.reset();
+    go_r.reset();
+    ScopedDebugChildGuard guard{child, go_w.release()};
 
     std::uint64_t fault_va = 0u;
-    ASSERT_EQ(::read(ready_pipe[0], &fault_va, sizeof(fault_va)), static_cast<ssize_t>(sizeof(fault_va)));
-    ::close(ready_pipe[0]);
+    ASSERT_EQ(::read(ready_r.fd, &fault_va, sizeof(fault_va)), static_cast<ssize_t>(sizeof(fault_va)));
+    ready_r.reset();
 
     auto backend = create_native_debug_backend();
     auto attached = backend->attach(static_cast<ProcessId>(child));
