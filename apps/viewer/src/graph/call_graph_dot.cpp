@@ -46,6 +46,45 @@ using detail::format_hex;
     return escaped;
 }
 
+[[nodiscard]] std::string dot_escape_record(std::string_view text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (const char ch : text) {
+        switch (ch) {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '"':
+                escaped += "\\\"";
+                break;
+            case '{':
+                escaped += "\\{";
+                break;
+            case '}':
+                escaped += "\\}";
+                break;
+            case '|':
+                escaped += "\\|";
+                break;
+            case '<':
+                escaped += "\\<";
+                break;
+            case '>':
+                escaped += "\\>";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                break;
+            default:
+                escaped.push_back(ch);
+                break;
+        }
+    }
+    return escaped;
+}
+
 [[nodiscard]] std::string node_shape(CallGraphNodeKind kind) {
     switch (kind) {
         case CallGraphNodeKind::Function:
@@ -102,24 +141,47 @@ using detail::format_hex;
     return std::string(token);
 }
 
-[[nodiscard]] std::string node_label(const CallGraphNode& node) {
-    const std::string base_label = node.label.empty() ? node.id : node.label;
-    std::string label = base_label;
+[[nodiscard]] std::string node_body_lines(const CallGraphNode& node, std::string_view base_label) {
+    std::string body;
+    const auto append_line = [&](std::string_view line) {
+        if (!body.empty()) {
+            body.push_back('\n');
+        }
+        body.append(line);
+    };
     if (!node.instructions.empty()) {
-        for (const auto& instruction : node.instructions)
-            label += "\n" + format_hex(instruction.address) + "  " + instruction.mnemonic + " " + instruction.operands;
-        return label;
+        for (const auto& instruction : node.instructions) {
+            append_line(format_hex(instruction.address) + "  " + instruction.mnemonic +
+                        (instruction.operands.empty() ? "" : (" " + instruction.operands)));
+        }
+        return body;
     }
     if (node.bytes.start.virtual_address) {
-        label += "\nVA " + format_hex(*node.bytes.start.virtual_address);
+        append_line("VA " + format_hex(*node.bytes.start.virtual_address));
     }
     if (node.bytes.start.file_offset) {
-        label += "\nfile " + format_hex(*node.bytes.start.file_offset);
+        append_line("file " + format_hex(*node.bytes.start.file_offset));
     }
     if (node.symbol && !node.symbol->name.empty() && node.symbol->name != base_label) {
-        label += "\n" + node.symbol->name;
+        append_line(node.symbol->name);
     }
-    return label;
+    return body;
+}
+
+[[nodiscard]] std::string format_dot_node_label(const CallGraphNode& node, std::string_view shape) {
+    const std::string base_label = node.label.empty() ? node.id : node.label;
+    const std::string body = node_body_lines(node, base_label);
+    if (shape == "record" || shape == "Mrecord") {
+        std::string escaped_header = dot_escape_record(base_label);
+        if (body.empty()) {
+            return escaped_header;
+        }
+        return "{" + escaped_header + "|" + dot_escape_record(body) + "}";
+    }
+    if (body.empty()) {
+        return dot_escape(base_label);
+    }
+    return dot_escape(base_label + "\n" + body);
 }
 
 } // namespace
@@ -133,8 +195,9 @@ std::string to_dot(const CallGraph& graph) {
     out << "  edge [fontname=\"Consolas\", fontsize=\"9\"];\n";
 
     for (const CallGraphNode& node : graph.nodes) {
-        out << "  \"" << dot_escape(node.id) << "\" [shape=\"" << node_shape(node.kind) << "\", label=\""
-            << dot_escape(node_label(node)) << "\"];\n";
+        const std::string shape = node_shape(node.kind);
+        out << "  \"" << dot_escape(node.id) << "\" [shape=\"" << shape << "\", label=\""
+            << format_dot_node_label(node, shape) << "\"];\n";
     }
 
     for (const CallGraphEdge& edge : graph.edges) {

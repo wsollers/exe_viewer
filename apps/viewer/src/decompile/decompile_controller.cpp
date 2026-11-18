@@ -73,6 +73,7 @@ DecompileController::DecompileController(WorkFn executor)
                     std::scoped_lock lock(self->mutex_);
                     self->shutting_down_ = true;
                     self->active_sequence_ = 0;
+                    self->active_job_stop_ = std::stop_source{std::nostopstate};
                     self->pending_.reset();
                 }
                 self->cv_.notify_all();
@@ -99,6 +100,7 @@ DecompileController::~DecompileController() noexcept {
 }
 
 std::uint64_t DecompileController::submit(DecompileJobSpec spec) {
+    std::stop_source pre_job_stop{};
     DecompiledUnit pre_cancelled{
         .status = DecompileStatus::Cancelled,
         .provider = "Decompiler",
@@ -116,12 +118,14 @@ std::uint64_t DecompileController::submit(DecompileJobSpec spec) {
     };
 
     std::uint64_t seq = 0;
+    std::stop_source stop_to_request{std::nostopstate};
     {
         std::scoped_lock lock(mutex_);
         seq = ++next_sequence_;
         pending_ = PendingJob{
             .sequence = seq,
             .spec = std::move(spec),
+            .job_stop = std::move(pre_job_stop),
             .cancelled_unit = std::move(pre_cancelled),
             .bad_alloc_unit = std::move(pre_oom),
             .unknown_error_unit = std::move(pre_unknown),
@@ -129,14 +133,18 @@ std::uint64_t DecompileController::submit(DecompileJobSpec spec) {
         completed_.reset();
         stale_result_discarded_ = false;
         if (active_sequence_ != 0) {
-            active_job_stop_.request_stop();
+            stop_to_request = active_job_stop_;
         }
+    }
+    if (stop_to_request.stop_possible()) {
+        stop_to_request.request_stop();
     }
     cv_.notify_all();
     return seq;
 }
 
 void DecompileController::cancel_current() noexcept {
+    std::stop_source stop_to_request{std::nostopstate};
     {
         std::scoped_lock lock(mutex_);
         if (active_sequence_ == 0 && !pending_.has_value()) {
@@ -161,13 +169,17 @@ void DecompileController::cancel_current() noexcept {
             };
         }
         if (active_sequence_ != 0) {
-            active_job_stop_.request_stop();
+            stop_to_request = active_job_stop_;
         }
+    }
+    if (stop_to_request.stop_possible()) {
+        stop_to_request.request_stop();
     }
     cv_.notify_all();
 }
 
 void DecompileController::reset_for_new_target() noexcept {
+    std::stop_source stop_to_request{std::nostopstate};
     {
         std::scoped_lock lock(mutex_);
         ++next_sequence_;
@@ -175,20 +187,27 @@ void DecompileController::reset_for_new_target() noexcept {
         completed_.reset();
         stale_result_discarded_ = false;
         if (active_sequence_ != 0) {
-            active_job_stop_.request_stop();
+            stop_to_request = active_job_stop_;
         }
+    }
+    if (stop_to_request.stop_possible()) {
+        stop_to_request.request_stop();
     }
     cv_.notify_all();
 }
 
 void DecompileController::shutdown() noexcept {
+    std::stop_source stop_to_request{std::nostopstate};
     {
         std::scoped_lock lock(mutex_);
         shutting_down_ = true;
         pending_.reset();
         if (active_sequence_ != 0) {
-            active_job_stop_.request_stop();
+            stop_to_request = active_job_stop_;
         }
+    }
+    if (stop_to_request.stop_possible()) {
+        stop_to_request.request_stop();
     }
     worker_.request_stop();
     cv_.notify_all();
@@ -259,6 +278,7 @@ void DecompileController::worker_loop(std::stop_token worker_stop) {
             });
             if (shutting_down_ || worker_stop.stop_requested()) {
                 active_sequence_ = 0;
+                active_job_stop_ = std::stop_source{std::nostopstate};
                 lock.unlock();
                 cv_.notify_all();
                 return;
@@ -266,7 +286,7 @@ void DecompileController::worker_loop(std::stop_token worker_stop) {
             job = std::move(*pending_);
             pending_.reset();
             active_sequence_ = job.sequence;
-            active_job_stop_ = std::stop_source{};
+            active_job_stop_ = std::move(job.job_stop);
             job_stop = active_job_stop_.get_token();
         }
 
@@ -298,6 +318,7 @@ void DecompileController::worker_loop(std::stop_token worker_stop) {
                 job_stop.stop_requested() || worker_stop.stop_requested() || shutting_down_;
             if (active_sequence_ == job.sequence) {
                 active_sequence_ = 0;
+                active_job_stop_ = std::stop_source{std::nostopstate};
             }
             if (!shutting_down_ && !worker_stop.stop_requested() && job.sequence == next_sequence_) {
                 if (was_cancelled && unit.status != DecompileStatus::Cancelled) {
@@ -364,6 +385,7 @@ void DecompileController::handle_worker_fatal_failure(bool is_oom, const char* w
             };
         }
         active_sequence_ = 0;
+        active_job_stop_ = std::stop_source{std::nostopstate};
         pending_.reset();
         shutting_down_ = true;
     }

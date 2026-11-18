@@ -152,6 +152,39 @@ void recover_cfg_jump_tables(
 
     const std::size_t limit = std::min(count_insns, instructions.size());
 
+    const auto x86_clobbers_gpr = [&](const cs_insn& ins, bool is_call, bool is_branch, int gpr) noexcept {
+        if (gpr < 0 || !ins.detail) return false;
+        const auto& x86 = ins.detail->x86;
+        if (ins.id == X86_INS_DIV || ins.id == X86_INS_IDIV || ins.id == X86_INS_MUL) {
+            return gpr == 0 || gpr == 2;
+        }
+        if (ins.id == X86_INS_CDQ || ins.id == X86_INS_CQO) {
+            return gpr == 2;
+        }
+        if (x86.op_count >= 1 && x86.operands[0].type == X86_OP_REG &&
+            ins.id != X86_INS_CMP && ins.id != X86_INS_TEST &&
+            ins.id != X86_INS_PUSH && !is_call && !is_branch) {
+            if (cfg_norm_x86_gpr(x86.operands[0].reg) == gpr) return true;
+            if (ins.id == X86_INS_XCHG && x86.op_count == 2 &&
+                x86.operands[1].type == X86_OP_REG &&
+                cfg_norm_x86_gpr(x86.operands[1].reg) == gpr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const auto x86_clobbers_flags = [](const cs_insn& ins, bool is_call, bool is_branch) noexcept {
+        const std::string_view mnem(ins.mnemonic);
+        return !(ins.id == X86_INS_MOV || ins.id == X86_INS_MOVABS ||
+                 ins.id == X86_INS_MOVZX || ins.id == X86_INS_MOVSX ||
+                 ins.id == X86_INS_MOVSXD || ins.id == X86_INS_LEA ||
+                 ins.id == X86_INS_NOP || ins.id == X86_INS_PUSH ||
+                 ins.id == X86_INS_POP || ins.id == X86_INS_XCHG ||
+                 ins.id == X86_INS_ENDBR64 || ins.id == X86_INS_ENDBR32 ||
+                 mnem.starts_with("cmov") || (is_branch && !is_call));
+    };
+
     const auto find_x86_guard = [&](std::size_t search_end_exclusive,
                                     int idx_reg,
                                     std::size_t& out_guard_idx) -> std::optional<std::size_t> {
@@ -162,8 +195,12 @@ void recover_cfg_jump_tables(
         for (std::size_t pos = search_end_exclusive; pos-- > 0;) {
             const cs_insn& ins = raw[pos];
             if (!ins.detail) continue;
-            if (pos + 1u < search_end_exclusive &&
-                (ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET)) break;
+            const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+            const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+            const bool is_ret = cs_insn_group(handle.get(), &ins, CS_GRP_RET);
+            if (is_call || is_ret || ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) {
+                break;
+            }
             const auto& x86 = ins.detail->x86;
             if (!saw_guard) {
                 if ((ins.id == X86_INS_JA || ins.id == X86_INS_JAE) &&
@@ -178,21 +215,36 @@ void recover_cfg_jump_tables(
                     x86.op_count == 2 && x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_REG &&
                     cfg_norm_x86_gpr(x86.operands[0].reg) == tracked) {
                     tracked = cfg_norm_x86_gpr(x86.operands[1].reg);
+                    if (tracked < 0) break;
+                    continue;
+                }
+                if (x86_clobbers_gpr(ins, is_call, is_branch, tracked)) {
+                    break;
                 }
             } else {
                 if (ins.id == X86_INS_CMP && x86.op_count == 2 &&
                     x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_IMM &&
                     x86.operands[1].imm >= 0 && cfg_norm_x86_gpr(x86.operands[0].reg) == tracked) {
-                    const std::uint64_t cases = strict_above
-                        ? (static_cast<std::uint64_t>(x86.operands[1].imm) + 1u)
-                        : static_cast<std::uint64_t>(x86.operands[1].imm);
+                    const auto uimm = static_cast<std::uint64_t>(x86.operands[1].imm);
+                    if (strict_above && uimm == std::numeric_limits<std::uint64_t>::max()) {
+                        return std::nullopt;
+                    }
+                    const std::uint64_t cases = strict_above ? (uimm + 1u) : uimm;
                     if (cases >= 1u && cases <= 256u) return static_cast<std::size_t>(cases);
                     return std::nullopt;
+                }
+                if (x86_clobbers_flags(ins, is_call, is_branch)) {
+                    break;
                 }
                 if ((ins.id == X86_INS_MOV || ins.id == X86_INS_MOVZX || ins.id == X86_INS_MOVSXD) &&
                     x86.op_count == 2 && x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_REG &&
                     cfg_norm_x86_gpr(x86.operands[0].reg) == tracked) {
                     tracked = cfg_norm_x86_gpr(x86.operands[1].reg);
+                    if (tracked < 0) break;
+                    continue;
+                }
+                if (x86_clobbers_gpr(ins, is_call, is_branch, tracked)) {
+                    break;
                 }
             }
         }
@@ -257,7 +309,12 @@ void recover_cfg_jump_tables(
                 for (std::size_t p = i; p-- > 0 && (i - p) <= 12u;) {
                     const cs_insn& ins = raw[p];
                     if (!ins.detail) continue;
-                    if (ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) break;
+                    const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+                    const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+                    const bool is_ret = cs_insn_group(handle.get(), &ins, CS_GRP_RET);
+                    if (is_call || is_ret || ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) {
+                        break;
+                    }
                     const auto& d = ins.detail->x86;
                     if (cand_a < 0) {
                         if (ins.id == X86_INS_ADD && d.op_count == 2 &&
@@ -273,6 +330,8 @@ void recover_cfg_jump_tables(
                                    d.operands[1].mem.scale == 1 && d.operands[1].mem.disp == 0) {
                             cand_a = cfg_norm_x86_gpr(d.operands[1].mem.base);
                             cand_b = cfg_norm_x86_gpr(d.operands[1].mem.index);
+                        } else if (x86_clobbers_gpr(ins, is_call, is_branch, jmp_reg)) {
+                            break;
                         }
                     } else if ((ins.id == X86_INS_MOVSXD || ins.id == X86_INS_MOVSX) &&
                                d.op_count == 2 && d.operands[0].type == X86_OP_REG &&
@@ -289,6 +348,13 @@ void recover_cfg_jump_tables(
                             found_movsxd = true;
                             break;
                         }
+                        if (x86_clobbers_gpr(ins, is_call, is_branch, cand_a) ||
+                            x86_clobbers_gpr(ins, is_call, is_branch, cand_b)) {
+                            break;
+                        }
+                    } else if (x86_clobbers_gpr(ins, is_call, is_branch, cand_a) ||
+                               x86_clobbers_gpr(ins, is_call, is_branch, cand_b)) {
+                        break;
                     }
                 }
 
@@ -297,7 +363,12 @@ void recover_cfg_jump_tables(
                     for (std::size_t p = movsxd_pos; p-- > 0 && (movsxd_pos - p) <= 12u;) {
                         const cs_insn& ins = raw[p];
                         if (!ins.detail) continue;
-                        if (ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) break;
+                        const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+                        const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+                        const bool is_ret = cs_insn_group(handle.get(), &ins, CS_GRP_RET);
+                        if (is_call || is_ret || ins.id == X86_INS_JMP || ins.id == X86_INS_LJMP || ins.id == X86_INS_RET) {
+                            break;
+                        }
                         const auto& d = ins.detail->x86;
                         if (ins.id == X86_INS_LEA && d.op_count == 2 &&
                             d.operands[0].type == X86_OP_REG &&
@@ -311,9 +382,7 @@ void recover_cfg_jump_tables(
                             }
                             break;
                         }
-                        if (d.op_count >= 1 && d.operands[0].type == X86_OP_REG &&
-                            ins.id != X86_INS_CMP && ins.id != X86_INS_TEST &&
-                            cfg_norm_x86_gpr(d.operands[0].reg) == matched_base) {
+                        if (x86_clobbers_gpr(ins, is_call, is_branch, matched_base)) {
                             break;
                         }
                     }
@@ -374,7 +443,26 @@ void recover_cfg_jump_tables(
                 for (std::size_t p = i; p-- > 0 && (i - p) <= 8u;) {
                     const cs_insn& ins = raw[p];
                     if (!ins.detail) continue;
+                    const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+                    const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+                    const bool is_ret = cs_insn_group(handle.get(), &ins, CS_GRP_RET);
                     const auto& d = ins.detail->arm;
+                    if (is_call || is_ret ||
+                        (is_branch && !is_call && (d.cc == ARM_CC_AL || d.cc == ARM_CC_INVALID))) {
+                        break;
+                    }
+                    const std::string_view arm_mnem(ins.mnemonic);
+                    const bool clobbers_tracked =
+                        d.op_count >= 1 && d.operands[0].type == ARM_OP_REG &&
+                        ins.id != ARM_INS_CMP && ins.id != ARM_INS_CMN &&
+                        ins.id != ARM_INS_TST && ins.id != ARM_INS_TEQ &&
+                        !arm_mnem.starts_with("str") && !arm_mnem.starts_with("stm") &&
+                        !arm_mnem.starts_with("push") && !is_call && !is_branch &&
+                        cfg_norm_arm_gpr(d.operands[0].reg) == tracked;
+                    const bool clobbers_flags =
+                        d.update_flags || is_call ||
+                        ins.id == ARM_INS_CMP || ins.id == ARM_INS_CMN ||
+                        ins.id == ARM_INS_TST || ins.id == ARM_INS_TEQ;
                     if (!saw_guard) {
                         if (ins.id == ARM_INS_B && (d.cc == ARM_CC_HI || d.cc == ARM_CC_HS)) {
                             saw_guard = true;
@@ -384,15 +472,35 @@ void recover_cfg_jump_tables(
                                    d.operands[0].type == ARM_OP_REG && d.operands[1].type == ARM_OP_REG &&
                                    cfg_norm_arm_gpr(d.operands[0].reg) == tracked) {
                             tracked = cfg_norm_arm_gpr(d.operands[1].reg);
+                            if (tracked < 0) break;
+                        } else if (clobbers_tracked) {
+                            break;
                         }
-                    } else if (ins.id == ARM_INS_CMP && d.op_count == 2 &&
-                               d.operands[0].type == ARM_OP_REG && d.operands[1].type == ARM_OP_IMM &&
-                               d.operands[1].imm >= 0 && cfg_norm_arm_gpr(d.operands[0].reg) == tracked) {
-                        const std::uint64_t cases = strict_above
-                            ? (static_cast<std::uint64_t>(d.operands[1].imm) + 1u)
-                            : static_cast<std::uint64_t>(d.operands[1].imm);
-                        if (cases >= 1u && cases <= 256u) count = static_cast<std::size_t>(cases);
-                        break;
+                    } else {
+                        if (ins.id == ARM_INS_CMP && d.op_count == 2 &&
+                            d.operands[0].type == ARM_OP_REG && d.operands[1].type == ARM_OP_IMM &&
+                            d.operands[1].imm >= 0 && cfg_norm_arm_gpr(d.operands[0].reg) == tracked) {
+                            const auto uimm = static_cast<std::uint64_t>(d.operands[1].imm);
+                            if (strict_above && uimm == std::numeric_limits<std::uint64_t>::max()) {
+                                break;
+                            }
+                            const std::uint64_t cases = strict_above ? (uimm + 1u) : uimm;
+                            if (cases >= 1u && cases <= 256u) count = static_cast<std::size_t>(cases);
+                            break;
+                        }
+                        if (clobbers_flags) {
+                            break;
+                        }
+                        if (ins.id == ARM_INS_MOV && d.op_count == 2 &&
+                            d.operands[0].type == ARM_OP_REG && d.operands[1].type == ARM_OP_REG &&
+                            cfg_norm_arm_gpr(d.operands[0].reg) == tracked) {
+                            tracked = cfg_norm_arm_gpr(d.operands[1].reg);
+                            if (tracked < 0) break;
+                            continue;
+                        }
+                        if (clobbers_tracked) {
+                            break;
+                        }
                     }
                 }
                 if (count && !has_direct_bypass(guard_idx, i)) {
@@ -429,6 +537,28 @@ void recover_cfg_jump_tables(
             if (dispatch.id == ARM64_INS_BR && a64.op_count == 1 && a64.operands[0].type == ARM64_OP_REG) {
                 const int target_reg = cfg_norm_arm64_gpr(a64.operands[0].reg);
 
+                const auto a64_is_uncond_stop = [&](const cs_insn& ins, bool is_call, bool is_branch) noexcept {
+                    const bool is_ret = cs_insn_group(handle.get(), &ins, CS_GRP_RET);
+                    if (is_call || is_ret) return true;
+                    const auto& d = ins.detail->arm64;
+                    return is_branch && !is_call &&
+                           ins.id != ARM64_INS_CBZ && ins.id != ARM64_INS_CBNZ &&
+                           ins.id != ARM64_INS_TBZ && ins.id != ARM64_INS_TBNZ &&
+                           (d.cc == ARM64_CC_AL || d.cc == ARM64_CC_NV || d.cc == ARM64_CC_INVALID);
+                };
+
+                const auto a64_clobbers_gpr = [](const cs_insn& ins, bool is_call, bool is_branch, int gpr) noexcept {
+                    if (gpr < 0 || gpr == 31 || !ins.detail) return false;
+                    const auto& d = ins.detail->arm64;
+                    const std::string_view mnem(ins.mnemonic);
+                    return d.op_count >= 1 && d.operands[0].type == ARM64_OP_REG &&
+                           ins.id != ARM64_INS_CMP && ins.id != ARM64_INS_CMN && ins.id != ARM64_INS_TST &&
+                           ins.id != ARM64_INS_CBZ && ins.id != ARM64_INS_CBNZ &&
+                           ins.id != ARM64_INS_TBZ && ins.id != ARM64_INS_TBNZ &&
+                           !mnem.starts_with("st") && !is_call && !is_branch &&
+                           cfg_norm_arm64_gpr(d.operands[0].reg) == gpr;
+                };
+
                 const auto resolve_a64_va = [&](std::size_t before_pos, int reg) -> std::optional<std::uint64_t> {
                     if (reg < 0) return std::nullopt;
                     int cur = reg;
@@ -436,12 +566,17 @@ void recover_cfg_jump_tables(
                     for (std::size_t p = before_pos; p-- > 0 && (before_pos - p) <= 12u;) {
                         const cs_insn& ins = raw[p];
                         if (!ins.detail) continue;
+                        const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+                        const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+                        if (a64_is_uncond_stop(ins, is_call, is_branch)) break;
                         const auto& d = ins.detail->arm64;
                         if ((ins.id == ARM64_INS_ADR || ins.id == ARM64_INS_ADRP) &&
                             d.op_count == 2 && d.operands[0].type == ARM64_OP_REG &&
                             cfg_norm_arm64_gpr(d.operands[0].reg) == cur &&
                             d.operands[1].type == ARM64_OP_IMM) {
-                            return static_cast<std::uint64_t>(d.operands[1].imm) + add_off.value_or(0ULL);
+                            return peelf::checked_add_u64(
+                                static_cast<std::uint64_t>(d.operands[1].imm),
+                                add_off.value_or(0ULL));
                         }
                         if (!add_off && ins.id == ARM64_INS_ADD && d.op_count == 3 &&
                             d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
@@ -449,13 +584,13 @@ void recover_cfg_jump_tables(
                             cfg_norm_arm64_gpr(d.operands[0].reg) == cur) {
                             const std::uint64_t sh = d.operands[2].shift.type == ARM64_SFT_LSL
                                 ? d.operands[2].shift.value : 0u;
+                            if (sh >= 64u) break;
                             add_off = static_cast<std::uint64_t>(d.operands[2].imm) << sh;
                             cur = cfg_norm_arm64_gpr(d.operands[1].reg);
+                            if (cur < 0) break;
                             continue;
                         }
-                        if (d.op_count >= 1 && d.operands[0].type == ARM64_OP_REG &&
-                            ins.id != ARM64_INS_CMP && ins.id != ARM64_INS_TST &&
-                            cfg_norm_arm64_gpr(d.operands[0].reg) == cur) {
+                        if (a64_clobbers_gpr(ins, is_call, is_branch, cur)) {
                             break;
                         }
                     }
@@ -472,7 +607,16 @@ void recover_cfg_jump_tables(
                     for (std::size_t p = before_pos; p-- > 0 && (before_pos - p) <= 12u;) {
                         const cs_insn& ins = raw[p];
                         if (!ins.detail) continue;
+                        const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+                        const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+                        if (a64_is_uncond_stop(ins, is_call, is_branch)) break;
                         const auto& d = ins.detail->arm64;
+                        const bool clobbers_flags =
+                            d.update_flags || is_call ||
+                            ins.id == ARM64_INS_CMP || ins.id == ARM64_INS_CMN ||
+                            ins.id == ARM64_INS_TST || ins.id == ARM64_INS_SUBS ||
+                            ins.id == ARM64_INS_ADDS || ins.id == ARM64_INS_ANDS ||
+                            ins.id == ARM64_INS_CCMP || ins.id == ARM64_INS_CCMN;
                         if (!saw_guard) {
                             if (ins.id == ARM64_INS_B && (d.cc == ARM64_CC_HI || d.cc == ARM64_CC_HS)) {
                                 saw_guard = true;
@@ -482,6 +626,9 @@ void recover_cfg_jump_tables(
                                        d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
                                        cfg_norm_arm64_gpr(d.operands[0].reg) == tracked) {
                                 tracked = cfg_norm_arm64_gpr(d.operands[1].reg);
+                                if (tracked < 0) break;
+                            } else if (a64_clobbers_gpr(ins, is_call, is_branch, tracked)) {
+                                break;
                             }
                         } else {
                             if ((ins.id == ARM64_INS_CMP && d.op_count >= 2 &&
@@ -494,10 +641,27 @@ void recover_cfg_jump_tables(
                                 const unsigned imm_op = (ins.id == ARM64_INS_SUBS) ? 2u : 1u;
                                 const std::uint64_t sh = d.operands[imm_op].shift.type == ARM64_SFT_LSL
                                     ? d.operands[imm_op].shift.value : 0u;
+                                if (sh >= 64u) return std::nullopt;
                                 const std::uint64_t imm = static_cast<std::uint64_t>(d.operands[imm_op].imm) << sh;
+                                if (strict_above && imm == std::numeric_limits<std::uint64_t>::max()) {
+                                    return std::nullopt;
+                                }
                                 const std::uint64_t cases = strict_above ? (imm + 1u) : imm;
                                 if (cases >= 1u && cases <= 256u) return static_cast<std::size_t>(cases);
                                 return std::nullopt;
+                            }
+                            if (clobbers_flags) {
+                                break;
+                            }
+                            if (ins.id == ARM64_INS_MOV && d.op_count == 2 &&
+                                d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
+                                cfg_norm_arm64_gpr(d.operands[0].reg) == tracked) {
+                                tracked = cfg_norm_arm64_gpr(d.operands[1].reg);
+                                if (tracked < 0) break;
+                                continue;
+                            }
+                            if (a64_clobbers_gpr(ins, is_call, is_branch, tracked)) {
+                                break;
                             }
                         }
                     }
@@ -507,6 +671,9 @@ void recover_cfg_jump_tables(
                 for (std::size_t p = i; p-- > 0 && (i - p) <= 8u;) {
                     const cs_insn& ins = raw[p];
                     if (!ins.detail) continue;
+                    const bool is_call = cs_insn_group(handle.get(), &ins, CS_GRP_CALL);
+                    const bool is_branch = cs_insn_group(handle.get(), &ins, CS_GRP_JUMP);
+                    if (a64_is_uncond_stop(ins, is_call, is_branch)) break;
                     const auto& d = ins.detail->arm64;
                     if (ins.id == ARM64_INS_ADD && d.op_count == 3 &&
                         d.operands[0].type == ARM64_OP_REG && d.operands[1].type == ARM64_OP_REG &&
@@ -523,6 +690,9 @@ void recover_cfg_jump_tables(
                         for (std::size_t lp = p; lp-- > 0 && (p - lp) <= 8u;) {
                             const cs_insn& lins = raw[lp];
                             if (!lins.detail) continue;
+                            const bool lis_call = cs_insn_group(handle.get(), &lins, CS_GRP_CALL);
+                            const bool lis_branch = cs_insn_group(handle.get(), &lins, CS_GRP_JUMP);
+                            if (a64_is_uncond_stop(lins, lis_call, lis_branch)) break;
                             const auto& ld = lins.detail->arm64;
                             if ((lins.id == ARM64_INS_LDRB || lins.id == ARM64_INS_LDRSB ||
                                  lins.id == ARM64_INS_LDRH || lins.id == ARM64_INS_LDRSH ||
@@ -600,7 +770,14 @@ void recover_cfg_jump_tables(
                                 }
                                 break;
                             }
+                            if (a64_clobbers_gpr(lins, lis_call, lis_branch, off_r) ||
+                                a64_clobbers_gpr(lins, lis_call, lis_branch, anchor_r)) {
+                                break;
+                            }
                         }
+                        break;
+                    }
+                    if (a64_clobbers_gpr(ins, is_call, is_branch, target_reg)) {
                         break;
                     }
                 }

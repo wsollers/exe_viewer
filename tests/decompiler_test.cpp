@@ -1,5 +1,6 @@
 #include "decompile/decompile_controller.hpp"
 #include "decompile/decompiler.hpp"
+#include "decompile/structured_decompiler.hpp"
 #include <peelf/sha256.hpp>
 #include <gtest/gtest.h>
 #include <atomic>
@@ -8,14 +9,156 @@
 #include "model/binary_model.hpp"
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
 #include <format>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 #include "symbols/debug_symbols.hpp"
 using namespace viewer;
+
+namespace {
+
+[[nodiscard]] unsigned long current_test_pid() noexcept {
+#ifdef _WIN32
+    return static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+[[nodiscard]] std::optional<std::string> read_env_var(const char* name) {
+#ifdef _WIN32
+    char* buf = nullptr;
+    std::size_t len = 0;
+    if (_dupenv_s(&buf, &len, name) != 0 || buf == nullptr) {
+        return std::nullopt;
+    }
+    std::string val(buf);
+    std::free(buf);
+    return val;
+#else
+    const char* val = std::getenv(name);
+    if (val == nullptr) {
+        return std::nullopt;
+    }
+    return std::string(val);
+#endif
+}
+
+void write_env_var(const char* name, const std::optional<std::string>& value) {
+#ifdef _WIN32
+    (void)_putenv_s(name, value.has_value() ? value->c_str() : "");
+#else
+    if (value.has_value()) {
+        (void)::setenv(name, value->c_str(), 1);
+    } else {
+        (void)::unsetenv(name);
+    }
+#endif
+}
+
+[[nodiscard]] std::filesystem::path safe_test_temp_root() {
+    std::error_code ec;
+    auto base = std::filesystem::temp_directory_path(ec);
+#ifndef _WIN32
+    std::string generic = base.generic_string();
+    std::ranges::transform(generic, generic.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (ec || base.empty() || generic == "/mnt/c" || generic.starts_with("/mnt/c/")) {
+        return "/tmp";
+    }
+#endif
+    return base;
+}
+
+class IsolatedGhidraCacheEnvironment final : public ::testing::Environment {
+public:
+    IsolatedGhidraCacheEnvironment()
+        : prior_peelf_cache_dir_(read_env_var("PEELF_CACHE_DIR"))
+        , isolated_dir_(safe_test_temp_root() / std::format(
+              "peelf-decompiler-test-cache-{}-{}",
+              current_test_pid(),
+              std::chrono::steady_clock::now().time_since_epoch().count())) {
+        activate();
+    }
+
+    IsolatedGhidraCacheEnvironment(const IsolatedGhidraCacheEnvironment&) = delete;
+    IsolatedGhidraCacheEnvironment& operator=(const IsolatedGhidraCacheEnvironment&) = delete;
+    IsolatedGhidraCacheEnvironment(IsolatedGhidraCacheEnvironment&&) = delete;
+    IsolatedGhidraCacheEnvironment& operator=(IsolatedGhidraCacheEnvironment&&) = delete;
+
+    ~IsolatedGhidraCacheEnvironment() noexcept override {
+        cleanup();
+    }
+
+    void SetUp() override {
+        activate();
+    }
+
+    void TearDown() override {
+        cleanup();
+    }
+
+    [[nodiscard]] const std::filesystem::path& isolated_dir() const noexcept {
+        return isolated_dir_;
+    }
+
+private:
+    void activate() {
+        std::error_code ec;
+        std::filesystem::create_directories(isolated_dir_, ec);
+        std::filesystem::permissions(
+            isolated_dir_,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace,
+            ec);
+        write_env_var("PEELF_CACHE_DIR", isolated_dir_.string());
+        active_ = true;
+    }
+
+    void cleanup() noexcept {
+        if (!active_) {
+            return;
+        }
+        try {
+            write_env_var("PEELF_CACHE_DIR", prior_peelf_cache_dir_);
+        } catch (...) {
+        }
+        std::error_code ec;
+        std::filesystem::remove_all(isolated_dir_, ec);
+        active_ = false;
+    }
+
+    std::optional<std::string> prior_peelf_cache_dir_;
+    std::filesystem::path isolated_dir_;
+    bool active_ = false;
+};
+
+// NOLINTNEXTLINE(cppcoreguidelines-owning-memory)
+const auto* const g_isolated_ghidra_cache_env = static_cast<IsolatedGhidraCacheEnvironment*>(
+    ::testing::AddGlobalTestEnvironment(new IsolatedGhidraCacheEnvironment()));
+
+} // namespace
 
 TEST(Decompiler, MappedRangesAndStructuresRoundTrip) {
     const auto unit=parse_decompiler_output("PEELF_DECOMPILE 3 ready \"C\" 2 0 \"{\" 2 4096 3 4102 5 \"  return count;\" 1 \"Packet\" 16 0 1 8 8 \"weight\" \"double\"");
@@ -417,6 +560,11 @@ TEST(Decompiler, DecompileCacheHitInvalidationAndLruEviction) {
 TEST(Decompiler, GhidraWorkspaceColdImportThenWarmProcessReuseAndInvalidation) {
     struct TempDir {
         std::filesystem::path path;
+        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
+        TempDir(const TempDir&) = delete;
+        TempDir& operator=(const TempDir&) = delete;
+        TempDir(TempDir&&) = delete;
+        TempDir& operator=(TempDir&&) = delete;
         ~TempDir() {
             std::error_code ec;
             std::filesystem::remove_all(path, ec);
@@ -573,6 +721,11 @@ TEST(Decompiler, GhidraWorkspaceColdImportThenWarmProcessReuseAndInvalidation) {
 TEST(Decompiler, GhidraWarmFailureRecoversViaCleanColdReimport) {
     struct TempDir {
         std::filesystem::path path;
+        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
+        TempDir(const TempDir&) = delete;
+        TempDir& operator=(const TempDir&) = delete;
+        TempDir(TempDir&&) = delete;
+        TempDir& operator=(TempDir&&) = delete;
         ~TempDir() {
             std::error_code ec;
             std::filesystem::remove_all(path, ec);
@@ -647,6 +800,11 @@ TEST(Decompiler, GhidraWorkspaceLruEvictionAndCacheRootOffMntC) {
 
     struct TempDir {
         std::filesystem::path path;
+        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
+        TempDir(const TempDir&) = delete;
+        TempDir& operator=(const TempDir&) = delete;
+        TempDir(TempDir&&) = delete;
+        TempDir& operator=(TempDir&&) = delete;
         ~TempDir() {
             std::error_code ec;
             std::filesystem::remove_all(path, ec);
@@ -1056,5 +1214,436 @@ TEST(Decompiler, DecompileCacheZeroCapacityAndLruUpdateConsistency) {
     alt_req.address = 0x1000;
     EXPECT_FALSE(cache.get(make_decompile_cache_key(alt_req, alt_settings)).has_value());
 }
+
+TEST(Decompiler, DefaultGhidraCacheIsIsolatedInTestProcessAndEnforcesPrivatePermissionsAndLock) {
+    ASSERT_NE(g_isolated_ghidra_cache_env, nullptr);
+    const auto resolved_default = default_ghidra_cache_directory();
+    EXPECT_EQ(resolved_default, g_isolated_ghidra_cache_env->isolated_dir() / "ghidra");
+
+    struct TempDir {
+        std::filesystem::path path;
+        explicit TempDir(std::filesystem::path p) : path(std::move(p)) {}
+        TempDir(const TempDir&) = delete;
+        TempDir& operator=(const TempDir&) = delete;
+        TempDir(TempDir&&) = delete;
+        TempDir& operator=(TempDir&&) = delete;
+        ~TempDir() noexcept {
+            std::error_code ec;
+            std::filesystem::remove_all(path, ec);
+        }
+    } temp{safe_test_temp_root() / std::format("peelf-ghidra-fbf05b-perm-{}", current_test_pid())};
+    std::filesystem::remove_all(temp.path);
+
+    const auto ghidra_home = temp.path / "ghidra_install";
+    const auto scripts_dir = temp.path / "scripts";
+    const auto cache_dir = temp.path / "cache";
+    std::filesystem::create_directories(ghidra_home / "Ghidra/Framework/Utility/lib");
+    std::filesystem::create_directories(scripts_dir);
+    std::ofstream(ghidra_home / "Ghidra/Framework/Utility/lib/Utility.jar").put('J');
+    std::ofstream(scripts_dir / "PeelfDecompile.java").put('/');
+
+    struct InspectingRunner final : IBackendRunner {
+        mutable std::filesystem::path last_project_dir;
+        mutable std::filesystem::path last_scratch_dir;
+        mutable std::filesystem::perms scratch_perms = std::filesystem::perms::unknown;
+        BackendProcessResult run(const std::filesystem::path&,
+                                 const std::vector<std::string>& args,
+                                 std::chrono::milliseconds,
+                                 std::stop_token) const override {
+            const auto headless = std::ranges::find(args, "ghidra.app.util.headless.AnalyzeHeadless");
+            if (headless != args.end() && std::next(headless) != args.end()) {
+                last_project_dir = *std::next(headless);
+                if (std::ranges::find(args, "-import") != args.end() &&
+                    std::ranges::find(args, "-deleteProject") == args.end()) {
+                    std::ofstream(last_project_dir / "analysis.gpr") << "ok";
+                }
+            }
+            const auto post = std::ranges::find(args, "-postScript");
+            if (post != args.end() && std::distance(post, args.end()) > 4) {
+                const std::filesystem::path out_file(*std::next(post, 3));
+                last_scratch_dir = out_file.parent_path();
+                std::error_code ec;
+                scratch_perms = std::filesystem::status(last_scratch_dir, ec).permissions();
+                std::ofstream(out_file) << "PEELF_DECOMPILE 2 ready \"Ghidra\" 1 4096 \"return 7;\"";
+            }
+            return {0};
+        }
+    } runner;
+
+    DecompilerSettings settings;
+    settings.ghidra_home = ghidra_home;
+    settings.cache_directory = cache_dir;
+    settings.reuse_analysis = true;
+
+    DecompileRequest req;
+    req.address = 4096;
+    req.architecture = peelf::Architecture::X86_64;
+    req.image_bytes = {0x90u, 0xC3u};
+
+    GhidraDecompiler backend(settings, scripts_dir, runner);
+    ASSERT_EQ(backend.decompile(req).status, DecompileStatus::Ready);
+    ASSERT_FALSE(runner.last_project_dir.empty());
+
+#ifndef _WIN32
+    constexpr auto kGroupOther =
+        std::filesystem::perms::group_all | std::filesystem::perms::others_all;
+    EXPECT_EQ(runner.scratch_perms & kGroupOther, std::filesystem::perms::none);
+    EXPECT_EQ(runner.scratch_perms & std::filesystem::perms::owner_all,
+              std::filesystem::perms::owner_all);
+
+    for (const auto& private_dir : {cache_dir, cache_dir / ".locks", runner.last_project_dir}) {
+        std::error_code ec;
+        const auto perms = std::filesystem::status(private_dir, ec).permissions();
+        ASSERT_FALSE(ec) << private_dir;
+        EXPECT_EQ(perms & kGroupOther, std::filesystem::perms::none) << private_dir;
+        EXPECT_EQ(perms & std::filesystem::perms::owner_all, std::filesystem::perms::owner_all)
+            << private_dir;
+    }
+
+    // Hold an external exclusive flock on the workspace lockfile and verify decompile waits
+    // cooperatively and honours stop_token cancellation instead of corrupting the .gpr project.
+    const auto lock_file =
+        cache_dir / ".locks" / (runner.last_project_dir.filename().string() + ".lock");
+    ASSERT_TRUE(std::filesystem::exists(lock_file));
+    const int ext_fd = ::open(lock_file.c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(ext_fd, 0);
+    ASSERT_EQ(::flock(ext_fd, LOCK_EX | LOCK_NB), 0);
+
+    std::stop_source cancel_src;
+    std::jthread canceller([&cancel_src] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        cancel_src.request_stop();
+    });
+    const auto blocked_unit = backend.decompile(req, cancel_src.get_token());
+    EXPECT_EQ(blocked_unit.status, DecompileStatus::Cancelled);
+    canceller.join();
+
+    (void)::flock(ext_fd, LOCK_UN);
+    (void)::close(ext_fd);
+
+    const auto unblocked_unit = backend.decompile(req);
+    EXPECT_EQ(unblocked_unit.status, DecompileStatus::Ready);
+    EXPECT_EQ(unblocked_unit.cache_source, DecompileCacheSource::ReusedWorkspace);
+#endif
+}
+
+TEST(DecompileController, StopCallbackReentryDoesNotDeadlockOnCancelSubmitResetOrShutdown) {
+    const DecompileValidationStamp stamp{
+        .target_identity = "sha256:stop-reentry-test",
+        .file_generation = 1,
+        .edit_revision = 0,
+        .snapshot_revision = 0,
+    };
+
+    std::mutex sync_mutex;
+    std::condition_variable sync_cv;
+    bool callback_armed = false;
+    std::atomic<int> reentry_calls{0};
+
+    std::unique_ptr<DecompileController> controller;
+    controller = std::make_unique<DecompileController>(
+        [&](const DecompileJobSpec&, std::stop_token stop) -> DecompiledUnit {
+            std::stop_callback on_stop(stop, [&] {
+                (void)controller->is_busy();
+                (void)controller->latest_sequence();
+                (void)controller->poll_completed(stamp);
+                reentry_calls.fetch_add(1, std::memory_order_relaxed);
+            });
+            {
+                std::scoped_lock lock(sync_mutex);
+                callback_armed = true;
+            }
+            sync_cv.notify_all();
+            while (!stop.stop_requested()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            return DecompiledUnit{
+                .status = DecompileStatus::Cancelled,
+                .provider = "Mock",
+                .diagnostic = "stopped",
+            };
+        });
+
+    auto submit_and_wait_armed = [&](std::uint64_t addr) {
+        DecompileJobSpec spec;
+        spec.request.address = addr;
+        spec.stamp = stamp;
+        (void)controller->submit(std::move(spec));
+        std::unique_lock lock(sync_mutex);
+        ASSERT_TRUE(sync_cv.wait_for(lock, std::chrono::seconds(5), [&] { return callback_armed; }));
+        callback_armed = false;
+    };
+
+    // 1. cancel_current() invokes stop_callback outside mutex_.
+    submit_and_wait_armed(0x7001u);
+    controller->cancel_current();
+    controller->wait_for_idle();
+
+    // 2. submit() superseding an active job invokes stop_callback outside mutex_.
+    submit_and_wait_armed(0x7002u);
+    submit_and_wait_armed(0x7003u);
+
+    // 3. reset_for_new_target() invokes stop_callback outside mutex_.
+    controller->reset_for_new_target();
+    controller->wait_for_idle();
+
+    // 4. shutdown() / destructor invokes stop_callback outside mutex_.
+    submit_and_wait_armed(0x7004u);
+    controller->shutdown();
+
+    EXPECT_GE(reentry_calls.load(std::memory_order_relaxed), 4);
+}
+
+namespace {
+
+[[nodiscard]] std::string join_decompiled_lines(const DecompiledUnit& unit) {
+    std::string text;
+    for (const auto& line : unit.lines) {
+        text += line.text;
+        text.push_back('\n');
+    }
+    return text;
+}
+
+} // namespace
+
+TEST(StructuredDecompiler, DeepThousandBlockConditionalChainCompletesWithoutStackOverflow) {
+    constexpr std::size_t kChainBlocks = 1000u;
+    constexpr std::uint64_t kBaseVa = 0x400000u;
+    const std::uint64_t exit_va = kBaseVa + static_cast<std::uint64_t>(kChainBlocks) * 8u;
+
+    CallGraph cfg;
+    cfg.id = "function_cfg";
+    cfg.architecture = peelf::Architecture::X86_64;
+    cfg.nodes.reserve(kChainBlocks + 1u);
+    cfg.edges.reserve(kChainBlocks * 2u);
+
+    for (std::size_t i = 0; i < kChainBlocks; ++i) {
+        const std::uint64_t va = kBaseVa + static_cast<std::uint64_t>(i) * 8u;
+        const std::string id = "bb_" + std::to_string(i);
+        const std::string next_id = (i + 1u < kChainBlocks)
+                                        ? ("bb_" + std::to_string(i + 1u))
+                                        : std::string("bb_exit");
+        cfg.nodes.push_back(CallGraphNode{
+            .id = id,
+            .label = std::format("loc_0x{:x}", va),
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{
+                .start = GraphAddress{.virtual_address = va},
+                .size = 8u,
+            },
+            .instructions = {
+                GraphInstruction{
+                    .address = va,
+                    .mnemonic = "cmp",
+                    .operands = std::format("edi, {}", i),
+                },
+                GraphInstruction{
+                    .address = va + 4u,
+                    .mnemonic = "je",
+                    .operands = std::format("0x{:x}", exit_va),
+                },
+            },
+        });
+        cfg.edges.push_back(CallGraphEdge{
+            .from_node_id = id,
+            .to_node_id = "bb_exit",
+            .kind = CallGraphEdgeKind::ConditionalBranch,
+        });
+        cfg.edges.push_back(CallGraphEdge{
+            .from_node_id = id,
+            .to_node_id = next_id,
+            .kind = CallGraphEdgeKind::Fallthrough,
+        });
+    }
+
+    cfg.nodes.push_back(CallGraphNode{
+        .id = "bb_exit",
+        .label = std::format("loc_0x{:x}", exit_va),
+        .kind = CallGraphNodeKind::BasicBlock,
+        .bytes = GraphByteRange{
+            .start = GraphAddress{.virtual_address = exit_va},
+            .size = 2u,
+        },
+        .instructions = {
+            GraphInstruction{.address = exit_va, .mnemonic = "ret", .operands = ""},
+        },
+    });
+
+    DecompileRequest req;
+    req.address = kBaseVa;
+    req.architecture = peelf::Architecture::X86_64;
+    req.fallback_graph = std::move(cfg);
+
+    const DecompiledUnit unit = StructuredPseudoCDecompiler{}.decompile(req);
+    ASSERT_EQ(unit.status, DecompileStatus::Ready) << unit.diagnostic;
+    const std::string code = join_decompiled_lines(unit);
+    EXPECT_NE(code.find("goto "), std::string::npos);
+    EXPECT_NE(code.find("999"), std::string::npos);
+}
+
+TEST(StructuredDecompiler, FlagClobberingAddXorAndCallInvalidateStaleCmp) {
+    CallGraph cfg;
+    cfg.id = "function_cfg";
+    cfg.architecture = peelf::Architecture::X86_64;
+    cfg.nodes = {
+        CallGraphNode{
+            .id = "bb_0",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x1000u}, .size = 16u},
+            .instructions = {
+                {0x1000u, "cmp", "edi, 42"},
+                {0x1003u, "add", "eax, 1"},
+                {0x1006u, "je", "0x1030"},
+            },
+        },
+        CallGraphNode{
+            .id = "bb_1",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x1010u}, .size = 16u},
+            .instructions = {
+                {0x1010u, "cmp", "esi, 99"},
+                {0x1013u, "xor", "ecx, ebx"},
+                {0x1016u, "jne", "0x1030"},
+            },
+        },
+        CallGraphNode{
+            .id = "bb_2",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x1020u}, .size = 16u},
+            .instructions = {
+                {0x1020u, "cmp", "edx, 77"},
+                {0x1023u, "call", "0x2000"},
+                {0x1028u, "je", "0x1030"},
+            },
+        },
+        CallGraphNode{
+            .id = "bb_3",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x102Cu}, .size = 4u},
+            .instructions = {
+                {0x102Cu, "mov", "eax, 0"},
+                {0x102Eu, "ret", ""},
+            },
+        },
+        CallGraphNode{
+            .id = "bb_exit",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x1030u}, .size = 2u},
+            .instructions = {
+                {0x1030u, "ret", ""},
+            },
+        },
+    };
+    cfg.edges = {
+        {"bb_0", "bb_exit", CallGraphEdgeKind::ConditionalBranch, ""},
+        {"bb_0", "bb_1", CallGraphEdgeKind::Fallthrough, ""},
+        {"bb_1", "bb_exit", CallGraphEdgeKind::ConditionalBranch, ""},
+        {"bb_1", "bb_2", CallGraphEdgeKind::Fallthrough, ""},
+        {"bb_2", "bb_exit", CallGraphEdgeKind::ConditionalBranch, ""},
+        {"bb_2", "bb_3", CallGraphEdgeKind::Fallthrough, ""},
+    };
+
+    DecompileRequest req;
+    req.address = 0x1000u;
+    req.architecture = peelf::Architecture::X86_64;
+    req.fallback_graph = std::move(cfg);
+
+    const DecompiledUnit unit = StructuredPseudoCDecompiler{}.decompile(req);
+    ASSERT_EQ(unit.status, DecompileStatus::Ready) << unit.diagnostic;
+    const std::string code = join_decompiled_lines(unit);
+
+    // None of the three overwritten cmp immediates (42, 99, 77) may appear in synthesized if(...) conditions.
+    EXPECT_EQ(code.find("42"), std::string::npos) << code;
+    EXPECT_EQ(code.find("99"), std::string::npos) << code;
+    EXPECT_EQ(code.find("77"), std::string::npos) << code;
+    EXPECT_NE(code.find("eax += 1"), std::string::npos) << code;
+    EXPECT_NE(code.find("if (eax != 0)"), std::string::npos) << code;
+    EXPECT_NE(code.find("ecx ^= ebx"), std::string::npos) << code;
+    EXPECT_NE(code.find("if (ecx == 0)"), std::string::npos) << code;
+    EXPECT_NE(code.find("if (flags != 0)"), std::string::npos) << code;
+}
+
+TEST(StructuredDecompiler, SwitchPreservesSelectorAndTruncatedBranchEmitsDiagnosticGoto) {
+    // 1. Switch selector recovery: jmp qword ptr [rdi*8 + 0x402000] -> switch (rdi)
+    CallGraph sw_cfg;
+    sw_cfg.id = "function_cfg";
+    sw_cfg.architecture = peelf::Architecture::X86_64;
+    sw_cfg.nodes = {
+        CallGraphNode{
+            .id = "bb_0",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x2000u}, .size = 12u},
+            .instructions = {
+                {0x2000u, "jmp", "qword ptr [rdi*8 + 0x402000]"},
+            },
+        },
+        CallGraphNode{
+            .id = "bb_c0",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x2010u}, .size = 4u},
+            .instructions = {{0x2010u, "mov", "eax, 10"}, {0x2013u, "ret", ""}},
+        },
+        CallGraphNode{
+            .id = "bb_c1",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x2020u}, .size = 4u},
+            .instructions = {{0x2020u, "mov", "eax, 20"}, {0x2023u, "ret", ""}},
+        },
+    };
+    sw_cfg.edges = {
+        {"bb_0", "bb_c0", CallGraphEdgeKind::UnconditionalBranch, "case 0"},
+        {"bb_0", "bb_c1", CallGraphEdgeKind::UnconditionalBranch, "case 1"},
+    };
+
+    DecompileRequest sw_req;
+    sw_req.address = 0x2000u;
+    sw_req.architecture = peelf::Architecture::X86_64;
+    sw_req.fallback_graph = std::move(sw_cfg);
+    const DecompiledUnit sw_unit = StructuredPseudoCDecompiler{}.decompile(sw_req);
+    ASSERT_EQ(sw_unit.status, DecompileStatus::Ready) << sw_unit.diagnostic;
+    const std::string sw_code = join_decompiled_lines(sw_unit);
+    EXPECT_NE(sw_code.find("switch (rdi)"), std::string::npos) << sw_code;
+    EXPECT_EQ(sw_code.find("switch (selector)"), std::string::npos) << sw_code;
+
+    // 2. Truncated conditional branch: taken arm exists (0x3020), fallthrough (0x3006) was truncated out.
+    CallGraph trunc_cfg;
+    trunc_cfg.id = "function_cfg";
+    trunc_cfg.architecture = peelf::Architecture::X86_64;
+    trunc_cfg.nodes = {
+        CallGraphNode{
+            .id = "bb_0",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x3000u}, .size = 6u},
+            .instructions = {
+                {0x3000u, "cmp", "edi, 0"},
+                {0x3003u, "je", "0x3020"},
+            },
+        },
+        CallGraphNode{
+            .id = "bb_taken",
+            .kind = CallGraphNodeKind::BasicBlock,
+            .bytes = GraphByteRange{.start = GraphAddress{.virtual_address = 0x3020u}, .size = 2u},
+            .instructions = {
+                {0x3020u, "ret", ""},
+            },
+        },
+    };
+    trunc_cfg.edges = {
+        {"bb_0", "bb_taken", CallGraphEdgeKind::ConditionalBranch, ""},
+    };
+
+    DecompileRequest trunc_req;
+    trunc_req.address = 0x3000u;
+    trunc_req.architecture = peelf::Architecture::X86_64;
+    trunc_req.fallback_graph = std::move(trunc_cfg);
+    const DecompiledUnit trunc_unit = StructuredPseudoCDecompiler{}.decompile(trunc_req);
+    ASSERT_EQ(trunc_unit.status, DecompileStatus::Ready) << trunc_unit.diagnostic;
+    const std::string trunc_code = join_decompiled_lines(trunc_unit);
+    EXPECT_NE(trunc_code.find("goto block_3020;"), std::string::npos) << trunc_code;
+    EXPECT_NE(trunc_code.find("truncated disassembly window"), std::string::npos) << trunc_code;
+    EXPECT_NE(trunc_code.find("sub_3006()"), std::string::npos) << trunc_code;
+}
+
 
 

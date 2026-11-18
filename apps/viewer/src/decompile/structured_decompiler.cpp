@@ -647,6 +647,62 @@ struct ResolvedSymbol {
     return clean_atom(op);
 }
 
+[[nodiscard]] std::optional<std::string> extract_memory_index_expr(std::string_view op) {
+    const std::size_t lb = op.find('[');
+    const std::size_t rb = op.find(']', lb == std::string_view::npos ? 0u : lb);
+    if (lb == std::string_view::npos || rb == std::string_view::npos || rb <= lb) {
+        return std::nullopt;
+    }
+    const std::string_view inside = trim_sv(op.substr(lb + 1u, rb - lb - 1u));
+    if (inside.empty()) {
+        return std::nullopt;
+    }
+
+    // Scaled index form: `[eax*4 + 0x1020]`, `[rcx + rax*4]`, `[4*rax + rcx]`
+    if (inside.find('*') != std::string_view::npos) {
+        std::size_t start = 0u;
+        while (start < inside.size()) {
+            std::size_t end = start;
+            while (end < inside.size() && inside[end] != '+' && inside[end] != '-') {
+                ++end;
+            }
+            const std::string_view term = trim_sv(inside.substr(start, end - start));
+            if (const std::size_t star = term.find('*'); star != std::string_view::npos) {
+                const std::string_view lhs_raw = trim_sv(term.substr(0u, star));
+                const std::string_view rhs_raw = trim_sv(term.substr(star + 1u));
+                if (parse_signed_int(rhs_raw).has_value() && !parse_signed_int(lhs_raw).has_value()) {
+                    std::string idx = clean_atom(lhs_raw);
+                    if (!idx.empty()) {
+                        return idx;
+                    }
+                } else if (parse_signed_int(lhs_raw).has_value() && !parse_signed_int(rhs_raw).has_value()) {
+                    std::string idx = clean_atom(rhs_raw);
+                    if (!idx.empty()) {
+                        return idx;
+                    }
+                }
+            }
+            start = end + 1u;
+        }
+    }
+
+    // Comma-indexed form: `[pc, r0]`, `[pc, r0, lsl #1]`, `[x8, w0, uxtw #2]`
+    if (const std::size_t comma = inside.find(','); comma != std::string_view::npos) {
+        const std::string_view after_base = trim_sv(inside.substr(comma + 1u));
+        const std::size_t comma2 = after_base.find(',');
+        const std::string_view second_part =
+            trim_sv(comma2 == std::string_view::npos ? after_base : after_base.substr(0u, comma2));
+        if (!second_part.empty() && !parse_signed_int(second_part).has_value()) {
+            std::string idx = clean_atom(second_part);
+            if (!idx.empty()) {
+                return idx;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
 [[nodiscard]] std::string format_value_expr(
     std::string_view op,
     std::string_view mnemonic,
@@ -1209,8 +1265,12 @@ struct BlockIR {
     const std::string m = normalize_mnemonic(insn.mnemonic, arch);
     const std::vector<std::string> ops = split_operands(insn.operands);
     const bool arch_64 = is_64bit_arch(arch);
+    const bool is_x86 = (arch == peelf::Architecture::X86 || arch == peelf::Architecture::X86_64);
 
     if (is_prologue_or_epilogue_noise(m, ops, arch)) {
+        if ((is_x86 && (m == "add" || m == "sub")) || m == "adds" || m == "subs") {
+            flags = FlagState{};
+        }
         return std::nullopt;
     }
 
@@ -1250,6 +1310,7 @@ struct BlockIR {
         block_written_regs.insert(ret_fam);
         func_written_regs.insert(ret_fam);
         reg_const_va.erase(ret_fam);
+        flags = FlagState{};
         return stmt;
     }
 
@@ -1453,11 +1514,11 @@ struct BlockIR {
         flags = FlagState{d, "0", true};
         return std::format("{}--;", d);
     }
-    if ((m == "neg" || m == "negs" || m == "negw") && !ops.empty()) {
+    if ((m == "neg" || m == "negs" || m == "neg." || m == "negw") && !ops.empty()) {
         const std::string d = dst_expr(0u);
         const std::string s = ops.size() >= 2u ? val_expr(1u) : d;
         mark_write(ops[0]);
-        if (m == "negs") {
+        if (is_x86 || m == "negs" || m == "neg.") {
             flags = FlagState{d, "0", true};
         }
         return std::format("{} = -{};", d, s);
@@ -1514,6 +1575,9 @@ struct BlockIR {
                     const std::string dst = dst_expr(0u);
                     mark_write(ops[0]);
                     reg_const_va[canonical_reg_family(ops[0], arch)] = combined;
+                    if (sets_flags) {
+                        flags = FlagState{dst, "0", true};
+                    }
                     if (const auto sym_it = symbols.find(combined); sym_it != symbols.end()) {
                         return std::format("{} = &{}; /* 0x{:X} */", dst, sym_it->second.c_ident, combined);
                     }
@@ -1555,19 +1619,28 @@ struct BlockIR {
         return std::format("{} = {} {} {};", dst, lhs, c_op, rhs);
     };
 
-    if (m == "add" || m == "adds" || m == "addw" || m == "addi" || m == "addiw" ||
-        m == "addiu" || m == "daddiu" || m == "addu" || m == "daddu" || m == "c.add" || m == "c.addi") {
-        return emit_binop("+", m == "adds");
+    if (m == "add" || m == "adds" || m == "add." || m == "addic." || m == "addw" ||
+        m == "addi" || m == "addiw" || m == "addiu" || m == "daddiu" ||
+        m == "addu" || m == "daddu" || m == "c.add" || m == "c.addi") {
+        return emit_binop("+", (is_x86 && m == "add") || m == "adds" || m == "add." || m == "addic.");
     }
-    if (m == "sub" || m == "subs" || m == "subw" || m == "subi" || m == "subu" || m == "dsubu" || m == "c.sub") {
-        return emit_binop("-", m == "subs");
+    if (m == "sub" || m == "subs" || m == "sub." || m == "subw" || m == "subi" ||
+        m == "subu" || m == "dsubu" || m == "c.sub") {
+        return emit_binop("-", (is_x86 && m == "sub") || m == "subs" || m == "sub.");
     }
-    if (m == "subf" && ops.size() >= 3u) {
+    if ((m == "subf" || m == "subf.") && ops.size() >= 3u) {
         const std::string d = dst_expr(0u);
         mark_write(ops[0]);
+        if (m == "subf.") {
+            flags = FlagState{d, "0", true};
+        }
         return std::format("{} = {} - {};", d, val_expr(2u), val_expr(1u));
     }
-    if (m == "imul" || m == "mul" || m == "mulw" || m == "mullw" || m == "mulld") {
+    if (m == "imul" || m == "mul" || m == "muls" || m == "mulw" ||
+        m == "mullw" || m == "mullw." || m == "mulld" || m == "mulld.") {
+        if (is_x86 || m == "muls" || m.ends_with('.')) {
+            flags = FlagState{};
+        }
         if (m == "imul" && ops.size() == 1u) {
             const std::string_view acc = arch_64 ? "rax" : "eax";
             mark_write(acc);
@@ -1576,6 +1649,9 @@ struct BlockIR {
         return emit_binop("*");
     }
     if (m == "div" || m == "idiv") {
+        if (is_x86) {
+            flags = FlagState{};
+        }
         if (ops.size() == 1u) {
             const std::string_view acc = arch_64 ? "rax" : "eax";
             mark_write(acc);
@@ -1583,36 +1659,50 @@ struct BlockIR {
         }
         return emit_binop("/");
     }
-    if (m == "udiv" || m == "sdiv" || m == "divw" || m == "divuw" || m == "divd" || m == "divdu") {
+    if (m == "udiv" || m == "sdiv" || m == "divw" || m == "divw." ||
+        m == "divuw" || m == "divuw." || m == "divd" || m == "divd." ||
+        m == "divdu" || m == "divdu.") {
+        if (m.ends_with('.')) {
+            flags = FlagState{};
+        }
         return emit_binop("/");
     }
     if (m == "rem" || m == "remu" || m == "remw" || m == "remuw") {
         return emit_binop("%");
     }
-    if (m == "and" || m == "ands" || m == "andi" || m == "andi." || m == "c.and" || m == "c.andi") {
-        return emit_binop("&", m == "ands" || m == "andi.");
+    if (m == "and" || m == "ands" || m == "and." || m == "andi" || m == "andi." ||
+        m == "c.and" || m == "c.andi") {
+        return emit_binop("&", (is_x86 && m == "and") || m == "ands" || m == "and." || m == "andi.");
     }
-    if (m == "bic") {
-        return emit_binop("&", false, true);
+    if (m == "bic" || m == "bics" || m == "andc" || m == "andc.") {
+        return emit_binop("&", m == "bics" || m == "andc.", true);
     }
-    if (m == "or" || m == "orr" || m == "ori" || m == "or." || m == "c.or") {
-        return emit_binop("|", m == "or.");
+    if (m == "or" || m == "ors" || m == "orr" || m == "ori" || m == "or." || m == "ori." || m == "c.or") {
+        return emit_binop("|", (is_x86 && m == "or") || m == "ors" || m == "or." || m == "ori.");
     }
-    if (m == "orn") {
-        return emit_binop("|", false, true);
+    if (m == "orn" || m == "orns" || m == "orc" || m == "orc.") {
+        return emit_binop("|", m == "orns" || m == "orc.", true);
     }
-    if (m == "xor" || m == "eor" || m == "xori" || m == "c.xor") {
-        return emit_binop("^");
+    if (m == "xor" || m == "eor" || m == "eors" || m == "xor." || m == "xori" || m == "xori." || m == "c.xor") {
+        return emit_binop("^", (is_x86 && m == "xor") || m == "eors" || m == "xor." || m == "xori.");
     }
-    if (m == "shl" || m == "sal" || m == "lsl" || m == "sll" || m == "slli" || m == "slliw" ||
-        m == "sllv" || m == "dsll" || m == "slw" || m == "sld" || m == "c.slli") {
-        return emit_binop("<<");
+    if (m == "shl" || m == "sal" || m == "lsl" || m == "lsls" || m == "sll" || m == "slli" || m == "slliw" ||
+        m == "sllv" || m == "dsll" || m == "slw" || m == "slw." || m == "sld" || m == "sld." || m == "c.slli") {
+        return emit_binop("<<", (is_x86 && (m == "shl" || m == "sal")) ||
+                                    m == "lsls" || m == "slw." || m == "sld.");
     }
-    if (m == "shr" || m == "lsr" || m == "srl" || m == "srli" || m == "srliw" ||
-        m == "srlv" || m == "dsrl" || m == "srw" || m == "srd" ||
-        m == "sar" || m == "asr" || m == "sra" || m == "srai" || m == "sraiw" ||
-        m == "srav" || m == "dsra" || m == "sraw" || m == "srad") {
-        return emit_binop(">>");
+    if (m == "shr" || m == "lsr" || m == "lsrs" || m == "srl" || m == "srli" || m == "srliw" ||
+        m == "srlv" || m == "dsrl" || m == "srw" || m == "srw." || m == "srd" || m == "srd." ||
+        m == "sar" || m == "asr" || m == "asrs" || m == "sra" || m == "srai" || m == "sraiw" ||
+        m == "srav" || m == "dsra" || m == "sraw" || m == "sraw." || m == "srad" || m == "srad.") {
+        return emit_binop(">>", (is_x86 && (m == "shr" || m == "sar")) ||
+                                    m == "lsrs" || m == "asrs" ||
+                                    m == "srw." || m == "srd." || m == "sraw." || m == "srad.");
+    }
+
+    if ((is_x86 && m != "xchg" && m != "bswap" && !m.starts_with("mov") && !m.starts_with("prefetch")) ||
+        m.ends_with('.') || m == "ccmp" || m == "ccmn" || m == "adcs" || m == "sbcs" || m == "rscs" || m == "teq") {
+        flags = FlagState{};
     }
 
     // Fallback: preserve full instruction fidelity via intrinsic call!
@@ -1852,6 +1942,7 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
         if (all_preds[b].size() == 1u && all_preds[b][0] < b) {
             flags = ir_blocks[all_preds[b][0]].out_flags;
         }
+        const FlagState entry_flags = flags;
         std::map<std::string, std::uint64_t> reg_const_va;
         std::set<std::string> block_written_regs;
 
@@ -1922,7 +2013,59 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
             }
         } else if (!ir.switch_cases.empty()) {
             ir.term_kind = TermKind::Switch;
-            ir.cond_expr = !term_ops.empty() ? clean_atom(term_ops[0]) : "index";
+            auto recover_switch_selector = [&]() -> std::string {
+                if (!term_ops.empty()) {
+                    if (auto mem_idx = extract_memory_index_expr(term_ops[0])) {
+                        return *mem_idx;
+                    }
+                }
+                const std::size_t scan_limit = control_idx.value_or(insn_count);
+                std::optional<std::string> table_index;
+                for (std::size_t rev = scan_limit; rev > 0u; --rev) {
+                    const GraphInstruction& gi = node.instructions[rev - 1u];
+                    const std::string gm = normalize_mnemonic(gi.mnemonic, request.architecture);
+                    const std::vector<std::string> gops = split_operands(gi.operands);
+                    if ((gm == "cmp" || gm == "cmpw" || gm == "cmpd" || gm == "cmpl" ||
+                         gm == "cmpwi" || gm == "cmpdi" || gm == "cmplwi" || gm == "cmpldi") &&
+                        gops.size() >= 2u) {
+                        const std::size_t lhs_i =
+                            (gops.size() >= 3u && to_lower_ascii(gops[0]).starts_with("cr")) ? 1u : 0u;
+                        std::string sel = format_value_expr(
+                            gops[lhs_i], gm, gi.address, insn_sizes[rev - 1u],
+                            request.architecture, symbols, stack_locals);
+                        if (!sel.empty()) {
+                            return sel;
+                        }
+                    }
+                    if (!table_index.has_value()) {
+                        for (const std::string& gop : gops) {
+                            if (auto idx = extract_memory_index_expr(gop)) {
+                                table_index = std::move(*idx);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (entry_flags.valid && !entry_flags.lhs.empty() && entry_flags.lhs != "flags") {
+                    return entry_flags.lhs;
+                }
+                if (table_index.has_value()) {
+                    return *table_index;
+                }
+                if (!term_ops.empty()) {
+                    if (is_memory_operand(term_ops[0])) {
+                        return format_value_expr(
+                            term_ops[0], term_m, term_insn.address, term_sz,
+                            request.architecture, symbols, stack_locals);
+                    }
+                    std::string cleaned = clean_atom(term_ops[0]);
+                    if (!cleaned.empty()) {
+                        return cleaned;
+                    }
+                }
+                return "index";
+            };
+            ir.cond_expr = recover_switch_selector();
         } else if (ir.taken_block.has_value() ||
                    (external_edge != nullptr && external_edge->kind == CallGraphEdgeKind::ConditionalBranch)) {
             ir.term_kind = TermKind::CondBranch;
@@ -2119,305 +2262,372 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
         push_code(addr, {CodeRange{addr, sz}}, indent, std::format("goto {};", block_label_name(target)));
     };
 
+    constexpr std::size_t kMaxStructureDepth = 128u;
+    constexpr std::size_t kMaxIndent = 64u;
+
+    auto emit_truncated_fallthrough = [&](std::uint64_t term_addr,
+                                          std::uint64_t term_size,
+                                          std::size_t indent) {
+        if (const auto fall_va = peelf::checked_add_u64(term_addr, term_size)) {
+            push_code(term_addr,
+                      {CodeRange{term_addr, term_size}},
+                      indent,
+                      std::format("/* truncated disassembly window: missing fallthrough to 0x{:X} */",
+                                  *fall_va));
+            push_code(term_addr,
+                      {CodeRange{term_addr, term_size}},
+                      indent,
+                      std::format("return sub_{:X}();", *fall_va));
+        } else {
+            push_code(term_addr,
+                      {CodeRange{term_addr, term_size}},
+                      indent,
+                      "/* truncated disassembly window: missing fallthrough arm */");
+            push_code(term_addr, {CodeRange{term_addr, term_size}}, indent, "return 0;");
+        }
+    };
+
     auto emit_region = [&](auto& self,
                            std::size_t b,
                            std::optional<std::size_t> stop_block,
                            std::size_t indent,
-                           std::optional<std::size_t> suppress_loop_at) -> void {
-        if (stop.stop_requested() || b >= num_blocks) {
-            return;
-        }
-        if (stop_block.has_value() && b == *stop_block) {
-            return;
-        }
-        if (emitted[b]) {
-            emit_goto_or_loop_jump(b, stop_block, ir_blocks[b].start_va, ir_blocks[b].first_insn_size, indent);
-            return;
-        }
-
-        const BlockIR& bir = ir_blocks[b];
-
-        // Natural loop detection at header `b`.
-        if (max_back_latch[b].has_value() && (!suppress_loop_at.has_value() || *suppress_loop_at != b)) {
-            const std::size_t latch = *max_back_latch[b];
-
-            // L1: Single-block self-loop `do { ... } while (cond);`
-            if (latch == b && bir.term_kind == TermKind::CondBranch &&
-                (bir.taken_block == b || bir.fall_block == b)) {
-                emitted[b] = true;
-                push_label_slot(b, indent);
-                push_code(bir.start_va, {CodeRange{bir.start_va, bir.first_insn_size}}, indent, "do {");
-                for (const LiftedStmt& st : bir.body) {
-                    push_code(st.address, {CodeRange{st.address, st.size}}, indent + 1u, st.code);
-                }
-                const bool taken_loops = (bir.taken_block == b);
-                const std::string loop_cond = taken_loops ? bir.cond_expr : invert_condition(bir.cond_expr);
-                const std::optional<std::size_t> exit_blk = taken_loops ? bir.fall_block : bir.taken_block;
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                          std::format("}} while ({});", loop_cond));
-                if (exit_blk.has_value()) {
-                    self(self, *exit_blk, stop_block, indent, std::nullopt);
-                }
+                           std::optional<std::size_t> suppress_loop_at,
+                           std::size_t depth) -> void {
+        while (!stop.stop_requested() && b < num_blocks) {
+            if (stop_block.has_value() && b == *stop_block) {
+                return;
+            }
+            if (emitted[b]) {
+                emit_goto_or_loop_jump(
+                    b, stop_block, ir_blocks[b].start_va, ir_blocks[b].first_insn_size, indent);
                 return;
             }
 
-            // L2: Top-tested `while (cond) { ... }` where `b` branches into `(b, latch]` vs `exit > latch`.
-            if (latch > b && (!stop_block.has_value() || latch < *stop_block) &&
-                bir.term_kind == TermKind::CondBranch &&
-                bir.taken_block.has_value() && bir.fall_block.has_value()) {
-                const std::size_t t = *bir.taken_block;
-                const std::size_t f = *bir.fall_block;
-                const bool t_in = (t > b && t <= latch);
-                const bool f_in = (f > b && f <= latch);
-                const bool t_out = (t > latch);
-                const bool f_out = (f > latch);
+            const BlockIR& bir = ir_blocks[b];
 
-                if ((t_in && f_out) || (f_in && t_out)) {
-                    const std::size_t body_blk = t_in ? t : f;
-                    const std::size_t exit_blk = t_in ? f : t;
-                    const std::string stay_cond = t_in ? bir.cond_expr : invert_condition(bir.cond_expr);
+            // Natural loop detection at header `b`.
+            if (depth < kMaxStructureDepth && max_back_latch[b].has_value() &&
+                (!suppress_loop_at.has_value() || *suppress_loop_at != b)) {
+                const std::size_t latch = *max_back_latch[b];
 
+                // L1: Single-block self-loop `do { ... } while (cond);`
+                if (latch == b && bir.term_kind == TermKind::CondBranch &&
+                    (bir.taken_block == b || bir.fall_block == b)) {
                     emitted[b] = true;
                     push_label_slot(b, indent);
-                    if (bir.body.empty()) {
-                        push_code(bir.term_addr, bir.all_ranges, indent, std::format("while ({}) {{", stay_cond));
-                    } else {
-                        push_code(bir.start_va, {CodeRange{bir.start_va, bir.first_insn_size}}, indent, "while (1) {");
-                        for (const LiftedStmt& st : bir.body) {
-                            push_code(st.address, {CodeRange{st.address, st.size}}, indent + 1u, st.code);
-                        }
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
-                                  std::format("if ({}) break;", invert_condition(stay_cond)));
-                    }
-
-                    loop_stack.push_back(LoopContext{.header_idx = b, .exit_idx = exit_blk});
-                    self(self, body_blk, b, indent + 1u, std::nullopt);
-                    for (std::size_t k = b + 1u; k <= latch; ++k) {
-                        if (!emitted[k] && goto_targets.contains(k)) {
-                            self(self, k, b, indent + 1u, std::nullopt);
-                        }
-                    }
-                    loop_stack.pop_back();
-
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                    self(self, exit_blk, stop_block, indent, std::nullopt);
-                    return;
-                }
-            }
-
-            // L3: Bottom-tested `do { ... } while (cond);` where `latch > b` branches back to `b`.
-            if (latch > b && (!stop_block.has_value() || latch < *stop_block) &&
-                !emitted[latch] && ir_blocks[latch].term_kind == TermKind::CondBranch &&
-                (ir_blocks[latch].taken_block == b || ir_blocks[latch].fall_block == b)) {
-                const BlockIR& lir = ir_blocks[latch];
-                const bool taken_loops = (lir.taken_block == b);
-                const std::optional<std::size_t> exit_blk = taken_loops ? lir.fall_block : lir.taken_block;
-                if (!exit_blk.has_value() || *exit_blk > latch) {
-                    push_label_slot(b, indent);
                     push_code(bir.start_va, {CodeRange{bir.start_va, bir.first_insn_size}}, indent, "do {");
-
-                    loop_stack.push_back(LoopContext{.header_idx = b, .exit_idx = exit_blk});
-                    self(self, b, latch, indent + 1u, b);
-                    for (std::size_t k = b + 1u; k < latch; ++k) {
-                        if (!emitted[k] && goto_targets.contains(k)) {
-                            self(self, k, latch, indent + 1u, std::nullopt);
-                        }
+                    for (const LiftedStmt& st : bir.body) {
+                        push_code(st.address, {CodeRange{st.address, st.size}}, indent + 1u, st.code);
                     }
-                    if (!emitted[latch]) {
-                        emitted[latch] = true;
-                        push_label_slot(latch, indent + 1u);
-                        for (const LiftedStmt& st : lir.body) {
-                            push_code(st.address, {CodeRange{st.address, st.size}}, indent + 1u, st.code);
-                        }
-                    }
-                    loop_stack.pop_back();
-
-                    const std::string stay_cond = taken_loops ? lir.cond_expr : invert_condition(lir.cond_expr);
-                    push_code(lir.term_addr, {CodeRange{lir.term_addr, lir.term_size}}, indent,
-                              std::format("}} while ({});", stay_cond));
+                    const bool taken_loops = (bir.taken_block == b);
+                    const std::string loop_cond = taken_loops ? bir.cond_expr : invert_condition(bir.cond_expr);
+                    const std::optional<std::size_t> exit_blk = taken_loops ? bir.fall_block : bir.taken_block;
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                              std::format("}} while ({});", loop_cond));
                     if (exit_blk.has_value()) {
-                        self(self, *exit_blk, stop_block, indent, std::nullopt);
+                        b = *exit_blk;
+                        suppress_loop_at = std::nullopt;
+                        continue;
+                    }
+                    if (taken_loops) {
+                        emit_truncated_fallthrough(bir.term_addr, bir.term_size, indent);
+                    } else if (!bir.external_stmt.empty()) {
+                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                  bir.external_stmt);
                     }
                     return;
                 }
-            }
-        }
 
-        // Standard basic block emission.
-        emitted[b] = true;
-        push_label_slot(b, indent);
-        for (const LiftedStmt& st : bir.body) {
-            push_code(st.address, {CodeRange{st.address, st.size}}, indent, st.code);
-        }
+                // L2: Top-tested `while (cond) { ... }` where `b` branches into `(b, latch]` vs `exit > latch`.
+                if (latch > b && (!stop_block.has_value() || latch < *stop_block) &&
+                    bir.term_kind == TermKind::CondBranch &&
+                    bir.taken_block.has_value() && bir.fall_block.has_value()) {
+                    const std::size_t t = *bir.taken_block;
+                    const std::size_t f = *bir.fall_block;
+                    const bool t_in = (t > b && t <= latch);
+                    const bool f_in = (f > b && f <= latch);
+                    const bool t_out = (t > latch);
+                    const bool f_out = (f > latch);
 
-        switch (bir.term_kind) {
-            case TermKind::Fallthrough: {
-                if (bir.fall_block.has_value()) {
-                    const std::size_t next = *bir.fall_block;
-                    if (stop_block.has_value() && next == *stop_block) {
+                    if ((t_in && f_out) || (f_in && t_out)) {
+                        const std::size_t body_blk = t_in ? t : f;
+                        const std::size_t exit_blk = t_in ? f : t;
+                        const std::string stay_cond = t_in ? bir.cond_expr : invert_condition(bir.cond_expr);
+
+                        emitted[b] = true;
+                        push_label_slot(b, indent);
+                        if (bir.body.empty()) {
+                            push_code(bir.term_addr, bir.all_ranges, indent, std::format("while ({}) {{", stay_cond));
+                        } else {
+                            push_code(bir.start_va, {CodeRange{bir.start_va, bir.first_insn_size}}, indent,
+                                      "while (1) {");
+                            for (const LiftedStmt& st : bir.body) {
+                                push_code(st.address, {CodeRange{st.address, st.size}}, indent + 1u, st.code);
+                            }
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
+                                      std::format("if ({}) break;", invert_condition(stay_cond)));
+                        }
+
+                        loop_stack.push_back(LoopContext{.header_idx = b, .exit_idx = exit_blk});
+                        self(self, body_blk, b, indent + 1u, std::nullopt, depth + 1u);
+                        for (std::size_t k = b + 1u; k <= latch; ++k) {
+                            if (!emitted[k] && goto_targets.contains(k)) {
+                                self(self, k, b, indent + 1u, std::nullopt, depth + 1u);
+                            }
+                        }
+                        loop_stack.pop_back();
+
+                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                        b = exit_blk;
+                        suppress_loop_at = std::nullopt;
+                        continue;
+                    }
+                }
+
+                // L3: Bottom-tested `do { ... } while (cond);` where `latch > b` branches back to `b`.
+                if (latch > b && (!stop_block.has_value() || latch < *stop_block) &&
+                    !emitted[latch] && ir_blocks[latch].term_kind == TermKind::CondBranch &&
+                    (ir_blocks[latch].taken_block == b || ir_blocks[latch].fall_block == b)) {
+                    const BlockIR& lir = ir_blocks[latch];
+                    const bool taken_loops = (lir.taken_block == b);
+                    const std::optional<std::size_t> exit_blk = taken_loops ? lir.fall_block : lir.taken_block;
+                    if (!exit_blk.has_value() || *exit_blk > latch) {
+                        push_label_slot(b, indent);
+                        push_code(bir.start_va, {CodeRange{bir.start_va, bir.first_insn_size}}, indent, "do {");
+
+                        loop_stack.push_back(LoopContext{.header_idx = b, .exit_idx = exit_blk});
+                        self(self, b, latch, indent + 1u, b, depth + 1u);
+                        for (std::size_t k = b + 1u; k < latch; ++k) {
+                            if (!emitted[k] && goto_targets.contains(k)) {
+                                self(self, k, latch, indent + 1u, std::nullopt, depth + 1u);
+                            }
+                        }
+                        if (!emitted[latch]) {
+                            emitted[latch] = true;
+                            push_label_slot(latch, indent + 1u);
+                            for (const LiftedStmt& st : lir.body) {
+                                push_code(st.address, {CodeRange{st.address, st.size}}, indent + 1u, st.code);
+                            }
+                        }
+                        loop_stack.pop_back();
+
+                        const std::string stay_cond = taken_loops ? lir.cond_expr : invert_condition(lir.cond_expr);
+                        push_code(lir.term_addr, {CodeRange{lir.term_addr, lir.term_size}}, indent,
+                                  std::format("}} while ({});", stay_cond));
+                        if (exit_blk.has_value()) {
+                            b = *exit_blk;
+                            suppress_loop_at = std::nullopt;
+                            continue;
+                        }
+                        if (taken_loops) {
+                            emit_truncated_fallthrough(lir.term_addr, lir.term_size, indent);
+                        } else if (!lir.external_stmt.empty()) {
+                            push_code(lir.term_addr, {CodeRange{lir.term_addr, lir.term_size}}, indent,
+                                      lir.external_stmt);
+                        }
                         return;
                     }
-                    if (!emitted[next]) {
-                        self(self, next, stop_block, indent, std::nullopt);
-                    } else {
-                        emit_goto_or_loop_jump(next, stop_block, bir.term_addr, bir.term_size, indent);
+                }
+            }
+
+            // Standard basic block emission.
+            emitted[b] = true;
+            push_label_slot(b, indent);
+            for (const LiftedStmt& st : bir.body) {
+                push_code(st.address, {CodeRange{st.address, st.size}}, indent, st.code);
+            }
+
+            std::optional<std::size_t> next_b;
+            switch (bir.term_kind) {
+                case TermKind::Fallthrough: {
+                    if (bir.fall_block.has_value()) {
+                        const std::size_t next = *bir.fall_block;
+                        if (stop_block.has_value() && next == *stop_block) {
+                            return;
+                        }
+                        if (!emitted[next]) {
+                            next_b = next;
+                        } else {
+                            emit_goto_or_loop_jump(next, stop_block, bir.term_addr, bir.term_size, indent);
+                        }
                     }
+                    break;
                 }
-                break;
-            }
 
-            case TermKind::Return: {
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, bir.return_stmt);
-                break;
-            }
-
-            case TermKind::ConditionalReturn: {
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                          std::format("if ({}) {{", bir.cond_expr));
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u, bir.return_stmt);
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                if (bir.fall_block.has_value()) {
-                    self(self, *bir.fall_block, stop_block, indent, std::nullopt);
+                case TermKind::Return: {
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, bir.return_stmt);
+                    break;
                 }
-                break;
-            }
 
-            case TermKind::TailOrExternal: {
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, bir.external_stmt);
-                break;
-            }
-
-            case TermKind::Jump: {
-                if (bir.jump_block.has_value()) {
-                    const std::size_t dst = *bir.jump_block;
-                    if (stop_block.has_value() && dst == *stop_block) {
-                        return;
-                    }
-                    if (!emitted[dst] && forward_preds[dst] == 1u && back_preds[dst] == 0u && dst > b) {
-                        self(self, dst, stop_block, indent, std::nullopt);
-                    } else {
-                        emit_goto_or_loop_jump(dst, stop_block, bir.term_addr, bir.term_size, indent);
-                    }
-                }
-                break;
-            }
-
-            case TermKind::Switch: {
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                          std::format("switch ({}) {{", bir.cond_expr));
-                for (const auto& [case_label, target_idx] : bir.switch_cases) {
-                    goto_targets.insert(target_idx);
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
-                              std::format("{}: goto {};", case_label, block_label_name(target_idx)));
-                }
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                break;
-            }
-
-            case TermKind::CondBranch: {
-                // External taken branch + internal fallthrough.
-                if (!bir.taken_block.has_value()) {
+                case TermKind::ConditionalReturn: {
                     push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
                               std::format("if ({}) {{", bir.cond_expr));
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
-                              bir.external_stmt.empty() ? "return 0;" : bir.external_stmt);
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u, bir.return_stmt);
                     push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
                     if (bir.fall_block.has_value()) {
-                        self(self, *bir.fall_block, stop_block, indent, std::nullopt);
+                        next_b = *bir.fall_block;
                     }
                     break;
                 }
-                if (!bir.fall_block.has_value()) {
-                    emit_goto_or_loop_jump(*bir.taken_block, stop_block, bir.term_addr, bir.term_size, indent);
+
+                case TermKind::TailOrExternal: {
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, bir.external_stmt);
                     break;
                 }
 
-                const std::size_t t = *bir.taken_block;
-                const std::size_t f = *bir.fall_block;
+                case TermKind::Jump: {
+                    if (bir.jump_block.has_value()) {
+                        const std::size_t dst = *bir.jump_block;
+                        if (stop_block.has_value() && dst == *stop_block) {
+                            return;
+                        }
+                        if (!emitted[dst] && forward_preds[dst] == 1u && back_preds[dst] == 0u && dst > b) {
+                            next_b = dst;
+                        } else {
+                            emit_goto_or_loop_jump(dst, stop_block, bir.term_addr, bir.term_size, indent);
+                        }
+                    }
+                    break;
+                }
 
-                // Loop break / continue idioms.
-                if (!loop_stack.empty()) {
-                    const LoopContext& lc = loop_stack.back();
-                    if (lc.exit_idx.has_value() && t == *lc.exit_idx && !emitted[f]) {
+                case TermKind::Switch: {
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                              std::format("switch ({}) {{", bir.cond_expr));
+                    for (const auto& [case_label, target_idx] : bir.switch_cases) {
+                        goto_targets.insert(target_idx);
+                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
+                                  std::format("{}: goto {};", case_label, block_label_name(target_idx)));
+                    }
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                    break;
+                }
+
+                case TermKind::CondBranch: {
+                    // External taken branch + internal (or truncated) fallthrough.
+                    if (!bir.taken_block.has_value()) {
                         push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
                                   std::format("if ({}) {{", bir.cond_expr));
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u, "break;");
+                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
+                                  bir.external_stmt.empty() ? "return 0;" : bir.external_stmt);
                         push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                        self(self, f, stop_block, indent, std::nullopt);
-                        break;
-                    }
-                    if (lc.exit_idx.has_value() && f == *lc.exit_idx && !emitted[t]) {
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                                  std::format("if ({}) {{", invert_condition(bir.cond_expr)));
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u, "break;");
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                        self(self, t, stop_block, indent, std::nullopt);
-                        break;
-                    }
-                }
-
-                // Half-diamond 1 (most common compiler pattern): `if (!cond) { fall_region }` merging into `taken`.
-                if (t > f && (!stop_block.has_value() || t <= *stop_block) && region_merges_cleanly(f, t)) {
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                              std::format("if ({}) {{", invert_condition(bir.cond_expr)));
-                    self(self, f, t, indent + 1u, std::nullopt);
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                    self(self, t, stop_block, indent, std::nullopt);
-                    break;
-                }
-
-                // Half-diamond 2: `if (cond) { taken_region }` merging into `fall`.
-                if ((!stop_block.has_value() || f <= *stop_block) && region_merges_cleanly(t, f)) {
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                              std::format("if ({}) {{", bir.cond_expr));
-                    self(self, t, f, indent + 1u, std::nullopt);
-                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                    self(self, f, stop_block, indent, std::nullopt);
-                    break;
-                }
-
-                // Full `if (...) { ... } else { ... }` diamond.
-                if (!emitted[f] && !emitted[t] && f != t &&
-                    forward_preds[f] == 1u && forward_preds[t] == 1u &&
-                    back_preds[f] == 0u && back_preds[t] == 0u) {
-                    const auto merge = find_diamond_merge(f, t, stop_block);
-                    if (merge.has_value() ||
-                        (region_merges_cleanly(f, std::nullopt) && region_merges_cleanly(t, std::nullopt))) {
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                                  std::format("if ({}) {{", invert_condition(bir.cond_expr)));
-                        self(self, f, merge, indent + 1u, std::nullopt);
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "} else {");
-                        self(self, t, merge, indent + 1u, std::nullopt);
-                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
-                        if (merge.has_value() && (!stop_block.has_value() || *merge != *stop_block)) {
-                            self(self, *merge, stop_block, indent, std::nullopt);
+                        if (bir.fall_block.has_value()) {
+                            next_b = *bir.fall_block;
+                        } else {
+                            emit_truncated_fallthrough(bir.term_addr, bir.term_size, indent);
                         }
                         break;
                     }
-                }
-
-                // Irreducible / multi-predecessor fallback: emit structured conditional goto + fallthrough.
-                goto_targets.insert(t);
-                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
-                          std::format("if ({}) goto {};", bir.cond_expr, block_label_name(t)));
-                if (!stop_block.has_value() || f != *stop_block) {
-                    if (!emitted[f]) {
-                        self(self, f, stop_block, indent, std::nullopt);
-                    } else {
-                        emit_goto_or_loop_jump(f, stop_block, bir.term_addr, bir.term_size, indent);
+                    if (!bir.fall_block.has_value()) {
+                        goto_targets.insert(*bir.taken_block);
+                        push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                  std::format("if ({}) goto {};",
+                                              bir.cond_expr,
+                                              block_label_name(*bir.taken_block)));
+                        emit_truncated_fallthrough(bir.term_addr, bir.term_size, indent);
+                        break;
                     }
+
+                    const std::size_t t = *bir.taken_block;
+                    const std::size_t f = *bir.fall_block;
+
+                    // Loop break / continue idioms.
+                    if (!loop_stack.empty()) {
+                        const LoopContext& lc = loop_stack.back();
+                        if (lc.exit_idx.has_value() && t == *lc.exit_idx && !emitted[f]) {
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                      std::format("if ({}) {{", bir.cond_expr));
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
+                                      "break;");
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                            next_b = f;
+                            break;
+                        }
+                        if (lc.exit_idx.has_value() && f == *lc.exit_idx && !emitted[t]) {
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                      std::format("if ({}) {{", invert_condition(bir.cond_expr)));
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent + 1u,
+                                      "break;");
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                            next_b = t;
+                            break;
+                        }
+                    }
+
+                    if (depth < kMaxStructureDepth) {
+                        // Half-diamond 1: `if (!cond) { fall_region }` merging into `taken`.
+                        if (t > f && (!stop_block.has_value() || t <= *stop_block) &&
+                            region_merges_cleanly(f, t)) {
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                      std::format("if ({}) {{", invert_condition(bir.cond_expr)));
+                            self(self, f, t, indent + 1u, std::nullopt, depth + 1u);
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                            next_b = t;
+                            break;
+                        }
+
+                        // Half-diamond 2: `if (cond) { taken_region }` merging into `fall`.
+                        if ((!stop_block.has_value() || f <= *stop_block) && region_merges_cleanly(t, f)) {
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                      std::format("if ({}) {{", bir.cond_expr));
+                            self(self, t, f, indent + 1u, std::nullopt, depth + 1u);
+                            push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                            next_b = f;
+                            break;
+                        }
+
+                        // Full `if (...) { ... } else { ... }` diamond.
+                        if (!emitted[f] && !emitted[t] && f != t &&
+                            forward_preds[f] == 1u && forward_preds[t] == 1u &&
+                            back_preds[f] == 0u && back_preds[t] == 0u) {
+                            const auto merge = find_diamond_merge(f, t, stop_block);
+                            if (merge.has_value() ||
+                                (region_merges_cleanly(f, std::nullopt) &&
+                                 region_merges_cleanly(t, std::nullopt))) {
+                                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                          std::format("if ({}) {{", invert_condition(bir.cond_expr)));
+                                self(self, f, merge, indent + 1u, std::nullopt, depth + 1u);
+                                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                                          "} else {");
+                                self(self, t, merge, indent + 1u, std::nullopt, depth + 1u);
+                                push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent, "}");
+                                if (merge.has_value() && (!stop_block.has_value() || *merge != *stop_block)) {
+                                    next_b = *merge;
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    // Irreducible / multi-predecessor / depth-bounded fallback: emit conditional goto + fallthrough.
+                    goto_targets.insert(t);
+                    push_code(bir.term_addr, {CodeRange{bir.term_addr, bir.term_size}}, indent,
+                              std::format("if ({}) goto {};", bir.cond_expr, block_label_name(t)));
+                    if (!stop_block.has_value() || f != *stop_block) {
+                        if (!emitted[f]) {
+                            next_b = f;
+                        } else {
+                            emit_goto_or_loop_jump(f, stop_block, bir.term_addr, bir.term_size, indent);
+                        }
+                    }
+                    break;
                 }
-                break;
             }
+
+            if (next_b.has_value()) {
+                b = *next_b;
+                suppress_loop_at = std::nullopt;
+                continue;
+            }
+            return;
         }
     };
 
-    emit_region(emit_region, 0u, std::nullopt, 1u, std::nullopt);
+    emit_region(emit_region, 0u, std::nullopt, 1u, std::nullopt, 0u);
 
     // Ensure every basic block in `fallback_graph` is emitted exactly once in address order.
     for (std::size_t i = 0u; i < num_blocks; ++i) {
         if (!emitted[i]) {
-            emit_region(emit_region, i, std::nullopt, 1u, std::nullopt);
+            emit_region(emit_region, i, std::nullopt, 1u, std::nullopt, 0u);
         }
     }
 
@@ -2466,11 +2676,12 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
     }
 
     for (const OutputItem& item : out_items) {
+        const std::size_t clamped_indent = std::min<std::size_t>(item.indent, kMaxIndent);
         if (item.is_label_placeholder) {
             if (!goto_targets.contains(item.block_idx)) {
                 continue;
             }
-            const std::string pad(item.indent * 4u, ' ');
+            const std::string pad(clamped_indent * 4u, ' ');
             unit.lines.push_back(DecompiledLine{
                 .address = item.address,
                 .text = std::format("{}{}:", pad, block_label_name(item.block_idx)),
@@ -2478,7 +2689,7 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
             });
             continue;
         }
-        const std::string pad(item.indent * 4u, ' ');
+        const std::string pad(clamped_indent * 4u, ' ');
         unit.lines.push_back(DecompiledLine{
             .address = item.address,
             .text = pad + item.text,

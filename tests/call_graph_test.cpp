@@ -1621,3 +1621,173 @@ TEST(CallGraph, ResolvesRipRelativeIatSlotIndirectCallsInFanoutGraph) {
     ASSERT_FALSE(graph.indirect_recoveries.empty());
     EXPECT_EQ(graph.indirect_recoveries.front().confidence, "IndirectPointerSlot");
 }
+
+TEST(CallGraph, EscapesRecordDelimitersForCppTemplatesOperatorsAndBraces) {
+    viewer::CallGraph graph{
+        .id = "function_cfg",
+        .label = "std::less<int>::operator|(a, b)",
+        .architecture = peelf::Architecture::X86_64,
+        .endianness = peelf::Endianness::Little,
+        .nodes = {
+            viewer::CallGraphNode{
+                .id = "bb_0",
+                .label = "std::less<int>::operator|{entry}",
+                .kind = viewer::CallGraphNodeKind::BasicBlock,
+                .instructions = {
+                    viewer::GraphInstruction{
+                        .address = 0x1000u,
+                        .mnemonic = "call",
+                        .operands = "std::less<int>::operator|(x, y) ; {closure<T>}",
+                    },
+                    viewer::GraphInstruction{
+                        .address = 0x1005u,
+                        .mnemonic = "ret",
+                        .operands = "",
+                    },
+                },
+            },
+        },
+        .edges = {},
+        .indirect_recoveries = {},
+    };
+
+    const std::string dot = viewer::to_dot(graph);
+    EXPECT_NE(dot.find("shape=\"record\""), std::string::npos) << dot;
+    // Intentional outer {header|body} compartment delimiters remain intact while inner
+    // record characters (<, >, |, {, }) in C++ template/operator text are backslash-escaped.
+    EXPECT_NE(dot.find("label=\"{std::less\\<int\\>::operator\\|\\{entry\\}|"), std::string::npos) << dot;
+    EXPECT_NE(dot.find("std::less\\<int\\>::operator\\|(x, y) ; \\{closure\\<T\\>\\}"), std::string::npos) << dot;
+
+#if defined(PEELF_GRAPHVIZ_DOT_AVAILABLE) && PEELF_GRAPHVIZ_DOT_AVAILABLE
+    const std::filesystem::path output_path =
+        std::filesystem::temp_directory_path() / "peelf_call_graph_record_escape_test.svg";
+    const std::filesystem::path dot_path = output_path.string() + ".dot";
+    std::filesystem::remove(output_path);
+    std::filesystem::remove(dot_path);
+
+    const viewer::DefaultProcessRunner runner;
+    const viewer::GraphRenderResult rendered =
+        viewer::render_graph_with_graphviz(graph, output_path, viewer::GraphRenderFormat::Svg, runner);
+    EXPECT_TRUE(rendered.success) << rendered.diagnostic << "\n" << dot;
+    EXPECT_EQ(rendered.exit_code, 0);
+
+    std::filesystem::remove(output_path);
+    std::filesystem::remove(dot_path);
+#endif
+}
+
+TEST(CallGraph, RejectsJumpTableWhenIndexOrFlagsClobberedBetweenCmpGuardAndDispatch) {
+    const std::array<std::uint8_t, 12> rodata_table{
+        0x1A, 0xF0, 0xFF, 0xFF,
+        0x20, 0xF0, 0xFF, 0xFF,
+        0x23, 0xF0, 0xFF, 0xFF,
+    };
+    const viewer::GraphByteReader reader = [&](std::uint64_t va, std::size_t len) -> std::vector<std::uint8_t> {
+        if (va == 0x2000u && len == rodata_table.size()) {
+            return std::vector<std::uint8_t>(rodata_table.begin(), rodata_table.end());
+        }
+        return {};
+    };
+
+    // Case 1: index register (eax) is clobbered with a constant (`mov eax, 1`) after `ja`,
+    // disconnecting `rax` in `[rcx + rax*4]` from the guarded `edi`.
+    const std::vector<std::uint8_t> clobbered_index_code{
+        0x83, 0xFF, 0x02,                         // 0x1000: cmp edi, 2
+        0x77, 0x22,                               // 0x1003: ja 0x1027
+        0xB8, 0x01, 0x00, 0x00, 0x00,             // 0x1005: mov eax, 1  (clobbers eax!)
+        0x48, 0x8D, 0x0D, 0xEF, 0x0F, 0x00, 0x00, // 0x100A: lea rcx, [rip + 0xFEF] -> 0x2000
+        0x48, 0x63, 0x04, 0x81,                   // 0x1011: movsxd rax, dword ptr [rcx + rax*4]
+        0x48, 0x01, 0xC8,                         // 0x1015: add rax, rcx
+        0xFF, 0xE0,                               // 0x1018: jmp rax
+        0xB8, 0x0A, 0x00, 0x00, 0x00, 0xC3,       // 0x101A
+        0x31, 0xC0, 0xC3,                         // 0x1020
+        0xB0, 0x02, 0x90, 0xC3,                   // 0x1023
+        0x83, 0xC8, 0xFF, 0xC3,                   // 0x1027
+    };
+    const viewer::CallGraph g_idx = viewer::build_function_cfg_call_graph(
+        clobbered_index_code,
+        0x1000u,
+        peelf::Architecture::X86_64,
+        peelf::Endianness::Little,
+        std::nullopt,
+        "clobbered_idx_switch",
+        false,
+        true,
+        reader);
+    EXPECT_TRUE(g_idx.indirect_recoveries.empty());
+    EXPECT_FALSE(std::ranges::any_of(g_idx.edges, [](const auto& e) { return e.label.starts_with("case "); }));
+
+    // Case 2: EFLAGS is clobbered (`xor edx, edx`) between `cmp edi, 2` and `ja`,
+    // invalidating the unsigned upper-bound guard.
+    const std::vector<std::uint8_t> clobbered_flags_code{
+        0x83, 0xFF, 0x02,                         // 0x1000: cmp edi, 2
+        0x31, 0xD2,                               // 0x1003: xor edx, edx (clobbers EFLAGS!)
+        0x77, 0x1F,                               // 0x1005: ja 0x1026
+        0x89, 0xF8,                               // 0x1007: mov eax, edi
+        0x48, 0x8D, 0x0D, 0xF0, 0x0F, 0x00, 0x00, // 0x1009: lea rcx, [rip + 0xFF0] -> 0x2000
+        0x48, 0x63, 0x04, 0x81,                   // 0x1010: movsxd rax, dword ptr [rcx + rax*4]
+        0x48, 0x01, 0xC8,                         // 0x1014: add rax, rcx
+        0xFF, 0xE0,                               // 0x1017: jmp rax
+        0xB8, 0x0A, 0x00, 0x00, 0x00, 0xC3,       // 0x1019
+        0x31, 0xC0, 0xC3,                         // 0x101F
+        0xB0, 0x02, 0x90, 0xC3,                   // 0x1022
+        0x83, 0xC8, 0xFF, 0xC3,                   // 0x1026
+    };
+    const viewer::CallGraph g_flags = viewer::build_function_cfg_call_graph(
+        clobbered_flags_code,
+        0x1000u,
+        peelf::Architecture::X86_64,
+        peelf::Endianness::Little,
+        std::nullopt,
+        "clobbered_flags_switch",
+        false,
+        true,
+        reader);
+    EXPECT_TRUE(g_flags.indirect_recoveries.empty());
+    EXPECT_FALSE(std::ranges::any_of(g_flags.edges, [](const auto& e) { return e.label.starts_with("case "); }));
+}
+
+TEST(CallGraph, FindSymbolForAddressHandlesHighVirtualAddressWithoutUint64Overflow) {
+    class HighVaImage final : public peelf::IBinaryImage {
+    public:
+        HighVaImage() {
+            symbols_.push_back(peelf::Symbol{
+                .name = "high_va_kernel_stub",
+                .virtual_address = 0xFFFF'FFFF'FFFF'FFF0ULL,
+                .size = 0x20ULL, // virtual_address + size wraps 64-bit unsigned!
+            });
+        }
+        [[nodiscard]] peelf::Format format() const noexcept override { return peelf::Format::ELF; }
+        [[nodiscard]] peelf::ImageKind kind() const noexcept override { return peelf::ImageKind::Executable; }
+        [[nodiscard]] peelf::Architecture architecture() const noexcept override { return peelf::Architecture::X86_64; }
+        [[nodiscard]] peelf::Endianness endianness() const noexcept override { return peelf::Endianness::Little; }
+        [[nodiscard]] bool is_64bit() const noexcept override { return true; }
+        [[nodiscard]] std::uint64_t image_base() const noexcept override { return 0; }
+        [[nodiscard]] std::uint64_t entry_point() const noexcept override { return 0xFFFF'FFFF'FFFF'FFF0ULL; }
+        [[nodiscard]] const std::vector<peelf::Section>& sections() const noexcept override { return sections_; }
+        [[nodiscard]] const std::vector<peelf::Segment>& segments() const noexcept override { return segments_; }
+        [[nodiscard]] const std::vector<peelf::Symbol>& symbols() const noexcept override { return symbols_; }
+        [[nodiscard]] const std::vector<peelf::ImportEntry>& imports() const noexcept override { return imports_; }
+        [[nodiscard]] const std::vector<peelf::ExportEntry>& exports() const noexcept override { return exports_; }
+        [[nodiscard]] std::optional<std::uint64_t> file_offset_to_virtual_address(std::uint64_t) const noexcept override {
+            return std::nullopt;
+        }
+        [[nodiscard]] std::optional<std::uint64_t> virtual_address_to_file_offset(std::uint64_t) const noexcept override {
+            return std::nullopt;
+        }
+
+    private:
+        std::vector<peelf::Section> sections_{};
+        std::vector<peelf::Segment> segments_{};
+        std::vector<peelf::Symbol> symbols_{};
+        std::vector<peelf::ImportEntry> imports_{};
+        std::vector<peelf::ExportEntry> exports_{};
+    };
+
+    const HighVaImage image;
+    const auto hit = viewer::find_symbol_for_address(image, 0xFFFF'FFFF'FFFF'FFF8ULL);
+    ASSERT_TRUE(hit.has_value());
+    EXPECT_EQ(hit->name, "high_va_kernel_stub");
+    EXPECT_FALSE(viewer::find_symbol_for_address(image, 0xFFFF'FFFF'FFFF'FFE0ULL).has_value());
+}
+

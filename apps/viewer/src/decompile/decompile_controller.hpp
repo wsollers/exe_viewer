@@ -80,6 +80,7 @@ private:
     struct PendingJob {
         std::uint64_t sequence = 0;
         DecompileJobSpec spec{};
+        std::stop_source job_stop{std::nostopstate};
         DecompiledUnit cancelled_unit{};
         DecompiledUnit bad_alloc_unit{};
         DecompiledUnit unknown_error_unit{};
@@ -98,7 +99,7 @@ private:
     std::optional<DecompileJobResult> completed_;
     DecompiledUnit fatal_worker_oom_unit_{};
     DecompiledUnit fatal_worker_error_unit_{};
-    std::stop_source active_job_stop_;
+    std::stop_source active_job_stop_{std::nostopstate};
     bool shutting_down_ = false;
     bool stale_result_discarded_ = false;
     std::jthread worker_;

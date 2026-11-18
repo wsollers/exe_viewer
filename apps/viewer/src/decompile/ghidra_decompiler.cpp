@@ -4,15 +4,30 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <format>
 #include <iomanip>
 #include <mutex>
+#include <optional>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -52,6 +67,197 @@ std::filesystem::path safe_scratch_base_directory() {
 #else
     return std::filesystem::temp_directory_path();
 #endif
+}
+
+[[nodiscard]] unsigned long current_process_id() noexcept {
+#ifdef _WIN32
+    return static_cast<unsigned long>(::GetCurrentProcessId());
+#else
+    return static_cast<unsigned long>(::getpid());
+#endif
+}
+
+[[nodiscard]] bool ensure_private_directory(const std::filesystem::path& dir) noexcept {
+    if (dir.empty()) {
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (!std::filesystem::is_directory(dir, ec)) {
+        return false;
+    }
+    std::filesystem::permissions(
+        dir,
+        std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace,
+        ec);
+    return true;
+}
+
+enum class LockAcquireOutcome : std::uint8_t {
+    Acquired,
+    Cancelled,
+    TimedOut,
+    Failed,
+};
+
+class ScopedWorkspaceFileLock {
+public:
+    ScopedWorkspaceFileLock() noexcept = default;
+    ~ScopedWorkspaceFileLock() noexcept {
+        release();
+    }
+
+    ScopedWorkspaceFileLock(const ScopedWorkspaceFileLock&) = delete;
+    ScopedWorkspaceFileLock& operator=(const ScopedWorkspaceFileLock&) = delete;
+
+    ScopedWorkspaceFileLock(ScopedWorkspaceFileLock&& other) noexcept
+#ifdef _WIN32
+        : handle_(std::exchange(other.handle_, INVALID_HANDLE_VALUE))
+        , locked_(std::exchange(other.locked_, false))
+#else
+        : fd_(std::exchange(other.fd_, -1))
+        , locked_(std::exchange(other.locked_, false))
+#endif
+    {
+    }
+
+    ScopedWorkspaceFileLock& operator=(ScopedWorkspaceFileLock&& other) noexcept {
+        if (this != &other) {
+            release();
+#ifdef _WIN32
+            handle_ = std::exchange(other.handle_, INVALID_HANDLE_VALUE);
+#else
+            fd_ = std::exchange(other.fd_, -1);
+#endif
+            locked_ = std::exchange(other.locked_, false);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] static std::optional<ScopedWorkspaceFileLock> try_acquire(
+        const std::filesystem::path& lock_path) noexcept {
+        ScopedWorkspaceFileLock guard;
+        if (!guard.open_file(lock_path)) {
+            return std::nullopt;
+        }
+        if (!guard.try_lock_once()) {
+            return std::nullopt;
+        }
+        return guard;
+    }
+
+    [[nodiscard]] static std::pair<LockAcquireOutcome, ScopedWorkspaceFileLock> acquire(
+        const std::filesystem::path& lock_path,
+        std::chrono::milliseconds timeout,
+        std::stop_token stop) {
+        ScopedWorkspaceFileLock guard;
+        if (stop.stop_requested()) {
+            return {LockAcquireOutcome::Cancelled, ScopedWorkspaceFileLock{}};
+        }
+        if (!guard.open_file(lock_path)) {
+            return {LockAcquireOutcome::Failed, ScopedWorkspaceFileLock{}};
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (true) {
+            if (guard.try_lock_once()) {
+                return {LockAcquireOutcome::Acquired, std::move(guard)};
+            }
+            if (stop.stop_requested()) {
+                return {LockAcquireOutcome::Cancelled, ScopedWorkspaceFileLock{}};
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return {LockAcquireOutcome::TimedOut, ScopedWorkspaceFileLock{}};
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+
+    void release() noexcept {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            if (locked_) {
+                OVERLAPPED ov{};
+                (void)::UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &ov);
+                locked_ = false;
+            }
+            (void)::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            if (locked_) {
+                (void)::flock(fd_, LOCK_UN);
+                locked_ = false;
+            }
+            (void)::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+
+private:
+    [[nodiscard]] bool open_file(const std::filesystem::path& lock_path) noexcept {
+#ifdef _WIN32
+        handle_ = ::CreateFileW(
+            lock_path.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr,
+            OPEN_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        return handle_ != INVALID_HANDLE_VALUE;
+#else
+        do {
+            fd_ = ::open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
+        } while (fd_ < 0 && errno == EINTR);
+        if (fd_ >= 0) {
+            (void)::fchmod(fd_, S_IRUSR | S_IWUSR);
+        }
+        return fd_ >= 0;
+#endif
+    }
+
+    [[nodiscard]] bool try_lock_once() noexcept {
+#ifdef _WIN32
+        OVERLAPPED ov{};
+        if (::LockFileEx(handle_,
+                         LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                         0,
+                         MAXDWORD,
+                         MAXDWORD,
+                         &ov) != 0) {
+            locked_ = true;
+            return true;
+        }
+        return false;
+#else
+        int rc = 0;
+        do {
+            rc = ::flock(fd_, LOCK_EX | LOCK_NB);
+        } while (rc != 0 && errno == EINTR);
+        if (rc == 0) {
+            locked_ = true;
+            return true;
+        }
+        return false;
+#endif
+    }
+
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+    bool locked_ = false;
+};
+
+[[nodiscard]] std::filesystem::path workspace_lock_path(
+    const std::filesystem::path& cache_root,
+    std::string_view ws_dir_name) {
+    return cache_root / ".locks" / (std::string(ws_dir_name) + ".lock");
 }
 
 std::mutex& ghidra_workspace_mutex() {
@@ -126,9 +332,15 @@ void prune_ghidra_workspaces(const std::filesystem::path& cache_root,
         return a.order < b.order;
     });
     std::size_t remaining = workspaces.size();
+    (void)ensure_private_directory(cache_root / ".locks");
     for (const auto& ws : workspaces) {
         if (remaining <= limit) break;
         if (ws.path == protected_dir) continue;
+        const std::string ws_name = ws.path.filename().string();
+        auto ws_lock = ScopedWorkspaceFileLock::try_acquire(workspace_lock_path(cache_root, ws_name));
+        if (!ws_lock.has_value()) {
+            continue;
+        }
         std::filesystem::remove_all(ws.path, ec);
         --remaining;
     }
@@ -163,9 +375,18 @@ void clear_ghidra_workspace_cache(const std::filesystem::path& cache_root) {
     std::scoped_lock lock(ghidra_workspace_mutex());
     std::error_code ec;
     if (!std::filesystem::exists(cache_root, ec)) return;
+    const bool locks_ready = ensure_private_directory(cache_root / ".locks");
     for (const auto& entry : std::filesystem::directory_iterator(cache_root, ec)) {
+        if (!entry.is_directory(ec)) continue;
         const std::string name = entry.path().filename().string();
         if (name.starts_with("ws-")) {
+            std::optional<ScopedWorkspaceFileLock> ws_lock;
+            if (locks_ready) {
+                ws_lock = ScopedWorkspaceFileLock::try_acquire(workspace_lock_path(cache_root, name));
+                if (!ws_lock.has_value()) {
+                    continue;
+                }
+            }
             std::filesystem::remove_all(entry.path(), ec);
         }
     }
@@ -290,18 +511,21 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
 
     static std::atomic<std::uint64_t> serial{};
     const auto scratch_dir = safe_scratch_base_directory() / std::format(
-        "peelf-ghidra-run-{}-{}",
+        "peelf-ghidra-run-{}-{}-{}",
+        current_process_id(),
         std::chrono::steady_clock::now().time_since_epoch().count(),
         ++serial);
     std::error_code ec;
-    if (!std::filesystem::create_directories(scratch_dir, ec))
+    if (!ensure_private_directory(scratch_dir))
         return failure(DecompileStatus::Failed, "Cannot create Ghidra workspace");
     struct Workspace {
         std::filesystem::path path;
         explicit Workspace(std::filesystem::path p) : path(std::move(p)) {}
         Workspace(const Workspace&) = delete;
         Workspace& operator=(const Workspace&) = delete;
-        ~Workspace() {
+        Workspace(Workspace&&) = delete;
+        Workspace& operator=(Workspace&&) = delete;
+        ~Workspace() noexcept {
             std::error_code ignored;
             std::filesystem::remove_all(path, ignored);
         }
@@ -398,12 +622,31 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
 
     const std::filesystem::path cache_root = effective_cache_directory();
     std::scoped_lock lock(ghidra_workspace_mutex());
-    if (!std::filesystem::create_directories(cache_root, ec) &&
-        !std::filesystem::is_directory(cache_root, ec)) {
+    if (cache_root.parent_path().filename() == "peelf_viewer") {
+        (void)ensure_private_directory(cache_root.parent_path());
+    }
+    if (!ensure_private_directory(cache_root) ||
+        !ensure_private_directory(cache_root / ".locks")) {
         return failure(DecompileStatus::Failed, "Cannot create Ghidra cache directory");
     }
 
-    const std::filesystem::path project_dir = cache_root / ("ws-" + ws_id);
+    const std::string ws_dir_name = "ws-" + ws_id;
+    auto [lock_outcome, ws_file_lock] = ScopedWorkspaceFileLock::acquire(
+        workspace_lock_path(cache_root, ws_dir_name),
+        std::chrono::seconds(settings_.timeout_seconds),
+        stop);
+    if (lock_outcome == LockAcquireOutcome::Cancelled) {
+        return failure(DecompileStatus::Cancelled, "Decompilation cancelled");
+    }
+    if (lock_outcome == LockAcquireOutcome::TimedOut) {
+        return failure(DecompileStatus::Timeout,
+                       "Timed out waiting for concurrent Ghidra workspace lock.");
+    }
+    if (lock_outcome != LockAcquireOutcome::Acquired) {
+        return failure(DecompileStatus::Failed, "Cannot acquire Ghidra workspace lock");
+    }
+
+    const std::filesystem::path project_dir = cache_root / ws_dir_name;
     const std::filesystem::path gpr_file = project_dir / "analysis.gpr";
     const std::filesystem::path stamp_file = project_dir / ".peelf_complete";
     const std::filesystem::path input = project_dir / "input.bin";
@@ -418,6 +661,11 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
         std::filesystem::is_regular_file(input, ec);
 
     if (warm_ready) {
+        std::filesystem::permissions(
+            project_dir,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace,
+            ec);
         const std::string applied_symbols_sha = read_stamp_file(stamp_file);
         const bool symbols_changed = (applied_symbols_sha != symbols_sha);
         const std::string warm_phase = symbols_changed ? "export_sync" : "export_warm";
@@ -453,7 +701,7 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
     }
 
     std::filesystem::remove_all(project_dir, ec);
-    if (!std::filesystem::create_directories(project_dir, ec)) {
+    if (!ensure_private_directory(project_dir)) {
         return failure(DecompileStatus::Failed, "Cannot create Ghidra project workspace");
     }
     {

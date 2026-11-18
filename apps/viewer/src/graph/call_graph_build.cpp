@@ -1022,7 +1022,7 @@ std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage&
     for (std::uint64_t index = 0; index < symbols.size(); ++index) {
         const peelf::Symbol& symbol = symbols[static_cast<std::size_t>(index)];
         const std::uint64_t symbol_size = std::max<std::uint64_t>(symbol.size, 1);
-        if (virtual_address >= symbol.virtual_address && virtual_address < symbol.virtual_address + symbol_size) {
+        if (virtual_address >= symbol.virtual_address && virtual_address - symbol.virtual_address < symbol_size) {
             return GraphSymbolRef{
                 .name = symbol.name,
                 .demangled_name = peelf::demangle_symbol(symbol.name).demangled,
