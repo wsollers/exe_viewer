@@ -23,24 +23,6 @@ namespace viewer {
 namespace {
 using detail::format_hex_addr;
 using detail::utf8_path;
-
-[[nodiscard]] bool interval_list_contains(const std::vector<peelf::PatchInterval>& list,
-                                          std::uint64_t address) noexcept {
-    const auto it = std::upper_bound(
-        list.begin(),
-        list.end(),
-        address,
-        [](std::uint64_t addr, const peelf::PatchInterval& iv) {
-            return addr < iv.offset;
-        });
-    if (it == list.begin()) {
-        return false;
-    }
-    const peelf::PatchInterval& prev = *std::prev(it);
-    const auto len = static_cast<std::uint64_t>(prev.patched.size());
-    return address >= prev.offset && (address - prev.offset) < len;
-}
-
 } // namespace
 
     class BinaryModel::AsyncScriptRunner {
@@ -250,7 +232,7 @@ using detail::utf8_path;
                 harvested->status = AsyncScriptStatus::StaleDiscarded;
                 harvested->mutations_applied_to_model = false;
                 harvested->apply_diagnostic =
-                    "Target binary or patch state changed while script was executing; staged mutations discarded.";
+                    "Target binary, patch, or annotation state changed while script was executing; staged mutations discarded.";
             }
             return harvested;
         }
@@ -345,9 +327,69 @@ using detail::utf8_path;
         reset_timeline_sources();
     }
 
-    BinaryModel::~BinaryModel() noexcept = default;
+    BinaryModel::PreMoveTeardown::PreMoveTeardown(PreMoveTeardown&& other) noexcept
+        : owner(nullptr)
+        , hook(std::move(other.hook)) {
+        if (other.owner != nullptr) {
+            other.owner->cancel_and_join_workers();
+            other.owner = nullptr;
+        }
+    }
+
+    BinaryModel::PreMoveTeardown& BinaryModel::PreMoveTeardown::operator=(
+        PreMoveTeardown&& other) noexcept {
+        if (this != &other) {
+            if (owner != nullptr) {
+                owner->cancel_and_join_workers();
+                owner->release_live_sessions();
+            }
+            if (other.owner != nullptr) {
+                other.owner->cancel_and_join_workers();
+                other.owner = nullptr;
+            }
+            if (!hook && other.hook) {
+                hook = std::move(other.hook);
+            } else {
+                other.hook = {};
+            }
+        }
+        return *this;
+    }
+
+    BinaryModel::~BinaryModel() noexcept {
+        cancel_and_join_workers();
+        release_live_sessions();
+    }
     BinaryModel::BinaryModel(BinaryModel&&) noexcept = default;
     BinaryModel& BinaryModel::operator=(BinaryModel&&) noexcept = default;
+
+    void BinaryModel::cancel_and_join_workers() noexcept {
+        if (script_runner_ != nullptr) {
+            script_runner_->cancel();
+            script_runner_->wait_for_idle();
+            script_runner_->clear_pending();
+        }
+        if (teardown_guard_.hook) {
+            try {
+                teardown_guard_.hook();
+            } catch (...) {
+            }
+        }
+    }
+
+    void BinaryModel::release_live_sessions() noexcept {
+        debug_timeline_source_.reset();
+        execution_timeline_.clear(true);
+        execution_timeline_.clear_sources();
+        session_.reset();
+        if (debug_session_ != nullptr) {
+            try {
+                (void)debug_session_->detach();
+            } catch (...) {
+            }
+            debug_session_.reset();
+        }
+    }
 
     void BinaryModel::reset_timeline_sources() {
         debug_timeline_source_.reset();
@@ -358,11 +400,8 @@ using detail::utf8_path;
     }
 
     void BinaryModel::reset_all() {
-        if (script_runner_ != nullptr) {
-            script_runner_->cancel();
-            script_runner_->wait_for_idle();
-            script_runner_->clear_pending();
-        }
+        teardown_guard_.owner = this;
+        cancel_and_join_workers();
         last_script_outcome_.reset();
         ++content_generation_;
         cached_content_sha256_.clear();
@@ -396,11 +435,8 @@ using detail::utf8_path;
         patch_metadata_by_offset_.clear();
         ++structure_binding_revision_;
         ++bookmark_revision_;
-        session_.reset();
-        if (debug_session_ != nullptr) {
-            (void)debug_session_->detach();
-            debug_session_.reset();
-        }
+        ++annotation_revision_;
+        release_live_sessions();
         debug_breakpoints_.clear();
         last_synced_debug_stop_revision_ = 0;
         previous_debug_registers_.clear();
@@ -1255,8 +1291,15 @@ using detail::utf8_path;
         for (Bookmark& existing : bookmarks_) {
             if (existing.address == bookmark.address &&
                 existing.is_file_offset == bookmark.is_file_offset) {
-                existing = std::move(bookmark);
+                existing.label = std::move(bookmark.label);
+                if (!bookmark.category.empty()) {
+                    existing.category = std::move(bookmark.category);
+                }
+                if (!bookmark.note.empty()) {
+                    existing.note = std::move(bookmark.note);
+                }
                 ++bookmark_revision_;
+                ++annotation_revision_;
                 return;
             }
         }
@@ -1271,6 +1314,7 @@ using detail::utf8_path;
             });
         bookmarks_.insert(pos, std::move(bookmark));
         ++bookmark_revision_;
+        ++annotation_revision_;
     }
 
     bool BinaryModel::remove_bookmark_at(std::uint64_t address, bool is_file_offset) {
@@ -1282,6 +1326,7 @@ using detail::utf8_path;
         }
         bookmarks_.erase(it);
         ++bookmark_revision_;
+        ++annotation_revision_;
         return true;
     }
 
@@ -1289,6 +1334,7 @@ using detail::utf8_path;
         if (index < bookmarks_.size()) {
             bookmarks_.erase(bookmarks_.begin() + static_cast<std::ptrdiff_t>(index));
             ++bookmark_revision_;
+            ++annotation_revision_;
         }
     }
 
@@ -1500,7 +1546,7 @@ using detail::utf8_path;
 
         std::vector<std::uint8_t> effective_buf;
         std::span<const std::uint8_t> parse_span = bytes_;
-        if (!changed_intervals().empty()) {
+        if (editable_image_ && editable_image_->dirty()) {
             if (auto eff = read_effective_bytes(0u, bytes_.size()); eff.has_value()) {
                 effective_buf = std::move(*eff);
                 parse_span = effective_buf;
@@ -1512,6 +1558,9 @@ using detail::utf8_path;
             last_diagnostic_ = parsed.error().message;
             return false;
         }
+
+        cancel_and_join_workers();
+        last_script_outcome_.reset();
 
         const std::string current_path = file_info_.path;
         image_ = std::move(*parsed);
@@ -1526,6 +1575,7 @@ using detail::utf8_path;
         if (!bookmarks_.empty()) {
             bookmarks_.clear();
             ++bookmark_revision_;
+            ++annotation_revision_;
         }
 
         if (!load_macho(current_path)) {
@@ -1868,28 +1918,24 @@ using detail::utf8_path;
 
     BytePatchState BinaryModel::byte_patch_state_at_offset(std::uint64_t offset) const noexcept {
         if (is_live_process()) {
-            if (offset >= live_window_size_) {
+            if (offset >= live_window_size_ ||
+                offset > std::numeric_limits<std::uint64_t>::max() - live_window_base_) {
                 return BytePatchState::Unchanged;
             }
             const std::uint64_t va = live_window_base_ + offset;
-            const auto staged = live_patches_.staged_intervals();
-            if (interval_list_contains(staged, va)) {
+            switch (live_patches_.byte_state_at(va)) {
+            case peelf::LiveByteState::Staged:
                 return BytePatchState::Staged;
-            }
-            for (const peelf::CommittedPatchInterval& ci : live_patches_.committed_intervals()) {
-                const auto len = static_cast<std::uint64_t>(ci.committed.size());
-                if (va >= ci.address && (va - ci.address) < len) {
-                    return BytePatchState::Committed;
-                }
+            case peelf::LiveByteState::Committed:
+                return BytePatchState::Committed;
+            case peelf::LiveByteState::Unmodified:
+                return BytePatchState::Unchanged;
             }
             return BytePatchState::Unchanged;
         }
 
-        if (editable_image_) {
-            const auto staged = editable_image_->changed_intervals();
-            if (interval_list_contains(staged, offset)) {
-                return BytePatchState::Staged;
-            }
+        if (editable_image_ && editable_image_->is_patched(offset)) {
+            return BytePatchState::Staged;
         }
         return BytePatchState::Unchanged;
     }
@@ -1909,7 +1955,7 @@ using detail::utf8_path;
         }
 
         if (!is_live_process()) {
-            if (!editable_image_ || editable_image_->changed_intervals().empty()) {
+            if (!editable_image_ || !editable_image_->dirty()) {
                 cached_content_sha256_ = peelf::sha256_hex(bytes_);
                 return cached_content_sha256_;
             }
@@ -2018,6 +2064,7 @@ using detail::utf8_path;
         if (!has_file()) {
             return peelf::make_error("No binary image or live process target is loaded");
         }
+        teardown_guard_.owner = this;
         if (script_runner_ == nullptr) {
             script_runner_ = std::make_unique<AsyncScriptRunner>();
         }
@@ -2138,21 +2185,43 @@ using detail::utf8_path;
             }
 
             if (patch_ok) {
-                if (outcome.script_result.staged_summary.bookmarks_modified) {
+                const auto& staged_summary = outcome.script_result.staged_summary;
+                if (staged_summary.bookmarks_modified) {
+                    std::map<std::uint64_t, std::pair<std::string, std::string>> preserved_va_meta;
+                    for (const Bookmark& existing : bookmarks_) {
+                        if (!existing.is_file_offset) {
+                            preserved_va_meta.emplace(existing.address,
+                                                      std::make_pair(existing.category, existing.note));
+                        }
+                    }
                     std::erase_if(bookmarks_, [](const Bookmark& b) {
                         return !b.is_file_offset;
                     });
                     for (const peelf::ScriptBookmark& wbm :
                          outcome.committed_workspace.bookmarks()) {
+                        std::string category = "Script";
+                        std::string note{};
+                        if (const auto it = preserved_va_meta.find(wbm.virtual_address);
+                            it != preserved_va_meta.end()) {
+                            if (!it->second.first.empty()) {
+                                category = it->second.first;
+                            }
+                            note = it->second.second;
+                        }
                         add_or_update_bookmark(Bookmark{
                             .address = wbm.virtual_address,
                             .is_file_offset = false,
                             .label = wbm.label,
-                            .category = "Script",
-                            .note = {},
+                            .category = std::move(category),
+                            .note = std::move(note),
                         });
                     }
                     ++bookmark_revision_;
+                }
+                if (staged_summary.bookmarks_modified ||
+                    !staged_summary.staged_labels.empty() ||
+                    !staged_summary.staged_comments.empty()) {
+                    ++annotation_revision_;
                 }
                 outcome.mutations_applied_to_model = true;
             } else {

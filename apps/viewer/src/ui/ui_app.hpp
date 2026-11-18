@@ -84,7 +84,7 @@ namespace viewer {
         void on_file_loaded();
         void on_process_attached();
         void load_debug_symbols(const std::filesystem::path& path);
-        void navigate_to_address(std::uint64_t address, PreferredView view = PreferredView::Disassembly);
+        bool navigate_to_address(std::uint64_t address, PreferredView view = PreferredView::Disassembly);
         void enqueue_navigation(std::uint64_t address,
                                 PreferredView view = PreferredView::Disassembly,
                                 std::size_t highlight_size = 0,

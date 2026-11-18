@@ -549,6 +549,7 @@ void DebuggerPanel::draw_transport_bar() {
     ImGui::SameLine();
     ImGui::BeginDisabled(!is_active);
     if (ImGui::Button("Detach Cleanly")) {
+        model_.cancel_and_join_workers();
         if (auto r = dbg->detach(); !r.has_value()) {
             model_.refresh_debug_breakpoints();
             status_msg_ = r.error().message;
@@ -561,6 +562,7 @@ void DebuggerPanel::draw_transport_bar() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Terminate")) {
+        model_.cancel_and_join_workers();
         if (auto r = dbg->terminate(); !r.has_value()) {
             status_msg_ = r.error().message;
         } else {

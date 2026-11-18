@@ -369,9 +369,9 @@ std::optional<SymbolRecord> UiApp::navigation_graph_root(std::uint64_t address) 
     return std::nullopt;
 }
 
-void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
+bool UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
     if (!model_.has_file()) {
-        return;
+        return false;
     }
 
     std::optional<std::uint64_t> offset = model_.virtual_address_to_offset(address);
@@ -383,7 +383,7 @@ void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
     }
     if (!offset || *offset >= model_.view_size()) {
         Log().warn("Address 0x{:X} is not mapped in the active image or memory map", address);
-        return;
+        return false;
     }
 
     navigation_history_.visit(current_selection_);
@@ -426,6 +426,7 @@ void UiApp::navigate_to_address(std::uint64_t address, PreferredView view) {
         focus_listing_ = true;
     }
     navigation_history_.visit(current_selection_);
+    return true;
 }
 
 void UiApp::dispatch_entity_context_action(
@@ -514,7 +515,9 @@ void UiApp::drain_pending_navigations() {
     pending_navigations_.drain([this](DeferredNavigationRequest& req) {
         switch (req.kind) {
             case DeferredNavigationRequest::Kind::Address: {
-                navigate_to_address(req.target, req.preferred_view);
+                if (!navigate_to_address(req.target, req.preferred_view)) {
+                    break;
+                }
                 if (req.highlight_size > 1) {
                     if (const auto off = model_.virtual_address_to_offset(req.target)) {
                         hex_panel_.navigate_to_range(*off, req.highlight_size);

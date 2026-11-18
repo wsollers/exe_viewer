@@ -101,6 +101,7 @@ BinaryDiffPanel::BinaryDiffPanel(BinaryModel& model,
 
 void BinaryDiffPanel::invalidate() noexcept {
     differ_.cancel();
+    differ_.wait_for_idle();
     mode_ = ActiveDiffMode::None;
     static_report_.reset();
     live_report_.reset();

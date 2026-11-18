@@ -8,7 +8,9 @@
 #include <peelf/sha256.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -29,8 +32,11 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <process.h>
+#define NOMINMAX
+#include <windows.h>
 #else
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -115,8 +121,42 @@ void append_json_escaped(std::string& out, std::string_view text) {
     return hash;
 }
 
+[[nodiscard]] bool normalize_sha256_hex(std::string& value) noexcept {
+    if (value.empty()) {
+        return true;
+    }
+    if (value.size() != 64u) {
+        return false;
+    }
+    for (char& ch : value) {
+        const auto uch = static_cast<unsigned char>(ch);
+        if (std::isxdigit(uch) == 0) {
+            return false;
+        }
+        ch = static_cast<char>(std::tolower(uch));
+    }
+    return true;
+}
+
 [[nodiscard]] peelf::Result<std::vector<std::uint8_t>> read_binary_file(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    std::optional<std::size_t> max_bytes = std::nullopt,
+    std::string_view max_bytes_message = "File exceeds maximum allowed size") {
+    if (max_bytes.has_value()) {
+        std::error_code fs_ec{};
+        if (!std::filesystem::is_regular_file(path, fs_ec) || fs_ec) {
+            return peelf::make_error(std::format("Failed to open file '{}'", path.string()));
+        }
+        const std::uintmax_t disk_size = std::filesystem::file_size(path, fs_ec);
+        if (fs_ec) {
+            return peelf::make_error(
+                std::format("Failed to determine file size of '{}'", path.string()));
+        }
+        if (disk_size > static_cast<std::uintmax_t>(*max_bytes)) {
+            return peelf::make_error(std::string(max_bytes_message));
+        }
+    }
+
     std::ifstream ifs(path, std::ios::binary | std::ios::ate);
     if (!ifs) {
         return peelf::make_error(std::format("Failed to open file '{}'", path.string()));
@@ -126,7 +166,15 @@ void append_json_escaped(std::string& out, std::string_view text) {
         return peelf::make_error(
             std::format("Failed to determine file size of '{}'", path.string()));
     }
-    std::vector<std::uint8_t> data(static_cast<std::size_t>(end_pos));
+    const auto uend_pos = static_cast<std::uintmax_t>(end_pos);
+    if (max_bytes.has_value() && uend_pos > static_cast<std::uintmax_t>(*max_bytes)) {
+        return peelf::make_error(std::string(max_bytes_message));
+    }
+    if (uend_pos > static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max())) {
+        return peelf::make_error(
+            std::format("File '{}' is too large to fit in memory", path.string()));
+    }
+    std::vector<std::uint8_t> data(static_cast<std::size_t>(uend_pos));
     ifs.seekg(0, std::ios::beg);
     if (!data.empty() &&
         !ifs.read(reinterpret_cast<char*>(data.data()),
@@ -139,6 +187,10 @@ void append_json_escaped(std::string& out, std::string_view text) {
 [[nodiscard]] peelf::Result<void> write_text_file_atomically(
     const std::filesystem::path& output_path,
     std::string_view content) {
+    if (output_path.empty() || output_path.filename().empty()) {
+        return peelf::make_error("Invalid output file path");
+    }
+
     std::error_code ec{};
     const std::filesystem::path parent = output_path.parent_path();
     if (!parent.empty()) {
@@ -151,44 +203,200 @@ void append_json_escaped(std::string& out, std::string_view text) {
         }
     }
 
+    std::error_code base_ec{};
+    const std::filesystem::path base_dir =
+        parent.empty() ? std::filesystem::current_path(base_ec) : parent;
+    if (base_ec) {
+        return peelf::make_error(std::format(
+            "Failed to resolve output directory for '{}': {}",
+            output_path.string(),
+            base_ec.message()));
+    }
+
+    struct TempFileGuard {
+        std::filesystem::path temp_path{};
 #ifdef _WIN32
-    const int pid = _getpid();
+        HANDLE handle{INVALID_HANDLE_VALUE};
 #else
-    const int pid = static_cast<int>(::getpid());
+        int fd{-1};
 #endif
-    const std::filesystem::path tmp_path =
-        output_path.string() + std::format(".tmp.{}", pid);
+        bool committed{false};
 
-    {
-        std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!ofs) {
-            return peelf::make_error(
-                std::format("Failed to open temporary output file '{}'", tmp_path.string()));
+        TempFileGuard() = default;
+        TempFileGuard(const TempFileGuard&) = delete;
+        TempFileGuard& operator=(const TempFileGuard&) = delete;
+        TempFileGuard(TempFileGuard&&) = delete;
+        TempFileGuard& operator=(TempFileGuard&&) = delete;
+
+        ~TempFileGuard() noexcept {
+#ifdef _WIN32
+            if (handle != INVALID_HANDLE_VALUE) {
+                (void)::CloseHandle(handle);
+                handle = INVALID_HANDLE_VALUE;
+            }
+            if (!committed && !temp_path.empty()) {
+                (void)::DeleteFileW(temp_path.c_str());
+            }
+#else
+            if (fd >= 0) {
+                (void)::close(fd);
+                fd = -1;
+            }
+            if (!committed && !temp_path.empty()) {
+                (void)::unlink(temp_path.c_str());
+            }
+#endif
         }
-        ofs.write(content.data(), static_cast<std::streamsize>(content.size()));
-        ofs.flush();
-        if (!ofs) {
-            ofs.close();
-            std::filesystem::remove(tmp_path, ec);
-            return peelf::make_error(
-                std::format("Failed while writing temporary output file '{}'", tmp_path.string()));
+    };
+
+    static std::atomic<std::uint64_t> tmp_counter{0u};
+    const std::uint64_t pid =
+#ifdef _WIN32
+        static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+        static_cast<std::uint64_t>(::getpid());
+#endif
+
+    TempFileGuard guard{};
+#ifndef _WIN32
+    mode_t preserved_mode = 0666;
+    bool has_preserved_mode = false;
+    struct stat existing_st {};
+    if (::stat(output_path.c_str(), &existing_st) == 0 && S_ISREG(existing_st.st_mode)) {
+        preserved_mode = static_cast<mode_t>(existing_st.st_mode & 07777);
+        has_preserved_mode = true;
+    }
+#endif
+
+    constexpr std::uint32_t kMaxCreateAttempts = 128u;
+    bool opened = false;
+    for (std::uint32_t attempt = 0u; attempt < kMaxCreateAttempts; ++attempt) {
+        std::filesystem::path candidate = base_dir / output_path.filename();
+        candidate += std::format(".{}-{}-{}.tmp",
+                                 pid,
+                                 std::chrono::steady_clock::now().time_since_epoch().count(),
+                                 tmp_counter.fetch_add(1u, std::memory_order_relaxed) + 1u);
+#ifdef _WIN32
+        const HANDLE h = ::CreateFileW(
+            candidate.c_str(),
+            GENERIC_WRITE,
+            0u,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            guard.temp_path = std::move(candidate);
+            guard.handle = h;
+            opened = true;
+            break;
         }
+        const DWORD last_err = ::GetLastError();
+        if (last_err == ERROR_FILE_EXISTS || last_err == ERROR_ALREADY_EXISTS) {
+            continue;
+        }
+        return peelf::make_error(
+            std::format("Failed to open temporary output file '{}'", candidate.string()));
+#else
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int fd = -1;
+        do {
+            fd = ::open(candidate.c_str(), flags, 0666);
+        } while (fd < 0 && errno == EINTR);
+        if (fd >= 0) {
+            if (has_preserved_mode) {
+                (void)::fchmod(fd, preserved_mode);
+            }
+            guard.temp_path = std::move(candidate);
+            guard.fd = fd;
+            opened = true;
+            break;
+        }
+        if (errno == EEXIST) {
+            continue;
+        }
+        return peelf::make_error(
+            std::format("Failed to open temporary output file '{}'", candidate.string()));
+#endif
     }
 
-    std::filesystem::rename(tmp_path, output_path, ec);
-    if (ec) {
-        std::filesystem::remove(output_path, ec);
-        ec.clear();
-        std::filesystem::rename(tmp_path, output_path, ec);
-        if (ec) {
-            std::error_code rm_ec{};
-            std::filesystem::remove(tmp_path, rm_ec);
+    if (!opened) {
+        return peelf::make_error(std::format(
+            "Failed to create unique temporary output file for '{}'", output_path.string()));
+    }
+
+#ifdef _WIN32
+    std::size_t offset = 0u;
+    while (offset < content.size()) {
+        const std::size_t remaining = content.size() - offset;
+        const auto chunk =
+            static_cast<DWORD>(std::min<std::size_t>(remaining, 64u * 1024u * 1024u));
+        DWORD written = 0u;
+        if (!::WriteFile(guard.handle, content.data() + offset, chunk, &written, nullptr) ||
+            written == 0u) {
             return peelf::make_error(std::format(
-                "Failed to commit output file '{}': {}",
-                output_path.string(),
-                ec.message()));
+                "Failed while writing temporary output file '{}'", guard.temp_path.string()));
         }
+        offset += static_cast<std::size_t>(written);
     }
+    if (!::FlushFileBuffers(guard.handle)) {
+        return peelf::make_error(std::format(
+            "Failed to flush temporary output file '{}'", guard.temp_path.string()));
+    }
+    const HANDLE closing = guard.handle;
+    guard.handle = INVALID_HANDLE_VALUE;
+    if (!::CloseHandle(closing)) {
+        return peelf::make_error(std::format(
+            "Failed to close temporary output file '{}'", guard.temp_path.string()));
+    }
+    if (!::MoveFileExW(guard.temp_path.c_str(),
+                       output_path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return peelf::make_error(
+            std::format("Failed to commit output file '{}'", output_path.string()));
+    }
+#else
+    std::size_t offset = 0u;
+    while (offset < content.size()) {
+        const std::size_t remaining = content.size() - offset;
+        const std::size_t chunk = std::min<std::size_t>(remaining, 64u * 1024u * 1024u);
+        const ssize_t written = ::write(guard.fd, content.data() + offset, chunk);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return peelf::make_error(std::format(
+                "Failed while writing temporary output file '{}'", guard.temp_path.string()));
+        }
+        if (written == 0) {
+            return peelf::make_error(std::format(
+                "Failed while writing temporary output file '{}'", guard.temp_path.string()));
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    while (::fsync(guard.fd) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        return peelf::make_error(std::format(
+            "Failed to flush temporary output file '{}'", guard.temp_path.string()));
+    }
+    const int closing = guard.fd;
+    guard.fd = -1;
+    if (::close(closing) != 0 && errno != EINTR) {
+        return peelf::make_error(std::format(
+            "Failed to close temporary output file '{}'", guard.temp_path.string()));
+    }
+    if (::rename(guard.temp_path.c_str(), output_path.c_str()) != 0) {
+        return peelf::make_error(
+            std::format("Failed to commit output file '{}'", output_path.string()));
+    }
+#endif
+
+    guard.committed = true;
     return {};
 }
 
@@ -245,11 +453,19 @@ struct HeadlessProjectData {
         std::string category{};
         std::string note{};
     };
+    struct SavedVaBookmarkMeta {
+        std::string category{};
+        std::string note{};
+    };
 
+    std::uint64_t source_size{0u};
+    std::uint64_t fingerprint{0u};
+    std::string source_sha256{};
     bool thumb{false};
     std::vector<peelf::PatchInterval> patches{};
     peelf::ProjectWorkspace workspace{};
     std::vector<SavedOffsetBookmark> preserved_offset_bookmarks{};
+    std::map<std::uint64_t, SavedVaBookmarkMeta> preserved_va_bookmark_meta{};
     std::vector<SavedSymbol> symbols{};
     std::vector<SavedStructBinding> structure_bindings{};
     std::string raw_history_and_layout{"0 0\n\"\"\n"};
@@ -257,13 +473,12 @@ struct HeadlessProjectData {
 
 [[nodiscard]] peelf::Result<HeadlessProjectData> load_headless_peproj(
     const std::filesystem::path& peproj_path,
-    std::uint64_t expected_source_size) {
-    auto bytes = read_binary_file(peproj_path);
+    std::span<const std::uint8_t> target_binary_bytes,
+    bool allow_modified_binary) {
+    auto bytes = read_binary_file(
+        peproj_path, kMaxProjectFileBytes, "Project exceeds 64 MiB limit");
     if (!bytes.has_value()) {
         return std::unexpected(bytes.error());
-    }
-    if (bytes->size() > kMaxProjectFileBytes) {
-        return peelf::make_error("Project exceeds 64 MiB limit");
     }
 
     const std::string text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
@@ -286,6 +501,8 @@ struct HeadlessProjectData {
             (thumb != 0 && thumb != 1)) {
             return peelf::make_error("Malformed PEELF_PROJECT v1 header");
         }
+        out.source_size = proj_source_size;
+        out.fingerprint = fp;
         out.thumb = (thumb != 0);
     } else {
         std::string src{};
@@ -296,18 +513,39 @@ struct HeadlessProjectData {
         std::uint64_t saved_ms = 0u;
         if (!(in >> std::quoted(src) >> std::quoted(rel_src) >> std::quoted(sha) >>
               proj_source_size >> fp >> thumb >> saved_ms) ||
-            (thumb != 0 && thumb != 1)) {
+            (thumb != 0 && thumb != 1) || !normalize_sha256_hex(sha)) {
             return peelf::make_error("Malformed PEELF_PROJECT v2 header");
         }
+        out.source_size = proj_source_size;
+        out.fingerprint = fp;
+        out.source_sha256 = std::move(sha);
         out.thumb = (thumb != 0);
     }
 
-    if (proj_source_size != expected_source_size) {
-        return peelf::make_error(std::format(
-            "Project '{}' source size ({}) does not match target binary size ({})",
-            peproj_path.string(),
-            proj_source_size,
-            expected_source_size));
+    const auto expected_source_size = static_cast<std::uint64_t>(target_binary_bytes.size());
+    if (!allow_modified_binary) {
+        if (proj_source_size != expected_source_size) {
+            return peelf::make_error(std::format(
+                "Project '{}' source size ({}) does not match target binary size ({})",
+                peproj_path.string(),
+                proj_source_size,
+                expected_source_size));
+        }
+        if (!out.source_sha256.empty()) {
+            const std::string actual_sha256 = peelf::sha256_hex(target_binary_bytes);
+            if (actual_sha256 != out.source_sha256) {
+                return peelf::make_error(std::format(
+                    "Project '{}' source SHA-256 ({}) does not match target binary SHA-256 ({})",
+                    peproj_path.string(),
+                    out.source_sha256,
+                    actual_sha256));
+            }
+        }
+        if (out.fingerprint != 0u && fnv1a_fingerprint(target_binary_bytes) != out.fingerprint) {
+            return peelf::make_error(std::format(
+                "Project '{}' source fingerprint does not match target binary",
+                peproj_path.string()));
+        }
     }
 
     std::size_t patch_count = 0u;
@@ -326,6 +564,23 @@ struct HeadlessProjectData {
             iv.offset < prev_end || iv.offset > proj_source_size ||
             iv.patched.size() > proj_source_size - iv.offset) {
             return peelf::make_error("Invalid patch entry in project file");
+        }
+        if (iv.offset > expected_source_size ||
+            iv.patched.size() > expected_source_size - iv.offset) {
+            return peelf::make_error(std::format(
+                "Project '{}' patch interval at offset 0x{:x} exceeds target binary bounds",
+                peproj_path.string(),
+                iv.offset));
+        }
+        if (!allow_modified_binary &&
+            !std::ranges::equal(
+                iv.original,
+                target_binary_bytes.subspan(static_cast<std::size_t>(iv.offset),
+                                            iv.original.size()))) {
+            return peelf::make_error(std::format(
+                "Project '{}' saved patch original bytes at offset 0x{:x} do not match target binary",
+                peproj_path.string(),
+                iv.offset));
         }
         prev_end = iv.end_offset();
         out.patches.push_back(std::move(iv));
@@ -389,6 +644,10 @@ struct HeadlessProjectData {
                     .note = std::move(bm_note),
                 });
             } else {
+                out.preserved_va_bookmark_meta[bm_addr] = HeadlessProjectData::SavedVaBookmarkMeta{
+                    .category = std::move(bm_cat),
+                    .note = std::move(bm_note),
+                };
                 out.workspace.add_bookmark(bm_addr, std::move(bm_label));
             }
         }
@@ -512,10 +771,19 @@ struct HeadlessProjectData {
             << std::quoted(obm.note) << '\n';
     }
     for (const peelf::ScriptBookmark& bm : ws_bookmarks) {
+        const auto meta_it = data.preserved_va_bookmark_meta.find(bm.virtual_address);
+        const std::string_view category =
+            (meta_it != data.preserved_va_bookmark_meta.end())
+                ? std::string_view{meta_it->second.category}
+                : std::string_view{"Script"};
+        const std::string_view note =
+            (meta_it != data.preserved_va_bookmark_meta.end())
+                ? std::string_view{meta_it->second.note}
+                : std::string_view{};
         out << bm.virtual_address << " 0 "
             << std::quoted(bm.label) << ' '
-            << std::quoted(std::string_view{"Script"}) << ' '
-            << std::quoted(std::string_view{}) << '\n';
+            << std::quoted(category) << ' '
+            << std::quoted(note) << '\n';
     }
 
     out << data.structure_bindings.size() << '\n';
@@ -552,6 +820,7 @@ void print_help_usage(std::ostream& stdout_stream) {
         << "\nHeadless Lua Scripting Options (--script):\n"
         << "  --script <file.lua>          Execute sandboxed Lua 5.4 script against <binary> (read-only default)\n"
         << "  --script-allow-mutations     Allow script to stage/commit patches, labels, comments & bookmarks\n"
+        << "  --allow-modified-binary      Allow loading a .peproj whose source SHA-256 differs from <binary>\n"
         << "  --output-binary <out_path>   Write patched binary atomically when script calls peelf.commit()\n"
         << "  --project <workspace.peproj> Load/save PEELF_PROJECT v2 annotations, bookmarks & byte patches\n"
         << "  --script-max-instructions <N> Override Lua VM instruction quota (default: 1000000)\n"
@@ -568,6 +837,9 @@ peelf::Result<HeadlessScriptRunReport> run_headless_script(
     }
     if (options.script_path.empty()) {
         return peelf::make_error("No Lua script path specified for --script");
+    }
+    if (options.limits.wall_clock_timeout <= std::chrono::milliseconds::zero()) {
+        return peelf::make_error("Lua script wall-clock timeout must be positive");
     }
 
     auto script_bytes = read_binary_file(options.script_path);
@@ -630,7 +902,8 @@ peelf::Result<HeadlessScriptRunReport> run_headless_script(
     std::error_code fs_ec{};
     if (options.project_path.has_value() &&
         std::filesystem::exists(*options.project_path, fs_ec) && !fs_ec) {
-        auto loaded_proj = load_headless_peproj(*options.project_path, raw_bytes->size());
+        auto loaded_proj = load_headless_peproj(
+            *options.project_path, *raw_bytes, options.allow_modified_binary);
         if (!loaded_proj.has_value()) {
             return std::unexpected(loaded_proj.error());
         }
@@ -678,9 +951,25 @@ peelf::Result<HeadlessScriptRunReport> run_headless_script(
                 options.binary_path.string(),
                 opened_paged.error().message));
         }
+        if (opened_paged->size() != raw_bytes->size()) {
+            return peelf::make_error(std::format(
+                "Target binary '{}' changed size on disk before script execution",
+                options.binary_path.string()));
+        }
         if (!proj_data.patches.empty()) {
             auto seed_tx = opened_paged->begin_transaction("Seed project patches");
             for (const peelf::PatchInterval& iv : proj_data.patches) {
+                if (!options.allow_modified_binary) {
+                    auto orig_disk = opened_paged->read_original(iv.offset, iv.original.size());
+                    if (!orig_disk.has_value()) {
+                        return std::unexpected(orig_disk.error());
+                    }
+                    if (!std::ranges::equal(*orig_disk, iv.original)) {
+                        return peelf::make_error(std::format(
+                            "Saved patch original bytes at offset 0x{:x} do not match target binary",
+                            iv.offset));
+                    }
+                }
                 if (auto wr = seed_tx.write(iv.offset, iv.patched); !wr.has_value()) {
                     return std::unexpected(wr.error());
                 }
@@ -728,6 +1017,9 @@ peelf::Result<HeadlessScriptRunReport> run_headless_script(
                 *options.project_path,
                 *raw_bytes,
                 proj_data);
+            if (encoded.size() > kMaxProjectFileBytes) {
+                return peelf::make_error("Project exceeds 64 MiB limit");
+            }
             if (auto wr = write_text_file_atomically(*options.project_path, encoded);
                 !wr.has_value()) {
                 return std::unexpected(wr.error());
@@ -891,6 +1183,9 @@ std::optional<int> try_run_headless_or_help_cli(
             help = true;
         } else if (arg == "--script" || arg.starts_with("--script=") ||
                    arg == "--script-allow-mutations" ||
+                   arg.starts_with("--script-allow-mutations=") ||
+                   arg == "--allow-modified-binary" ||
+                   arg.starts_with("--allow-modified-binary=") ||
                    arg == "--output-binary" || arg.starts_with("--output-binary=") ||
                    arg == "--project" || arg.starts_with("--project=") ||
                    arg == "--script-max-instructions" || arg.starts_with("--script-max-instructions=") ||
@@ -969,6 +1264,12 @@ std::optional<int> try_run_headless_or_help_cli(
                 return 1;
             }
             opts.allow_mutations = true;
+        } else if (flag == "--allow-modified-binary") {
+            if (inline_val.has_value()) {
+                stderr_stream << "Error: --allow-modified-binary does not take a value\n";
+                return 1;
+            }
+            opts.allow_modified_binary = true;
         } else if (flag == "--output-binary") {
             auto val = require_next(flag);
             if (!val.has_value()) return 1;
@@ -1016,11 +1317,19 @@ std::optional<int> try_run_headless_or_help_cli(
         } else if (flag == "--script-timeout-ms") {
             auto val = require_next(flag);
             if (!val.has_value()) return 1;
-            std::uint64_t parsed = 0u;
-            const auto [ptr, ec] = std::from_chars(val->data(), val->data() + val->size(), parsed);
-            if (ec != std::errc{} || ptr != val->data() + val->size() || parsed == 0u) {
+            if (val->starts_with('-')) {
                 stderr_stream << "Error: invalid --script-timeout-ms '" << *val
                               << "' (expected positive integer)\n";
+                return 1;
+            }
+            std::uint64_t parsed = 0u;
+            const auto [ptr, ec] = std::from_chars(val->data(), val->data() + val->size(), parsed);
+            constexpr auto kMaxTimeoutMs =
+                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+            if (ec != std::errc{} || ptr != val->data() + val->size() || parsed == 0u ||
+                parsed > kMaxTimeoutMs) {
+                stderr_stream << "Error: invalid --script-timeout-ms '" << *val
+                              << "' (expected positive integer <= " << kMaxTimeoutMs << ")\n";
                 return 1;
             }
             opts.limits.wall_clock_timeout =

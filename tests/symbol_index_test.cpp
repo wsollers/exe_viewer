@@ -1,9 +1,17 @@
+#include "model/image_delay_load_descriptor.hpp"
+#include "model/pe_characteristics.hpp"
+#include "model/pe_machine_types.hpp"
+#include "model/pe_optional_image.hpp"
+#include "model/pe_subsystem.hpp"
+#include "model/section_header_characteristics.hpp"
+
 #include <cstdint>
 #include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <span>
 #include <string>
@@ -197,7 +205,21 @@ TEST(DebugSymbols, ConfiguredDiaBackendLoadsBuildPdb) {
         GTEST_SKIP() << "No build-produced peelf_tests.pdb found";
     }
 
-    const viewer::DebugSymbolLoadResult result = viewer::load_pdb_debug_symbols(pdb_path, *image);
+    const viewer::DebugSymbolLoadResult mismatched = viewer::load_pdb_debug_symbols(pdb_path, *image);
+    EXPECT_EQ(mismatched.status, viewer::DebugSymbolLoadStatus::BackendError);
+    EXPECT_NE(mismatched.diagnostic.find("RSDS"), std::string::npos);
+
+    const std::filesystem::path matching_exe = pdb_path.parent_path() / "peelf_tests.exe";
+    if (!std::filesystem::exists(matching_exe)) {
+        GTEST_SKIP() << "Matching peelf_tests.exe not found next to peelf_tests.pdb";
+    }
+    std::ifstream exe_file(matching_exe, std::ios::binary);
+    const std::vector<std::uint8_t> exe_bytes{std::istreambuf_iterator<char>(exe_file), {}};
+    const auto matching_image = peelf::parse_image(exe_bytes);
+    ASSERT_TRUE(matching_image.has_value()) << matching_image.error().message;
+
+    const viewer::DebugSymbolLoadResult result =
+        viewer::load_pdb_debug_symbols(pdb_path, **matching_image);
     EXPECT_EQ(result.status, viewer::DebugSymbolLoadStatus::Loaded) << result.diagnostic;
     EXPECT_FALSE(result.symbols.empty());
 #else
@@ -410,5 +432,97 @@ TEST(DebugSymbols, LocalCodeViewPdbVerifiesMsf7GuidAndAge) {
     write_file(pdb_path, make_msf7_pdb(wrong_guid, 2u, 2u));
     EXPECT_FALSE(viewer::find_local_codeview_pdb(**image, exe_path).has_value());
 
+    // 5. Manual load_pdb_debug_symbols also verifies CodeView RSDS GUID/Age before loading RVAs
+    const auto wrong_guid_res = viewer::load_pdb_debug_symbols(pdb_path, **image);
+    EXPECT_EQ(wrong_guid_res.status, viewer::DebugSymbolLoadStatus::BackendError);
+    EXPECT_NE(wrong_guid_res.diagnostic.find("RSDS"), std::string::npos);
+
+    write_file(pdb_path, make_msf7_pdb(guid, 1u, 1u));
+    const auto stale_age_res = viewer::load_pdb_debug_symbols(pdb_path, **image);
+    EXPECT_EQ(stale_age_res.status, viewer::DebugSymbolLoadStatus::BackendError);
+    EXPECT_NE(stale_age_res.diagnostic.find("RSDS"), std::string::npos);
+
     std::filesystem::remove_all(temp_root, ec);
+}
+
+TEST(SymbolIndex, ContainsAddressAtUint64MaxWithoutOverflow) {
+    constexpr std::uint64_t kMax = std::numeric_limits<std::uint64_t>::max();
+    viewer::SymbolIndex index;
+    index.add_discovered_symbol(viewer::SymbolRecord{
+        .name = "tail_span",
+        .source = viewer::SymbolSource::DebugSymbol,
+        .virtual_address = kMax - 7u,
+        .size = 16u,
+        .function = true,
+    });
+    index.add_discovered_symbol(viewer::SymbolRecord{
+        .name = "exact_max",
+        .source = viewer::SymbolSource::Export,
+        .virtual_address = kMax,
+        .size = 1u,
+        .function = true,
+    });
+
+    const viewer::SymbolRecord* mid = index.find_containing_address(kMax - 3u);
+    ASSERT_NE(mid, nullptr);
+    EXPECT_EQ(mid->name, "tail_span");
+
+    const viewer::SymbolRecord* at_max = index.find_containing_address(kMax);
+    ASSERT_NE(at_max, nullptr);
+    EXPECT_EQ(at_max->name, "tail_span");
+
+    viewer::SymbolIndex exact_only;
+    exact_only.add_discovered_symbol(viewer::SymbolRecord{
+        .name = "only_at_max",
+        .source = viewer::SymbolSource::DebugSymbol,
+        .virtual_address = kMax,
+        .size = 0u,
+        .function = true,
+    });
+    const viewer::SymbolRecord* hit = exact_only.find_containing_address(kMax);
+    ASSERT_NE(hit, nullptr);
+    EXPECT_EQ(hit->name, "only_at_max");
+}
+
+TEST(DebugSymbols, RebaseChecksImageBasePlusRvaOverflow) {
+    constexpr std::uint64_t kHighBase = std::numeric_limits<std::uint64_t>::max() - 0x100u;
+    const std::array<viewer::DebugSymbol, 2> syms{{
+        viewer::DebugSymbol{
+            .name = "valid_sym",
+            .relative_virtual_address = 0x80u,
+            .virtual_address = 0x80u,
+            .size = 16u,
+            .function = true,
+        },
+        viewer::DebugSymbol{
+            .name = "overflow_sym",
+            .relative_virtual_address = 0x200u,
+            .virtual_address = 0x200u,
+            .size = 16u,
+            .function = true,
+        },
+    }};
+    const auto rebased_syms = viewer::rebase_debug_symbols(syms, kHighBase);
+    ASSERT_EQ(rebased_syms.size(), 1u);
+    EXPECT_EQ(rebased_syms[0].name, "valid_sym");
+    EXPECT_EQ(rebased_syms[0].virtual_address, kHighBase + 0x80u);
+
+    const std::array<viewer::SourceLineMapping, 2> lines{{
+        viewer::SourceLineMapping{
+            .virtual_address = 0x40u,
+            .relative_virtual_address = 0x40u,
+            .file_name = "ok.c",
+            .line = 10u,
+        },
+        viewer::SourceLineMapping{
+            .virtual_address = 0x400u,
+            .relative_virtual_address = 0x400u,
+            .file_name = "overflow.c",
+            .line = 20u,
+        },
+    }};
+    const auto rebased_lines = viewer::rebase_source_lines(lines, kHighBase);
+    ASSERT_EQ(rebased_lines.size(), 1u);
+    EXPECT_EQ(rebased_lines[0].file_name, "ok.c");
+    EXPECT_EQ(rebased_lines[0].virtual_address, kHighBase + 0x40u);
 }

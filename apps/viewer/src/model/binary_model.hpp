@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -102,6 +103,7 @@ namespace viewer {
     struct ScriptExecutionStamp {
         std::uint64_t content_generation{0};
         std::uint64_t edit_revision{0};
+        std::uint64_t annotation_revision{0};
 
         auto operator<=>(const ScriptExecutionStamp&) const = default;
     };
@@ -286,11 +288,18 @@ namespace viewer {
             if (!bookmarks_.empty()) {
                 bookmarks_.clear();
                 ++bookmark_revision_;
+                ++annotation_revision_;
             }
         }
         [[nodiscard]] const Bookmark* find_bookmark(std::uint64_t address,
                                                     bool is_file_offset = false) const noexcept;
         [[nodiscard]] std::uint64_t bookmark_revision() const noexcept { return bookmark_revision_; }
+        [[nodiscard]] std::uint64_t annotation_revision() const noexcept { return annotation_revision_; }
+        void bump_annotation_revision() noexcept { ++annotation_revision_; }
+        void cancel_and_join_workers() noexcept;
+        void set_session_teardown_hook(std::function<void()> hook) {
+            teardown_guard_.hook = std::move(hook);
+        }
         [[nodiscard]] bool demangle_symbols() const noexcept { return demangle_symbols_; }
         void set_demangle_symbols(bool enabled) noexcept { demangle_symbols_ = enabled; }
         [[nodiscard]] bool analysis_thumb_mode() const noexcept { return analysis_thumb_mode_; }
@@ -384,6 +393,9 @@ namespace viewer {
         [[nodiscard]] std::vector<peelf::PatchInterval> staged_live_patches() const;
         [[nodiscard]] std::vector<peelf::PatchInterval> committed_live_patches() const;
         [[nodiscard]] BytePatchState byte_patch_state_at_offset(std::uint64_t offset) const noexcept;
+        [[nodiscard]] bool is_byte_patched(std::uint64_t offset) const noexcept {
+            return byte_patch_state_at_offset(offset) != BytePatchState::Unchanged;
+        }
         peelf::Result<void> apply_patch_set(std::span<const peelf::PatchInterval> patches);
 
         // Reusable JSON Patch Bundles (.pepatch.json) — static binaries only; strictly rejected on live processes.
@@ -485,6 +497,7 @@ namespace viewer {
             return ScriptExecutionStamp{
                 .content_generation = content_generation_,
                 .edit_revision = edit_revision_,
+                .annotation_revision = annotation_revision_,
             };
         }
         [[nodiscard]] peelf::Result<void> start_script_execution(
@@ -504,7 +517,22 @@ namespace viewer {
 
     private:
         class AsyncScriptRunner;
+        struct PreMoveTeardown {
+            BinaryModel* owner{nullptr};
+            std::function<void()> hook{};
+
+            PreMoveTeardown() = default;
+            explicit PreMoveTeardown(BinaryModel* self) noexcept : owner(self) {}
+            PreMoveTeardown(const PreMoveTeardown&) = delete;
+            PreMoveTeardown& operator=(const PreMoveTeardown&) = delete;
+            PreMoveTeardown(PreMoveTeardown&& other) noexcept;
+            PreMoveTeardown& operator=(PreMoveTeardown&& other) noexcept;
+            ~PreMoveTeardown() = default;
+        };
+
+        void release_live_sessions() noexcept;
         void sync_live_executable_settings();
+        PreMoveTeardown teardown_guard_{this};
         BinarySourceKind source_kind_ = BinarySourceKind::None;
         LiveViewTargetKind live_target_kind_ = LiveViewTargetKind::None;
         BinaryFormat format_ = BinaryFormat::None;
@@ -542,6 +570,7 @@ namespace viewer {
         std::map<std::uint64_t, PatchEntryMetadata> patch_metadata_by_offset_;
         std::uint64_t structure_binding_revision_ = 0;
         std::uint64_t bookmark_revision_ = 0;
+        std::uint64_t annotation_revision_ = 0;
 
         std::shared_ptr<peelf::IProcessBackend> backend_;
         std::shared_ptr<peelf::debugger::IDebugBackend> debug_backend_;

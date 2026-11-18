@@ -23,6 +23,7 @@
 #include <fstream>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -1333,6 +1334,171 @@ TEST(ScriptingTest, BinaryModelAsyncScriptSupportsCancellationAndReloadCleanup) 
     ASSERT_TRUE(model.load_file(bin_path_2.string()));
     EXPECT_FALSE(model.is_script_running());
     EXPECT_FALSE(model.harvest_script_execution().has_value());
+}
+
+TEST(ScriptingTest, ConcurrentAnnotationAndBookmarkEditsInvalidateAsyncScriptAndPreserveMetadata) {
+    const TempDirGuard tmp{};
+    const std::filesystem::path bin_path =
+        tmp.write_bytes("target_annot.macho", make_synthetic_x86_64_macho());
+
+    viewer::BinaryModel model{};
+    ASSERT_TRUE(model.load_file(bin_path.string()));
+
+    // Verify add_or_update_bookmark preserves existing category & note unless overridden.
+    model.add_or_update_bookmark(viewer::Bookmark{
+        .address = 0x100000C00ULL,
+        .is_file_offset = false,
+        .label = "InitialLabel",
+        .category = "Security",
+        .note = "Important check",
+    });
+    model.add_or_update_bookmark(viewer::Bookmark{
+        .address = 0x100000C00ULL,
+        .is_file_offset = false,
+        .label = "RenamedLabel",
+        .category = {},
+        .note = {},
+    });
+    ASSERT_EQ(model.bookmarks().size(), 1u);
+    EXPECT_EQ(model.bookmarks()[0].label, "RenamedLabel");
+    EXPECT_EQ(model.bookmarks()[0].category, "Security");
+    EXPECT_EQ(model.bookmarks()[0].note, "Important check");
+
+    peelf::ScriptLimits generous_limits{};
+    generous_limits.max_instructions = 500'000'000ULL;
+    generous_limits.wall_clock_timeout = std::chrono::milliseconds{10000};
+
+    // 1. Concurrent bookmark mutation during async script execution -> StaleDiscarded.
+    {
+        ASSERT_TRUE(model.start_script_execution(
+                        "local entry = peelf.target_info().entry_point\n"
+                        "peelf.add_bookmark(entry + 8, 'ScriptBM')\n"
+                        "peelf.commit()\n",
+                        generous_limits,
+                        /*request_allow_mutations=*/true)
+                        .has_value());
+        model.add_or_update_bookmark(viewer::Bookmark{
+            .address = 0x100000C04ULL,
+            .is_file_offset = false,
+            .label = "ConcurrentUserBM",
+            .category = "User",
+            .note = "Concurrent note",
+        });
+
+        const auto stale = wait_for_script_harvest(model);
+        ASSERT_TRUE(stale.has_value());
+        EXPECT_EQ(stale->status, viewer::AsyncScriptStatus::StaleDiscarded);
+        EXPECT_FALSE(stale->mutations_applied_to_model);
+        ASSERT_EQ(model.bookmarks().size(), 2u);
+    }
+
+    // 2. Concurrent UI label/comment edit (bump_annotation_revision) -> StaleDiscarded.
+    {
+        ASSERT_TRUE(model.start_script_execution(
+                        "local entry = peelf.target_info().entry_point\n"
+                        "peelf.set_label(entry, 'script_label')\n"
+                        "peelf.commit()\n",
+                        generous_limits,
+                        /*request_allow_mutations=*/true)
+                        .has_value());
+        model.bump_annotation_revision();
+
+        const auto stale = wait_for_script_harvest(model);
+        ASSERT_TRUE(stale.has_value());
+        EXPECT_EQ(stale->status, viewer::AsyncScriptStatus::StaleDiscarded);
+        EXPECT_FALSE(stale->mutations_applied_to_model);
+    }
+}
+
+TEST(ScriptingTest, HeadlessCliRejectsMismatchedProjectPreservesBookmarkMetadataAndBoundsTimeout) {
+    // 1. --script-timeout-ms rejects <= 0 and > INT64_MAX cleanly.
+    {
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::array<std::string_view, 6> zero_args{
+            "--headless", "bin", "--script", "s.lua", "--script-timeout-ms", "0"};
+        const auto zero_rc = viewer::try_run_headless_or_help_cli(zero_args, out_ss, err_ss);
+        ASSERT_TRUE(zero_rc.has_value());
+        EXPECT_NE(*zero_rc, 0);
+        EXPECT_NE(err_ss.str().find("--script-timeout-ms"), std::string::npos);
+
+        out_ss.str("");
+        err_ss.str("");
+        const std::array<std::string_view, 6> huge_args{
+            "--headless", "bin", "--script", "s.lua", "--script-timeout-ms", "9223372036854775808"};
+        const auto huge_rc = viewer::try_run_headless_or_help_cli(huge_args, out_ss, err_ss);
+        ASSERT_TRUE(huge_rc.has_value());
+        EXPECT_NE(*huge_rc, 0);
+        EXPECT_NE(err_ss.str().find("--script-timeout-ms"), std::string::npos);
+    }
+
+    // 2. --headless --project rejects mismatched source_sha256 unless --allow-modified-binary,
+    //    and preserves existing VA bookmark category/note across script commits.
+    const std::vector<std::uint8_t> orig_bytes = make_synthetic_x86_64_macho();
+    std::vector<std::uint8_t> modified_bytes = orig_bytes;
+    modified_bytes.back() ^= 0xFFu;
+
+    const TempDirGuard tmp{};
+    const std::filesystem::path orig_bin = tmp.write_bytes("orig_proj.macho", orig_bytes);
+    const std::filesystem::path mod_bin = tmp.write_bytes("mod_proj.macho", modified_bytes);
+    const std::filesystem::path peproj_path = tmp.path() / "state.peproj";
+
+    {
+        viewer::BinaryModel seed_model;
+        ASSERT_TRUE(seed_model.load_file(orig_bin.string()));
+        seed_model.add_or_update_bookmark(viewer::Bookmark{
+            .address = 0x100000C00ULL,
+            .is_file_offset = false,
+            .label = "OldEntryBM",
+            .category = "Triage",
+            .note = "Keep this note",
+        });
+        const viewer::AnalysisProject proj = viewer::build_analysis_project(seed_model, peproj_path);
+        ASSERT_TRUE(viewer::write_analysis_file(peproj_path, viewer::encode_project(proj)).has_value());
+    }
+
+    const std::filesystem::path script_path = tmp.write_text(
+        "update_bm.lua",
+        R"lua(
+            local entry = peelf.target_info().entry_point
+            peelf.add_bookmark(entry, "UpdatedEntryBM")
+            assert(peelf.commit() == true)
+        )lua");
+
+    // Mismatched binary without --allow-modified-binary must fail cleanly with SHA-256 mismatch.
+    {
+        viewer::HeadlessScriptCliOptions opts;
+        opts.binary_path = mod_bin;
+        opts.script_path = script_path;
+        opts.project_path = peproj_path;
+        opts.allow_mutations = true;
+        const auto mismatched = viewer::run_headless_script(opts);
+        ASSERT_FALSE(mismatched.has_value());
+        EXPECT_NE(mismatched.error().message.find("SHA-256"), std::string::npos)
+            << mismatched.error().message;
+    }
+
+    // Matching binary succeeds and preserves VA bookmark category and note in saved .peproj.
+    {
+        viewer::HeadlessScriptCliOptions opts;
+        opts.binary_path = orig_bin;
+        opts.script_path = script_path;
+        opts.project_path = peproj_path;
+        opts.allow_mutations = true;
+        const auto ok_report = viewer::run_headless_script(opts);
+        ASSERT_TRUE(ok_report.has_value()) << ok_report.error().message;
+        EXPECT_TRUE(ok_report->project_written);
+
+        const auto proj_text = viewer::read_project_file(peproj_path);
+        ASSERT_TRUE(proj_text.has_value()) << proj_text.error().message;
+        const auto decoded = viewer::decode_project(*proj_text);
+        ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+        ASSERT_EQ(decoded->bookmarks.size(), 1u);
+        EXPECT_EQ(decoded->bookmarks[0].address, 0x100000C00ULL);
+        EXPECT_EQ(decoded->bookmarks[0].label, "UpdatedEntryBM");
+        EXPECT_EQ(decoded->bookmarks[0].category, "Triage");
+        EXPECT_EQ(decoded->bookmarks[0].note, "Keep this note");
+    }
 }
 
 #if defined(PEELF_VIEWER_EXECUTABLE_PATH)

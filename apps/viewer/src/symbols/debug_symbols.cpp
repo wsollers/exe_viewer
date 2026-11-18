@@ -239,6 +239,91 @@ struct MsfPdbIdentity {
     return true;
 }
 
+[[nodiscard]] constexpr std::optional<std::uint64_t> checked_add_rva(
+    std::uint64_t image_base,
+    std::uint64_t rva) noexcept {
+    if (rva > std::numeric_limits<std::uint64_t>::max() - image_base) {
+        return std::nullopt;
+    }
+    return image_base + rva;
+}
+
+[[nodiscard]] std::string format_guid_hex(std::span<const std::uint8_t> guid) {
+    std::string out;
+    out.reserve(guid.size() * 2u);
+    constexpr std::string_view kHex = "0123456789ABCDEF";
+    for (const std::uint8_t b : guid) {
+        out.push_back(kHex[(b >> 4u) & 0x0Fu]);
+        out.push_back(kHex[b & 0x0Fu]);
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<std::string> validate_pdb_matches_image_codeview(
+    const std::filesystem::path& pdb_path,
+    const peelf::IBinaryImage& image) {
+    bool has_codeview_rsds = false;
+    const peelf::PeDebugDirectory* first_rsds = nullptr;
+    for (const peelf::PeDebugDirectory& debug : image.pe_debug_directories()) {
+        const bool has_rsds_guid = std::ranges::any_of(
+            debug.codeview_guid, [](std::uint8_t b) { return b != 0u; });
+        if (debug.codeview_signature != 0x5344'5352u && !has_rsds_guid) {
+            continue;
+        }
+        has_codeview_rsds = true;
+        if (first_rsds == nullptr) {
+            first_rsds = &debug;
+        }
+        if (pdb_matches_codeview_entry(pdb_path, debug)) {
+            return std::nullopt;
+        }
+    }
+
+    if (!has_codeview_rsds) {
+        return std::nullopt;
+    }
+
+    std::string diag = "PDB GUID/Age does not match PE CodeView RSDS debug directory: " + pdb_path.string();
+    if (first_rsds != nullptr) {
+        diag += " (expected GUID=" + format_guid_hex(first_rsds->codeview_guid) +
+                ", age=" + std::to_string(first_rsds->codeview_age);
+        if (const auto pdb_id = read_msf7_pdb_identity(pdb_path)) {
+            diag += "; actual GUID=" + format_guid_hex(pdb_id->guid) +
+                    ", info_age=" + std::to_string(pdb_id->info_age);
+            if (pdb_id->dbi_age.has_value()) {
+                diag += ", dbi_age=" + std::to_string(*pdb_id->dbi_age);
+            }
+        }
+        diag.push_back(')');
+    }
+    return diag;
+}
+
+void sort_and_deduplicate_debug_symbols(std::vector<DebugSymbol>& symbols) {
+    std::ranges::sort(symbols, [](const DebugSymbol& lhs, const DebugSymbol& rhs) {
+        if (lhs.virtual_address != rhs.virtual_address) {
+            return lhs.virtual_address < rhs.virtual_address;
+        }
+        if (lhs.name != rhs.name) {
+            return lhs.name < rhs.name;
+        }
+        if (lhs.function != rhs.function) {
+            return lhs.function > rhs.function;
+        }
+        if (lhs.size != rhs.size) {
+            return lhs.size > rhs.size;
+        }
+        if (lhs.relative_virtual_address != rhs.relative_virtual_address) {
+            return lhs.relative_virtual_address < rhs.relative_virtual_address;
+        }
+        return lhs.library < rhs.library;
+    });
+    const auto dup = std::ranges::unique(symbols, [](const DebugSymbol& lhs, const DebugSymbol& rhs) {
+        return lhs.virtual_address == rhs.virtual_address && lhs.name == rhs.name;
+    });
+    symbols.erase(dup.begin(), symbols.end());
+}
+
 [[maybe_unused]] [[nodiscard]] std::uint64_t resolve_pe_image_base(
     const peelf::IBinaryImage& image) noexcept {
     if (image.image_base() != 0) {
@@ -510,10 +595,16 @@ void add_dia_children(IDiaSymbol& global,
             if (SUCCEEDED(symbol->get_type(type.put())) && type) type->get_length(&length);
         }
 
+        const auto va = checked_add_rva(image_base, rva);
+        if (!va.has_value()) {
+            symbol.reset();
+            continue;
+        }
+
         out.push_back(DebugSymbol{
             .name = to_utf8(name.get()),
             .relative_virtual_address = rva,
-            .virtual_address = image_base + rva,
+            .virtual_address = *va,
             .size = static_cast<std::uint64_t>(length),
             .function = is_function,
         });
@@ -627,7 +718,7 @@ std::optional<std::filesystem::path> find_local_codeview_pdb(const peelf::IBinar
 
 DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_path,
                                              const peelf::IBinaryImage& image) {
-    if (!has_pdb_extension(pdb_path)) {
+    if (!has_pdb_extension(pdb_path) && !has_native_pdb_signature(pdb_path)) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::UnsupportedFormat,
             .symbols = {},
@@ -646,6 +737,14 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
             .status = DebugSymbolLoadStatus::UnsupportedFormat,
             .symbols = {},
             .diagnostic = "File does not have a recognized native PDB/MSF signature",
+        };
+    }
+    if (const auto mismatch = validate_pdb_matches_image_codeview(pdb_path, image);
+        mismatch.has_value()) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::BackendError,
+            .symbols = {},
+            .diagnostic = *mismatch,
         };
     }
 
@@ -734,10 +833,7 @@ DebugSymbolLoadResult load_pdb_debug_symbols(const std::filesystem::path& pdb_pa
     for (auto& symbol : result.symbols)
         if (const auto it=libraries_by_address.find(symbol.virtual_address); it!=libraries_by_address.end()) symbol.library=it->second;
 
-    std::ranges::sort(result.symbols, {}, &DebugSymbol::name);
-    result.symbols.erase(std::ranges::unique(result.symbols, [](const DebugSymbol& lhs, const DebugSymbol& rhs) {
-        return lhs.name == rhs.name && lhs.virtual_address == rhs.virtual_address;
-    }).begin(), result.symbols.end());
+    sort_and_deduplicate_debug_symbols(result.symbols);
 
     result.status = DebugSymbolLoadStatus::Loaded;
     result.diagnostic = pdb_path.string();
@@ -792,7 +888,8 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
     const std::uint64_t target_base = target_image.image_base();
     const bool phdr_less_source = (source_base == 0 && dwarf_source_image.segments().empty());
 
-    const auto compute_rva_and_va = [&](std::uint64_t raw_addr) -> std::pair<std::uint64_t, std::uint64_t> {
+    const auto compute_rva_and_va =
+        [&](std::uint64_t raw_addr) noexcept -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
         std::uint64_t rva = raw_addr;
         if (source_base != 0) {
             rva = (raw_addr >= source_base) ? (raw_addr - source_base) : raw_addr;
@@ -800,8 +897,14 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
                    target_image.virtual_address_to_file_offset(raw_addr).has_value()) {
             rva = raw_addr - target_base;
         }
-        const std::uint64_t va = (target_base != 0) ? (target_base + rva) : raw_addr;
-        return {rva, va};
+        if (target_base != 0) {
+            const auto va = checked_add_rva(target_base, rva);
+            if (!va.has_value()) {
+                return std::nullopt;
+            }
+            return std::pair<std::uint64_t, std::uint64_t>{rva, *va};
+        }
+        return std::pair<std::uint64_t, std::uint64_t>{rva, raw_addr};
     };
 
     DebugSymbolLoadResult result;
@@ -813,7 +916,11 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
         if (fn.low_pc == 0) {
             continue;
         }
-        const auto [rva, va] = compute_rva_and_va(fn.low_pc);
+        const auto resolved = compute_rva_and_va(fn.low_pc);
+        if (!resolved.has_value()) {
+            continue;
+        }
+        const auto [rva, va] = *resolved;
         const std::string& sym_name = !fn.linkage_name.empty() ? fn.linkage_name : fn.name;
         if (sym_name.empty()) {
             continue;
@@ -827,6 +934,7 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
             .library = fn.comp_unit,
         });
     }
+    sort_and_deduplicate_debug_symbols(result.symbols);
 
     result.types.reserve(parsed->types.size());
     for (const peelf::DwarfAggregateType& agg : parsed->types) {
@@ -851,7 +959,11 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
         if (line.address == 0 || line.line == 0) {
             continue;
         }
-        const auto [rva, va] = compute_rva_and_va(line.address);
+        const auto resolved = compute_rva_and_va(line.address);
+        if (!resolved.has_value()) {
+            continue;
+        }
+        const auto [rva, va] = *resolved;
         result.lines.push_back(SourceLineMapping{
             .virtual_address = va,
             .relative_virtual_address = rva,
@@ -940,7 +1052,11 @@ std::vector<DebugSymbol> rebase_debug_symbols(std::span<const DebugSymbol> symbo
     rebased.reserve(symbols.size());
     for (DebugSymbol sym : symbols) {
         if (sym.relative_virtual_address != 0) {
-            sym.virtual_address = image_base + sym.relative_virtual_address;
+            const auto va = checked_add_rva(image_base, sym.relative_virtual_address);
+            if (!va.has_value()) {
+                continue;
+            }
+            sym.virtual_address = *va;
         }
         rebased.push_back(std::move(sym));
     }
@@ -953,7 +1069,11 @@ std::vector<SourceLineMapping> rebase_source_lines(std::span<const SourceLineMap
     rebased.reserve(lines.size());
     for (SourceLineMapping entry : lines) {
         if (entry.relative_virtual_address != 0) {
-            entry.virtual_address = image_base + entry.relative_virtual_address;
+            const auto va = checked_add_rva(image_base, entry.relative_virtual_address);
+            if (!va.has_value()) {
+                continue;
+            }
+            entry.virtual_address = *va;
         }
         rebased.push_back(std::move(entry));
     }

@@ -99,6 +99,7 @@ ShellcodeParseResult parse_hex_shellcode(std::string_view input) {
                 is_hex_digit(input[index + 2u]) && is_hex_digit(input[index + 3u])) {
                 const std::optional<std::uint8_t> byte = parse_byte_token(input.substr(index + 2u, 2u));
                 if (!byte) {
+                    result.bytes.clear();
                     result.diagnostic = "Invalid escaped byte.";
                     return result;
                 }
@@ -106,8 +107,13 @@ ShellcodeParseResult parse_hex_shellcode(std::string_view input) {
                 index += 4u;
                 continue;
             }
-            ++index;
-            continue;
+            result.bytes.clear();
+            if (index + 1u < input.size() && (input[index + 1u] == 'x' || input[index + 1u] == 'X')) {
+                result.diagnostic = "Malformed \\x hex escape: expected exactly two hex digits.";
+            } else {
+                result.diagnostic = "Invalid escape sequence: expected \\xHH.";
+            }
+            return result;
         }
 
         if (ch == '0' && index + 1u < input.size() && (input[index + 1u] == 'x' || input[index + 1u] == 'X')) {

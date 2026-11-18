@@ -320,6 +320,20 @@ std::vector<PatchInterval> PagedBinaryImage::changed_intervals() const {
     return result;
 }
 
+bool PagedBinaryImage::is_patched(std::uint64_t offset) const noexcept {
+    if (offset >= size_ || patches_.empty()) {
+        return false;
+    }
+    auto it = patches_.upper_bound(offset);
+    if (it == patches_.begin()) {
+        return false;
+    }
+    --it;
+    const PatchInterval& patch = it->second;
+    return offset >= patch.offset &&
+           (offset - patch.offset) < static_cast<std::uint64_t>(patch.patched.size());
+}
+
 std::vector<PatchInterval> PagedBinaryImage::changed_intervals(std::uint64_t offset,
                                                                std::uint64_t size) const {
     std::vector<PatchInterval> result;
@@ -633,6 +647,44 @@ void LiveMemoryPatchSpace::clear_staged() noexcept {
     staged_.clear();
     undo_stack_.clear();
     redo_stack_.clear();
+}
+
+bool LiveMemoryPatchSpace::is_staged(std::uint64_t address) const noexcept {
+    if (staged_.empty()) {
+        return false;
+    }
+    auto it = staged_.upper_bound(address);
+    if (it == staged_.begin()) {
+        return false;
+    }
+    --it;
+    const PatchInterval& patch = it->second;
+    return address >= patch.offset &&
+           (address - patch.offset) < static_cast<std::uint64_t>(patch.patched.size());
+}
+
+bool LiveMemoryPatchSpace::is_committed(std::uint64_t address) const noexcept {
+    if (committed_.empty()) {
+        return false;
+    }
+    auto it = committed_.upper_bound(address);
+    if (it == committed_.begin()) {
+        return false;
+    }
+    --it;
+    const CommittedPatchInterval& ci = it->second;
+    return address >= ci.address &&
+           (address - ci.address) < static_cast<std::uint64_t>(ci.committed.size());
+}
+
+LiveByteState LiveMemoryPatchSpace::byte_state_at(std::uint64_t address) const noexcept {
+    if (is_staged(address)) {
+        return LiveByteState::Staged;
+    }
+    if (is_committed(address)) {
+        return LiveByteState::Committed;
+    }
+    return LiveByteState::Unmodified;
 }
 
 std::vector<PatchInterval> LiveMemoryPatchSpace::staged_intervals() const {

@@ -1,5 +1,6 @@
 #include "navigation/viewer_navigation.hpp"
 #include "ui/context_actions.hpp"
+#include "ui/logger.hpp"
 #include "ui/workspace_layout.hpp"
 
 #include <peelf/capability_matrix.hpp>
@@ -14,6 +15,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -525,6 +527,86 @@ TEST(ContextActionsTest, EnqueuesFollowInActionsOntoNavigationRequestQueueWithou
     EXPECT_EQ(drained[4].target, 0x80ULL);
     EXPECT_EQ(drained[4].highlight_size, 64u);
     EXPECT_TRUE(drained[4].open_structure_view);
+}
+
+TEST(ContextActionsTest, SanitizesInvalidUtf8SequencesWithReplacementEscapeAndRejectsNonNavigableDecompile) {
+    // Valid multi-byte UTF-8 ("λ" = CE BB, "🚀" = F0 9F 9A 80) is preserved,
+    // while lone continuation (0x80), invalid 0xFF, overlong 0xC0 0xAF,
+    // UTF-16 surrogate (ED A0 80), and truncated 3-byte prefix (E2 82) before 'A'
+    // are replaced with \uFFFD without swallowing 'A'.
+    const std::string mixed_label =
+        std::string("ok_\xCE\xBB_\xF0\x9F\x9A\x80_") +
+        std::string("\x80", 1u) + "_" +
+        std::string("\xFF", 1u) + "_" +
+        std::string("\xC0\xAF", 2u) + "_" +
+        std::string("\xED\xA0\x80", 3u) + "_" +
+        std::string("\xE2\x82" "A", 3u);
+
+    const InspectableEntity entity{
+        .va = 0x401000ULL,
+        .file_offset = 0x100ULL,
+        .size = 4ULL,
+        .symbol_or_label = mixed_label,
+        .module_name = std::string("mod\xF4\x90\x80\x80.dll", 11u),
+    };
+
+    const std::string json = format_entity_json_summary(entity);
+    EXPECT_NE(json.find("ok_\xCE\xBB_\xF0\x9F\x9A\x80_\\uFFFD_\\uFFFD_\\uFFFD\\uFFFD_\\uFFFD\\uFFFD\\uFFFD_\\uFFFDA"),
+              std::string::npos)
+        << json;
+    EXPECT_NE(json.find("mod\\uFFFD\\uFFFD\\uFFFD\\uFFFD.dll"), std::string::npos) << json;
+
+    // FollowInDecompiler must reject file-offset-only and unmapped zero-VA entities.
+    NavigationRequestQueue queue;
+    const InspectableEntity offset_only{
+        .va = std::nullopt,
+        .file_offset = 0x80ULL,
+        .size = 16ULL,
+        .symbol_or_label = "dos_header",
+    };
+    const InspectableEntity zero_unmapped{
+        .va = 0ULL,
+        .file_offset = std::nullopt,
+        .size = 0ULL,
+        .symbol_or_label = "undef_sym",
+    };
+    EXPECT_FALSE(enqueue_context_navigation_action(
+        queue, ContextActionKind::FollowInDecompiler, offset_only, /*has_static_image=*/true));
+    EXPECT_FALSE(enqueue_context_navigation_action(
+        queue, ContextActionKind::FollowInDecompiler, zero_unmapped, /*has_static_image=*/true));
+}
+
+TEST(ContextActionsTest, LoggerHandlesZeroCapacityAndConcurrentSnapshotSafely) {
+    Logger& log = Logger::instance();
+    const std::size_t prev_cap = log.capacity();
+
+    log.set_capacity(0u);
+    EXPECT_EQ(log.capacity(), 0u);
+    log.info("dropped safely without modulo-by-zero");
+    EXPECT_TRUE(log.snapshot().empty());
+
+    log.set_capacity(64u);
+    log.clear();
+
+    std::jthread writer([&log]() {
+        for (int i = 0; i < 200; ++i) {
+            log.info("worker msg {}", i);
+        }
+    });
+    for (int i = 0; i < 50; ++i) {
+        const auto snap = log.snapshot();
+        EXPECT_LE(snap.size(), 64u);
+        std::size_t visited = 0u;
+        log.for_each_entry([&visited](const LogEntry&) noexcept { ++visited; });
+        EXPECT_LE(visited, 64u);
+    }
+    writer.join();
+
+    const auto final_snap = log.snapshot();
+    EXPECT_EQ(final_snap.size(), 64u);
+
+    log.clear();
+    log.set_capacity(prev_cap > 0u ? prev_cap : 1000u);
 }
 
 } // namespace

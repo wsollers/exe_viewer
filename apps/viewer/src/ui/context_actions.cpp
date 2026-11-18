@@ -11,28 +11,108 @@
 namespace viewer {
 namespace {
 
+[[nodiscard]] constexpr bool is_utf8_continuation(unsigned char b) noexcept {
+    return b >= 0x80u && b <= 0xBFu;
+}
+
 void append_json_escaped(std::string& out, std::string_view text) {
     out.push_back('"');
-    for (const char raw_ch : text) {
-        const auto c = static_cast<unsigned char>(raw_ch);
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20u) {
-                    out += std::format("\\u{:04x}", static_cast<unsigned int>(c));
-                } else {
-                    out.push_back(static_cast<char>(c));
-                }
-                break;
+    for (std::size_t i = 0u; i < text.size();) {
+        const auto b0 = static_cast<unsigned char>(text[i]);
+        if (b0 < 0x80u) {
+            switch (b0) {
+                case '"':  out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default:
+                    if (b0 < 0x20u) {
+                        out += std::format("\\u{:04x}", static_cast<unsigned int>(b0));
+                    } else {
+                        out.push_back(static_cast<char>(b0));
+                    }
+                    break;
+            }
+            ++i;
+            continue;
         }
+
+        if (b0 >= 0xC2u && b0 <= 0xDFu) {
+            if (i + 1u < text.size() && is_utf8_continuation(static_cast<unsigned char>(text[i + 1u]))) {
+                out.append(text.substr(i, 2u));
+                i += 2u;
+            } else {
+                out += "\\uFFFD";
+                ++i;
+            }
+            continue;
+        }
+
+        if (b0 >= 0xE0u && b0 <= 0xEFu) {
+            const auto valid_second = [b0](unsigned char b1) noexcept -> bool {
+                if (b0 == 0xE0u) {
+                    return b1 >= 0xA0u && b1 <= 0xBFu;
+                }
+                if (b0 == 0xEDu) {
+                    return b1 >= 0x80u && b1 <= 0x9Fu;
+                }
+                return is_utf8_continuation(b1);
+            };
+            if (i + 1u >= text.size() || !valid_second(static_cast<unsigned char>(text[i + 1u]))) {
+                out += "\\uFFFD";
+                ++i;
+            } else if (i + 2u >= text.size() || !is_utf8_continuation(static_cast<unsigned char>(text[i + 2u]))) {
+                out += "\\uFFFD";
+                i += 2u;
+            } else {
+                out.append(text.substr(i, 3u));
+                i += 3u;
+            }
+            continue;
+        }
+
+        if (b0 >= 0xF0u && b0 <= 0xF4u) {
+            const auto valid_second = [b0](unsigned char b1) noexcept -> bool {
+                if (b0 == 0xF0u) {
+                    return b1 >= 0x90u && b1 <= 0xBFu;
+                }
+                if (b0 == 0xF4u) {
+                    return b1 >= 0x80u && b1 <= 0x8Fu;
+                }
+                return is_utf8_continuation(b1);
+            };
+            if (i + 1u >= text.size() || !valid_second(static_cast<unsigned char>(text[i + 1u]))) {
+                out += "\\uFFFD";
+                ++i;
+            } else if (i + 2u >= text.size() || !is_utf8_continuation(static_cast<unsigned char>(text[i + 2u]))) {
+                out += "\\uFFFD";
+                i += 2u;
+            } else if (i + 3u >= text.size() || !is_utf8_continuation(static_cast<unsigned char>(text[i + 3u]))) {
+                out += "\\uFFFD";
+                i += 3u;
+            } else {
+                out.append(text.substr(i, 4u));
+                i += 4u;
+            }
+            continue;
+        }
+
+        out += "\\uFFFD";
+        ++i;
     }
     out.push_back('"');
+}
+
+[[nodiscard]] constexpr bool has_valid_decompile_target(
+    const InspectableEntity& entity,
+    bool has_static_image) noexcept {
+    if (!entity.va.has_value()) {
+        return false;
+    }
+    return *entity.va != 0u || (has_static_image && entity.file_offset.has_value());
 }
 
 [[nodiscard]] constexpr std::size_t clamp_highlight_size(std::uint64_t raw_size) noexcept {
@@ -180,12 +260,14 @@ std::vector<EvaluatedContextAction> evaluate_context_actions(
             capabilities.get(peelf::Operation::ExternalBinaryNinjaDecompile).can_execute();
         bool enabled = false;
         std::string reason;
-        if (!any_decompiler) {
+        if (!byte_nav_ready) {
+            reason = img_unready_reason;
+        } else if (!any_decompiler) {
             reason = !struct_dec.reason.empty()
                          ? struct_dec.reason
                          : "Decompilation is not supported for this target";
-        } else if (!entity.va.has_value()) {
-            reason = "Decompilation requires a virtual address";
+        } else if (!has_valid_decompile_target(entity, has_static_image)) {
+            reason = "Decompilation requires a valid navigable virtual address";
         } else {
             enabled = true;
         }
@@ -410,7 +492,7 @@ std::optional<NavigationRequest> build_context_navigation_request(
             return std::nullopt;
 
         case ContextActionKind::FollowInDecompiler:
-            if (entity.va.has_value()) {
+            if (has_valid_decompile_target(entity, has_static_image)) {
                 return NavigationRequest{
                     .kind = NavigationRequest::Kind::Address,
                     .target = *entity.va,

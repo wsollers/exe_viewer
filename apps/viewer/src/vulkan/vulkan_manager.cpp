@@ -874,9 +874,23 @@ void VulkanManager::recreate_swapchain(GLFWwindow* window) {
     swapchain_ = SwapchainState{};
 
     const VkSurfaceFormatKHR surface_format = choose_surface_format();
+    const bool format_changed =
+        (surface_format.format != swapchain_format_) || !render_pass_;
+    if (format_changed) {
+        swapchain_format_ = surface_format.format;
+        create_render_pass();
+    }
     create_swapchain(window, surface_format);
     create_framebuffers();
-    if (ImGui::GetCurrentContext() != nullptr) {
+    if (ImGui::GetCurrentContext() != nullptr &&
+        ImGui::GetIO().BackendRendererUserData != nullptr) {
+        if (format_changed) {
+            ImGui_ImplVulkan_PipelineInfo pipeline_info{};
+            pipeline_info.RenderPass = render_pass_.get();
+            pipeline_info.Subpass = 0;
+            pipeline_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+            ImGui_ImplVulkan_CreateMainPipeline(&pipeline_info);
+        }
         ImGui_ImplVulkan_SetMinImageCount(min_image_count_);
     }
     swapchain_dirty_ = false;

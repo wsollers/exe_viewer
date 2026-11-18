@@ -41,6 +41,22 @@ TEST(ShellcodeConverterTest, ReportsOddBareHexToken) {
     EXPECT_NE(parsed.diagnostic.find("Odd-length"), std::string::npos);
 }
 
+TEST(ShellcodeConverterTest, RejectsMalformedHexEscapes) {
+    for (const std::string_view bad : {
+             std::string_view{R"(\xGG)"},
+             std::string_view{R"(\x90\xGG\x90)"},
+             std::string_view{R"(\x1)"},
+             std::string_view{R"(\x)"},
+             std::string_view{R"(\z90)"},
+             std::string_view{"\\"},
+         }) {
+        const viewer::ShellcodeParseResult parsed = viewer::parse_hex_shellcode(bad);
+        EXPECT_FALSE(parsed.success) << "Input should fail: " << bad;
+        EXPECT_TRUE(parsed.bytes.empty()) << "Input should clear bytes: " << bad;
+        EXPECT_FALSE(parsed.diagnostic.empty()) << "Input should report diagnostic: " << bad;
+    }
+}
+
 TEST(ShellcodeConverterTest, FormatsHexViewWithOffsetsAndAscii) {
     const std::vector<std::uint8_t> bytes{0x48u, 0x69u, 0x00u, 0xC3u};
 

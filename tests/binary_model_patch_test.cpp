@@ -1,3 +1,10 @@
+#include "model/image_delay_load_descriptor.hpp"
+#include "model/pe_characteristics.hpp"
+#include "model/pe_machine_types.hpp"
+#include "model/pe_optional_image.hpp"
+#include "model/pe_subsystem.hpp"
+#include "model/section_header_characteristics.hpp"
+
 #include "model/binary_model.hpp"
 #include "navigation/byte_range.hpp"
 #include "disasm/disassembler.hpp"
@@ -10,6 +17,8 @@
 #include <filesystem>
 #include <fstream>
 #include <span>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #ifndef PEELF_TEST_FIXTURES_DIR
@@ -41,6 +50,11 @@ class InstructionPatchRoundTrip : public testing::TestWithParam<InstructionPatch
 
 struct TemporaryExport {
     std::filesystem::path path;
+    explicit TemporaryExport(std::filesystem::path target_path) : path(std::move(target_path)) {}
+    TemporaryExport(const TemporaryExport&) = delete;
+    TemporaryExport& operator=(const TemporaryExport&) = delete;
+    TemporaryExport(TemporaryExport&&) = delete;
+    TemporaryExport& operator=(TemporaryExport&&) = delete;
     ~TemporaryExport() { std::error_code error; std::filesystem::remove(path, error); }
 };
 }
@@ -262,4 +276,69 @@ TEST(BinaryModelPatching, SavesPatchedImageToNewFile) {
     ASSERT_GE(exported.size(), 8u);
     EXPECT_EQ(std::vector<std::uint8_t>(exported.begin() + 4, exported.begin() + 8), replacement);
     EXPECT_NE(std::vector<std::uint8_t>(model.bytes().begin() + 4, model.bytes().begin() + 8), replacement);
+}
+
+TEST(PeModelHeaders, SelfContainedConstexprLookupsAndFlags) {
+    static_assert(sizeof(pe::ImageDelayLoadDescriptor) == 32u);
+    static_assert(pe::get_machine_name(pe::machine::AMD64) != nullptr);
+    static_assert(pe::optional_image::magic::is_64bit(pe::optional_image::magic::PE32PLUS));
+    static_assert(pe::get_subsystem_info(pe::subsystem::WINDOWS_CUI) != nullptr);
+    static_assert(pe::get_section_alignment_bytes(pe::section_flags::ALIGN_16BYTES) == 16u);
+    static_assert(pe::is_section_executable(pe::section_flags::MEM_EXECUTE));
+
+    pe::ImageDelayLoadDescriptor desc{};
+    desc.Attributes = pe::delay_load_attributes::RVA_BASED;
+    desc.DllNameRVA = 0x2000u;
+    EXPECT_TRUE(pe::is_valid_delay_load_descriptor(desc));
+    EXPECT_TRUE(pe::is_rva_based(desc));
+
+    EXPECT_STREQ(pe::get_machine_name(pe::machine::AMD64), "x64 (AMD64)");
+    EXPECT_STREQ(pe::optional_image::magic::get_magic_name(pe::optional_image::magic::PE32PLUS), "PE32+");
+    EXPECT_STREQ(pe::get_subsystem_name(pe::subsystem::WINDOWS_CUI), "WINDOWS_CUI");
+
+    const std::string file_flags = pe::get_characteristics_string(
+        pe::characteristics::EXECUTABLE_IMAGE | pe::characteristics::LARGE_ADDRESS_AWARE);
+    EXPECT_EQ(file_flags, "EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE");
+
+    const std::string dll_flags = pe::optional_image::get_dll_characteristics_string(
+        pe::optional_image::dll_characteristics::DYNAMIC_BASE |
+        pe::optional_image::dll_characteristics::NX_COMPAT);
+    EXPECT_EQ(dll_flags, "DYNAMIC_BASE | NX_COMPAT");
+
+    const std::string sec_desc = pe::get_section_flags_string(
+        pe::section_flags::CNT_CODE | pe::section_flags::MEM_EXECUTE |
+        pe::section_flags::MEM_READ | pe::section_flags::ALIGN_16BYTES);
+    EXPECT_EQ(sec_desc, "CNT_CODE | MEM_EXECUTE | MEM_READ | ALIGN_16BYTES");
+    EXPECT_EQ(pe::get_section_flags_string(0u), "NONE");
+}
+
+TEST(BinaryModelPatching, NonAllocatingNoexceptIsPatchedTracksApplyUndoRedo) {
+    static_assert(noexcept(std::declval<const peelf::PagedBinaryImage&>().is_patched(0u)));
+    static_assert(noexcept(std::declval<const viewer::BinaryModel&>().is_byte_patched(0u)));
+
+    viewer::BinaryModel model;
+    ASSERT_TRUE(model.load_file(fixture_path("hello.elf").string()));
+    ASSERT_NE(model.editable_image(), nullptr);
+    ASSERT_GE(model.bytes().size(), 12u);
+
+    EXPECT_FALSE(model.is_byte_patched(4u));
+    EXPECT_FALSE(model.editable_image()->is_patched(4u));
+
+    const std::uint8_t orig4 = model.bytes()[4];
+    const std::vector<std::uint8_t> replacement{static_cast<std::uint8_t>(orig4 ^ 0xFFu), 0xABu};
+    ASSERT_TRUE(model.apply_patch_bytes(4u, replacement, "check is_patched").has_value());
+
+    EXPECT_FALSE(model.is_byte_patched(3u));
+    EXPECT_TRUE(model.is_byte_patched(4u));
+    EXPECT_EQ(model.editable_image()->is_patched(5u), model.bytes()[5] != 0xABu);
+    EXPECT_FALSE(model.is_byte_patched(6u));
+    EXPECT_FALSE(model.is_byte_patched(model.bytes().size() + 100u));
+
+    ASSERT_TRUE(model.undo_patch().has_value());
+    EXPECT_FALSE(model.is_byte_patched(4u));
+    EXPECT_FALSE(model.editable_image()->is_patched(4u));
+
+    ASSERT_TRUE(model.redo_patch().has_value());
+    EXPECT_TRUE(model.is_byte_patched(4u));
+    EXPECT_TRUE(model.editable_image()->is_patched(4u));
 }

@@ -4,48 +4,51 @@
 
 #ifndef PEELF_EXPLORER_PE_MACHINE_TYPES_HPP
 #define PEELF_EXPLORER_PE_MACHINE_TYPES_HPP
+
+#include <cstdint>
+
 namespace pe {
 
 // Machine types
 namespace machine {
-    constexpr uint16_t UNKNOWN      = 0x0000;  // Unknown / any machine type
-    constexpr uint16_t ALPHA        = 0x0184;  // Alpha AXP, 32-bit
-    constexpr uint16_t ALPHA64      = 0x0284;  // Alpha 64 / AXP64
-    constexpr uint16_t AM33         = 0x01D3;  // Matsushita AM33
-    constexpr uint16_t AMD64        = 0x8664;  // x64
-    constexpr uint16_t ARM          = 0x01C0;  // ARM little endian
-    constexpr uint16_t ARM64        = 0xAA64;  // ARM64 little endian
-    constexpr uint16_t ARM64EC      = 0xA641;  // ARM64EC (emulation compatible)
-    constexpr uint16_t ARM64X       = 0xA64E;  // ARM64X (hybrid)
-    constexpr uint16_t ARMNT        = 0x01C4;  // ARM Thumb-2 little endian
-    constexpr uint16_t AXP64        = 0x0284;  // Same as ALPHA64
-    constexpr uint16_t EBC          = 0x0EBC;  // EFI byte code
-    constexpr uint16_t I386         = 0x014C;  // Intel 386 or later
-    constexpr uint16_t IA64         = 0x0200;  // Intel Itanium
-    constexpr uint16_t LOONGARCH32  = 0x6232;  // LoongArch 32-bit
-    constexpr uint16_t LOONGARCH64  = 0x6264;  // LoongArch 64-bit
-    constexpr uint16_t M32R         = 0x9041;  // Mitsubishi M32R little endian
-    constexpr uint16_t MIPS16       = 0x0266;  // MIPS16
-    constexpr uint16_t MIPSFPU      = 0x0366;  // MIPS with FPU
-    constexpr uint16_t MIPSFPU16    = 0x0466;  // MIPS16 with FPU
-    constexpr uint16_t POWERPC      = 0x01F0;  // Power PC little endian
-    constexpr uint16_t POWERPCFP    = 0x01F1;  // Power PC with floating point
-    constexpr uint16_t R3000        = 0x0162;  // MIPS I, 32-bit little endian
-    constexpr uint16_t R3000BE      = 0x0160;  // MIPS I, 32-bit big endian
-    constexpr uint16_t R4000        = 0x0166;  // MIPS III, 64-bit little endian
-    constexpr uint16_t R10000       = 0x0168;  // MIPS IV, 64-bit little endian
-    constexpr uint16_t RISCV32      = 0x5032;  // RISC-V 32-bit
-    constexpr uint16_t RISCV64      = 0x5064;  // RISC-V 64-bit
-    constexpr uint16_t RISCV128     = 0x5128;  // RISC-V 128-bit
-    constexpr uint16_t SH3          = 0x01A2;  // Hitachi SH3
-    constexpr uint16_t SH3DSP       = 0x01A3;  // Hitachi SH3 DSP
-    constexpr uint16_t SH4          = 0x01A6;  // Hitachi SH4
-    constexpr uint16_t SH5          = 0x01A8;  // Hitachi SH5
-    constexpr uint16_t THUMB        = 0x01C2;  // Thumb
-    constexpr uint16_t WCEMIPSV2    = 0x0169;  // MIPS little-endian WCE v2
-}
+    inline constexpr std::uint16_t UNKNOWN      = 0x0000u;  // Unknown / any machine type
+    inline constexpr std::uint16_t ALPHA        = 0x0184u;  // Alpha AXP, 32-bit
+    inline constexpr std::uint16_t ALPHA64      = 0x0284u;  // Alpha 64 / AXP64
+    inline constexpr std::uint16_t AM33         = 0x01D3u;  // Matsushita AM33
+    inline constexpr std::uint16_t AMD64        = 0x8664u;  // x64
+    inline constexpr std::uint16_t ARM          = 0x01C0u;  // ARM little endian
+    inline constexpr std::uint16_t ARM64        = 0xAA64u;  // ARM64 little endian
+    inline constexpr std::uint16_t ARM64EC      = 0xA641u;  // ARM64EC (emulation compatible)
+    inline constexpr std::uint16_t ARM64X       = 0xA64Eu;  // ARM64X (hybrid)
+    inline constexpr std::uint16_t ARMNT        = 0x01C4u;  // ARM Thumb-2 little endian
+    inline constexpr std::uint16_t AXP64        = 0x0284u;  // Same as ALPHA64
+    inline constexpr std::uint16_t EBC          = 0x0EBCu;  // EFI byte code
+    inline constexpr std::uint16_t I386         = 0x014Cu;  // Intel 386 or later
+    inline constexpr std::uint16_t IA64         = 0x0200u;  // Intel Itanium
+    inline constexpr std::uint16_t LOONGARCH32  = 0x6232u;  // LoongArch 32-bit
+    inline constexpr std::uint16_t LOONGARCH64  = 0x6264u;  // LoongArch 64-bit
+    inline constexpr std::uint16_t M32R         = 0x9041u;  // Mitsubishi M32R little endian
+    inline constexpr std::uint16_t MIPS16       = 0x0266u;  // MIPS16
+    inline constexpr std::uint16_t MIPSFPU      = 0x0366u;  // MIPS with FPU
+    inline constexpr std::uint16_t MIPSFPU16    = 0x0466u;  // MIPS16 with FPU
+    inline constexpr std::uint16_t POWERPC      = 0x01F0u;  // Power PC little endian
+    inline constexpr std::uint16_t POWERPCFP    = 0x01F1u;  // Power PC with floating point
+    inline constexpr std::uint16_t R3000        = 0x0162u;  // MIPS I, 32-bit little endian
+    inline constexpr std::uint16_t R3000BE      = 0x0160u;  // MIPS I, 32-bit big endian
+    inline constexpr std::uint16_t R4000        = 0x0166u;  // MIPS III, 64-bit little endian
+    inline constexpr std::uint16_t R10000       = 0x0168u;  // MIPS IV, 64-bit little endian
+    inline constexpr std::uint16_t RISCV32      = 0x5032u;  // RISC-V 32-bit
+    inline constexpr std::uint16_t RISCV64      = 0x5064u;  // RISC-V 64-bit
+    inline constexpr std::uint16_t RISCV128     = 0x5128u;  // RISC-V 128-bit
+    inline constexpr std::uint16_t SH3          = 0x01A2u;  // Hitachi SH3
+    inline constexpr std::uint16_t SH3DSP       = 0x01A3u;  // Hitachi SH3 DSP
+    inline constexpr std::uint16_t SH4          = 0x01A6u;  // Hitachi SH4
+    inline constexpr std::uint16_t SH5          = 0x01A8u;  // Hitachi SH5
+    inline constexpr std::uint16_t THUMB        = 0x01C2u;  // Thumb
+    inline constexpr std::uint16_t WCEMIPSV2    = 0x0169u;  // MIPS little-endian WCE v2
+} // namespace machine
 
-constexpr const char* get_machine_name(uint16_t machine_type) {
+[[nodiscard]] constexpr const char* get_machine_name(std::uint16_t machine_type) noexcept {
     switch (machine_type) {
         case machine::UNKNOWN:      return "Unknown";
         case machine::ALPHA:        return "Alpha AXP (32-bit)";

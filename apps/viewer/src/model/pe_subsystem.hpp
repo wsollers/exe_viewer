@@ -4,33 +4,38 @@
 
 #ifndef PEELF_EXPLORER_PE_SUBSYSTEM_HPP
 #define PEELF_EXPLORER_PE_SUBSYSTEM_HPP
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
 namespace pe {
 
 // Windows subsystem values
 namespace subsystem {
-    constexpr uint16_t UNKNOWN                  = 0;   // Unknown subsystem
-    constexpr uint16_t NATIVE                   = 1;   // Device drivers and native Windows processes
-    constexpr uint16_t WINDOWS_GUI              = 2;   // Windows graphical user interface
-    constexpr uint16_t WINDOWS_CUI              = 3;   // Windows character subsystem (console)
-    constexpr uint16_t OS2_CUI                  = 5;   // OS/2 character subsystem
-    constexpr uint16_t POSIX_CUI                = 7;   // POSIX character subsystem
-    constexpr uint16_t NATIVE_WINDOWS           = 8;   // Native Win9x driver
-    constexpr uint16_t WINDOWS_CE_GUI           = 9;   // Windows CE
-    constexpr uint16_t EFI_APPLICATION          = 10;  // EFI application
-    constexpr uint16_t EFI_BOOT_SERVICE_DRIVER  = 11;  // EFI driver with boot services
-    constexpr uint16_t EFI_RUNTIME_DRIVER       = 12;  // EFI driver with run-time services
-    constexpr uint16_t EFI_ROM                  = 13;  // EFI ROM image
-    constexpr uint16_t XBOX                     = 14;  // Xbox
-    constexpr uint16_t WINDOWS_BOOT_APPLICATION = 16;  // Windows boot application
-}
+    inline constexpr std::uint16_t UNKNOWN                  = 0u;   // Unknown subsystem
+    inline constexpr std::uint16_t NATIVE                   = 1u;   // Device drivers and native Windows processes
+    inline constexpr std::uint16_t WINDOWS_GUI              = 2u;   // Windows graphical user interface
+    inline constexpr std::uint16_t WINDOWS_CUI              = 3u;   // Windows character subsystem (console)
+    inline constexpr std::uint16_t OS2_CUI                  = 5u;   // OS/2 character subsystem
+    inline constexpr std::uint16_t POSIX_CUI                = 7u;   // POSIX character subsystem
+    inline constexpr std::uint16_t NATIVE_WINDOWS           = 8u;   // Native Win9x driver
+    inline constexpr std::uint16_t WINDOWS_CE_GUI           = 9u;   // Windows CE
+    inline constexpr std::uint16_t EFI_APPLICATION          = 10u;  // EFI application
+    inline constexpr std::uint16_t EFI_BOOT_SERVICE_DRIVER  = 11u;  // EFI driver with boot services
+    inline constexpr std::uint16_t EFI_RUNTIME_DRIVER       = 12u;  // EFI driver with run-time services
+    inline constexpr std::uint16_t EFI_ROM                  = 13u;  // EFI ROM image
+    inline constexpr std::uint16_t XBOX                     = 14u;  // Xbox
+    inline constexpr std::uint16_t WINDOWS_BOOT_APPLICATION = 16u;  // Windows boot application
+} // namespace subsystem
 
 struct SubsystemInfo {
-    uint16_t value;
-    const char* name;
-    const char* description;
+    std::uint16_t value{0};
+    const char* name{""};
+    const char* description{""};
 };
 
-constexpr SubsystemInfo subsystem_table[] = {
+inline constexpr std::array<SubsystemInfo, 14> subsystem_table{{
     { subsystem::UNKNOWN,                  "UNKNOWN",                  "Unknown subsystem" },
     { subsystem::NATIVE,                   "NATIVE",                   "Device drivers and native Windows processes" },
     { subsystem::WINDOWS_GUI,              "WINDOWS_GUI",              "Windows GUI application" },
@@ -45,11 +50,11 @@ constexpr SubsystemInfo subsystem_table[] = {
     { subsystem::EFI_ROM,                  "EFI_ROM",                  "EFI ROM image" },
     { subsystem::XBOX,                     "XBOX",                     "Xbox application" },
     { subsystem::WINDOWS_BOOT_APPLICATION, "WINDOWS_BOOT_APPLICATION", "Windows boot application" },
-};
+}};
 
-constexpr size_t subsystem_table_size = sizeof(subsystem_table) / sizeof(subsystem_table[0]);
+inline constexpr std::size_t subsystem_table_size = subsystem_table.size();
 
-constexpr const char* get_subsystem_name(uint16_t value) {
+[[nodiscard]] constexpr const char* get_subsystem_name(std::uint16_t value) noexcept {
     switch (value) {
         case subsystem::UNKNOWN:                  return "UNKNOWN";
         case subsystem::NATIVE:                   return "NATIVE";
@@ -69,7 +74,7 @@ constexpr const char* get_subsystem_name(uint16_t value) {
     }
 }
 
-constexpr const char* get_subsystem_description(uint16_t value) {
+[[nodiscard]] constexpr const char* get_subsystem_description(std::uint16_t value) noexcept {
     switch (value) {
         case subsystem::UNKNOWN:                  return "Unknown subsystem";
         case subsystem::NATIVE:                   return "Device drivers and native Windows processes";
@@ -89,35 +94,35 @@ constexpr const char* get_subsystem_description(uint16_t value) {
     }
 }
 
-constexpr const SubsystemInfo* get_subsystem_info(uint16_t value) {
-    for (size_t i = 0; i < subsystem_table_size; ++i) {
-        if (subsystem_table[i].value == value) {
-            return &subsystem_table[i];
+[[nodiscard]] constexpr const SubsystemInfo* get_subsystem_info(std::uint16_t value) noexcept {
+    for (const SubsystemInfo& info : subsystem_table) {
+        if (info.value == value) {
+            return &info;
         }
     }
     return nullptr;
 }
 
 // Helper functions
-constexpr bool is_gui(uint16_t value) {
+[[nodiscard]] constexpr bool is_gui(std::uint16_t value) noexcept {
     return value == subsystem::WINDOWS_GUI ||
            value == subsystem::WINDOWS_CE_GUI;
 }
 
-constexpr bool is_console(uint16_t value) {
+[[nodiscard]] constexpr bool is_console(std::uint16_t value) noexcept {
     return value == subsystem::WINDOWS_CUI ||
            value == subsystem::OS2_CUI ||
            value == subsystem::POSIX_CUI;
 }
 
-constexpr bool is_driver(uint16_t value) {
+[[nodiscard]] constexpr bool is_driver(std::uint16_t value) noexcept {
     return value == subsystem::NATIVE ||
            value == subsystem::NATIVE_WINDOWS ||
            value == subsystem::EFI_BOOT_SERVICE_DRIVER ||
            value == subsystem::EFI_RUNTIME_DRIVER;
 }
 
-constexpr bool is_efi(uint16_t value) {
+[[nodiscard]] constexpr bool is_efi(std::uint16_t value) noexcept {
     return value == subsystem::EFI_APPLICATION ||
            value == subsystem::EFI_BOOT_SERVICE_DRIVER ||
            value == subsystem::EFI_RUNTIME_DRIVER ||

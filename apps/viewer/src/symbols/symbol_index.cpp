@@ -15,15 +15,10 @@ namespace {
 }
 
 [[nodiscard]] bool contains_address(const SymbolRecord& record, std::uint64_t virtual_address) noexcept {
-    if (!record.virtual_address) {
+    if (!record.virtual_address || virtual_address < *record.virtual_address) {
         return false;
     }
-    const std::uint64_t start = *record.virtual_address;
-    const std::uint64_t size = normalized_size(record.size);
-    if (start > std::numeric_limits<std::uint64_t>::max() - size) {
-        return virtual_address == start;
-    }
-    return virtual_address >= start && virtual_address < start + size;
+    return (virtual_address - *record.virtual_address) < normalized_size(record.size);
 }
 
 [[nodiscard]] bool is_elf_mapping_symbol(std::string_view name) noexcept {
@@ -127,12 +122,12 @@ namespace {
     return nearest_after > virtual_address ? nearest_after - virtual_address : fallback_size;
 }
 
-[[nodiscard]] std::uint64_t exclusive_end(std::uint64_t start, std::uint64_t size) noexcept {
-    const std::uint64_t norm = normalized_size(size);
-    if (start > std::numeric_limits<std::uint64_t>::max() - norm) {
+[[nodiscard]] std::uint64_t inclusive_end(std::uint64_t start, std::uint64_t size) noexcept {
+    const std::uint64_t last_delta = normalized_size(size) - 1u;
+    if (last_delta > std::numeric_limits<std::uint64_t>::max() - start) {
         return std::numeric_limits<std::uint64_t>::max();
     }
-    return start + norm;
+    return start + last_delta;
 }
 
 } // namespace
@@ -174,7 +169,7 @@ void SymbolIndex::ensure_address_spans() const {
         const std::uint64_t s = *rec.virtual_address;
         sorted_spans_.push_back(AddressSpan{
             .start = s,
-            .end = exclusive_end(s, rec.size),
+            .end = inclusive_end(s, rec.size),
             .max_end_prefix = 0,
             .record_index = i,
         });
@@ -403,7 +398,7 @@ const SymbolRecord* SymbolIndex::find_containing_address(std::uint64_t virtual_a
     while (idx > 0) {
         --idx;
         const AddressSpan& sp = sorted_spans_[idx];
-        if (sp.max_end_prefix <= virtual_address) {
+        if (sp.max_end_prefix < virtual_address) {
             break;
         }
         if (contains_address(records_[sp.record_index], virtual_address)) {

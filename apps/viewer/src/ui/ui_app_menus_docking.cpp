@@ -511,12 +511,13 @@ void UiApp::render_main_menu() {
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Detach Debugger Cleanly", nullptr, false, dbg_paused || dbg_running)) {
+            model_.cancel_and_join_workers();
             if (auto r = dbg->detach(); !r.has_value()) {
                 model_.refresh_debug_breakpoints();
                 Log().error("Detach failed (target remains attached): {}", r.error().message);
             } else {
                 model_.detach_process();
-                on_process_attached();
+                on_file_loaded();
             }
         }
         ImGui::EndMenu();

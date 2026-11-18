@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -13,17 +14,12 @@
 #include "symbols/symbol_index.hpp"
 #include "tools/shellcode_converter.hpp"
 #include "ui_panel.hpp"
+#include "ui/logger.hpp"
 #include "ui/ui_context_menu.hpp"
 #include "analysis/patch_preview.hpp"
 #include "navigation/byte_range.hpp"
 
 namespace viewer {
-
-    enum class LogLevel {
-        Info,
-        Warning,
-        Error
-    };
 
     class FilePanel : public UiPanel {
     public:
@@ -331,20 +327,20 @@ namespace viewer {
 
     class LogPanel : public UiPanel {
     public:
+        using Entry = LogEntry;
+
         explicit LogPanel(std::size_t capacity = 5000); // ring buffer capacity
 
         void add(LogLevel level, const std::string& msg);
+        [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+        [[nodiscard]] std::vector<LogEntry> snapshot() const;
+        void clear() noexcept;
 
     protected:
         void draw_contents() override;
 
     private:
-        struct Entry {
-            std::string timestamp;
-            LogLevel level;
-            std::string message;
-        };
-
+        mutable std::mutex mutex_;
         std::vector<Entry> buffer_;
         std::size_t capacity_;
         std::size_t start_ = 0;   // ring buffer head

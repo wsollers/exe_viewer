@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -51,11 +52,23 @@ public:
     void set(std::uint64_t address, std::string name, std::string comment);
     [[nodiscard]] const Annotation* find(std::uint64_t address) const noexcept;
     [[nodiscard]] const std::map<std::uint64_t, Annotation>& records() const noexcept { return records_; }
-    void clear() noexcept { records_.clear(); ++revision_; }
+    void clear() noexcept {
+        const bool had_records = !records_.empty();
+        records_.clear();
+        ++revision_;
+        if (had_records && on_changed_) {
+            try {
+                on_changed_();
+            } catch (...) {
+            }
+        }
+    }
     [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
+    void set_on_changed(std::function<void()> callback) { on_changed_ = std::move(callback); }
 private:
     std::map<std::uint64_t, Annotation> records_;
     std::uint64_t revision_ = 0;
+    std::function<void()> on_changed_{};
 };
 
 struct ReferenceScanChunk {

@@ -27,6 +27,7 @@ struct HeadlessScriptCliOptions {
     std::optional<std::filesystem::path> project_path{};
     HeadlessScriptOutputFormat format{HeadlessScriptOutputFormat::Text};
     bool allow_mutations{false};
+    bool allow_modified_binary{false};
     peelf::ScriptLimits limits{};
 };
 
@@ -52,10 +53,10 @@ struct HeadlessScriptRunReport {
 
 /// Handles `--help` / `-h` and `--headless` CLI invocations for `peelf_viewer`.
 /// Supports `--headless <binary> --script <file.lua>` (with `--slice`,
-/// `--script-allow-mutations`, `--output-binary`, `--project`,
-/// `--script-max-instructions`, `--script-timeout-ms`, `--format text|json`,
-/// `--output`) and delegates standard headless static/security inspection to
-/// `peelf::try_run_headless_or_help_cli`.
+/// `--script-allow-mutations`, `--allow-modified-binary`, `--output-binary`,
+/// `--project`, `--script-max-instructions`, `--script-timeout-ms`,
+/// `--format text|json`, `--output`) and delegates standard headless
+/// static/security inspection to `peelf::try_run_headless_or_help_cli`.
 [[nodiscard]] std::optional<int> try_run_headless_or_help_cli(
     std::span<const std::string_view> args,
     std::ostream& stdout_stream,

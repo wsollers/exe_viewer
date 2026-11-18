@@ -226,10 +226,12 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
                     return;
                 }
                 if (target == StringReferrerTargetView::Decompile) {
-                    navigate_to_address(ref_copy.function_address.value_or(ref_copy.instruction_address),
-                                        PreferredView::Disassembly);
-                    selected_code_address_ = ref_copy.instruction_address;
-                    request_decompile();
+                    if (navigate_to_address(
+                            ref_copy.function_address.value_or(ref_copy.instruction_address),
+                            PreferredView::Disassembly)) {
+                        selected_code_address_ = ref_copy.instruction_address;
+                        request_decompile();
+                    }
                     return;
                 }
                 navigate_to_address(ref_copy.instruction_address, PreferredView::Disassembly);
@@ -580,9 +582,22 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     imports_panel_.set_context_action_callback(bind_ctx);
     exports_panel_.set_context_action_callback(bind_ctx);
     runtime_flags_panel_.set_context_action_callback(bind_ctx);
+
+    annotations_.set_on_changed([this]() noexcept {
+        model_.bump_annotation_revision();
+    });
+    model_.set_session_teardown_hook([this]() noexcept {
+        reference_scanner_.cancel(&reference_index_);
+        binary_diff_panel_.invalidate();
+        decompile_controller_.reset_for_new_target();
+    });
 }
 
 UiApp::~UiApp() {
+    model_.set_session_teardown_hook({});
+    annotations_.set_on_changed({});
+    reference_scanner_.cancel(&reference_index_);
+    binary_diff_panel_.invalidate();
     decompile_controller_.shutdown();
     call_graph_texture_.reset();
 }

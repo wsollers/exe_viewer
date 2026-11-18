@@ -4,6 +4,9 @@
 
 #ifndef PEELF_EXPLORER_IMAGE_DELAY_LOAD_DESCRIPTOR_HPP
 #define PEELF_EXPLORER_IMAGE_DELAY_LOAD_DESCRIPTOR_HPP
+
+#include <cstdint>
+
 namespace pe {
 
 #pragma pack(push, 1)
@@ -13,40 +16,40 @@ namespace pe {
 struct ImageDelayLoadDescriptor {
     // Must be zero. Reserved for future use.
     // Can indicate presence of new fields or behaviors.
-    uint32_t Attributes;
+    std::uint32_t Attributes{0};
 
     // RVA of the name of the DLL to be loaded.
     // The name resides in the read-only data section of the image.
-    uint32_t DllNameRVA;
+    std::uint32_t DllNameRVA{0};
 
     // RVA of the module handle (in the data section).
     // Used for storage by the delay-load helper routine.
     // The helper stores the handle to the loaded DLL here.
-    uint32_t ModuleHandleRVA;
+    std::uint32_t ModuleHandleRVA{0};
 
     // RVA of the delay-load import address table (IAT).
     // The delay-load helper updates these pointers with real
     // entry points so thunks are no longer in the calling loop.
-    uint32_t ImportAddressTableRVA;
+    std::uint32_t ImportAddressTableRVA{0};
 
     // RVA of the delay-load import name table (INT).
     // Contains the names of imports that might need to be loaded.
     // Matches the layout of the standard import name table.
-    uint32_t ImportNameTableRVA;
+    std::uint32_t ImportNameTableRVA{0};
 
     // RVA of the bound delay-load address table (BIAT), if it exists.
     // Optional table used with the timestamp field for post-process binding.
-    uint32_t BoundImportAddressTableRVA;
+    std::uint32_t BoundImportAddressTableRVA{0};
 
     // RVA of the unload delay-load address table (UIAT), if it exists.
     // Exact copy of the delay IAT. If caller unloads the DLL,
     // this table should be copied back over the delay IAT
     // so subsequent calls continue to use the thunking mechanism.
-    uint32_t UnloadInformationTableRVA;
+    std::uint32_t UnloadInformationTableRVA{0};
 
     // Timestamp of the DLL to which this image has been bound.
     // Used for binding validation.
-    uint32_t TimeDateStamp;
+    std::uint32_t TimeDateStamp{0};
 };
 
 #pragma pack(pop)
@@ -57,32 +60,32 @@ static_assert(sizeof(ImageDelayLoadDescriptor) == 32, "ImageDelayLoadDescriptor 
 namespace delay_load_attributes {
     // If set, use RVAs instead of pointers.
     // All modern delay-load descriptors use RVAs.
-    constexpr uint32_t RVA_BASED = 0x00000001;
-}
+    inline constexpr std::uint32_t RVA_BASED = 0x00000001u;
+} // namespace delay_load_attributes
 
 // Helper to check if delay-load descriptor is valid (not the null terminator)
-constexpr bool is_valid_delay_load_descriptor(const ImageDelayLoadDescriptor& desc) {
-    return desc.DllNameRVA != 0;
+[[nodiscard]] constexpr bool is_valid_delay_load_descriptor(const ImageDelayLoadDescriptor& desc) noexcept {
+    return desc.DllNameRVA != 0u;
 }
 
 // Helper to check if delay-load uses RVAs (modern format)
-constexpr bool is_rva_based(const ImageDelayLoadDescriptor& desc) {
-    return desc.Attributes & delay_load_attributes::RVA_BASED;
+[[nodiscard]] constexpr bool is_rva_based(const ImageDelayLoadDescriptor& desc) noexcept {
+    return (desc.Attributes & delay_load_attributes::RVA_BASED) != 0u;
 }
 
 // Helper to check if delay-load has bound imports
-constexpr bool has_bound_imports(const ImageDelayLoadDescriptor& desc) {
-    return desc.BoundImportAddressTableRVA != 0;
+[[nodiscard]] constexpr bool has_bound_imports(const ImageDelayLoadDescriptor& desc) noexcept {
+    return desc.BoundImportAddressTableRVA != 0u;
 }
 
 // Helper to check if delay-load has unload information
-constexpr bool has_unload_info(const ImageDelayLoadDescriptor& desc) {
-    return desc.UnloadInformationTableRVA != 0;
+[[nodiscard]] constexpr bool has_unload_info(const ImageDelayLoadDescriptor& desc) noexcept {
+    return desc.UnloadInformationTableRVA != 0u;
 }
 
 // Helper to check if delay-load is bound (has valid timestamp)
-constexpr bool is_bound(const ImageDelayLoadDescriptor& desc) {
-    return desc.TimeDateStamp != 0;
+[[nodiscard]] constexpr bool is_bound(const ImageDelayLoadDescriptor& desc) noexcept {
+    return desc.TimeDateStamp != 0u;
 }
 
 } // namespace pe

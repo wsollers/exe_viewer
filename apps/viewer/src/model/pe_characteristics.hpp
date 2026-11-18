@@ -5,35 +5,40 @@
 #ifndef PEELF_EXPLORER_PE_CHARACTERISTICS_HPP
 #define PEELF_EXPLORER_PE_CHARACTERISTICS_HPP
 
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
 namespace pe {
 
 // File header characteristics flags
 namespace characteristics {
-    constexpr uint16_t RELOCS_STRIPPED         = 0x0001;  // No base relocations, must load at preferred base
-    constexpr uint16_t EXECUTABLE_IMAGE        = 0x0002;  // Image is valid and can be run
-    constexpr uint16_t LINE_NUMS_STRIPPED      = 0x0004;  // COFF line numbers removed (deprecated, should be 0)
-    constexpr uint16_t LOCAL_SYMS_STRIPPED     = 0x0008;  // COFF symbol table entries removed (deprecated, should be 0)
-    constexpr uint16_t AGGRESSIVE_WS_TRIM      = 0x0010;  // Aggressively trim working set (obsolete, must be 0)
-    constexpr uint16_t LARGE_ADDRESS_AWARE     = 0x0020;  // Application can handle > 2GB addresses
-    constexpr uint16_t RESERVED_0040           = 0x0040;  // Reserved for future use
-    constexpr uint16_t BYTES_REVERSED_LO       = 0x0080;  // Little endian (deprecated, should be 0)
-    constexpr uint16_t MACHINE_32BIT           = 0x0100;  // Machine is based on 32-bit architecture
-    constexpr uint16_t DEBUG_STRIPPED          = 0x0200;  // Debugging information removed from image
-    constexpr uint16_t REMOVABLE_RUN_FROM_SWAP = 0x0400;  // If on removable media, fully load and copy to swap
-    constexpr uint16_t NET_RUN_FROM_SWAP       = 0x0800;  // If on network media, fully load and copy to swap
-    constexpr uint16_t SYSTEM                  = 0x1000;  // Image is a system file, not a user program
-    constexpr uint16_t DLL                     = 0x2000;  // Image is a DLL
-    constexpr uint16_t UP_SYSTEM_ONLY          = 0x4000;  // Should only run on uniprocessor machine
-    constexpr uint16_t BYTES_REVERSED_HI       = 0x8000;  // Big endian (deprecated, should be 0)
-}
+    inline constexpr std::uint16_t RELOCS_STRIPPED         = 0x0001u;  // No base relocations, must load at preferred base
+    inline constexpr std::uint16_t EXECUTABLE_IMAGE        = 0x0002u;  // Image is valid and can be run
+    inline constexpr std::uint16_t LINE_NUMS_STRIPPED      = 0x0004u;  // COFF line numbers removed (deprecated, should be 0)
+    inline constexpr std::uint16_t LOCAL_SYMS_STRIPPED     = 0x0008u;  // COFF symbol table entries removed (deprecated, should be 0)
+    inline constexpr std::uint16_t AGGRESSIVE_WS_TRIM      = 0x0010u;  // Aggressively trim working set (obsolete, must be 0)
+    inline constexpr std::uint16_t LARGE_ADDRESS_AWARE     = 0x0020u;  // Application can handle > 2GB addresses
+    inline constexpr std::uint16_t RESERVED_0040           = 0x0040u;  // Reserved for future use
+    inline constexpr std::uint16_t BYTES_REVERSED_LO       = 0x0080u;  // Little endian (deprecated, should be 0)
+    inline constexpr std::uint16_t MACHINE_32BIT           = 0x0100u;  // Machine is based on 32-bit architecture
+    inline constexpr std::uint16_t DEBUG_STRIPPED          = 0x0200u;  // Debugging information removed from image
+    inline constexpr std::uint16_t REMOVABLE_RUN_FROM_SWAP = 0x0400u;  // If on removable media, fully load and copy to swap
+    inline constexpr std::uint16_t NET_RUN_FROM_SWAP       = 0x0800u;  // If on network media, fully load and copy to swap
+    inline constexpr std::uint16_t SYSTEM                  = 0x1000u;  // Image is a system file, not a user program
+    inline constexpr std::uint16_t DLL                     = 0x2000u;  // Image is a DLL
+    inline constexpr std::uint16_t UP_SYSTEM_ONLY          = 0x4000u;  // Should only run on uniprocessor machine
+    inline constexpr std::uint16_t BYTES_REVERSED_HI       = 0x8000u;  // Big endian (deprecated, should be 0)
+} // namespace characteristics
 
 struct CharacteristicInfo {
-    uint16_t flag;
-    const char* name;
-    const char* description;
+    std::uint16_t flag{0};
+    const char* name{""};
+    const char* description{""};
 };
 
-constexpr CharacteristicInfo characteristics_table[] = {
+inline constexpr std::array<CharacteristicInfo, 15> characteristics_table{{
     { characteristics::RELOCS_STRIPPED,         "RELOCS_STRIPPED",         "No base relocations" },
     { characteristics::EXECUTABLE_IMAGE,        "EXECUTABLE_IMAGE",        "Executable image" },
     { characteristics::LINE_NUMS_STRIPPED,      "LINE_NUMS_STRIPPED",      "Line numbers stripped (deprecated)" },
@@ -49,30 +54,30 @@ constexpr CharacteristicInfo characteristics_table[] = {
     { characteristics::DLL,                     "DLL",                     "Dynamic-link library" },
     { characteristics::UP_SYSTEM_ONLY,          "UP_SYSTEM_ONLY",          "Uniprocessor only" },
     { characteristics::BYTES_REVERSED_HI,       "BYTES_REVERSED_HI",       "Big endian (deprecated)" },
-};
+}};
 
-constexpr size_t characteristics_table_size = sizeof(characteristics_table) / sizeof(characteristics_table[0]);
+inline constexpr std::size_t characteristics_table_size = characteristics_table.size();
 
 // Helper to get all set flags as a string
-inline std::string get_characteristics_string(uint16_t flags) {
-    std::string result;
-    for (size_t i = 0; i < characteristics_table_size; ++i) {
-        if (flags & characteristics_table[i].flag) {
+[[nodiscard]] inline std::string get_characteristics_string(std::uint16_t flags) {
+    std::string result{};
+    for (const CharacteristicInfo& info : characteristics_table) {
+        if ((flags & info.flag) != 0u) {
             if (!result.empty()) {
                 result += " | ";
             }
-            result += characteristics_table[i].name;
+            result += info.name;
         }
     }
-    return result.empty() ? "NONE" : result;
+    return result.empty() ? std::string("NONE") : result;
 }
 
 // Helper to iterate over set flags
 template<typename Func>
-void for_each_characteristic(uint16_t flags, Func&& func) {
-    for (size_t i = 0; i < characteristics_table_size; ++i) {
-        if (flags & characteristics_table[i].flag) {
-            func(characteristics_table[i]);
+void for_each_characteristic(std::uint16_t flags, Func&& func) {
+    for (const CharacteristicInfo& info : characteristics_table) {
+        if ((flags & info.flag) != 0u) {
+            func(info);
         }
     }
 }

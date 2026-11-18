@@ -40,6 +40,9 @@ void AnnotationStore::set(std::uint64_t address, std::string name, std::string c
     if (name.empty() && comment.empty()) records_.erase(address);
     else records_.insert_or_assign(address, Annotation{std::move(name), std::move(comment)});
     ++revision_;
+    if (on_changed_) {
+        on_changed_();
+    }
 }
 
 const Annotation* AnnotationStore::find(std::uint64_t address) const noexcept {

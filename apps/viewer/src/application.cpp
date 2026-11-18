@@ -117,7 +117,7 @@ void Application::ScopedNfdSession::reset() noexcept {
 }
 
 void Application::ScopedLoggerAttachment::attach(LogPanel* panel) noexcept {
-    Logger::instance().init(panel);
+    Logger::instance().init(panel, panel != nullptr ? std::optional<std::size_t>(panel->capacity()) : std::nullopt);
     attached_ = (panel != nullptr);
 }
 

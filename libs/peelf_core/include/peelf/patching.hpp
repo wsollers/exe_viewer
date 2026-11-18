@@ -88,6 +88,7 @@ public:
     [[nodiscard]] std::vector<PatchInterval> changed_intervals() const;
     [[nodiscard]] std::vector<PatchInterval> changed_intervals(std::uint64_t offset,
                                                                std::uint64_t size) const;
+    [[nodiscard]] bool is_patched(std::uint64_t offset) const noexcept;
 
     [[nodiscard]] PatchTransaction begin_transaction(std::string label);
     [[nodiscard]] Result<void> apply_patch(std::uint64_t offset,
@@ -155,6 +156,9 @@ public:
     [[nodiscard]] std::vector<PatchInterval> staged_intervals(std::uint64_t address,
                                                               std::uint64_t size) const;
     [[nodiscard]] std::vector<CommittedPatchInterval> committed_intervals() const;
+    [[nodiscard]] bool is_staged(std::uint64_t address) const noexcept;
+    [[nodiscard]] bool is_committed(std::uint64_t address) const noexcept;
+    [[nodiscard]] LiveByteState byte_state_at(std::uint64_t address) const noexcept;
 
     [[nodiscard]] Result<void> stage_patch(IProcessSession& session,
                                            std::uint64_t address,
