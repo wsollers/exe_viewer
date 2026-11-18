@@ -154,6 +154,9 @@ add_library(peelf_gui SHARED
         src/graph/call_graph_dot.cpp
         src/graph/call_graph_build.cpp
         src/graph/call_graph_cfg.cpp
+        src/graph/call_graph_galaxy.hpp
+        src/graph/call_graph_galaxy.cpp
+        src/vulkan/shaders/call_galaxy_spirv.hpp
         src/symbols/symbol_index.hpp
         src/symbols/symbol_index.cpp
         src/symbols/debug_symbols.hpp

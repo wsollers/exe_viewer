@@ -2,23 +2,31 @@
 #include "ui_app_internal.hpp"
 
 #include "graph/call_graph.hpp"
+#include "graph/call_graph_galaxy.hpp"
 #include "graph/layout_edit.hpp"
 #include "logger.hpp"
+#include "ui/ui_context_menu.hpp"
+
+#include <peelf/byte_viz.hpp>
 
 #include <imgui.h>
 #include <imgui_internal.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <optional>
 #include <random>
+#include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -255,6 +263,7 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
     original_call_graph_layout_.reset();
     dragged_graph_card_.reset();
     loaded_call_graph_bmp_.clear();
+    call_galaxy_.cached_unrendered_graph = graph;
 
     auto temp_dir_res = ScopedGraphvizTempDir::create();
     if (!temp_dir_res.has_value()) {
@@ -384,7 +393,7 @@ void UiApp::render_call_graph_panel() {
     }
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput) {
         if (ImGui::IsKeyPressed(ImGuiKey_Space)) switch_analysis_view(false);
-        if (current_call_graph_ && !current_call_graph_->nodes.empty()) {
+        if (!call_galaxy_.enabled && current_call_graph_ && !current_call_graph_->nodes.empty()) {
             std::vector<const CallGraphNode*> nodes;
             for (const auto& node : current_call_graph_->nodes)
                 if (node.bytes.start.virtual_address && node.bytes.start.file_offset) nodes.push_back(&node);
@@ -406,13 +415,32 @@ void UiApp::render_call_graph_panel() {
         }
     }
 
-    if (ImGui::RadioButton("Control flow", function_cfg_)) {
-        function_cfg_ = true; pending_call_graph_root_ = active_graph_root_;
+    if (ImGui::RadioButton("Control flow", !call_galaxy_.enabled && function_cfg_)) {
+        call_galaxy_.enabled = false;
+        function_cfg_ = true;
+        pending_call_graph_root_ = active_graph_root_;
     }
     ImGui::SameLine();
-    if (ImGui::RadioButton("Calls", !function_cfg_)) {
-        function_cfg_ = false; pending_call_graph_root_ = active_graph_root_;
+    if (ImGui::RadioButton("Calls", !call_galaxy_.enabled && !function_cfg_)) {
+        call_galaxy_.enabled = false;
+        function_cfg_ = false;
+        pending_call_graph_root_ = active_graph_root_;
     }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("GPU Galaxy", call_galaxy_.enabled)) {
+        if (!call_galaxy_.enabled) {
+            call_galaxy_.enabled = true;
+            call_galaxy_.dirty = true;
+            call_galaxy_.fit_requested = true;
+        }
+    }
+
+    if (call_galaxy_.enabled) {
+        render_call_galaxy_view();
+        ImGui::End();
+        return;
+    }
+
     ImGui::SameLine();
     if (ImGui::Button("Image overview")) {
         queue_call_graph_sample(CallGraphSample::LoadedImage);
@@ -436,6 +464,30 @@ void UiApp::render_call_graph_panel() {
 
     if (!call_graph_status_.empty()) {
         ImGui::TextUnformatted(call_graph_status_.c_str());
+        const bool graphviz_unavailable =
+            !current_call_graph_layout_ &&
+            (call_graph_status_.find("Graphviz") != std::string::npos ||
+             call_graph_status_.find("Failed") != std::string::npos ||
+             call_graph_status_.find("temporary") != std::string::npos);
+        if (graphviz_unavailable) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Switch to GPU Galaxy")) {
+                call_galaxy_.enabled = true;
+                if (active_graph_root_.has_value()) {
+                    call_galaxy_.scope = function_cfg_
+                                             ? GalaxyScopeMode::ActiveFunctionCfg
+                                             : GalaxyScopeMode::ActiveSymbolFanout;
+                } else {
+                    call_galaxy_.scope = GalaxyScopeMode::WholeBinary;
+                }
+                call_galaxy_.dirty = true;
+                call_galaxy_.fit_requested = true;
+                ImGui::End();
+                return;
+            }
+            ImGui::TextDisabled(
+                "Tip: Graphviz 'dot' is not required in GPU Galaxy mode (native Barnes-Hut force layout).");
+        }
     }
     if (model_.image() != nullptr && reference_index_.total_executable_bytes() > 0) {
         const bool scanning = reference_index_.is_scanning() || reference_scanner_.is_scanning();
@@ -738,6 +790,1498 @@ void UiApp::render_call_graph_panel() {
         ImGui::SetCursorScreenPos(ImVec2(canvas_pos.x, canvas_pos.y + canvas_size.y));
     }
     ImGui::End();
+}
+
+namespace {
+
+[[nodiscard]] const char* galaxy_scope_label(std::uint8_t idx) noexcept {
+    switch (idx) {
+        case 0u: return "Whole-Binary Call Galaxy";
+        case 1u: return "Active Function CFG";
+        case 2u: return "Active Symbol Fanout";
+        default: return "Whole-Binary Call Galaxy";
+    }
+}
+
+[[nodiscard]] const char* galaxy_color_mode_label(GalaxyColorMode mode) noexcept {
+    switch (mode) {
+        case GalaxyColorMode::OriginAndSection:  return "Origin / Section";
+        case GalaxyColorMode::EntryReachability: return "Entry Reachability";
+        case GalaxyColorMode::SecurityFindings:  return "Security Findings";
+        case GalaxyColorMode::BinaryDiff:        return "Binary Diff";
+        case GalaxyColorMode::CallDegreeHeat:    return "Call Degree Heat";
+    }
+    return "Origin / Section";
+}
+
+[[nodiscard]] bool galaxy_node_matches_search(
+    const CallGalaxyNode& node,
+    std::string_view query) {
+    if (query.empty()) {
+        return false;
+    }
+    if (symbol_name_matches(node.display_name, query) ||
+        symbol_name_matches(node.raw_name, query) ||
+        symbol_name_matches(node.module_or_section, query)) {
+        return true;
+    }
+    if (node.virtual_address != 0u) {
+        const std::string va_hex = std::format("0x{:X}", node.virtual_address);
+        if (symbol_name_matches(va_hex, query)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] ImVec4 galaxy_reachability_badge_color(GalaxyReachability reach) noexcept {
+    switch (reach) {
+        case GalaxyReachability::EntryPoint:
+            return ImVec4(0.98f, 0.78f, 0.25f, 1.0f);
+        case GalaxyReachability::ReachableFromEntry:
+            return ImVec4(0.35f, 0.90f, 0.56f, 1.0f);
+        case GalaxyReachability::UnreachableInternal:
+            return ImVec4(0.66f, 0.68f, 0.76f, 1.0f);
+        case GalaxyReachability::ExternalImport:
+            return ImVec4(0.55f, 0.80f, 0.98f, 1.0f);
+    }
+    return ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
+}
+
+[[nodiscard]] ImVec4 galaxy_security_badge_color(GalaxySecuritySeverity sev) noexcept {
+    switch (sev) {
+        case GalaxySecuritySeverity::Error:   return ImVec4(0.98f, 0.34f, 0.34f, 1.0f);
+        case GalaxySecuritySeverity::Warning: return ImVec4(0.98f, 0.74f, 0.24f, 1.0f);
+        case GalaxySecuritySeverity::Note:    return ImVec4(0.45f, 0.80f, 0.98f, 1.0f);
+        case GalaxySecuritySeverity::Pass:    return ImVec4(0.38f, 0.88f, 0.54f, 1.0f);
+        case GalaxySecuritySeverity::None:    return ImVec4(0.62f, 0.64f, 0.70f, 1.0f);
+    }
+    return ImVec4(0.62f, 0.64f, 0.70f, 1.0f);
+}
+
+[[nodiscard]] ImVec4 galaxy_diff_badge_color(GalaxyDiffStatus status) noexcept {
+    switch (status) {
+        case GalaxyDiffStatus::Added:     return ImVec4(0.35f, 0.92f, 0.52f, 1.0f);
+        case GalaxyDiffStatus::Modified:  return ImVec4(0.98f, 0.72f, 0.24f, 1.0f);
+        case GalaxyDiffStatus::Removed:   return ImVec4(0.98f, 0.36f, 0.36f, 1.0f);
+        case GalaxyDiffStatus::Relocated: return ImVec4(0.46f, 0.78f, 0.98f, 1.0f);
+        case GalaxyDiffStatus::Unchanged: return ImVec4(0.62f, 0.64f, 0.70f, 1.0f);
+    }
+    return ImVec4(0.62f, 0.64f, 0.70f, 1.0f);
+}
+
+} // namespace
+
+void UiApp::ensure_call_galaxy_worker_started() {
+    if (call_galaxy_.worker.joinable()) {
+        return;
+    }
+    call_galaxy_.worker = std::jthread([this](std::stop_token st) {
+        call_galaxy_worker_loop(std::move(st));
+    });
+}
+
+void UiApp::call_galaxy_worker_loop(std::stop_token stop_token) {
+    BarnesHutGalaxyLayout local_layout{};
+    std::uint64_t active_gen = 0u;
+    bool converged = true;
+
+    while (!stop_token.stop_requested()) {
+        std::optional<CallGalaxyGraph> seed_graph{};
+        BarnesHutLayoutConfig seed_cfg{};
+        std::vector<GalaxyPinCommand> pin_cmds{};
+        bool do_reheat = false;
+        bool do_unpin_all = false;
+        bool playing = false;
+        std::uint64_t target_gen = 0u;
+
+        {
+            std::unique_lock<std::mutex> lock(call_galaxy_.worker_mutex);
+            call_galaxy_.worker_cv.wait(lock, stop_token, [&]() {
+                const bool has_new_seed = call_galaxy_.pending_seed_graph.has_value();
+                const bool has_cmds =
+                    !call_galaxy_.pending_pin_commands.empty() ||
+                    call_galaxy_.pending_reheat ||
+                    call_galaxy_.pending_unpin_all;
+                const bool can_step =
+                    call_galaxy_.worker_playing && !converged && local_layout.node_count() > 0u;
+                return has_new_seed || has_cmds || can_step;
+            });
+            if (stop_token.stop_requested()) {
+                return;
+            }
+
+            target_gen = call_galaxy_.worker_generation;
+            if (call_galaxy_.pending_seed_graph.has_value()) {
+                seed_graph = std::move(call_galaxy_.pending_seed_graph);
+                call_galaxy_.pending_seed_graph.reset();
+                seed_cfg = call_galaxy_.pending_seed_config;
+            }
+            pin_cmds.swap(call_galaxy_.pending_pin_commands);
+            do_reheat = std::exchange(call_galaxy_.pending_reheat, false);
+            do_unpin_all = std::exchange(call_galaxy_.pending_unpin_all, false);
+            playing = call_galaxy_.worker_playing;
+        }
+
+        if (seed_graph.has_value()) {
+            active_gen = target_gen;
+            local_layout.reset(*seed_graph, seed_cfg);
+            converged = (local_layout.node_count() <= 1u);
+        } else if (active_gen != target_gen) {
+            converged = true;
+            continue;
+        }
+
+        bool state_mutated = seed_graph.has_value();
+        if (do_unpin_all && local_layout.node_count() > 0u) {
+            local_layout.unpin_all();
+            local_layout.reheat(0.35f);
+            converged = false;
+            state_mutated = true;
+        }
+        for (const GalaxyPinCommand& cmd : pin_cmds) {
+            if (cmd.node_index < local_layout.node_count()) {
+                if (cmd.pinned) {
+                    local_layout.set_node_position(cmd.node_index, cmd.world_x, cmd.world_y);
+                }
+                local_layout.set_node_pinned(cmd.node_index, cmd.pinned);
+                local_layout.reheat(0.18f);
+                converged = false;
+                state_mutated = true;
+            }
+        }
+        if (do_reheat && local_layout.node_count() > 0u) {
+            local_layout.reheat(0.65f);
+            converged = false;
+            state_mutated = true;
+        }
+
+        BarnesHutStepResult step_stats{};
+        if (playing && !converged && local_layout.node_count() > 1u) {
+            const std::uint32_t batch_iters =
+                (local_layout.node_count() > 4096u) ? 2u : 4u;
+            step_stats = local_layout.step(batch_iters, stop_token);
+            if (stop_token.stop_requested()) {
+                return;
+            }
+            converged = step_stats.converged;
+            state_mutated = true;
+        } else {
+            step_stats.iterations_executed = 0u;
+            step_stats.temperature = local_layout.temperature();
+            step_stats.converged = converged;
+        }
+
+        if (state_mutated) {
+            const auto px = local_layout.positions_x();
+            const auto py = local_layout.positions_y();
+            const auto pm = local_layout.pinned_mask();
+            const std::uint32_t tot_iters = local_layout.total_iterations();
+
+            std::scoped_lock lock(call_galaxy_.worker_mutex);
+            if (active_gen == call_galaxy_.worker_generation) {
+                call_galaxy_.published_pos_x.assign(px.begin(), px.end());
+                call_galaxy_.published_pos_y.assign(py.begin(), py.end());
+                call_galaxy_.published_pinned.assign(pm.begin(), pm.end());
+                call_galaxy_.published_stats = step_stats;
+                call_galaxy_.published_total_iterations = tot_iters;
+                call_galaxy_.published_converged = converged;
+                call_galaxy_.published_generation = active_gen;
+                ++call_galaxy_.published_seq;
+            }
+        }
+    }
+}
+
+void UiApp::cancel_and_reset_call_galaxy() noexcept {
+    if (call_galaxy_.worker.joinable()) {
+        call_galaxy_.worker.request_stop();
+        call_galaxy_.worker_cv.notify_all();
+        call_galaxy_.worker.join();
+    }
+
+    {
+        std::scoped_lock lock(call_galaxy_.worker_mutex);
+        ++call_galaxy_.worker_generation;
+        call_galaxy_.pending_seed_graph.reset();
+        call_galaxy_.pending_pin_commands.clear();
+        call_galaxy_.pending_reheat = false;
+        call_galaxy_.pending_unpin_all = false;
+        call_galaxy_.published_pos_x.clear();
+        call_galaxy_.published_pos_y.clear();
+        call_galaxy_.published_pinned.clear();
+        call_galaxy_.published_stats = {};
+        call_galaxy_.published_total_iterations = 0u;
+        call_galaxy_.published_converged = false;
+        call_galaxy_.published_seq = 0u;
+        call_galaxy_.consumed_seq = 0u;
+    }
+
+    call_galaxy_.graph = {};
+    call_galaxy_.cached_unrendered_graph.reset();
+    call_galaxy_.dirty = true;
+    call_galaxy_.fit_requested = true;
+    call_galaxy_.was_ref_scanning = false;
+    call_galaxy_.ui_pos_x.clear();
+    call_galaxy_.ui_pos_y.clear();
+    call_galaxy_.ui_pinned.clear();
+    call_galaxy_.last_stats = {};
+    call_galaxy_.ui_total_iterations = 0u;
+    call_galaxy_.layout_converged = false;
+    call_galaxy_.hovered_node.reset();
+    call_galaxy_.selected_node.reset();
+    call_galaxy_.dragged_node.reset();
+    call_galaxy_.drag_moved = false;
+    call_galaxy_.ego_mask = {};
+    call_galaxy_.highlighted_path = {};
+    call_galaxy_.trace_status.clear();
+    call_galaxy_.context_node.reset();
+    call_galaxy_.context_entity = {};
+    call_galaxy_.current_batch = {};
+    call_galaxy_.needs_gpu_record_this_frame = false;
+}
+
+void UiApp::shutdown_call_galaxy() noexcept {
+    cancel_and_reset_call_galaxy();
+    if (vulkan_.device() != VK_NULL_HANDLE) {
+        (void)vkDeviceWaitIdle(vulkan_.device());
+    }
+    call_galaxy_.edge_pipeline.shutdown();
+    call_galaxy_.node_pipeline.shutdown();
+    call_galaxy_.edge_ring.shutdown();
+    call_galaxy_.node_ring.shutdown();
+    call_galaxy_.canvas.shutdown();
+    call_galaxy_.canvas_initialized = false;
+    call_galaxy_.pipelines_attempted = false;
+}
+
+CallGalaxyBuildOptions UiApp::current_call_galaxy_overlay_options(
+    std::vector<peelf::ByteVizDiffRange>& diff_scratch) const {
+    diff_scratch.clear();
+    CallGalaxyBuildOptions opts{};
+    const peelf::SecurityAuditReport& sec = model_.security_audit();
+    if (!sec.findings.empty()) {
+        opts.security_report = &sec;
+    }
+    if (model_.is_live_process()) {
+        if (const auto& live_rep = binary_diff_panel_.active_live_report();
+            live_rep.has_value()) {
+            diff_scratch = peelf::extract_byte_viz_diff_ranges(*live_rep);
+            opts.diff_ranges = diff_scratch;
+        }
+    } else if (const auto& static_rep = binary_diff_panel_.active_static_report();
+               static_rep.has_value()) {
+        opts.diff_report = &*static_rep;
+        diff_scratch = peelf::extract_byte_viz_diff_ranges(*static_rep, true);
+        opts.diff_ranges = diff_scratch;
+    }
+    return opts;
+}
+
+std::optional<CallGraph> UiApp::build_scoped_call_graph_for_galaxy(GalaxyScopeMode scope) {
+    const peelf::IBinaryImage* img = model_.image();
+    if (img == nullptr) {
+        return std::nullopt;
+    }
+
+    std::optional<SymbolRecord> root = active_graph_root_;
+    if (!root.has_value() && current_selection_.virtual_address.has_value()) {
+        if (const SymbolRecord* sym =
+                symbol_index_.find_containing_address(*current_selection_.virtual_address);
+            sym != nullptr) {
+            root = *sym;
+        }
+    }
+    if (!root.has_value() && img->entry_point() != 0u) {
+        if (const SymbolRecord* ep_sym = symbol_index_.find_exact_address(img->entry_point());
+            ep_sym != nullptr) {
+            root = *ep_sym;
+        } else {
+            SymbolRecord synth{};
+            synth.name = "Entry point";
+            synth.virtual_address = img->entry_point();
+            synth.file_offset = img->virtual_address_to_file_offset(img->entry_point());
+            root = std::move(synth);
+        }
+    }
+    if (!root.has_value() && !model_.function_index().empty()) {
+        const FunctionEntry& first_fn = model_.function_index().entries().front();
+        SymbolRecord synth{};
+        synth.name = first_fn.name;
+        synth.raw_name = first_fn.raw_name;
+        synth.demangled_name = first_fn.demangled_name;
+        synth.virtual_address = first_fn.virtual_address;
+        synth.file_offset = first_fn.file_offset;
+        synth.size = first_fn.size;
+        root = std::move(synth);
+    }
+
+    if (!root.has_value() || !root->virtual_address.has_value()) {
+        if (call_galaxy_.cached_unrendered_graph.has_value()) {
+            return call_galaxy_.cached_unrendered_graph;
+        }
+        if (current_call_graph_.has_value()) {
+            return current_call_graph_;
+        }
+        return build_entry_call_graph(*img, symbol_index_);
+    }
+
+    SymbolRecord root_for_extent = *root;
+    if (root->virtual_address.has_value()) {
+        root_for_extent.file_offset = img->virtual_address_to_file_offset(*root->virtual_address);
+    }
+
+    if (scope == GalaxyScopeMode::ActiveFunctionCfg) {
+        const std::size_t analysis_size = static_cast<std::size_t>(model_.analysis_image_size());
+        if (root_for_extent.file_offset.has_value() &&
+            *root_for_extent.file_offset < analysis_size) {
+            if (const auto extent =
+                    discover_function_extent(*img, symbol_index_, root_for_extent, analysis_size);
+                extent.has_value()) {
+                const auto size = static_cast<std::size_t>(extent->size);
+                if (const auto bytes = model_.read_virtual_bytes(extent->virtual_address, size);
+                    bytes.has_value()) {
+                    const auto window_off =
+                        model_.virtual_address_to_offset(extent->virtual_address)
+                            .value_or(extent->file_offset);
+                    const GraphByteReader va_reader =
+                        [this](std::uint64_t va, std::size_t len) -> std::vector<std::uint8_t> {
+                        auto res = model_.read_virtual_bytes(va, len);
+                        return res ? std::move(*res) : std::vector<std::uint8_t>{};
+                    };
+                    return build_function_cfg_call_graph(
+                        *bytes,
+                        *root_for_extent.virtual_address,
+                        img->architecture(),
+                        img->endianness(),
+                        static_cast<std::size_t>(window_off),
+                        root->name,
+                        thumb_mode_,
+                        extent->source == FunctionExtentSource::ExecutableRegion ||
+                            extent->source == FunctionExtentSource::NextSymbol,
+                        va_reader);
+                }
+            }
+        }
+    }
+
+    if (model_.is_live_process()) {
+        const GraphByteReader reader =
+            [this](std::uint64_t offset, std::size_t length) -> std::vector<std::uint8_t> {
+            if (const auto va = model_.offset_to_virtual_address(offset); va.has_value()) {
+                if (auto vbytes = model_.read_virtual_bytes(*va, length); vbytes.has_value()) {
+                    return std::move(*vbytes);
+                }
+            }
+            auto sample = model_.read_window_sample(offset, length);
+            if (!sample || sample->bytes.empty()) {
+                return {};
+            }
+            std::size_t readable_prefix = 0u;
+            while (readable_prefix < sample->valid.size() && sample->valid[readable_prefix] != 0u) {
+                ++readable_prefix;
+            }
+            sample->bytes.resize(readable_prefix);
+            return std::move(sample->bytes);
+        };
+        return build_symbol_fanout_call_graph(*img, reader, symbol_index_, *root);
+    }
+
+    return build_symbol_fanout_call_graph(*img, model_.bytes(), symbol_index_, *root);
+}
+
+void UiApp::fit_call_galaxy_camera(float viewport_w, float viewport_h) noexcept {
+    call_galaxy_.camera.min_scale = 0.015;
+    call_galaxy_.camera.max_scale = 80.0;
+    const std::size_t n = call_galaxy_.ui_pos_x.size();
+    if (n == 0u || call_galaxy_.ui_pos_y.size() < n ||
+        viewport_w <= 1.0f || viewport_h <= 1.0f) {
+        call_galaxy_.camera.center_x = 0.0;
+        call_galaxy_.camera.center_y = 0.0;
+        call_galaxy_.camera.scale_x = 1.0;
+        call_galaxy_.camera.scale_y = 1.0;
+        return;
+    }
+
+    float min_x = call_galaxy_.ui_pos_x[0];
+    float max_x = call_galaxy_.ui_pos_x[0];
+    float min_y = call_galaxy_.ui_pos_y[0];
+    float max_y = call_galaxy_.ui_pos_y[0];
+    for (std::size_t i = 1u; i < n; ++i) {
+        min_x = std::min(min_x, call_galaxy_.ui_pos_x[i]);
+        max_x = std::max(max_x, call_galaxy_.ui_pos_x[i]);
+        min_y = std::min(min_y, call_galaxy_.ui_pos_y[i]);
+        max_y = std::max(max_y, call_galaxy_.ui_pos_y[i]);
+    }
+    const double pad = std::max(40.0, 0.12 * std::max(max_x - min_x, max_y - min_y));
+    call_galaxy_.camera.fit_bounds(
+        static_cast<double>(min_x) - pad,
+        static_cast<double>(min_y) - pad,
+        static_cast<double>(max_x) + pad,
+        static_cast<double>(max_y) + pad,
+        static_cast<double>(viewport_w),
+        static_cast<double>(viewport_h),
+        true);
+}
+
+void UiApp::rebuild_call_galaxy_if_needed(float viewport_w, float viewport_h) {
+    const peelf::IBinaryImage* img = model_.image();
+    if (img == nullptr) {
+        if (!call_galaxy_.graph.empty()) {
+            cancel_and_reset_call_galaxy();
+        }
+        return;
+    }
+
+    const bool ref_scanning =
+        reference_index_.is_scanning() || reference_scanner_.is_scanning();
+    const bool ref_just_finished = call_galaxy_.was_ref_scanning && !ref_scanning;
+    call_galaxy_.was_ref_scanning = ref_scanning;
+
+    std::optional<std::uint64_t> desired_root_va{};
+    if (call_galaxy_.scope != GalaxyScopeMode::WholeBinary) {
+        if (active_graph_root_.has_value() && active_graph_root_->virtual_address.has_value()) {
+            desired_root_va = *active_graph_root_->virtual_address;
+        } else if (current_selection_.virtual_address.has_value()) {
+            desired_root_va = *current_selection_.virtual_address;
+        }
+    }
+
+    const std::uint64_t cur_diff_rev = binary_diff_panel_.diff_revision();
+    const std::size_t cur_sec_count = model_.security_audit().findings.size();
+
+    const bool topology_stale =
+        call_galaxy_.dirty ||
+        call_galaxy_.built_file_generation != file_generation_ ||
+        call_galaxy_.built_scope != call_galaxy_.scope ||
+        call_galaxy_.built_edit_revision != model_.edit_revision() ||
+        call_galaxy_.built_symbol_revision != symbol_revision_ ||
+        (call_galaxy_.scope != GalaxyScopeMode::WholeBinary &&
+         call_galaxy_.built_root_va != desired_root_va) ||
+        (call_galaxy_.scope == GalaxyScopeMode::WholeBinary &&
+         !ref_scanning &&
+         call_galaxy_.built_ref_revision != reference_index_.revision()) ||
+        ref_just_finished;
+
+    if (!topology_stale) {
+        if (call_galaxy_.built_diff_revision != cur_diff_rev ||
+            call_galaxy_.built_security_finding_count != cur_sec_count) {
+            std::vector<peelf::ByteVizDiffRange> diff_scratch{};
+            const CallGalaxyBuildOptions overlay_opts =
+                current_call_galaxy_overlay_options(diff_scratch);
+            apply_call_galaxy_overlays(call_galaxy_.graph, img, overlay_opts);
+            call_galaxy_.built_diff_revision = cur_diff_rev;
+            call_galaxy_.built_security_finding_count = cur_sec_count;
+        }
+        return;
+    }
+
+    std::vector<peelf::ByteVizDiffRange> diff_scratch{};
+    const CallGalaxyBuildOptions build_opts =
+        current_call_galaxy_overlay_options(diff_scratch);
+
+    CallGalaxyGraph rebuilt{};
+    if (call_galaxy_.scope == GalaxyScopeMode::WholeBinary) {
+        rebuilt = build_whole_binary_call_galaxy(
+            *img,
+            symbol_index_,
+            model_.function_index(),
+            reference_index_,
+            build_opts);
+    } else if (const auto scoped_cg = build_scoped_call_graph_for_galaxy(call_galaxy_.scope);
+               scoped_cg.has_value()) {
+        rebuilt = build_call_galaxy_from_call_graph(*scoped_cg, build_opts);
+    }
+
+    call_galaxy_.dirty = false;
+    call_galaxy_.built_file_generation = file_generation_;
+    call_galaxy_.built_ref_revision = reference_index_.revision();
+    call_galaxy_.built_symbol_revision = symbol_revision_;
+    call_galaxy_.built_edit_revision = model_.edit_revision();
+    call_galaxy_.built_diff_revision = cur_diff_rev;
+    call_galaxy_.built_security_finding_count = cur_sec_count;
+    call_galaxy_.built_root_va = desired_root_va;
+    call_galaxy_.built_scope = call_galaxy_.scope;
+
+    call_galaxy_.graph = std::move(rebuilt);
+    call_galaxy_.hovered_node.reset();
+    call_galaxy_.dragged_node.reset();
+    call_galaxy_.drag_moved = false;
+    call_galaxy_.highlighted_path = {};
+    call_galaxy_.trace_status.clear();
+
+    // Preserve selection by virtual address across rebuilds when possible.
+    call_galaxy_.selected_node.reset();
+    call_galaxy_.ego_mask = {};
+    if (current_selection_.virtual_address.has_value()) {
+        if (const auto match =
+                call_galaxy_.graph.find_node_at_va(*current_selection_.virtual_address);
+            match.has_value()) {
+            call_galaxy_.selected_node = *match;
+            call_galaxy_.ego_mask =
+                compute_ego_network_mask(call_galaxy_.graph, *match);
+        }
+    }
+
+    BarnesHutLayoutConfig lcfg{};
+    if (call_galaxy_.scope == GalaxyScopeMode::ActiveFunctionCfg) {
+        lcfg.spring_length = 42.0f;
+        lcfg.repulsion_strength = 920.0f;
+        lcfg.gravity_strength = 0.032f;
+    }
+
+    BarnesHutGalaxyLayout initial_seeder{};
+    initial_seeder.reset(call_galaxy_.graph, lcfg);
+    // Run a tiny synchronous pre-relaxation on small graphs so CFGs look great on frame 1.
+    if (call_galaxy_.graph.nodes.size() > 1u && call_galaxy_.graph.nodes.size() <= 256u) {
+        call_galaxy_.last_stats = initial_seeder.step(24u);
+    } else {
+        call_galaxy_.last_stats = {};
+    }
+    call_galaxy_.ui_total_iterations = initial_seeder.total_iterations();
+    const auto sx = initial_seeder.positions_x();
+    const auto sy = initial_seeder.positions_y();
+    const auto sp = initial_seeder.pinned_mask();
+    call_galaxy_.ui_pos_x.assign(sx.begin(), sx.end());
+    call_galaxy_.ui_pos_y.assign(sy.begin(), sy.end());
+    call_galaxy_.ui_pinned.assign(sp.begin(), sp.end());
+    call_galaxy_.layout_converged =
+        (call_galaxy_.graph.nodes.size() <= 1u) || call_galaxy_.last_stats.converged;
+
+    if (call_galaxy_.fit_requested) {
+        fit_call_galaxy_camera(viewport_w, viewport_h);
+        call_galaxy_.fit_requested = false;
+    }
+
+    ensure_call_galaxy_worker_started();
+    {
+        std::scoped_lock lock(call_galaxy_.worker_mutex);
+        ++call_galaxy_.worker_generation;
+        call_galaxy_.pending_seed_graph = call_galaxy_.graph;
+        call_galaxy_.pending_seed_config = lcfg;
+        call_galaxy_.pending_pin_commands.clear();
+        call_galaxy_.pending_reheat = false;
+        call_galaxy_.pending_unpin_all = false;
+        call_galaxy_.worker_playing = call_galaxy_.layout_playing;
+    }
+    call_galaxy_.worker_cv.notify_all();
+}
+
+void UiApp::select_call_galaxy_node(std::uint32_t node_index, bool navigate_views) {
+    if (node_index >= call_galaxy_.graph.nodes.size()) {
+        return;
+    }
+    call_galaxy_.selected_node = node_index;
+    call_galaxy_.ego_mask = compute_ego_network_mask(call_galaxy_.graph, node_index);
+
+    const CallGalaxyNode& node = call_galaxy_.graph.nodes[node_index];
+    if (node.virtual_address == 0u) {
+        return;
+    }
+
+    if (navigate_views) {
+        if (ImGui::GetIO().KeyCtrl) {
+            InspectableEntity ent{};
+            ent.va = node.virtual_address;
+            if (const peelf::IBinaryImage* img = model_.image(); img != nullptr) {
+                ent.file_offset = img->virtual_address_to_file_offset(node.virtual_address);
+            }
+            ent.size = node.size_bytes;
+            ent.symbol_or_label = node.display_name;
+            dispatch_entity_context_action(ContextActionKind::FollowInDecompiler, ent);
+            return;
+        }
+        const PreferredView target_view =
+            ImGui::GetIO().KeyAlt ? PreferredView::Hex : PreferredView::Disassembly;
+        enqueue_navigation(node.virtual_address, target_view);
+        return;
+    }
+
+    navigation_history_.visit(current_selection_);
+    current_selection_.virtual_address = node.virtual_address;
+    current_selection_.size = std::max<std::uint64_t>(node.size_bytes, 1u);
+    current_selection_.label = node.display_name;
+    current_selection_.preferred_view = PreferredView::Graph;
+    if (const auto off = model_.virtual_address_to_offset(node.virtual_address);
+        off.has_value()) {
+        current_selection_.file_offset = *off;
+        hex_panel_.navigate_to_range(
+            clamp_to_size_t(*off),
+            clamp_to_size_t(current_selection_.size));
+        if (node.kind != GalaxyNodeKind::ExternalImport) {
+            disassemble_at_offset(*off, node.virtual_address);
+        }
+    }
+    last_navigation_selection_ = current_selection_;
+}
+
+void UiApp::render_call_galaxy_view() {
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(195.0f);
+    const auto cur_scope_idx = static_cast<std::uint8_t>(call_galaxy_.scope);
+    if (ImGui::BeginCombo("Scope##GalaxyScope", galaxy_scope_label(cur_scope_idx))) {
+        for (std::uint8_t s = 0u; s < 3u; ++s) {
+            const bool is_sel = (cur_scope_idx == s);
+            if (ImGui::Selectable(galaxy_scope_label(s), is_sel)) {
+                const auto next_scope = static_cast<GalaxyScopeMode>(s);
+                if (call_galaxy_.scope != next_scope) {
+                    call_galaxy_.scope = next_scope;
+                    call_galaxy_.dirty = true;
+                    call_galaxy_.fit_requested = true;
+                }
+            }
+            if (is_sel) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(165.0f);
+    if (ImGui::BeginCombo(
+            "Color##GalaxyColor",
+            galaxy_color_mode_label(call_galaxy_.color_mode))) {
+        constexpr std::array<GalaxyColorMode, 5> kModes = {{
+            GalaxyColorMode::OriginAndSection,
+            GalaxyColorMode::EntryReachability,
+            GalaxyColorMode::SecurityFindings,
+            GalaxyColorMode::BinaryDiff,
+            GalaxyColorMode::CallDegreeHeat,
+        }};
+        for (const GalaxyColorMode mode : kModes) {
+            const bool is_sel = (call_galaxy_.color_mode == mode);
+            if (ImGui::Selectable(galaxy_color_mode_label(mode), is_sel)) {
+                call_galaxy_.color_mode = mode;
+            }
+            if (is_sel) {
+                ImGui::SetItemDefaultFocus();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button(call_galaxy_.layout_playing ? "Pause Layout" : "Play Layout")) {
+        call_galaxy_.layout_playing = !call_galaxy_.layout_playing;
+        {
+            std::scoped_lock lock(call_galaxy_.worker_mutex);
+            call_galaxy_.worker_playing = call_galaxy_.layout_playing;
+        }
+        call_galaxy_.worker_cv.notify_all();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reheat")) {
+        call_galaxy_.layout_playing = true;
+        call_galaxy_.layout_converged = false;
+        {
+            std::scoped_lock lock(call_galaxy_.worker_mutex);
+            call_galaxy_.worker_playing = true;
+            call_galaxy_.pending_reheat = true;
+        }
+        call_galaxy_.worker_cv.notify_all();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Fit##GalaxyFit")) {
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        fit_call_galaxy_camera(std::max(avail.x, 64.0f), std::max(avail.y - 36.0f, 64.0f));
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Rebuild##GalaxyRebuild")) {
+        call_galaxy_.dirty = true;
+        call_galaxy_.fit_requested = true;
+    }
+
+    const bool has_any_pinned = std::ranges::any_of(
+        call_galaxy_.ui_pinned,
+        [](std::uint8_t v) noexcept { return v != 0u; });
+    if (has_any_pinned) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Unpin All")) {
+            std::ranges::fill(call_galaxy_.ui_pinned, std::uint8_t{0u});
+            call_galaxy_.layout_playing = true;
+            {
+                std::scoped_lock lock(call_galaxy_.worker_mutex);
+                call_galaxy_.worker_playing = true;
+                call_galaxy_.pending_unpin_all = true;
+            }
+            call_galaxy_.worker_cv.notify_all();
+        }
+    }
+
+    // Second toolbar row: search, 1-hop spotlight, trace entry -> selected, labels, status.
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::InputTextWithHint(
+        "##GalaxyFindNode",
+        "Filter nodes (name or 0xVA)...",
+        graph_search_,
+        sizeof(graph_search_));
+    ImGui::SameLine();
+    ImGui::Checkbox("1-Hop Spotlight", &call_galaxy_.ego_spotlight);
+    ImGui::SameLine();
+    ImGui::Checkbox("Labels", &call_galaxy_.show_labels);
+
+    const bool can_trace =
+        call_galaxy_.selected_node.has_value() &&
+        *call_galaxy_.selected_node < call_galaxy_.graph.nodes.size() &&
+        !call_galaxy_.graph.primary_entry_nodes.empty();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!can_trace);
+    if (ImGui::Button("Trace Entry -> Selected")) {
+        call_galaxy_.highlighted_path = find_shortest_call_path_from_roots(
+            call_galaxy_.graph,
+            call_galaxy_.graph.primary_entry_nodes,
+            *call_galaxy_.selected_node);
+        const CallGalaxyNode& dst = call_galaxy_.graph.nodes[*call_galaxy_.selected_node];
+        if (!call_galaxy_.highlighted_path.empty()) {
+            const CallGalaxyNode& src =
+                call_galaxy_.graph.nodes[call_galaxy_.highlighted_path.nodes.front()];
+            call_galaxy_.trace_status = std::format(
+                "{} -> {} ({} hop{})",
+                src.display_name,
+                dst.display_name,
+                call_galaxy_.highlighted_path.edges.size(),
+                call_galaxy_.highlighted_path.edges.size() == 1u ? "" : "s");
+        } else {
+            call_galaxy_.trace_status = std::format(
+                "No directed call path from entry/export roots to {}",
+                dst.display_name);
+        }
+    }
+    ImGui::EndDisabled();
+
+    if (!call_galaxy_.highlighted_path.empty() || !call_galaxy_.trace_status.empty()) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Trace")) {
+            call_galaxy_.highlighted_path = {};
+            call_galaxy_.trace_status.clear();
+        }
+    }
+
+    // Status & background reference-scan banner.
+    {
+        const char* sim_state =
+            call_galaxy_.layout_converged
+                ? "Converged"
+                : (call_galaxy_.layout_playing ? "Barnes-Hut simulating" : "Layout paused");
+        ImGui::TextDisabled(
+            "%zu nodes  |  %zu edges  |  %s (iter %u, T=%.1f, disp=%.2f)  |  Wheel: zoom  Drag node: pin  Dbl-click: jump  Right-click: menu",
+            call_galaxy_.graph.nodes.size(),
+            call_galaxy_.graph.edges.size(),
+            sim_state,
+            call_galaxy_.ui_total_iterations,
+            static_cast<double>(call_galaxy_.last_stats.temperature),
+            static_cast<double>(call_galaxy_.last_stats.max_displacement));
+
+        if (model_.image() != nullptr && reference_index_.total_executable_bytes() > 0u) {
+            const bool scanning = reference_index_.is_scanning() || reference_scanner_.is_scanning();
+            if (scanning || reference_index_.incomplete()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "| Xref scan %.1f%%",
+                    reference_index_.coverage_percent());
+                if (scanning) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Refresh Partial##galaxy_ref_now")) {
+                        call_galaxy_.dirty = true;
+                    }
+                } else if (reference_index_.incomplete() &&
+                           reference_scanner_.has_resumable_work()) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Scan Full Binary##galaxy_scan_full")) {
+                        reference_scanner_.scan_full(reference_index_);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!call_galaxy_.trace_status.empty()) {
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.84f, 0.28f, 1.0f),
+            "Call Trace: %s",
+            call_galaxy_.trace_status.c_str());
+        if (!call_galaxy_.highlighted_path.empty() &&
+            call_galaxy_.highlighted_path.nodes.size() <= 12u) {
+            for (std::size_t h = 0u; h < call_galaxy_.highlighted_path.nodes.size(); ++h) {
+                const std::uint32_t ni = call_galaxy_.highlighted_path.nodes[h];
+                if (ni >= call_galaxy_.graph.nodes.size()) {
+                    continue;
+                }
+                if (h > 0u) {
+                    ImGui::SameLine(0.0f, 4.0f);
+                    ImGui::TextDisabled("->");
+                }
+                if (h > 0u) {
+                    ImGui::SameLine(0.0f, 4.0f);
+                }
+                ImGui::PushID(static_cast<int>(h));
+                if (ImGui::SmallButton(call_galaxy_.graph.nodes[ni].display_name.c_str())) {
+                    select_call_galaxy_node(ni, false);
+                    if (ni < call_galaxy_.ui_pos_x.size()) {
+                        call_galaxy_.camera.center_x =
+                            static_cast<double>(call_galaxy_.ui_pos_x[ni]);
+                        call_galaxy_.camera.center_y =
+                            static_cast<double>(call_galaxy_.ui_pos_y[ni]);
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
+    }
+
+    // Search match mask & compact jump results list.
+    const std::string_view search_sv(graph_search_);
+    const bool has_search = !search_sv.empty();
+    std::vector<std::uint8_t> search_mask{};
+    if (has_search && !call_galaxy_.graph.nodes.empty()) {
+        search_mask.assign(call_galaxy_.graph.nodes.size(), 0u);
+        std::vector<std::uint32_t> hit_indices{};
+        for (const CallGalaxyNode& node : call_galaxy_.graph.nodes) {
+            if (galaxy_node_matches_search(node, search_sv)) {
+                search_mask[node.node_index] = 1u;
+                if (hit_indices.size() < 64u) {
+                    hit_indices.push_back(node.node_index);
+                }
+            }
+        }
+        if (!hit_indices.empty()) {
+            ImGui::BeginChild("GalaxySearchHits", ImVec2(0.0f, 76.0f), true);
+            for (const std::uint32_t ni : hit_indices) {
+                const CallGalaxyNode& node = call_galaxy_.graph.nodes[ni];
+                ImGui::PushID(static_cast<int>(ni));
+                const std::string row_label =
+                    (node.virtual_address != 0u)
+                        ? std::format("0x{:X}  {}", node.virtual_address, node.display_name)
+                        : node.display_name;
+                if (ImGui::Selectable(row_label.c_str(), call_galaxy_.selected_node == ni)) {
+                    select_call_galaxy_node(ni, false);
+                    if (ni < call_galaxy_.ui_pos_x.size()) {
+                        call_galaxy_.camera.center_x =
+                            static_cast<double>(call_galaxy_.ui_pos_x[ni]);
+                        call_galaxy_.camera.center_y =
+                            static_cast<double>(call_galaxy_.ui_pos_y[ni]);
+                    }
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+    }
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const ImVec2 canvas_size(std::max(avail.x, 64.0f), std::max(avail.y, 64.0f));
+    const ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+    const auto req_w = static_cast<std::uint32_t>(std::lround(canvas_size.x));
+    const auto req_h = static_cast<std::uint32_t>(std::lround(canvas_size.y));
+
+    rebuild_call_galaxy_if_needed(canvas_size.x, canvas_size.y);
+
+    // Pull latest positions from Barnes-Hut worker (microsecond lock).
+    {
+        std::scoped_lock lock(call_galaxy_.worker_mutex);
+        if (call_galaxy_.published_seq != call_galaxy_.consumed_seq &&
+            call_galaxy_.published_generation == call_galaxy_.worker_generation &&
+            call_galaxy_.published_pos_x.size() == call_galaxy_.graph.nodes.size()) {
+            const std::optional<std::uint32_t> active_drag = call_galaxy_.dragged_node;
+            float drag_x = 0.0f;
+            float drag_y = 0.0f;
+            if (active_drag.has_value() && *active_drag < call_galaxy_.ui_pos_x.size() &&
+                call_galaxy_.drag_moved) {
+                drag_x = call_galaxy_.ui_pos_x[*active_drag];
+                drag_y = call_galaxy_.ui_pos_y[*active_drag];
+            }
+            call_galaxy_.ui_pos_x = call_galaxy_.published_pos_x;
+            call_galaxy_.ui_pos_y = call_galaxy_.published_pos_y;
+            call_galaxy_.ui_pinned = call_galaxy_.published_pinned;
+            if (active_drag.has_value() && *active_drag < call_galaxy_.ui_pos_x.size() &&
+                call_galaxy_.drag_moved) {
+                call_galaxy_.ui_pos_x[*active_drag] = drag_x;
+                call_galaxy_.ui_pos_y[*active_drag] = drag_y;
+                call_galaxy_.ui_pinned[*active_drag] = 1u;
+            }
+            call_galaxy_.last_stats = call_galaxy_.published_stats;
+            call_galaxy_.ui_total_iterations = call_galaxy_.published_total_iterations;
+            call_galaxy_.layout_converged = call_galaxy_.published_converged;
+            call_galaxy_.consumed_seq = call_galaxy_.published_seq;
+        }
+    }
+
+    // Lazily initialize Vulkan offscreen canvas, ring buffers, and dual 2D SDF pipelines.
+    if (!call_galaxy_.canvas_initialized && vulkan_.device() != VK_NULL_HANDLE) {
+        try {
+            call_galaxy_.canvas.init(
+                vulkan_,
+                GpuOffscreenCanvasConfig{
+                    .sampler_filter = VK_FILTER_NEAREST,
+                    .resize_debounce_frames = 2u,
+                });
+            call_galaxy_.edge_ring.attach(vulkan_, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            call_galaxy_.node_ring.attach(vulkan_, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            call_galaxy_.canvas_initialized = true;
+        } catch (const std::exception& ex) {
+            call_galaxy_.gpu_status =
+                std::format("Call galaxy GPU canvas fallback: {}", ex.what());
+            call_galaxy_.canvas_initialized = false;
+        }
+    }
+
+    if (call_galaxy_.canvas_initialized) {
+        (void)call_galaxy_.canvas.ensure_size(req_w, req_h);
+        if (call_galaxy_.canvas.can_use_graphics() &&
+            !call_galaxy_.pipelines_attempted) {
+            call_galaxy_.pipelines_attempted = true;
+            try {
+                const std::array<VkVertexInputBindingDescription, 1> bindings = {{
+                    VkVertexInputBindingDescription{
+                        .binding = 0u,
+                        .stride = sizeof(GalaxyEdgeGpuInstance),
+                        .inputRate = VK_VERTEX_INPUT_RATE_INSTANCE,
+                    },
+                }};
+                const std::array<VkVertexInputAttributeDescription, 2> attrs = {{
+                    VkVertexInputAttributeDescription{
+                        .location = 0u,
+                        .binding = 0u,
+                        .format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                        .offset = 0u,
+                    },
+                    VkVertexInputAttributeDescription{
+                        .location = 1u,
+                        .binding = 0u,
+                        .format = VK_FORMAT_R32G32B32A32_UINT,
+                        .offset = 16u,
+                    },
+                }};
+                call_galaxy_.edge_pipeline.init(
+                    vulkan_,
+                    call_galaxy_.canvas.offscreen_render_pass(),
+                    GpuGraphics2DPipelineDesc{
+                        .vertex_spirv = shaders::kGalaxyEdgeVertSpirv,
+                        .fragment_spirv = shaders::kGalaxyEdgeFragSpirv,
+                        .vertex_bindings = bindings,
+                        .vertex_attributes = attrs,
+                        .push_constant_bytes = sizeof(shaders::CallGalaxyPushConstants),
+                        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                        .alpha_blend = true,
+                    });
+                call_galaxy_.node_pipeline.init(
+                    vulkan_,
+                    call_galaxy_.canvas.offscreen_render_pass(),
+                    GpuGraphics2DPipelineDesc{
+                        .vertex_spirv = shaders::kGalaxyNodeVertSpirv,
+                        .fragment_spirv = shaders::kGalaxyNodeFragSpirv,
+                        .vertex_bindings = bindings,
+                        .vertex_attributes = attrs,
+                        .push_constant_bytes = sizeof(shaders::CallGalaxyPushConstants),
+                        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                        .alpha_blend = true,
+                    });
+            } catch (const std::exception& ex) {
+                call_galaxy_.gpu_status =
+                    std::format("Call galaxy CPU RGBA8 fallback active: {}", ex.what());
+            }
+        }
+    }
+
+    const float eff_w =
+        (call_galaxy_.canvas_initialized && call_galaxy_.canvas.valid())
+            ? static_cast<float>(call_galaxy_.canvas.width())
+            : canvas_size.x;
+    const float eff_h =
+        (call_galaxy_.canvas_initialized && call_galaxy_.canvas.valid())
+            ? static_cast<float>(call_galaxy_.canvas.height())
+            : canvas_size.y;
+
+    ImGui::SetCursorScreenPos(canvas_pos);
+    ImGui::InvisibleButton("CallGalaxyInteractiveCanvas", canvas_size);
+    const bool canvas_hovered = ImGui::IsItemHovered();
+    const bool canvas_active = ImGui::IsItemActive();
+    const ImGuiIO& io = ImGui::GetIO();
+    const float local_mx = io.MousePos.x - canvas_pos.x;
+    const float local_my = io.MousePos.y - canvas_pos.y;
+
+    if (canvas_hovered && !call_galaxy_.graph.empty()) {
+        call_galaxy_.hovered_node = hit_test_galaxy_node(
+            call_galaxy_.graph,
+            call_galaxy_.ui_pos_x,
+            call_galaxy_.ui_pos_y,
+            call_galaxy_.camera,
+            eff_w,
+            eff_h,
+            local_mx,
+            local_my,
+            4.0f);
+    } else if (!call_galaxy_.dragged_node.has_value()) {
+        call_galaxy_.hovered_node.reset();
+    }
+
+    // Cursor-anchored wheel zoom & middle-drag / background left-drag pan.
+    if (canvas_hovered && io.MouseWheel != 0.0f) {
+        const double factor = std::pow(1.16, static_cast<double>(io.MouseWheel));
+        call_galaxy_.camera.zoom_at_screen_pixel(
+            static_cast<double>(local_mx),
+            static_cast<double>(local_my),
+            factor,
+            static_cast<double>(eff_w),
+            static_cast<double>(eff_h));
+    }
+
+    if (canvas_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (call_galaxy_.hovered_node.has_value()) {
+            call_galaxy_.dragged_node = *call_galaxy_.hovered_node;
+            call_galaxy_.drag_moved = false;
+            call_galaxy_.drag_start_mouse = io.MousePos;
+        } else {
+            call_galaxy_.dragged_node.reset();
+            call_galaxy_.drag_moved = false;
+        }
+    }
+
+    if (call_galaxy_.dragged_node.has_value() && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const std::uint32_t dn = *call_galaxy_.dragged_node;
+        const float dx = io.MousePos.x - call_galaxy_.drag_start_mouse.x;
+        const float dy = io.MousePos.y - call_galaxy_.drag_start_mouse.y;
+        const float thresh = io.MouseDragThreshold;
+        if (dn < call_galaxy_.ui_pos_x.size() &&
+            (call_galaxy_.drag_moved || (dx * dx + dy * dy) >= (thresh * thresh))) {
+            call_galaxy_.drag_moved = true;
+            const Vec2d world_pt = call_galaxy_.camera.screen_to_world(
+                static_cast<double>(local_mx),
+                static_cast<double>(local_my),
+                static_cast<double>(eff_w),
+                static_cast<double>(eff_h));
+            const auto wx = static_cast<float>(world_pt.x);
+            const auto wy = static_cast<float>(world_pt.y);
+            call_galaxy_.ui_pos_x[dn] = wx;
+            call_galaxy_.ui_pos_y[dn] = wy;
+            if (dn < call_galaxy_.ui_pinned.size()) {
+                call_galaxy_.ui_pinned[dn] = 1u;
+            }
+            {
+                std::scoped_lock lock(call_galaxy_.worker_mutex);
+                call_galaxy_.pending_pin_commands.push_back(GalaxyPinCommand{
+                    .node_index = dn,
+                    .pinned = true,
+                    .world_x = wx,
+                    .world_y = wy,
+                });
+            }
+            call_galaxy_.worker_cv.notify_all();
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        }
+    } else if (call_galaxy_.dragged_node.has_value() &&
+               !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        const std::uint32_t dn = *call_galaxy_.dragged_node;
+        if (!call_galaxy_.drag_moved && canvas_hovered) {
+            select_call_galaxy_node(dn, false);
+        }
+        call_galaxy_.dragged_node.reset();
+        call_galaxy_.drag_moved = false;
+    } else if ((canvas_active && ImGui::IsMouseDragging(ImGuiMouseButton_Left) &&
+                !call_galaxy_.dragged_node.has_value()) ||
+               (canvas_hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Middle))) {
+        call_galaxy_.camera.pan_by_pixels(
+            static_cast<double>(io.MouseDelta.x),
+            static_cast<double>(io.MouseDelta.y));
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+    }
+
+    if (canvas_hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) &&
+        call_galaxy_.hovered_node.has_value()) {
+        select_call_galaxy_node(*call_galaxy_.hovered_node, true);
+    }
+
+    // Right-click universal InspectableEntity context menu.
+    if (canvas_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
+        call_galaxy_.hovered_node.has_value() &&
+        *call_galaxy_.hovered_node < call_galaxy_.graph.nodes.size()) {
+        const std::uint32_t ni = *call_galaxy_.hovered_node;
+        select_call_galaxy_node(ni, false);
+        const CallGalaxyNode& node = call_galaxy_.graph.nodes[ni];
+        InspectableEntity ent{};
+        if (node.virtual_address != 0u) {
+            ent.va = node.virtual_address;
+            if (const peelf::IBinaryImage* img = model_.image(); img != nullptr) {
+                ent.file_offset = img->virtual_address_to_file_offset(node.virtual_address);
+            }
+        }
+        ent.size = node.size_bytes;
+        ent.symbol_or_label = node.display_name;
+        ent.module_name = node.module_or_section;
+        ent.extra_json_fields = {
+            {"kind", std::string(to_string(node.kind))},
+            {"in_degree", std::to_string(node.in_degree)},
+            {"out_degree", std::to_string(node.out_degree)},
+            {"reachability", std::string(to_string(node.reachability))},
+            {"security", std::string(to_string(node.security_severity))},
+            {"diff_status", std::string(to_string(node.diff_status))},
+        };
+        call_galaxy_.context_node = ni;
+        call_galaxy_.context_entity = std::move(ent);
+        ImGui::OpenPopup("##CallGalaxyNodeCtx");
+    }
+
+    std::optional<PendingEntityContextAction> pending_ctx{};
+    if (ImGui::BeginPopup("##CallGalaxyNodeCtx")) {
+        if (call_galaxy_.context_node.has_value() &&
+            *call_galaxy_.context_node < call_galaxy_.graph.nodes.size()) {
+            const std::uint32_t cni = *call_galaxy_.context_node;
+            const CallGalaxyNode& cnode = call_galaxy_.graph.nodes[cni];
+            ImGui::TextUnformatted(cnode.display_name.c_str());
+            ImGui::Separator();
+
+            if (call_galaxy_.context_entity.va.has_value() ||
+                call_galaxy_.context_entity.file_offset.has_value()) {
+                (void)draw_inspectable_entity_context_menu_items(
+                    call_galaxy_.context_entity,
+                    model_,
+                    pending_ctx);
+                ImGui::Separator();
+            }
+
+            const bool is_pinned =
+                (cni < call_galaxy_.ui_pinned.size() && call_galaxy_.ui_pinned[cni] != 0u);
+            if (ImGui::MenuItem(is_pinned ? "Unpin Node" : "Pin Node Position")) {
+                const bool next_pin = !is_pinned;
+                if (cni < call_galaxy_.ui_pinned.size()) {
+                    call_galaxy_.ui_pinned[cni] = next_pin ? 1u : 0u;
+                }
+                const float wx = (cni < call_galaxy_.ui_pos_x.size()) ? call_galaxy_.ui_pos_x[cni] : 0.0f;
+                const float wy = (cni < call_galaxy_.ui_pos_y.size()) ? call_galaxy_.ui_pos_y[cni] : 0.0f;
+                {
+                    std::scoped_lock lock(call_galaxy_.worker_mutex);
+                    call_galaxy_.pending_pin_commands.push_back(GalaxyPinCommand{
+                        .node_index = cni,
+                        .pinned = next_pin,
+                        .world_x = wx,
+                        .world_y = wy,
+                    });
+                }
+                call_galaxy_.worker_cv.notify_all();
+            }
+
+            if (!call_galaxy_.graph.primary_entry_nodes.empty() &&
+                ImGui::MenuItem("Trace Entry -> This Node")) {
+                call_galaxy_.highlighted_path = find_shortest_call_path_from_roots(
+                    call_galaxy_.graph,
+                    call_galaxy_.graph.primary_entry_nodes,
+                    cni);
+                call_galaxy_.trace_status =
+                    !call_galaxy_.highlighted_path.empty()
+                        ? std::format(
+                              "Entry -> {} ({} hops)",
+                              cnode.display_name,
+                              call_galaxy_.highlighted_path.edges.size())
+                        : std::format(
+                              "No directed call path from entry roots to {}",
+                              cnode.display_name);
+            }
+
+            if (cnode.virtual_address != 0u && cnode.kind != GalaxyNodeKind::ExternalImport) {
+                if (ImGui::MenuItem("Focus Function CFG in Galaxy")) {
+                    SymbolRecord root_rec{};
+                    root_rec.name = cnode.display_name;
+                    root_rec.raw_name = cnode.raw_name;
+                    root_rec.virtual_address = cnode.virtual_address;
+                    active_graph_root_ = std::move(root_rec);
+                    call_galaxy_.scope = GalaxyScopeMode::ActiveFunctionCfg;
+                    call_galaxy_.dirty = true;
+                    call_galaxy_.fit_requested = true;
+                }
+                if (ImGui::MenuItem("Focus Symbol Fanout in Galaxy")) {
+                    SymbolRecord root_rec{};
+                    root_rec.name = cnode.display_name;
+                    root_rec.raw_name = cnode.raw_name;
+                    root_rec.virtual_address = cnode.virtual_address;
+                    active_graph_root_ = std::move(root_rec);
+                    call_galaxy_.scope = GalaxyScopeMode::ActiveSymbolFanout;
+                    call_galaxy_.dirty = true;
+                    call_galaxy_.fit_requested = true;
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+    if (pending_ctx.has_value()) {
+        dispatch_entity_context_action(pending_ctx->kind, pending_ctx->entity);
+    }
+
+    // Build GPU render batch for this frame.
+    const GalaxyEgoMask* active_ego =
+        (call_galaxy_.ego_spotlight && call_galaxy_.selected_node.has_value() &&
+         call_galaxy_.ego_mask.focus_node == *call_galaxy_.selected_node)
+            ? &call_galaxy_.ego_mask
+            : nullptr;
+
+    call_galaxy_.current_batch = build_galaxy_render_batch(
+        call_galaxy_.graph,
+        call_galaxy_.ui_pos_x,
+        call_galaxy_.ui_pos_y,
+        call_galaxy_.camera,
+        GalaxyRenderBuildOptions{
+            .viewport_width_px = eff_w,
+            .viewport_height_px = eff_h,
+            .color_mode = call_galaxy_.color_mode,
+            .hovered_node = call_galaxy_.hovered_node.value_or(kInvalidGalaxyNode),
+            .selected_node = call_galaxy_.selected_node.value_or(kInvalidGalaxyNode),
+            .pinned_mask = call_galaxy_.ui_pinned,
+            .ego_mask = active_ego,
+            .highlighted_path = call_galaxy_.highlighted_path.empty()
+                                    ? nullptr
+                                    : &call_galaxy_.highlighted_path,
+            .search_match_mask = search_mask,
+            .has_active_search = has_search,
+            .max_visible_edges = 65'536u,
+            .max_labels = call_galaxy_.show_labels ? 48u : 0u,
+        });
+
+    if (call_galaxy_.canvas_initialized && call_galaxy_.canvas.valid()) {
+        call_galaxy_.pending_push_constants = shaders::CallGalaxyPushConstants{
+            .viewport_width = static_cast<float>(call_galaxy_.canvas.width()),
+            .viewport_height = static_cast<float>(call_galaxy_.canvas.height()),
+            .node_ring_width_px = 1.65f,
+            .time_seconds = static_cast<float>(ImGui::GetTime()),
+            .hovered_node_index = call_galaxy_.hovered_node.value_or(kInvalidGalaxyNode),
+            .selected_node_index = call_galaxy_.selected_node.value_or(kInvalidGalaxyNode),
+            .flags = 0u,
+            .reserved = 0.0f,
+        };
+        call_galaxy_.needs_gpu_record_this_frame = true;
+    }
+
+    ImDrawList* draw_list = ImGui::GetWindowDrawList();
+    draw_list->PushClipRect(
+        canvas_pos,
+        ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+        true);
+    draw_list->AddRectFilled(
+        canvas_pos,
+        ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y),
+        IM_COL32(12, 14, 20, 255));
+
+    if (call_galaxy_.canvas_initialized && call_galaxy_.canvas.valid()) {
+        draw_list->AddImage(
+            call_galaxy_.canvas.imgui_texture_id(vulkan_.current_frame_index()),
+            canvas_pos,
+            ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y));
+    }
+
+    if (call_galaxy_.graph.empty()) {
+        const char* empty_msg =
+            (model_.image() == nullptr)
+                ? "Open a PE/ELF/Mach-O binary or attach to a process to explore its Call Galaxy."
+                : "No functions or call edges discovered in the selected scope yet.";
+        const ImVec2 ts = ImGui::CalcTextSize(empty_msg);
+        draw_list->AddText(
+            ImVec2(canvas_pos.x + (canvas_size.x - ts.x) * 0.5f,
+                   canvas_pos.y + (canvas_size.y - ts.y) * 0.5f),
+            IM_COL32(156, 162, 178, 255),
+            empty_msg);
+    } else if (call_galaxy_.show_labels) {
+        const float sx_ratio = canvas_size.x / std::max(1.0f, eff_w);
+        const float sy_ratio = canvas_size.y / std::max(1.0f, eff_h);
+        for (const GalaxyLabelCandidate& lbl : call_galaxy_.current_batch.labels) {
+            if (lbl.node_index >= call_galaxy_.graph.nodes.size()) {
+                continue;
+            }
+            const CallGalaxyNode& node = call_galaxy_.graph.nodes[lbl.node_index];
+            std::string_view text = node.display_name;
+            std::string truncated{};
+            if (text.size() > 38u) {
+                truncated = std::string(text.substr(0u, 35u)) + "...";
+                text = truncated;
+            }
+            const ImVec2 ts = ImGui::CalcTextSize(text.data(), text.data() + text.size());
+            const float lx =
+                canvas_pos.x + lbl.screen_x_px * sx_ratio - ts.x * 0.5f;
+            const float ly =
+                canvas_pos.y + (lbl.screen_y_px + lbl.radius_px + 3.0f) * sy_ratio;
+
+            const bool emph =
+                (call_galaxy_.hovered_node == lbl.node_index) ||
+                (call_galaxy_.selected_node == lbl.node_index);
+            draw_list->AddRectFilled(
+                ImVec2(lx - 3.0f, ly - 1.0f),
+                ImVec2(lx + ts.x + 3.0f, ly + ts.y + 1.0f),
+                emph ? IM_COL32(18, 22, 34, 232) : IM_COL32(12, 15, 24, 188),
+                3.0f);
+            draw_list->AddText(
+                ImVec2(lx, ly),
+                emph ? IM_COL32(255, 248, 214, 255) : IM_COL32(224, 230, 242, 238),
+                text.data(),
+                text.data() + text.size());
+        }
+    }
+
+    draw_list->PopClipRect();
+
+    // Rich hover tooltip.
+    if (canvas_hovered && call_galaxy_.hovered_node.has_value() &&
+        *call_galaxy_.hovered_node < call_galaxy_.graph.nodes.size() &&
+        !ImGui::IsPopupOpen("##CallGalaxyNodeCtx")) {
+        const std::uint32_t ni = *call_galaxy_.hovered_node;
+        const CallGalaxyNode& node = call_galaxy_.graph.nodes[ni];
+        ImGui::BeginTooltip();
+        ImGui::Text("%s", node.display_name.c_str());
+        if (!node.raw_name.empty() && node.raw_name != node.display_name) {
+            ImGui::TextDisabled("Raw: %s", node.raw_name.c_str());
+        }
+        ImGui::Separator();
+        if (node.virtual_address != 0u) {
+            ImGui::Text(
+                "VA: 0x%llX  |  Size: %llu B",
+                static_cast<unsigned long long>(node.virtual_address),
+                static_cast<unsigned long long>(node.size_bytes));
+        }
+        ImGui::Text(
+            "Kind: %.*s  |  %s: %s",
+            static_cast<int>(to_string(node.kind).size()),
+            to_string(node.kind).data(),
+            node.kind == GalaxyNodeKind::ExternalImport ? "Module" : "Section",
+            node.module_or_section.empty() ? "-" : node.module_or_section.c_str());
+        ImGui::Text(
+            "Callers (in): %u  |  Callees (out): %u",
+            node.in_degree,
+            node.out_degree);
+        ImGui::TextColored(
+            galaxy_reachability_badge_color(node.reachability),
+            "Reachability: %.*s",
+            static_cast<int>(to_string(node.reachability).size()),
+            to_string(node.reachability).data());
+        if (node.security_severity != GalaxySecuritySeverity::None) {
+            ImGui::TextColored(
+                galaxy_security_badge_color(node.security_severity),
+                "Security [%.*s]: %s",
+                static_cast<int>(to_string(node.security_severity).size()),
+                to_string(node.security_severity).data(),
+                node.top_security_finding.c_str());
+        }
+        if (node.diff_status != GalaxyDiffStatus::Unchanged) {
+            ImGui::TextColored(
+                galaxy_diff_badge_color(node.diff_status),
+                "Binary Diff: %.*s",
+                static_cast<int>(to_string(node.diff_status).size()),
+                to_string(node.diff_status).data());
+        }
+        const bool is_pinned =
+            (ni < call_galaxy_.ui_pinned.size() && call_galaxy_.ui_pinned[ni] != 0u);
+        ImGui::TextDisabled(
+            "%sDouble-click: Disassembly (Ctrl: Decompile, Alt: Hex)  |  Right-click: Actions",
+            is_pinned ? "[Pinned]  " : "");
+        ImGui::EndTooltip();
+    }
+}
+
+void UiApp::record_call_galaxy_pre_pass(VkCommandBuffer cmd, std::size_t frame_index) {
+    if (!call_galaxy_.needs_gpu_record_this_frame) {
+        return;
+    }
+    call_galaxy_.needs_gpu_record_this_frame = false;
+
+    if (!call_galaxy_.canvas_initialized || !call_galaxy_.canvas.valid()) {
+        return;
+    }
+
+    constexpr ColorFloat4 kClearColor{
+        12.0f / 255.0f,
+        14.0f / 255.0f,
+        20.0f / 255.0f,
+        1.0f,
+    };
+
+    const std::span<const GalaxyEdgeGpuInstance> edges(call_galaxy_.current_batch.edges);
+    const std::span<const GalaxyNodeGpuInstance> nodes(call_galaxy_.current_batch.nodes);
+    bool recorded_gpu = false;
+
+    if (call_galaxy_.canvas.can_use_graphics() &&
+        call_galaxy_.edge_pipeline.valid() &&
+        call_galaxy_.node_pipeline.valid()) {
+        try {
+            if (!edges.empty()) {
+                call_galaxy_.edge_ring.upload<GalaxyEdgeGpuInstance>(frame_index, edges);
+            }
+            if (!nodes.empty()) {
+                call_galaxy_.node_ring.upload<GalaxyNodeGpuInstance>(frame_index, nodes);
+            }
+            const VkBuffer edge_vb =
+                edges.empty() ? VK_NULL_HANDLE : call_galaxy_.edge_ring.buffer(frame_index);
+            const VkBuffer node_vb =
+                nodes.empty() ? VK_NULL_HANDLE : call_galaxy_.node_ring.buffer(frame_index);
+
+            if ((edges.empty() || edge_vb != VK_NULL_HANDLE) &&
+                (nodes.empty() || node_vb != VK_NULL_HANDLE)) {
+                call_galaxy_.canvas.record_instanced_render_pass(
+                    cmd,
+                    frame_index,
+                    kClearColor,
+                    [&](VkCommandBuffer pass_cmd, VkExtent2D /*extent*/) {
+                        const VkDeviceSize zero_offset = 0u;
+                        if (!edges.empty()) {
+                            vkCmdBindPipeline(
+                                pass_cmd,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                call_galaxy_.edge_pipeline.pipeline());
+                            vkCmdPushConstants(
+                                pass_cmd,
+                                call_galaxy_.edge_pipeline.pipeline_layout(),
+                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                0u,
+                                sizeof(call_galaxy_.pending_push_constants),
+                                &call_galaxy_.pending_push_constants);
+                            vkCmdBindVertexBuffers(pass_cmd, 0u, 1u, &edge_vb, &zero_offset);
+                            vkCmdDraw(
+                                pass_cmd,
+                                6u,
+                                static_cast<std::uint32_t>(edges.size()),
+                                0u,
+                                0u);
+                        }
+                        if (!nodes.empty()) {
+                            vkCmdBindPipeline(
+                                pass_cmd,
+                                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                call_galaxy_.node_pipeline.pipeline());
+                            vkCmdPushConstants(
+                                pass_cmd,
+                                call_galaxy_.node_pipeline.pipeline_layout(),
+                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                0u,
+                                sizeof(call_galaxy_.pending_push_constants),
+                                &call_galaxy_.pending_push_constants);
+                            vkCmdBindVertexBuffers(pass_cmd, 0u, 1u, &node_vb, &zero_offset);
+                            vkCmdDraw(
+                                pass_cmd,
+                                6u,
+                                static_cast<std::uint32_t>(nodes.size()),
+                                0u,
+                                0u);
+                        }
+                    });
+                recorded_gpu = true;
+            }
+        } catch (const std::exception&) {
+            recorded_gpu = false;
+        }
+    }
+
+    if (!recorded_gpu) {
+        const CallGalaxyRasterConfig rcfg{
+            .width = call_galaxy_.canvas.width(),
+            .height = call_galaxy_.canvas.height(),
+            .clear_rgba8 = pack_galaxy_rgba8(12u, 14u, 20u, 255u),
+            .node_ring_width_px = call_galaxy_.pending_push_constants.node_ring_width_px,
+        };
+        rasterize_call_galaxy_rgba8_into(
+            edges,
+            nodes,
+            rcfg,
+            call_galaxy_.cpu_rgba8_scratch);
+        call_galaxy_.canvas.record_cpu_rgba8_upload(
+            cmd,
+            frame_index,
+            call_galaxy_.cpu_rgba8_scratch);
+    }
 }
 
 } // namespace viewer

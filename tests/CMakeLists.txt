@@ -91,6 +91,7 @@ add_executable(peelf_tests
   memory_heatmap_test.cpp
   byte_viz_test.cpp
   timeline_viewport_test.cpp
+  call_graph_galaxy_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
@@ -101,6 +102,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_dot.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_build.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_cfg.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/graph/call_graph_galaxy.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/async_binary_diff.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp

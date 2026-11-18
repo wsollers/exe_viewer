@@ -630,6 +630,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         memory_heatmap_panel_.cancel_and_reset();
         byte_viz_panel_.cancel_and_reset();
         timeline_panel_.cancel_and_reset();
+        cancel_and_reset_call_galaxy();
         reference_scanner_.cancel(&reference_index_);
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
@@ -638,6 +639,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         memory_heatmap_panel_.record_pre_pass(cmd, frame_index);
         byte_viz_panel_.record_pre_pass(cmd, frame_index);
         timeline_panel_.record_pre_pass(cmd, frame_index);
+        record_call_galaxy_pre_pass(cmd, frame_index);
     });
     register_workspace_settings_handler();
 }
@@ -649,6 +651,7 @@ UiApp::~UiApp() {
     memory_heatmap_panel_.shutdown();
     byte_viz_panel_.shutdown();
     timeline_panel_.shutdown();
+    shutdown_call_galaxy();
     reference_scanner_.cancel(&reference_index_);
     binary_diff_panel_.invalidate();
     decompile_controller_.shutdown();
@@ -1118,6 +1121,10 @@ void UiApp::process_deferred_gpu_work() {
             graph_revision_ = model_.edit_revision();
             graph_pan_ = {};
             graph_zoom_ = 1.0f;
+            call_galaxy_.dirty = true;
+            if (call_galaxy_.enabled) {
+                return;
+            }
             SymbolRecord root_for_extent = root;
             if (root.virtual_address) {
                 root_for_extent.file_offset = img->virtual_address_to_file_offset(*root.virtual_address);
@@ -1206,6 +1213,7 @@ void UiApp::process_deferred_gpu_work() {
         byte_viz_panel_.cancel_and_reset();
         memory_search_panel_.reset_for_new_target();
         timeline_panel_.cancel_and_reset();
+        cancel_and_reset_call_galaxy();
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
         decompile_cache_.clear();

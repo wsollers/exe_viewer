@@ -200,7 +200,7 @@ Projects also preserve navigation history, ARM/Thumb mode, debug-symbol paths, a
 
 ### 2.4 Panel directory
 
-All 36 workspace panels are listed below. Open them through **View**; **Navigate > Symbols** opens **Functions & Names**, and **Navigate > Structure** opens the tree rather than the typed **Structure View**.
+All 38 workspace panels are listed below. Open them through **View**; **Navigate > Symbols** opens **Functions & Names**, and **Navigate > Structure** opens the tree rather than the typed **Structure View**.
 
 | Panel | What to use it for |
 |---|---|
@@ -209,8 +209,9 @@ All 36 workspace panels are listed below. Open them through **View**; **Navigate
 | Details | Read the selected object's location, fields, and available symbol/debug information. |
 | Sections | Compare section addresses, file ranges, sizes, permissions, and entropy; select a section to inspect its bytes. |
 | Hex View | Inspect bytes and ASCII, select ranges, copy hex, and stage static edits. |
+| Entropy & Digram | GPU/CPU 2D Hilbert/linear byte-entropy map and $256 \times 256$ Cantor-dust adjacent-byte digram plot with diff/patch/string overlays. |
 | Disassembly | Follow decoded instructions and targets; select ARM **Thumb mode** when needed. |
-| Flow Graph | Explore function control flow or calls; find, pan, zoom, and reposition nodes. |
+| Flow Graph | Explore function control flow, call fan-out, or interactive **`GPU Galaxy`** whole-binary/CFG Barnes-Hut force layouts. |
 | Functions | Filter functions by name/address and origin, then navigate to their code. |
 | Functions & Names | Search symbols and names; use **Functions only** and demangling filters. |
 | Imports | Filter by library or symbol and inspect imported addresses, ordinals, and delay-load entries. |
@@ -230,13 +231,14 @@ All 36 workspace panels are listed below. Open them through **View**; **Navigate
 | Scripting | Run sandboxed Lua analysis or explicitly permitted transactions. |
 | Binary Diff | Compare files or live module memory against disk and inspect matched functions and changed bytes. |
 | Memory Map | Browse process regions/modules, memory usage charts, protection flags, and address ranges. |
+| Memory Heatmap | GPU/CPU 2D Hilbert or linear live RAM residency, soft-dirty page delta watcher, and RWX/allocator tile map. |
 | Process Internals | Inspect handles/file descriptors, sockets, and security state. |
 | Threads & Stack | Select threads, inspect stack bytes/call frames/registers, and refresh context. |
 | Thread Locals | Inspect TLS metadata, variables, and available thread-specific slots. |
 | Memory Search | Search bytes, numeric values, and text in a file or selected process scope. |
 | PEB / TEB & Flags | Run the security audit and inspect header flags, process blocks, and thread blocks. |
 | Handlers | Filter recovered handlers and inspect available Linux signal dispositions. |
-| Execution Timeline | Capture snapshot deltas and inspect per-thread or chronological events. |
+| Execution Timeline | Tracy-style GPU-instanced thread swimlanes, live thread state/IP monitor, and snapshot/debug event stream. |
 | Debugger | Control an opt-in session, breakpoints/watchpoints, registers, stack, and debug events. |
 | Decompiler | Select a backend, configure it, and inspect address-linked output. |
 | Log | Read timestamped load, analysis, backend, and error diagnostics. |
@@ -332,22 +334,41 @@ In **Disassembly**, use Up/Down to move between instructions and Enter or double
 
 ![Disassembly and linked hex view](screenshots/disassembly-hex.png)
 
-### 5.2 Interactive `Flow Graph` (Call Fan-Out & Basic-Block CFG)
+### 5.2 2D Byte-Entropy & Cantor-Dust Minimap (`Entropy & Digram`)
+
+Open **Entropy & Digram** (**View > Entropy & Digram**) to triage packed, compressed, encrypted, machine-code, ASCII/UTF-16 string, and zero-padded regions across an entire image or selected section without scrolling megabytes of hex:
+
+1. **Spatial 2D Byte Map (`Hilbert` vs. `Linear`)**:
+   - Unfolds contiguous file or live-module bytes along a locality-preserving **2D Hilbert curve** (keeping adjacent bytes spatially clustered) or **Linear** row-major strips.
+   - Switch **Color Mode** between **Shannon Entropy** ($0.0\text{–}8.0$ bits/byte), **Byte Class** (nulls, printable ASCII, low control bytes, high bytes), and **Chi-Square Randomness** (distinguishing compressed/encrypted payloads from high-entropy native code).
+   - Toggle **Overlays** to highlight staged patches, extracted strings, cross-reference targets, and active **Binary Diff** modified/added ranges directly on the map.
+2. **$256 \times 256$ Adjacent-Byte Digram ("Cantor Dust")**:
+   - Plots log-normalized transition density $(b_i, b_{i+1})$ across the active byte window (`Whole Binary`, `Selected Section`, or `Hex Viewport`), instantly revealing x86/ARM opcode lattices, UTF-16 alternating zero lanes, ASCII text squares, or uniform cryptographic noise.
+3. **Interactive Navigation**:
+   - Scroll the mouse wheel to zoom around the cursor, middle-drag (or background-drag) to pan, hover any tile to inspect exact offset/VA, section name, entropy, and byte-class breakdown, and left-click to jump **Hex View** and **Disassembly** directly to that block. When Vulkan compute is unavailable, rendering falls back automatically to the deterministic CPU rasterizer.
+
+### 5.3 Interactive `Flow Graph` — Graphviz CFG/Calls & `GPU Galaxy`
 
 Open **Flow Graph** (**Analyze > Call graph** or press **`Space`** inside **Disassembly**):
 
-- **Modes**: Choose **Calls** to inspect loaded entry/export call relationships (including resolved PE CRT->`main`/`WinMain`, PDB symbols, and ELF `_start -> __libc_start_main -> main` + GOT/PLT targets) or switch to **Control flow** to view basic blocks, fallthroughs, true/false conditional edges, and recovered switch jump-table edges.
-- **Canvas Controls**:
-  - **Mouse Wheel**: Smooth zoom around cursor (`Fit`, `100%`, and **Reset cards** buttons in toolbar).
-  - **Middle-Mouse Drag** (or background drag): Pan across the canvas.
-  - **Left-Click / Drag Node Card**: Select block (synchronizing **Hex View**, **Disassembly**, and **Details**) or reposition cards interactively with live edge rerouting.
-  - **`Up` / `Down` & `Enter`** (or double-click): Walk instructions/nodes and dive into direct branch/call targets; use **`Alt+Left`** (`Backspace`) to pop back.
-
-Use **Find node** to search function names, **Image overview** for the image graph, **Reload** to refresh, and **Reset cards** to restore card positions. **Callers / Callees (current graph)** lists relationships in the displayed graph.
+1. **Hierarchical Graphviz Modes (`Control flow` & `Calls`)**:
+   - Choose **Calls** to inspect entry/export call relationships (including resolved PE CRT->`main`/`WinMain`, PDB symbols, and ELF `_start -> __libc_start_main -> main` + GOT/PLT targets) or **Control flow** to view basic blocks, fallthroughs, true/false conditional edges, and recovered switch jump-table edges.
+   - If Graphviz `dot` is not installed or times out on a large function, click the **Switch to GPU Galaxy** button in the banner to render immediately on the built-in GPU force-layout engine without external tools.
+2. **Whole-Binary & CFG `GPU Galaxy` Force Layout**:
+   - Select the **`GPU Galaxy`** radio button to explore $10,000+$ functions and $50,000+$ call/tail-jump edges smoothly via an $O(N \log N + E)$ Barnes-Hut quadtree solver (`BarnesHutGalaxyLayout`) and Vulkan instanced SDF edge/node pipelines:
+     - **Scope**: Switch between **Whole-Binary Call Galaxy**, **Active Function CFG**, and **Active Symbol Fanout**.
+     - **Color By**: Overlay **Origin / Section**, **Entry Reachability** (`EntryPoint`, `ReachableFromEntry`, `UnreachableInternal`, `ExternalImport`), **Security Findings** (`SecurityAudit` rule severity per function), **Binary Diff** (`Unchanged`, `Relocated`, `Modified`, `Added`, `Removed`), or **Call Degree Heat**.
+     - **Progressive Layout Controls**: Toggle **Play / Pause Layout**, click **Reheat** to re-anneal node positions, or **Fit** to frame the graph.
+     - **Spotlight & Shortest Call Path**: Selecting a node highlights its **1-hop callers & callees** while dimming unrelated clusters; click **Trace Entry -> Selected** to run a directed BFS and highlight the exact shortest call chain from an entry point to the selected function.
+3. **Canvas & Node Interaction**:
+   - **Mouse Wheel**: Cursor-anchored `ViewportCamera2D` zoom (`Fit` and `100%` buttons in toolbar).
+   - **Left-Drag on Background / Middle-Drag**: Pan across the canvas.
+   - **Left-Drag on a Node**: Pin and reposition a node interactively (`GPU Galaxy` keeps pinned nodes anchored while neighboring clusters relax around them; Graphviz mode reroutes splines live).
+   - **Search, Double-Click & Context Menu**: Filter functions via **Find node**, hover for a rich tooltip (demangled name, VA, size, in/out degree, reachability, security/diff badges), **double-click** a node to jump **Disassembly** / **Hex View** / **Decompiler**, or **right-click** any node to open the universal `InspectableEntity` context menu.
 
 ![Flow graph](screenshots/flow-graph.png)
 
-### 5.3 Decompilation (`F5`) — Built-In Pseudo-C vs. Persistent Headless Ghidra
+### 5.4 Decompilation (`F5`) — Built-In Pseudo-C vs. Persistent Headless Ghidra
 
 Select any function or instruction and press **`F5`** (**Navigate > Decompile selection**):
 
@@ -570,7 +591,17 @@ Open **Memory Map** (**View > Memory Map**) for a complete virtual & physical fo
 
 Use **Exec**, **Write**, **Modules**, and the region text filter to narrow the map. **Clear Chart Filters** removes a chart selection. **Refresh** updates the map; unavailable memory statistics remain marked rather than treated as zero.
 
-### 10.3 Bounded Endian-Aware `Memory Search`
+### 10.3 Live RAM, Dirty-Page & Allocator 2D Hilbert Heatmap (`Memory Heatmap`)
+
+Open **Memory Heatmap** (**View > Memory Heatmap**) to inspect page-level physical residency, write activity, and protection anomalies across a process or crash dump on an interactive 2D canvas:
+
+- **Hilbert vs. Linear Layout**: Unfolds virtual memory pages along a **2D Hilbert curve** (preserving 2D spatial locality across neighboring pages and allocations) or **Linear** address rows.
+- **Page-Level Residency & Dirty-Page Watcher**:
+  - Harvests Linux `/proc/<pid>/pagemap` (present in RAM, swapped, file-backed/shared, soft-dirty) or Windows `QueryWorkingSetEx` (`VirtualAttributes` residency, share count, and protection) without modifying target memory.
+  - Enable **Watch Dirty / Poll** (`MemoryHeatmapDeltaTracker`) to highlight pages newly faulted in, written/dirtied, or whose permissions transitioned (such as **`RW- -> RWX`** JIT/unpacking transitions) between refreshes.
+- **Color Modes & Click-to-Navigate**: Color tiles by **Residency & Dirty Delta**, **Protection (`RX` / `RW-` / `RWX` / Guard)**, or **Allocator Category (`Image` / `Heap` / `Stack` / `Mapped` / `Anon`)**. Wheel-zoom, pan, hover any tile for page VA, owning module/TID, and residency flags, and click to jump **Hex View** / **Memory Map** directly to that page.
+
+### 10.4 Bounded Endian-Aware `Memory Search`
 
 Open **Memory Search** (**Edit > Memory Search** or **Navigate > Memory Search**):
 
@@ -580,7 +611,7 @@ Open **Memory Search** (**Edit > Memory Search** or **Navigate > Memory Search**
 
 For static files, the scope is **Static Binary Image**. Enter a query and click **Search** or press Enter. Check the report’s scanned/skipped regions and limits before treating an empty result as exhaustive.
 
-### 10.4 `Process Internals`, `Threads & Stack`, `Thread Locals`, `PEB / TEB` & `Handlers`
+### 10.5 `Process Internals`, `Threads & Stack`, `Thread Locals`, `PEB / TEB` & `Handlers`
 
 - **Process Internals** (**Navigate > Process Internals**):
   - **Handles / FDs**: Open files, directories, pipes, `memfd`, `anon_inode` (`epoll`/`eventfd`), devices, registry keys, and sync objects with flags/offsets and filter combos.
@@ -591,16 +622,18 @@ For static files, the scope is **Static Binary Image**. Enter a query and click 
 
 Select a thread before inspecting **Stack View (Highlighted)**, **Call Frames**, or **Registers & Flags**. Use **Refresh Threads & Context** and **Refresh TLS** after the process changes. Thread pause/resume requires OS support and permission. Handler recovery can be partial; Linux signal masks identify caught/ignored/blocked signals without necessarily revealing handler addresses.
 
-### 10.5 Timestamped `ProcessStateSnapshot`, `SnapshotDiff` & Multi-Thread `Execution Timeline`
+### 10.6 Timestamped `ProcessStateSnapshot`, `SnapshotDiff`, GPU `Execution Timeline` & `Live Thread Monitor`
 
 Track how a live or debugged process evolves over time without losing uncertainty or sampling boundaries:
 
 1. **Point-in-Time `ProcessStateSnapshot` & `SnapshotDiff`**:
    - Capture timestamped snapshots from **Executable Settings** (`Capture Snapshot`) and compare any two revisions sharing the same `TargetInstanceId` (PID reuse across distinct process instances is rejected automatically).
    - `SnapshotDiff` surfaces loaded/unloaded modules, added/removed/split/merged virtual memory regions and **new `RWX` protection transitions**, created/exited threads + stack-pointer shifts, opened/closed handles & FDs (**detecting FD number reuse** when kernel object identity changes), and socket state transitions—propagating partial-capture uncertainty honestly rather than reporting false removals.
-2. **Multi-Thread `Execution Timeline` Swimlanes**:
-   - Open **Execution Timeline** (**View > Execution Timeline**) to inspect a chronological + per-thread swimlane view merging `IDebugSession` stop/breakpoint/watchpoint/signal/module events with `SnapshotDiff` deltas.
-   - **Honest Loss & Gap Markers**: Intervals between polled snapshots render explicit **`SamplingGap`** bands, and ring-buffer overflows render **`DroppedEvents`** markers so analysts never mistake unrecorded intervals for target inactivity. Click any event marker to jump **Disassembly**, **Hex View**, or **Threads & Stack** to its thread and instruction address.
+2. **Tracy-Style GPU `Execution Timeline` & Read-Only `Live Thread Monitor`**:
+   - Open **Execution Timeline** (**View > Execution Timeline**) and select **GPU Swimlanes** (alongside **Classic Swimlanes** and **Chronological Event Stream**) to render thousands of thread execution spans and debug/snapshot markers via Vulkan instanced SDF swimlanes (`TimelineViewportModel`):
+     - **Nanosecond-to-Hour Zoom & Multi-LOD Coalescing**: Mouse-wheel zoom smoothly around the cursor from nanosecond instruction stops out to multi-hour session overviews; sub-pixel bursts coalesce automatically into high-density LOD summary bars with event counts.
+     - **Read-Only `Live Thread Monitor`**: Toggle **Monitor Threads** on any attached `IProcessSession` to sample per-thread execution state (`Running`, `Sleeping/Waiting`, `Stopped`), instruction pointer + resolved symbol, CPU delta, and OS wait reason at a configurable millisecond cadence on a background `std::jthread`—without injecting breakpoints or `ptrace` traps.
+   - **Honest Loss & Gap Markers**: Unsampled intervals render explicit hatched **`SamplingGap`** bands, and ring-buffer overflows render **`DroppedEvents`** markers so analysts never mistake unrecorded intervals for target inactivity. Click any span or event marker to jump **Disassembly**, **Hex View**, or **Threads & Stack** to its thread and instruction address.
 
 ---
 

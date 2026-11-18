@@ -1,12 +1,15 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -33,7 +36,11 @@
 #include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
+#include "graph/call_graph_galaxy.hpp"
 #include "symbols/symbol_index.hpp"
+#include "vulkan/gpu_offscreen_canvas.hpp"
+#include "vulkan/shaders/call_galaxy_spirv.hpp"
+#include "vulkan/viewport_camera_2d.hpp"
 #include "vulkan/vulkan_manager.h"
 
 namespace viewer {
@@ -295,6 +302,95 @@ namespace viewer {
         std::string call_graph_status_;
         char graph_search_[128] = {};
         std::filesystem::path loaded_call_graph_bmp_;
+
+        enum class GalaxyScopeMode : std::uint8_t {
+            WholeBinary = 0,
+            ActiveFunctionCfg = 1,
+            ActiveSymbolFanout = 2,
+        };
+
+        struct GalaxyPinCommand {
+            std::uint32_t node_index{0u};
+            bool pinned{true};
+            float world_x{0.0f};
+            float world_y{0.0f};
+        };
+
+        struct CallGalaxyUiState {
+            bool enabled = false;
+            GalaxyScopeMode scope = GalaxyScopeMode::WholeBinary;
+            GalaxyColorMode color_mode = GalaxyColorMode::OriginAndSection;
+            bool ego_spotlight = true;
+            bool show_labels = true;
+            bool layout_playing = true;
+
+            CallGalaxyGraph graph{};
+            std::optional<CallGraph> cached_unrendered_graph{};
+            bool dirty = true;
+            bool fit_requested = true;
+            bool was_ref_scanning = false;
+            std::uint64_t built_file_generation = 0u;
+            std::uint64_t built_ref_revision = 0u;
+            std::uint64_t built_symbol_revision = 0u;
+            std::uint64_t built_edit_revision = 0u;
+            std::uint64_t built_diff_revision = 0u;
+            std::size_t built_security_finding_count = 0u;
+            std::optional<std::uint64_t> built_root_va{};
+            GalaxyScopeMode built_scope = GalaxyScopeMode::WholeBinary;
+
+            ViewportCamera2D camera{};
+            std::vector<float> ui_pos_x{};
+            std::vector<float> ui_pos_y{};
+            std::vector<std::uint8_t> ui_pinned{};
+            BarnesHutStepResult last_stats{};
+            std::uint32_t ui_total_iterations = 0u;
+            bool layout_converged = false;
+            std::optional<std::uint32_t> hovered_node{};
+            std::optional<std::uint32_t> selected_node{};
+            std::optional<std::uint32_t> dragged_node{};
+            bool drag_moved = false;
+            ImVec2 drag_start_mouse{};
+            GalaxyEgoMask ego_mask{};
+            GalaxyCallPath highlighted_path{};
+            std::string trace_status{};
+            std::optional<std::uint32_t> context_node{};
+            InspectableEntity context_entity{};
+
+            std::mutex worker_mutex{};
+            std::condition_variable_any worker_cv{};
+            std::uint64_t worker_generation = 0u;
+            std::optional<CallGalaxyGraph> pending_seed_graph{};
+            BarnesHutLayoutConfig pending_seed_config{};
+            std::vector<GalaxyPinCommand> pending_pin_commands{};
+            bool pending_reheat = false;
+            bool pending_unpin_all = false;
+            bool worker_playing = true;
+            std::uint64_t published_generation = 0u;
+            std::uint64_t published_seq = 0u;
+            std::uint64_t consumed_seq = 0u;
+            std::vector<float> published_pos_x{};
+            std::vector<float> published_pos_y{};
+            std::vector<std::uint8_t> published_pinned{};
+            BarnesHutStepResult published_stats{};
+            std::uint32_t published_total_iterations = 0u;
+            bool published_converged = false;
+            std::jthread worker{};
+
+            GpuOffscreenCanvas canvas{};
+            GpuHostRingBuffer edge_ring{};
+            GpuHostRingBuffer node_ring{};
+            GpuGraphics2DPipeline edge_pipeline{};
+            GpuGraphics2DPipeline node_pipeline{};
+            bool canvas_initialized = false;
+            bool pipelines_attempted = false;
+            bool needs_gpu_record_this_frame = false;
+            GalaxyRenderBatch current_batch{};
+            shaders::CallGalaxyPushConstants pending_push_constants{};
+            std::vector<std::uint8_t> cpu_rgba8_scratch{};
+            std::string gpu_status{};
+        };
+
+        CallGalaxyUiState call_galaxy_{};
         std::vector<Instruction> current_instructions_;
         struct DisassemblyLocation {
             std::uint64_t file_offset;
@@ -333,6 +429,19 @@ namespace viewer {
         void refresh_process_list();
         void sync_live_process_view(bool navigate_to_entry);
         void render_call_graph_panel();
+        void render_call_galaxy_view();
+        void ensure_call_galaxy_worker_started();
+        void call_galaxy_worker_loop(std::stop_token stop_token);
+        void rebuild_call_galaxy_if_needed(float viewport_w, float viewport_h);
+        void fit_call_galaxy_camera(float viewport_w, float viewport_h) noexcept;
+        void select_call_galaxy_node(std::uint32_t node_index, bool navigate_views);
+        [[nodiscard]] CallGalaxyBuildOptions current_call_galaxy_overlay_options(
+            std::vector<peelf::ByteVizDiffRange>& diff_scratch) const;
+        [[nodiscard]] std::optional<CallGraph> build_scoped_call_graph_for_galaxy(
+            GalaxyScopeMode scope);
+        void record_call_galaxy_pre_pass(VkCommandBuffer cmd, std::size_t frame_index);
+        void cancel_and_reset_call_galaxy() noexcept;
+        void shutdown_call_galaxy() noexcept;
         void load_call_graph_sample(CallGraphSample sample);
         void queue_call_graph_sample(CallGraphSample sample);
         void load_call_graph_from_graph(CallGraph graph, const std::filesystem::path& output_name);

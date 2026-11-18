@@ -35,9 +35,9 @@ flowchart LR
 ```
 
 ### Target Boundary Invariants
-- **`peelf_core` (`libs/peelf_core`)**: Zero ImGui, GLFW, or Vulkan dependencies. Uses `peelf::Result<T> = std::expected<T, peelf::Error>` across API boundaries (`peelf/error.hpp`), forgiving `ForgivingValue<T>` / `SubsystemStatus` (`peelf/forgiving.hpp`), and first-class `TargetCapabilityMatrix` + `Observed<T>` provenance (`peelf/target_capabilities.hpp`, `WU-21`). Image parsing is modularized behind `<peelf/binary_image.hpp>` into `binary_image.cpp` (dispatch & container slice selection), `image_mapping.cpp` (`ImageBase` VA/RVA <-> file-offset mapping & live PE normalization), `pe_image.cpp` (`PeImage`), `elf_image.cpp` (`ElfImage` with explicit `parse_warnings()`), and `macho_image.cpp` (`MachOImage` + Universal `FAT_MAGIC`/`FAT_CIGAM_64`, `WU-26`). Also hosts `ExecutableSettings` (`WU-22`), `ProcessStateSnapshot` / `SnapshotDiff` (`WU-23`), `ExecutionTimeline` (`WU-24`), clean-room `GdbRemoteBackend` RSP (`WU-25`), and embedded MIT Lua 5.4.7 `LuaScriptingEngine` (`peelf/scripting.hpp`, `WU-28`).
-- **`peelf_gui` (`apps/viewer`)**: Owns staged RAII `VulkanManager` (`UniqueTexture`) and `Application` (`std::unique_ptr<UiApp>`), `BinaryModel` (`binary_model.cpp` static/patching/scripting core + `binary_model_live.cpp` live/dump/debugger/GDB-RSP sessions), modular `UiApp` (`ui_app.cpp`, `ui_app_project.cpp`, `ui_app_menus_docking.cpp`, `ui_app_process.cpp`, `ui_app_graph.cpp`, `ui_app_navigation.cpp`), pure `DockNodeSpec` `WorkspaceLayout` v9 across 36 dockable panels & capability-aware `ContextActions` + `NavigationRequestQueue` (`WU-27`), `CallGraph` (`call_graph_dot.cpp`, `call_graph_build.cpp`, `call_graph_cfg.cpp`), background UI controllers (`AsyncReferenceScanner`, `AsyncBinaryDiffController`, `DecompileController`, `DecompileCache`, `BinaryModel::AsyncScriptRunner`), Capstone `Disassembler`, DIA/PDB symbol bridge, and `.peproj` v2 session management.
-- **Compiler & Sanitizer Gate**: Project targets compile with `-Wall -Wextra -Wpedantic -Werror` on Clang/GCC and `/W4 /WX /FS` on MSVC (`PEELF_WARNINGS_AS_ERRORS=ON`), while `FetchContent` headers are isolated as `SYSTEM`. All `449/449` CTests pass under `clang18-debug`, `clang18-release`, and `clang18-asan-ubsan` (`AddressSanitizer` + `UndefinedBehaviorSanitizer`).
+- **`peelf_core` (`libs/peelf_core`)**: Zero ImGui, GLFW, or Vulkan dependencies. Uses `peelf::Result<T> = std::expected<T, peelf::Error>` across API boundaries (`peelf/error.hpp`), forgiving `ForgivingValue<T>` / `SubsystemStatus` (`peelf/forgiving.hpp`), and first-class `TargetCapabilityMatrix` + `Observed<T>` provenance (`peelf/target_capabilities.hpp`, `WU-21`). Image parsing is modularized behind `<peelf/binary_image.hpp>` into `binary_image.cpp` (dispatch & container slice selection), `image_mapping.cpp` (`ImageBase` VA/RVA <-> file-offset mapping & live PE normalization), `pe_image.cpp` (`PeImage`), `elf_image.cpp` (`ElfImage` with explicit `parse_warnings()`), and `macho_image.cpp` (`MachOImage` + Universal `FAT_MAGIC`/`FAT_CIGAM_64`, `WU-26`). Also hosts `ExecutableSettings` (`WU-22`), `ProcessStateSnapshot` / `SnapshotDiff` (`WU-23`), `ExecutionTimeline` (`WU-24`), clean-room `GdbRemoteBackend` RSP (`WU-25`), embedded MIT Lua 5.4.7 `LuaScriptingEngine` (`peelf/scripting.hpp`, `WU-28`), and pure C++23 visualization models + deterministic CPU RGBA8 reference rasterizers for `MemoryHeatmap` (`peelf/memory_heatmap.hpp`, `WU-30`), `ByteViz` (`peelf/byte_viz.hpp`, `WU-31`), and `TimelineViewport` + `LiveThreadMonitor` (`peelf/timeline_viewport.hpp`, `WU-32`).
+- **`peelf_gui` (`apps/viewer`)**: Owns staged RAII `VulkanManager` (`UniqueTexture`, `GpuOffscreenCanvas`, `GpuHostRingBuffer`, `GpuComputePipeline`, `GpuGraphics2DPipeline`, `ViewportCamera2D`, and compile-time `validate_spirv_words`, `WU-29`) and `Application` (`std::unique_ptr<UiApp>`), `BinaryModel` (`binary_model.cpp` static/patching/scripting core + `binary_model_live.cpp` live/dump/debugger/GDB-RSP sessions), modular `UiApp` (`ui_app.cpp`, `ui_app_project.cpp`, `ui_app_menus_docking.cpp`, `ui_app_process.cpp`, `ui_app_graph.cpp`, `ui_app_navigation.cpp`), pure `DockNodeSpec` `WorkspaceLayout` v11 across 38 dockable panels & capability-aware `ContextActions` + `NavigationRequestQueue` (`WU-27`), `CallGraph` (`call_graph_dot.cpp`, `call_graph_build.cpp`, `call_graph_cfg.cpp`) + `CallGalaxyGraph` / `BarnesHutGalaxyLayout` (`call_graph_galaxy.*`, `WU-33`), background UI controllers (`AsyncReferenceScanner`, `AsyncBinaryDiffController`, `DecompileController`, `DecompileCache`, `BinaryModel::AsyncScriptRunner`), Capstone `Disassembler`, DIA/PDB symbol bridge, and `.peproj` v2 session management.
+- **Compiler, Lint & Sanitizer Gate**: Project targets compile with `-Wall -Wextra -Wpedantic -Werror` on Clang/GCC and `/W4 /WX /FS` on MSVC (`PEELF_WARNINGS_AS_ERRORS=ON`), pass `clang-tidy-18` (`WarningsAsErrors: '*'`), and isolate `FetchContent` headers as `SYSTEM`. All `543/543` CTests pass under `clang18-debug`, `clang18-release`, and `clang18-asan-ubsan` (`AddressSanitizer` + `UndefinedBehaviorSanitizer` + `LeakSanitizer`).
 
 ---
 
@@ -123,7 +123,7 @@ flowchart LR
 
 Panels communicate through `ViewerSelection` (`apps/viewer/src/navigation/viewer_navigation.hpp`) and deferred `NavigationRequestQueue` (`apps/viewer/src/ui/context_actions.hpp`) rather than mutating peer panels or Dear ImGui tables mid-iteration.
 
-- **Pure `DockNodeSpec` Workspace Engine (`workspace_layout.*`)**: Defines 5 deterministic `WorkspacePreset`s (*Static Reverse Engineering*, *Live Process / VMMap*, *Debugger*, *Binary Diff*, *Minimal*) over all 36 `WorkspacePanelId` windows (`kWorkspaceLayoutSchemaVersion = 9`), validated independent of ImGui/Vulkan for split-ratio bounds, non-duplicate leaf assignments, and active-tab determinism.
+- **Pure `DockNodeSpec` Workspace Engine (`workspace_layout.*`)**: Defines 5 deterministic `WorkspacePreset`s (*Static Reverse Engineering*, *Live Process / VMMap*, *Debugger*, *Binary Diff*, *Minimal*) over all 38 `WorkspacePanelId` windows (`kWorkspaceLayoutSchemaVersion = 11`), validated independent of ImGui/Vulkan for split-ratio bounds, non-duplicate leaf assignments, and active-tab determinism.
 - **Capability-Aware Universal Context Menus (`context_actions.*`)**: `evaluate_context_actions` inspects `InspectableEntity` + `TargetCapabilityMatrix` to enable/disable `Copy VA / File Offset / Label / JSON Summary`, `Follow in Hex / Disassembly / Decompiler / Structure View`, `Add Bookmark`, and `Toggle Software Breakpoint` with explicit unavailable reasons, queuing navigation mutations for safe post-frame execution.
 
 ```mermaid
@@ -179,30 +179,45 @@ flowchart TD
 
 ---
 
-## 6. Vulkan 2-Frames-in-Flight Rendering Loop (`WU-18`)
+## 6. Vulkan 2-Frames-in-Flight & Pre-Swapchain GPU Visualization Architecture (`WU-18`, `WU-29..WU-33`)
 
-`VulkanManager` (`apps/viewer/src/vulkan/vulkan_manager.*`) decouples CPU ImGui frame preparation from GPU presentation using `kMaxFramesInFlight = 2`:
+`VulkanManager` (`apps/viewer/src/vulkan/vulkan_manager.*`) decouples CPU ImGui frame preparation from GPU presentation using `kMaxFramesInFlight = 2`, and executes registered offscreen compute and instanced 2D render passes (`register_pre_pass_recorder`) on the same frame command buffer immediately **before** the swapchain ImGui render pass—yielding zero extra queue submissions and zero 1-frame texture lag:
 
 ```mermaid
 flowchart LR
-    glfw["GLFW Window Events<br/>Resize + Minimize Guard"]
-    fence["Wait Frame Fence<br/>frame_index in 0..1"]
-    acq["vkAcquireNextImageKHR<br/>image_available_sem[frame]"]
-    cmd["Reset Pool + Record ImGui<br/>command_buffer[frame]"]
-    sub["vkQueueSubmit<br/>render_finished_sem[image_idx]"]
-    pres["vkQueuePresentKHR<br/>Swapchain Recreate on OutOfDate"]
+    cam["ViewportCamera2D<br/>double World -> float32 Rel"]
+    models["Headless C++23 Models<br/>Heatmap · ByteViz · Timeline · Galaxy"]
+    ring["GpuHostRingBuffer<br/>Per-Frame SSBO / Instances"]
+    comp["GpuComputePipeline<br/>memory_heatmap · byte_viz"]
+    inst["GpuGraphics2DPipeline<br/>timeline_span · galaxy_edge/node"]
+    cpu["CPU RGBA8 Fallback<br/>Headless Tests & No-Compute"]
+    canvas["GpuOffscreenCanvas<br/>Ping-Pong VkImage[0..1]"]
+    barrier["Pipeline Barrier<br/>SHADER_READ_ONLY_OPTIMAL"]
+    imgui["Swapchain RenderPass<br/>ImGui::Image + Overlays"]
 
-    glfw --> fence
-    fence --> acq
-    acq --> cmd
-    cmd --> sub
-    sub --> pres
-    pres -->|"next frame (frame + 1) % 2"| fence
+    cam --> models
+    models --> ring
+    ring --> comp
+    ring --> inst
+    comp --> canvas
+    inst --> canvas
+    models -.->|"!can_use_compute/graphics()"| cpu
+    cpu -.-> canvas
+    canvas --> barrier
+    barrier --> imgui
 ```
 
-- Each in-flight frame (`0` and `1`) owns an isolated `VkCommandPool`, `VkCommandBuffer`, `image_available` `VkSemaphore`, and `in_flight` `VkFence`.
-- `render_finished` semaphores are indexed by acquired **swapchain `image_index`** rather than `frame_index` so semaphore reuse stays hazard-free under Vulkan validation layers across triple-buffered swapchains.
-- Minimized zero-extent windows (`width == 0 || height == 0`) pause acquisition cleanly, and `VK_ERROR_OUT_OF_DATE_KHR` / `VK_SUBOPTIMAL_KHR` trigger `recreate_swapchain()` + `ImGui_ImplVulkan_SetMinImageCount()`.
+### Frame Synchronization & Offscreen Primitives (`WU-18`, `WU-29`)
+- **2-Frames-in-Flight Hazards Eliminated**: Each in-flight slot (`frame_index` in `0..1`) owns an isolated `VkCommandPool`, `VkCommandBuffer`, `image_available` `VkSemaphore`, and `in_flight` `VkFence`, while `render_finished` semaphores are indexed by acquired **swapchain `image_index`**. Minimized zero-extent windows (`width == 0 || height == 0`) pause acquisition cleanly, and `VK_ERROR_OUT_OF_DATE_KHR` / `VK_SUBOPTIMAL_KHR` trigger `recreate_swapchain()`.
+- **`GpuOffscreenCanvas` & `GpuHostRingBuffer` (`gpu_offscreen_canvas.*`)**: Allocates per-frame `VK_FORMAT_R8G8B8A8_UNORM` images usable as storage images (`VK_IMAGE_USAGE_STORAGE_BIT`), color attachments (`VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT`), and sampled ImGui `VkDescriptorSet`s, paired with persistently mapped `HOST_VISIBLE | HOST_COHERENT` per-frame ring slices so streaming `100k+` instances never blocks an in-flight GPU frame.
+- **Double-Precision `ViewportCamera2D` (`viewport_camera_2d.hpp`)**: Maintains pan/zoom in `double` world coordinates (covering 64-bit virtual addresses and multi-hour nanosecond timestamps without float32 mantissa jitter) and projects visible primitives into camera-relative `float32` pixel coordinates before GPU upload.
+- **Compile-Time SPIR-V Validation & Deterministic CPU Fallback**: Every embedded GLSL 450 shader (`apps/viewer/src/vulkan/shaders/*.glsl` -> constexpr `uint32_t` arrays) is verified by `spirv-val` (`vulkan1.0`) and `static_assert(viewer::validate_spirv_words(...))` (`spirv_validation.hpp`), with `static_assert(sizeof(PushConstants) <= 128)`. Every GPU visualization shares an exact pure-C++23 RGBA8 reference rasterizer used both by headless GoogleTests and automatically at runtime when a Vulkan device lacks storage-image compute or offscreen graphics support.
+
+### Wave 3 Visualization Data-Flow (`WU-30 .. WU-33`)
+- **`WU-30` — `Memory Heatmap` (`peelf/memory_heatmap.hpp`, `memory_heatmap.comp.glsl`)**: Harvests Linux `/proc/<pid>/pagemap` + `/proc/<pid>/smaps` or Win32 `VirtualQueryEx` + `QueryWorkingSetEx` into compact 16-byte `MemoryTileGpu` SSBO records, tracks residency/soft-dirty/permission deltas in `MemoryHeatmapDeltaTracker`, and dispatches an $8 \times 8$ compute grid unfolding tiles along order-1..8 2D Hilbert curves or linear rows.
+- **`WU-31` — `Entropy & Digram` (`peelf/byte_viz.hpp`, `byte_entropy_map.comp.glsl`, `byte_digram.comp.glsl`)**: Computes multi-resolution Shannon entropy, byte-class ratios, chi-square randomness, diff/patch/xref bitmasks, and $256 \times 256$ adjacent-byte transition matrices (`ByteVizDigramMatrix`), dispatching two compute pipelines into side-by-side offscreen canvases.
+- **`WU-32` — `Execution Timeline` & `LiveThreadMonitor` (`peelf/timeline_viewport.hpp`, `timeline_span.{vert,frag}.glsl`)**: Background `LiveThreadMonitor` (`std::jthread` + `std::stop_token`) polls read-only `IProcessSession` thread states/IPs/wait reasons into `ExecutionTimeline`; `TimelineViewportModel` coalesces sub-pixel bursts into LOD spans and streams 32-byte `TimelineSpanGpuInstance` records (`VK_VERTEX_INPUT_RATE_INSTANCE`) through an anti-aliased SDF rounded-box pass with hatched `SamplingGap` bands.
+- **`WU-33` — `Flow Graph` `GPU Galaxy` (`call_graph_galaxy.*`, `galaxy_edge.{vert,frag}.glsl`, `galaxy_node.{vert,frag}.glsl`)**: Builds whole-binary (`10,000+` functions, `50,000+` call/tail-jump edges with entry-reachability BFS, `SecurityAuditReport` severity, and `BinaryDiffReport` overlays) or `CallGraph` CFG/fanout galaxies; steps a progressive background `std::jthread` $O(N \log N + E)$ `BarnesHutGalaxyLayout` quadtree solver (`kMaxQuadtreeDepth = 24`, cooperative `std::stop_token`, interactive node pinning); and records two instanced 2D passes (oriented tapered-alpha SDF edges followed by degree-scaled SDF discs with selection/ego/shortest-path halos) underneath crisp ImGui node labels.
 
 ---
 
@@ -213,7 +228,7 @@ flowchart LR
     matrix["bin-matrix/ + Malformed Matrix<br/>PE + ELF + Mach-O/FAT + Dumps"]
     presets["CMake Presets<br/>Clang 18 + ASan/UBSan + MSVC 2022"]
     gates["Compile Gates<br/>-Werror + /W4 /WX /FS + clang-tidy-18"]
-    ctest["CTest Suite<br/>449 / 449 Unit & Integration Tests"]
+    ctest["CTest Suite<br/>543 / 543 Unit & Integration Tests"]
     headless["peelf_viewer --headless<br/>JSON + SARIF 2.1.0 + --script"]
     gha[".github/workflows/ci.yml<br/>Ubuntu 24.04 + Windows 2022"]
 
