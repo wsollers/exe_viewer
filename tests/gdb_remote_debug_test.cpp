@@ -1258,5 +1258,118 @@ TEST(GdbRemoteDebugTest, BinaryModelRemoteAttachAndExecutionTimelineFlow) {
     EXPECT_TRUE(saw_exit);
 }
 
+TEST(GdbRemoteDebugTest, ClientInjectedSoftwareTrapStepsOffOnContinueAndUsesSortedGFallback) {
+    auto stub = make_x86_64_stub();
+    // Declare `rip` (regnum=3) BEFORE `rax`/`rbx`/`rsp` in target.xml while the wire `g`/`G`
+    // buffer remains ordered by ascending `regnum` (0, 1, 2, 3, 4).
+    stub->target_xml =
+        "<target version=\"1.0\">"
+        "<architecture>i386:x86-64</architecture>"
+        "<osabi>GNU/Linux</osabi>"
+        "<feature name=\"org.gnu.gdb.i386.core\">"
+        "<reg name=\"rip\" bitsize=\"64\" regnum=\"3\" type=\"code_ptr\"/>"
+        "<reg name=\"rax\" bitsize=\"64\" regnum=\"0\"/>"
+        "<reg name=\"rbx\" bitsize=\"64\" regnum=\"1\"/>"
+        "<reg name=\"rsp\" bitsize=\"64\" regnum=\"2\" type=\"data_ptr\"/>"
+        "<reg name=\"eflags\" bitsize=\"32\" regnum=\"4\"/>"
+        "</feature>"
+        "</target>";
+
+    // Force client-injected `0xCC` (`M` fallback) and `G`-packet register writes (`P` unsupported).
+    stub->z0_unsupported = true;
+    stub->p_write_unsupported = true;
+    stub->set_reg(3u, 0x401000ULL);
+
+    // Byte-accurate x86-64 NOP (0x90) / INT3 (0xCC) execution model:
+    // If `continue_execution()` fails to step off an enabled client-injected `0xCC`, the stub
+    // immediately re-hits `0xCC` at the exact same address forever instead of reaching the next BP.
+    stub->on_resume = [](FakeDebugStubState& s, std::string_view cmd) -> std::optional<std::string> {
+        const bool is_step = cmd.starts_with("vCont;s") || cmd == "s";
+        if (is_step) {
+            const std::uint64_t pc = s.get_reg(3u);
+            const auto insn = s.read_mem(pc, 1u);
+            if (!insn.has_value()) {
+                return std::format("T0bthread:{};", s.active_thread);
+            }
+            s.set_reg(3u, pc + 1u);
+            return std::format("T0503:{};thread:{};",
+                               encode_reg_hex(pc + 1u, 8u, Endianness::Little),
+                               s.active_thread);
+        }
+
+        for (std::size_t steps = 0u; steps < 32u; ++steps) {
+            const std::uint64_t pc = s.get_reg(3u);
+            if (pc >= 0x401008ULL) {
+                return std::string{"W00"};
+            }
+            const auto insn = s.read_mem(pc, 1u);
+            if (!insn.has_value()) {
+                return std::format("T0bthread:{};", s.active_thread);
+            }
+            s.set_reg(3u, pc + 1u);
+            if ((*insn)[0] == 0xCCu) {
+                return std::format("T0503:{};thread:{};",
+                                   encode_reg_hex(pc + 1u, 8u, Endianness::Little),
+                                   s.active_thread);
+            }
+        }
+        return std::string{"T05"};
+    };
+
+    auto opened = GdbRemoteBackend::open_debug(
+        std::make_unique<FakeDebugRspTransport>(stub),
+        ExplicitDebugConsent{.acknowledged_target_mutation = true});
+    ASSERT_TRUE(opened.has_value()) << opened.error().message;
+    auto& dbg = **opened;
+    const ThreadId tid = dbg.stop_status().active_tid;
+    ASSERT_NE(tid, 0u);
+
+    auto bp1 = dbg.add_software_breakpoint(0x401002ULL, "client_sw_bp_1");
+    ASSERT_TRUE(bp1.has_value()) << bp1.error().message;
+    auto bp2 = dbg.add_software_breakpoint(0x401005ULL, "client_sw_bp_2");
+    ASSERT_TRUE(bp2.has_value()) << bp2.error().message;
+
+    // Confirm client injected 0xCC via `M` fallback at both addresses.
+    ASSERT_EQ(stub->read_mem(0x401002ULL, 1u), (std::optional<std::vector<std::uint8_t>>{{0xCCu}}));
+    ASSERT_EQ(stub->read_mem(0x401005ULL, 1u), (std::optional<std::vector<std::uint8_t>>{{0xCCu}}));
+
+    // 1. First continue from 0x401000 hits 0x401002 (`pc` = 0x401003) and rewinds `rip` to 0x401002
+    // via `G` fallback using `regnum`-sorted layout without corrupting `rax`/`rbx`/`rsp`!
+    ASSERT_TRUE(dbg.continue_execution(false).has_value());
+    auto stop1 = dbg.wait_for_stop(std::chrono::milliseconds{500});
+    ASSERT_TRUE(stop1.has_value()) << stop1.error().message;
+    EXPECT_EQ(stop1->instruction_pointer, 0x401002ULL);
+    EXPECT_EQ(stub->get_reg(3u), 0x401002ULL);
+    EXPECT_EQ(stub->get_reg(0u), 0x1111ULL);
+    EXPECT_EQ(stub->get_reg(1u), 0x2222ULL);
+    EXPECT_EQ(stub->get_reg(2u), 0x7fffffffe000ULL);
+    ASSERT_TRUE(stop1->last_event.has_value());
+    EXPECT_EQ(stop1->last_event->kind, debugger::DebugEventKind::BreakpointHit);
+    EXPECT_EQ(stop1->last_event->breakpoint_id, bp1->id);
+
+    // 2. Continuing again while parked on 0x401002 must temporarily restore 0x90, single-step to
+    // 0x401003, re-arm 0xCC at 0x401002, and continue on to hit bp2 at 0x401005!
+    ASSERT_TRUE(dbg.continue_execution(false).has_value());
+    auto stop2 = dbg.wait_for_stop(std::chrono::milliseconds{500});
+    ASSERT_TRUE(stop2.has_value()) << stop2.error().message;
+    EXPECT_EQ(stop2->instruction_pointer, 0x401005ULL);
+    EXPECT_EQ(stub->get_reg(3u), 0x401005ULL);
+    ASSERT_TRUE(stop2->last_event.has_value());
+    EXPECT_EQ(stop2->last_event->kind, debugger::DebugEventKind::BreakpointHit);
+    EXPECT_EQ(stop2->last_event->breakpoint_id, bp2->id);
+    // Trap byte at 0x401002 was re-inserted after stepping off!
+    EXPECT_EQ(stub->read_mem(0x401002ULL, 1u), (std::optional<std::vector<std::uint8_t>>{{0xCCu}}));
+
+    // 3. `step_into` while parked on bp2 (0x401005) steps off 0x401005 cleanly to 0x401006
+    // and re-inserts 0xCC at 0x401005.
+    ASSERT_TRUE(dbg.step_into(tid).has_value());
+    auto stop3 = dbg.wait_for_stop(std::chrono::milliseconds{500});
+    ASSERT_TRUE(stop3.has_value()) << stop3.error().message;
+    EXPECT_EQ(stop3->instruction_pointer, 0x401006ULL);
+    ASSERT_TRUE(stop3->last_event.has_value());
+    EXPECT_EQ(stop3->last_event->kind, debugger::DebugEventKind::SingleStepCompleted);
+    EXPECT_EQ(stub->read_mem(0x401005ULL, 1u), (std::optional<std::vector<std::uint8_t>>{{0xCCu}}));
+}
+
 } // namespace
 } // namespace peelf

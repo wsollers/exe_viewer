@@ -1265,5 +1265,93 @@ TEST(GdbRemoteRspTest, RealLoopbackTcpTransportConnectNegotiateAndReadMemory) {
     server_thread.join();
 }
 
+TEST(GdbRemoteRspTest, UppercaseHexMemoryReadDisambiguatesFromExxErrorsAndClampsTinyPacketSize) {
+    auto stub = std::make_shared<StubSharedState>();
+    // Advertise tiny PacketSize=10 (16 bytes) and configure caller max_packet_size = 16 (< 64)
+    // to exercise std::clamp precondition safety in both parse_qsupported_reply and read_qxfer.
+    stub->qsupported_reply = "PacketSize=10;QStartNoAckMode+;qXfer:features:read+";
+    stub->features_annexes["target.xml"] =
+        "<target version=\"1.0\"><architecture>i386:x86-64</architecture>"
+        "<feature name=\"org.gnu.gdb.i386.core\">"
+        "<reg name=\"rip\" bitsize=\"64\" type=\"code_ptr\" regnum=\"0\"/>"
+        "</feature></target>";
+
+    stub->custom_handler = [](std::string_view cmd) -> std::optional<std::string> {
+        // Valid uppercase hex memory payloads starting with 'E' (even length -> data, NOT Exx!).
+        if (cmd == "m1000,1") {
+            return std::string{"EF"};
+        }
+        if (cmd == "m1002,2") {
+            return std::string{"EF01"};
+        }
+        if (cmd == "m1004,4") {
+            return std::string{"EFBEADDE"};
+        }
+        // Genuine RSP error replies: bare "E", 3-char "Exx", and "E.<text>".
+        if (cmd == "m2000,1") {
+            return std::string{"E01"};
+        }
+        if (cmd == "m2004,4") {
+            return std::string{"E.memfault"};
+        }
+        if (cmd == "m2008,1") {
+            return std::string{"E"};
+        }
+        // Uppercase register hex starting with 'E' on `p` packet.
+        if (cmd == "p0") {
+            return std::string{"EFBEADDE00000000"};
+        }
+        return std::nullopt;
+    };
+
+    RspClientOptions opts{};
+    opts.max_packet_size = 16u;
+    RspClient client(std::make_unique<FakeInMemoryRspTransport>(stub), opts);
+
+    const auto caps = client.negotiate();
+    ASSERT_TRUE(caps.has_value()) << caps.error().message;
+    EXPECT_GE(caps->packet_size, 64u);
+
+    const auto xml = client.read_qxfer("features", "target.xml");
+    ASSERT_TRUE(xml.has_value()) << xml.error().message;
+    EXPECT_EQ(*xml, stub->features_annexes["target.xml"]);
+
+    // 1-byte read starting with 0xEF -> "EF" (2 hex chars) must decode as {0xEF}, not RSP error.
+    std::array<std::uint8_t, 1> one_byte{};
+    const auto r1 = client.read_memory(0x1000ULL, one_byte);
+    ASSERT_TRUE(r1.has_value()) << r1.error().message;
+    EXPECT_EQ(*r1, 1u);
+    EXPECT_EQ(one_byte[0], 0xEFu);
+
+    // 2-byte read "EF01" -> {0xEF, 0x01}.
+    std::array<std::uint8_t, 2> two_bytes{};
+    const auto r2 = client.read_memory(0x1002ULL, two_bytes);
+    ASSERT_TRUE(r2.has_value()) << r2.error().message;
+    EXPECT_EQ(*r2, 2u);
+    EXPECT_EQ(two_bytes, (std::array<std::uint8_t, 2>{0xEFu, 0x01u}));
+
+    // 4-byte read "EFBEADDE" -> {0xEF, 0xBE, 0xAD, 0xDE}.
+    std::array<std::uint8_t, 4> four_bytes{};
+    const auto r4 = client.read_memory(0x1004ULL, four_bytes);
+    ASSERT_TRUE(r4.has_value()) << r4.error().message;
+    EXPECT_EQ(*r4, 4u);
+    EXPECT_EQ(four_bytes, (std::array<std::uint8_t, 4>{0xEFu, 0xBEu, 0xADu, 0xDEu}));
+
+    // Genuine RSP errors ("E01", "E.memfault", "E") still fail deterministically.
+    EXPECT_FALSE(client.read_memory(0x2000ULL, one_byte).has_value());
+    EXPECT_FALSE(client.read_memory(0x2004ULL, four_bytes).has_value());
+    EXPECT_FALSE(client.read_memory(0x2008ULL, one_byte).has_value());
+
+    const RspRegisterSpec reg0_spec{
+        .name = "rax",
+        .regnum = 0u,
+        .bitsize = 64u,
+    };
+    const auto reg0 = client.read_single_register(reg0_spec, Endianness::Little);
+    ASSERT_TRUE(reg0.has_value()) << reg0.error().message;
+    EXPECT_TRUE(reg0->is_available());
+    EXPECT_EQ(reg0->value_u64, 0xdeadbeefULL);
+}
+
 }  // namespace
 }  // namespace peelf

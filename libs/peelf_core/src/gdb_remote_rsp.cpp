@@ -148,8 +148,13 @@ namespace {
 }
 
 [[nodiscard]] constexpr bool is_rsp_error_reply(std::string_view reply) noexcept {
+    if (reply.empty() || reply.front() != 'E') {
+        return false;
+    }
+    if (reply.size() == 1u || reply.starts_with("E.")) {
+        return true;
+    }
     return reply.size() == 3u &&
-           (reply[0] == 'E' || reply[0] == 'e') &&
            hex_nibble(reply[1]).has_value() &&
            hex_nibble(reply[2]).has_value();
 }
@@ -881,9 +886,11 @@ RspCapabilities parse_qsupported_reply(
             if (token.starts_with("PacketSize=")) {
                 const std::string_view hex_sz = token.substr(std::string_view{"PacketSize="}.size());
                 if (const auto parsed = parse_uint64_hex(hex_sz);
-                    parsed.has_value() && *parsed >= 64u) {
-                    const auto clamped = static_cast<std::size_t>(std::min<std::uint64_t>(
-                        *parsed, static_cast<std::uint64_t>(max_client_packet_size)));
+                    parsed.has_value() && *parsed > 0u) {
+                    const std::uint64_t effective_client_max =
+                        std::max<std::uint64_t>(64u, static_cast<std::uint64_t>(max_client_packet_size));
+                    const auto clamped = static_cast<std::size_t>(
+                        std::clamp<std::uint64_t>(*parsed, 64u, effective_client_max));
                     caps.packet_size = clamped;
                 }
             } else if (token == "QStartNoAckMode+") {
@@ -2384,10 +2391,12 @@ Result<std::optional<std::string>> RspClient::read_qxfer(
     std::string_view object,
     std::string_view annex,
     std::stop_token stop_token) {
-    const std::size_t chunk_req = std::clamp<std::size_t>(
-        capabilities_.packet_size > 32u ? (capabilities_.packet_size - 16u) : 512u,
-        64u,
-        std::min<std::size_t>(options_.max_packet_size, 16384u));
+    const std::size_t effective_max_packet =
+        std::clamp<std::size_t>(options_.max_packet_size, 64u, 16384u);
+    const std::size_t desired_chunk =
+        capabilities_.packet_size > 32u ? (capabilities_.packet_size - 16u) : 512u;
+    const std::size_t chunk_req =
+        std::clamp<std::size_t>(desired_chunk, 64u, effective_max_packet);
 
     std::string accumulated;
     std::uint64_t offset = 0;
@@ -2582,16 +2591,17 @@ Result<void> RspClient::select_general_thread(
     if (!reply) {
         return std::unexpected(reply.error());
     }
-    if (*reply == "OK" || reply->empty()) {
+    const std::string_view trimmed = trim_ascii(*reply);
+    if (trimmed == "OK" || trimmed.empty()) {
         // Empty reply means the minimal single-thread stub ignores Hg; still usable.
-        if (*reply == "OK") {
+        if (trimmed == "OK") {
             selected_hg_thread_ = std::string(wire_token);
         }
         return {};
     }
-    if (is_rsp_error_reply(*reply)) {
+    if (is_rsp_error_reply(trimmed)) {
         return make_error("GDB RSP thread selection Hg" + std::string(wire_token) +
-                          " failed with '" + *reply + "'");
+                          " failed with '" + std::string(trimmed) + "'");
     }
     return {};
 }
@@ -2604,7 +2614,8 @@ Result<RspRegisterValue> RspClient::read_single_register(
     if (!reply) {
         return std::unexpected(reply.error());
     }
-    if (reply->empty() || is_rsp_error_reply(*reply)) {
+    const std::string_view trimmed_p = trim_ascii(*reply);
+    if (trimmed_p.empty() || is_rsp_error_reply(trimmed_p)) {
         const std::size_t byte_len = static_cast<std::size_t>((spec.bitsize + 7u) / 8u);
         RspRegisterValue unavail{};
         unavail.name = spec.name;
@@ -2661,14 +2672,19 @@ Result<std::vector<RspRegisterValue>> RspClient::read_all_registers(
             continue;
         }
         auto p_reply = send_command("p" + format_hex_u64(reg.regnum), stop_token);
-        if (!p_reply || p_reply->empty()) {
+        if (!p_reply) {
             p_supported = false;
             break;
         }
-        if (is_rsp_error_reply(*p_reply)) {
+        const std::string_view trimmed_p = trim_ascii(*p_reply);
+        if (trimmed_p.empty()) {
+            p_supported = false;
+            break;
+        }
+        if (is_rsp_error_reply(trimmed_p)) {
             continue;
         }
-        if (auto single = decode_rsp_register_hex(*it->second, *p_reply, description.endianness);
+        if (auto single = decode_rsp_register_hex(*it->second, trimmed_p, description.endianness);
             single.has_value()) {
             reg = std::move(*single);
         }
@@ -2712,7 +2728,7 @@ Result<std::size_t> RspClient::read_memory(
         }
 
         const std::string_view hex = trim_ascii(*reply);
-        if (hex.empty() || is_rsp_error_reply(hex) || hex.front() == 'E') {
+        if (hex.empty() || is_rsp_error_reply(hex)) {
             if (total_read > 0u) {
                 return total_read;
             }

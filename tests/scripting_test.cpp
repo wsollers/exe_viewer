@@ -914,6 +914,123 @@ TEST(ScriptingTest, RejectsMutationsOnReadOnlyTargetsAndUnmappedAddresses) {
     }
 }
 
+TEST(ScriptingTest, SandboxLoadReraisesMemoryQuotaErrorsAndRefusesCommit) {
+    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    fixture.workspace.set_label(0x100000C00ULL, "baseline_entry");
+    auto ctx = fixture.make_context();
+
+    peelf::ScriptLimits limits{};
+    limits.max_memory_bytes = 256u * 1024u;
+    limits.max_instructions = 2'000'000ULL;
+
+    // Even when `load(...)` is wrapped inside `pcall(...)`, an OOM / memory-quota failure
+    // during `lua_load` MUST re-raise fatally rather than returning `(nil, msg)` that the
+    // script could swallow and follow with `peelf.commit()`.
+    constexpr std::string_view kLoadOomScript = R"lua(
+        local entry = peelf.target_info().entry_point
+        peelf.stage_patch(entry, "\x90\xc3")
+        peelf.set_label(entry, "should_never_commit")
+        local chunk_src = string.rep("local a = 1;\n", 16384)
+        local ok, fn, err = pcall(function()
+            return load(chunk_src, "oom_chunk", "t")
+        end)
+        peelf.commit()
+    )lua";
+
+    const auto res = peelf::execute_lua_script(kLoadOomScript, ctx, limits);
+    EXPECT_FALSE(res.ok);
+    EXPECT_EQ(res.error_kind, peelf::ScriptErrorKind::MemoryLimitExceeded);
+    EXPECT_FALSE(res.committed);
+    EXPECT_LE(res.peak_memory_bytes, limits.max_memory_bytes);
+    EXPECT_FALSE(fixture.paged.dirty());
+    EXPECT_EQ(fixture.workspace.get_label(0x100000C00ULL),
+              std::optional<std::string>{"baseline_entry"});
+}
+
+TEST(ScriptingTest, HostStagedMemoryQuotaEnforcedAtomicallyWithoutTornPatches) {
+    // Build a synthetic Mach-O with an 8 KiB __text section so staging thousands of host
+    // patch cells exercises host-side `ScriptLimits::max_memory_bytes` accounting.
+    std::vector<std::uint8_t> big_macho = make_synthetic_x86_64_macho();
+    big_macho.resize(0x4000u, 0x90u);
+    // Widen LC_SEGMENT_64 __TEXT vmsize/filesize and __text section size to 0x2000 bytes.
+    auto patch_u64_le = [&](std::size_t off, std::uint64_t v) {
+        for (std::size_t i = 0u; i < 8u; ++i) {
+            big_macho[off + i] = static_cast<std::uint8_t>((v >> (i * 8u)) & 0xFFu);
+        }
+    };
+    // Header (32) + __PAGEZERO (72) = 104 -> __TEXT segment_command_64:
+    // vmsize @ +32 (136), filesize @ +48 (152); __text section_64 starts @ 176: size @ +40 (216).
+    patch_u64_le(136u, 0x4000ULL);
+    patch_u64_le(152u, 0x4000ULL);
+    patch_u64_le(216u, 0x2000ULL);
+
+    auto fixture = LoadedStaticFixture::from_bytes(std::move(big_macho));
+    auto ctx = fixture.make_context();
+
+    peelf::ScriptLimits limits{};
+    limits.max_memory_bytes = 256u * 1024u;
+    limits.max_instructions = 2'000'000ULL;
+
+    constexpr std::string_view kHostPatchQuotaScript = R"lua(
+        local entry = peelf.target_info().entry_point
+        peelf.stage_patch(entry, "\x31\xc0")
+        -- 6000 unique staged cells * 48B host node overhead exceeds the 256 KiB total cap;
+        -- pcall MUST NOT swallow the fatal MemoryLimitExceeded error or allow commit.
+        pcall(function()
+            peelf.stage_patch(entry + 2, string.rep("\x90", 6000))
+        end)
+        peelf.commit()
+    )lua";
+
+    const auto res = peelf::execute_lua_script(kHostPatchQuotaScript, ctx, limits);
+    EXPECT_FALSE(res.ok);
+    EXPECT_EQ(res.error_kind, peelf::ScriptErrorKind::MemoryLimitExceeded);
+    EXPECT_FALSE(res.committed);
+    EXPECT_LE(res.peak_memory_bytes, limits.max_memory_bytes);
+    EXPECT_FALSE(fixture.paged.dirty());
+}
+
+TEST(ScriptingTest, HostCommitIsAllOrNothingAcrossWorkspaceAndPagedBinaryImage) {
+    auto fixture = LoadedStaticFixture::from_bytes(make_synthetic_x86_64_macho());
+    fixture.workspace.set_label(0x100000C00ULL, "seed_label");
+    fixture.workspace.set_comment(0x100000C00ULL, "seed_comment");
+    fixture.workspace.add_bookmark(0x100000C04ULL, "SeedBM");
+
+    // 1. Failing PagedBinaryImage patch write/commit (e.g. truncated/undersized PagedBinaryImage)
+    // MUST roll back all ProjectWorkspace label/comment/bookmark mutations atomically.
+    const std::vector<std::uint8_t> tiny_backing(0x200u, 0u);
+    const TempFileGuard tiny_file(tiny_backing);
+    auto tiny_paged = peelf::PagedBinaryImage::open(tiny_file.path(), 64u);
+    ASSERT_TRUE(tiny_paged.has_value()) << tiny_paged.error().message;
+
+    peelf::ScriptTransaction tx{};
+    tx.reset(&fixture.workspace);
+    tx.stage_label(0x100000C00ULL, "corrupted_if_not_rolled_back");
+    tx.stage_label(0x100000C04ULL, "extra_label");
+    tx.stage_comment(0x100000C00ULL, ""); // erase seed comment
+    tx.stage_bookmark(0x100000C00ULL, "MutatedBM");
+    tx.stage_byte(0xC00u, 0x100000C00ULL, 0x55u, 0xCCu);
+    tx.request_commit("atomic_rollback_check");
+
+    const auto failed_patch_commit = tx.apply_to_host(&(*tiny_paged), &fixture.workspace);
+    EXPECT_FALSE(failed_patch_commit.has_value());
+    EXPECT_FALSE(tiny_paged->dirty());
+    EXPECT_EQ(fixture.workspace.get_label(0x100000C00ULL),
+              std::optional<std::string>{"seed_label"});
+    EXPECT_EQ(fixture.workspace.get_label(0x100000C04ULL), std::nullopt);
+    EXPECT_EQ(fixture.workspace.get_comment(0x100000C00ULL),
+              std::optional<std::string>{"seed_comment"});
+    ASSERT_EQ(fixture.workspace.bookmarks().size(), 1u);
+    EXPECT_EQ(fixture.workspace.bookmarks()[0].virtual_address, 0x100000C04ULL);
+    EXPECT_EQ(fixture.workspace.bookmarks()[0].label, "SeedBM");
+
+    // 2. Conversely, missing ProjectWorkspace when both patches and annotations are staged
+    // MUST NOT leave PagedBinaryImage mutated.
+    const auto failed_missing_ws = tx.apply_to_host(&fixture.paged, /*workspace=*/nullptr);
+    EXPECT_FALSE(failed_missing_ws.has_value());
+    EXPECT_FALSE(fixture.paged.dirty());
+}
+
 namespace {
 
 class TempDirGuard {

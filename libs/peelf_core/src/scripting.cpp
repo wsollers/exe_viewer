@@ -131,10 +131,17 @@ void ScriptTransaction::rollback() {
 }
 
 void ScriptTransaction::stage_label(std::uint64_t virtual_address, std::string name) {
+    std::map<std::uint64_t, std::optional<std::string>> tmp;
     if (name.empty()) {
-        staged_labels_[virtual_address] = std::nullopt;
+        tmp.emplace(virtual_address, std::nullopt);
     } else {
-        staged_labels_[virtual_address] = std::move(name);
+        tmp.emplace(virtual_address, std::move(name));
+    }
+    const auto existing = staged_labels_.find(virtual_address);
+    if (existing != staged_labels_.end()) {
+        existing->second = std::move(tmp.begin()->second);
+    } else {
+        staged_labels_.insert(tmp.extract(tmp.begin()));
     }
 }
 
@@ -151,10 +158,17 @@ std::optional<std::string> ScriptTransaction::effective_label(
 }
 
 void ScriptTransaction::stage_comment(std::uint64_t virtual_address, std::string text) {
+    std::map<std::uint64_t, std::optional<std::string>> tmp;
     if (text.empty()) {
-        staged_comments_[virtual_address] = std::nullopt;
+        tmp.emplace(virtual_address, std::nullopt);
     } else {
-        staged_comments_[virtual_address] = std::move(text);
+        tmp.emplace(virtual_address, std::move(text));
+    }
+    const auto existing = staged_comments_.find(virtual_address);
+    if (existing != staged_comments_.end()) {
+        existing->second = std::move(tmp.begin()->second);
+    } else {
+        staged_comments_.insert(tmp.extract(tmp.begin()));
     }
 }
 
@@ -254,49 +268,67 @@ void ScriptTransaction::request_commit(std::string label) {
 Result<void> ScriptTransaction::apply_to_host(PagedBinaryImage* paged_image,
                                               ProjectWorkspace* workspace) const {
     const std::vector<StagedBytePatch> patches = coalesced_patches();
-    if (!patches.empty()) {
-        if (paged_image == nullptr) {
-            return make_error(
-                "Cannot commit staged byte patches: ScriptContext has no PagedBinaryImage");
+    const bool has_patches = !patches.empty();
+    const bool has_annotations = has_staged_annotations();
+
+    if (has_patches && paged_image == nullptr) {
+        return make_error(
+            "Cannot commit staged byte patches: ScriptContext has no PagedBinaryImage");
+    }
+    if (has_annotations && workspace == nullptr) {
+        return make_error(
+            "Cannot commit staged annotations: ScriptContext has no ProjectWorkspace");
+    }
+
+    std::optional<ProjectWorkspace> workspace_snapshot{};
+    if (has_annotations) {
+        workspace_snapshot = *workspace;
+        try {
+            for (const auto& [va, maybe_label] : staged_labels_) {
+                if (maybe_label.has_value() && !maybe_label->empty()) {
+                    workspace->set_label(va, *maybe_label);
+                } else {
+                    workspace->erase_label(va);
+                }
+            }
+            for (const auto& [va, maybe_comment] : staged_comments_) {
+                if (maybe_comment.has_value() && !maybe_comment->empty()) {
+                    workspace->set_comment(va, *maybe_comment);
+                } else {
+                    workspace->erase_comment(va);
+                }
+            }
+            if (bookmarks_modified_) {
+                for (const ScriptBookmark& bm : staged_bookmarks_) {
+                    workspace->add_bookmark(bm.virtual_address, bm.label);
+                }
+            }
+        } catch (...) {
+            *workspace = std::move(*workspace_snapshot);
+            return make_error("Out of memory applying staged workspace annotations");
         }
+    }
+
+    if (has_patches) {
         PatchTransaction patch_tx = paged_image->begin_transaction(commit_label_);
         for (const StagedBytePatch& p : patches) {
             if (auto wr = patch_tx.write(p.file_offset, p.patched_bytes); !wr.has_value()) {
                 patch_tx.rollback();
+                if (workspace_snapshot.has_value()) {
+                    *workspace = std::move(*workspace_snapshot);
+                }
                 return wr;
             }
         }
         if (auto cm = patch_tx.commit(); !cm.has_value()) {
             patch_tx.rollback();
+            if (workspace_snapshot.has_value()) {
+                *workspace = std::move(*workspace_snapshot);
+            }
             return cm;
         }
     }
 
-    if (has_staged_annotations()) {
-        if (workspace == nullptr) {
-            return make_error(
-                "Cannot commit staged annotations: ScriptContext has no ProjectWorkspace");
-        }
-        for (const auto& [va, maybe_label] : staged_labels_) {
-            if (maybe_label.has_value() && !maybe_label->empty()) {
-                workspace->set_label(va, *maybe_label);
-            } else {
-                workspace->erase_label(va);
-            }
-        }
-        for (const auto& [va, maybe_comment] : staged_comments_) {
-            if (maybe_comment.has_value() && !maybe_comment->empty()) {
-                workspace->set_comment(va, *maybe_comment);
-            } else {
-                workspace->erase_comment(va);
-            }
-        }
-        if (bookmarks_modified_) {
-            for (const ScriptBookmark& bm : staged_bookmarks_) {
-                workspace->add_bookmark(bm.virtual_address, bm.label);
-            }
-        }
-    }
     return {};
 }
 
@@ -408,6 +440,9 @@ struct ScriptRuntimeState {
     std::string chunk_label{};
 
     std::size_t live_memory_bytes{0};
+    std::size_t host_staged_bytes{0};
+    std::size_t staged_cell_count{0};
+    std::size_t baseline_bookmark_bytes{0};
     std::size_t peak_memory_bytes{0};
     bool memory_limit_exceeded{false};
     bool enforce_memory_quota{false};
@@ -450,8 +485,13 @@ void* sandbox_lua_alloc(void* ud, void* ptr, std::size_t osize, std::size_t nsiz
 
     if (rt->enforce_memory_quota && nsize > actual_old_size) {
         const std::size_t growth = nsize - actual_old_size;
-        if (growth > rt->limits.max_memory_bytes ||
-            rt->live_memory_bytes > (rt->limits.max_memory_bytes - growth)) {
+        const std::size_t total_used =
+            (rt->live_memory_bytes <=
+             std::numeric_limits<std::size_t>::max() - rt->host_staged_bytes)
+                ? (rt->live_memory_bytes + rt->host_staged_bytes)
+                : std::numeric_limits<std::size_t>::max();
+        if (total_used > rt->limits.max_memory_bytes ||
+            growth > (rt->limits.max_memory_bytes - total_used)) {
             rt->memory_limit_exceeded = true;
             return nullptr;
         }
@@ -476,8 +516,12 @@ void* sandbox_lua_alloc(void* ud, void* ptr, std::size_t osize, std::size_t nsiz
             : 0u;
     }
 
-    if (rt->live_memory_bytes > rt->peak_memory_bytes) {
-        rt->peak_memory_bytes = rt->live_memory_bytes;
+    const std::size_t combined_used =
+        (rt->live_memory_bytes <= std::numeric_limits<std::size_t>::max() - rt->host_staged_bytes)
+            ? (rt->live_memory_bytes + rt->host_staged_bytes)
+            : std::numeric_limits<std::size_t>::max();
+    if (combined_used > rt->peak_memory_bytes) {
+        rt->peak_memory_bytes = combined_used;
     }
     return next;
 }
@@ -735,6 +779,13 @@ const char* sandbox_chunk_reader(lua_State* L, void* data, std::size_t* size) {
 }
 
 int lua_sandbox_load(lua_State* L) {
+    auto* rt = get_runtime_upvalue(L);
+    if (rt != nullptr) {
+        if (const char* err = check_hook_limits_noexcept(rt); err != nullptr) {
+            return raise_literal_error(L, err);
+        }
+    }
+
     const int chunk_type = lua_type(L, 1);
     if (chunk_type != LUA_TSTRING && chunk_type != LUA_TFUNCTION) {
         return raise_literal_error(
@@ -781,6 +832,43 @@ int lua_sandbox_load(lua_State* L) {
         lua_settop(L, 5); // reserve slot 5 for reader anchor
         SandboxReaderState reader_state{};
         status = lua_load(L, &sandbox_chunk_reader, &reader_state, effective_name, "t");
+    }
+
+    if (rt != nullptr &&
+        (status == LUA_ERRMEM ||
+         rt->memory_limit_exceeded ||
+         rt->fatal_abort_kind != ScriptErrorKind::None ||
+         rt->output_truncated ||
+         rt->stop_token.stop_requested())) {
+        if (rt->fatal_abort_kind == ScriptErrorKind::None) {
+            if (status == LUA_ERRMEM || rt->memory_limit_exceeded) {
+                rt->memory_limit_exceeded = true;
+                rt->fatal_abort_kind = ScriptErrorKind::MemoryLimitExceeded;
+                try {
+                    rt->fatal_abort_message = std::format(
+                        "script exceeded max_memory_bytes quota ({} bytes) during load()",
+                        rt->limits.max_memory_bytes);
+                } catch (...) {
+                }
+            } else if (rt->stop_token.stop_requested()) {
+                rt->fatal_abort_kind = ScriptErrorKind::Cancelled;
+            }
+        }
+        if (status == LUA_OK) {
+            return raise_literal_error(
+                L,
+                !rt->fatal_abort_message.empty()
+                    ? rt->fatal_abort_message.c_str()
+                    : "script quota exceeded during load()");
+        }
+        lua_error(L);
+        std::unreachable();
+    }
+
+    if (rt != nullptr) {
+        if (const char* err = check_hook_limits_noexcept(rt); err != nullptr) {
+            return raise_literal_error(L, err);
+        }
     }
 
     if (status == LUA_OK) {
@@ -1897,6 +1985,120 @@ int lua_peelf_security_audit(lua_State* L) {
 // Transactional annotation, patch staging, commit, and rollback bindings
 // ---------------------------------------------------------------------------
 
+[[nodiscard]] std::size_t remaining_memory_budget_noexcept(
+    const ScriptRuntimeState* rt) noexcept {
+    if (!rt->enforce_memory_quota) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    const std::size_t used =
+        (rt->live_memory_bytes <= std::numeric_limits<std::size_t>::max() - rt->host_staged_bytes)
+            ? (rt->live_memory_bytes + rt->host_staged_bytes)
+            : std::numeric_limits<std::size_t>::max();
+    return (used < rt->limits.max_memory_bytes) ? (rt->limits.max_memory_bytes - used) : 0u;
+}
+
+void trip_host_memory_quota_noexcept(ScriptRuntimeState* rt) noexcept {
+    rt->memory_limit_exceeded = true;
+    rt->fatal_abort_kind = ScriptErrorKind::MemoryLimitExceeded;
+    try {
+        rt->fatal_abort_message = std::format(
+            "script exceeded max_memory_bytes quota ({} bytes) in host staging buffer",
+            rt->limits.max_memory_bytes);
+        rt->scratch_error = rt->fatal_abort_message;
+    } catch (...) {
+        set_scratch_error(rt, "script exceeded max_memory_bytes quota in host staging buffer");
+    }
+}
+
+void sync_host_staged_memory_noexcept(ScriptRuntimeState* rt) noexcept {
+    auto sat_add = [](std::size_t a, std::size_t b) noexcept -> std::size_t {
+        return (a <= std::numeric_limits<std::size_t>::max() - b)
+                   ? (a + b)
+                   : std::numeric_limits<std::size_t>::max();
+    };
+    constexpr std::size_t kCellNodeBytes = 48u;
+    constexpr std::size_t kAnnotationNodeBytes =
+        sizeof(std::pair<const std::uint64_t, std::optional<std::string>>) + (3u * sizeof(void*));
+    constexpr std::size_t kBookmarkEntryBytes = sizeof(ScriptBookmark);
+
+    std::size_t staged =
+        (rt->staged_cell_count <= std::numeric_limits<std::size_t>::max() / kCellNodeBytes)
+            ? (rt->staged_cell_count * kCellNodeBytes)
+            : std::numeric_limits<std::size_t>::max();
+    for (const auto& [va, maybe_label] : rt->transaction.staged_labels()) {
+        (void)va;
+        staged = sat_add(staged, kAnnotationNodeBytes);
+        if (maybe_label.has_value()) {
+            staged = sat_add(staged, maybe_label->size());
+        }
+    }
+    for (const auto& [va, maybe_comment] : rt->transaction.staged_comments()) {
+        (void)va;
+        staged = sat_add(staged, kAnnotationNodeBytes);
+        if (maybe_comment.has_value()) {
+            staged = sat_add(staged, maybe_comment->size());
+        }
+    }
+    if (rt->transaction.has_staged_annotations()) {
+        std::size_t bm_total = 0u;
+        for (const ScriptBookmark& bm : rt->transaction.effective_bookmarks()) {
+            bm_total = sat_add(bm_total, sat_add(kBookmarkEntryBytes, bm.label.size()));
+        }
+        if (bm_total > rt->baseline_bookmark_bytes) {
+            staged = sat_add(staged, bm_total - rt->baseline_bookmark_bytes);
+        }
+    }
+    rt->host_staged_bytes = staged;
+    const std::size_t total =
+        (rt->live_memory_bytes <= std::numeric_limits<std::size_t>::max() - rt->host_staged_bytes)
+            ? (rt->live_memory_bytes + rt->host_staged_bytes)
+            : std::numeric_limits<std::size_t>::max();
+    if (total > rt->peak_memory_bytes) {
+        rt->peak_memory_bytes = total;
+    }
+}
+
+[[nodiscard]] bool check_host_growth_fits_noexcept(ScriptRuntimeState* rt,
+                                                   std::size_t additional_bytes) noexcept {
+    if (additional_bytes > remaining_memory_budget_noexcept(rt)) {
+        trip_host_memory_quota_noexcept(rt);
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] ScriptErrorKind classify_tripped_quota_noexcept(
+    ScriptRuntimeState& rt) noexcept {
+    if (rt.fatal_abort_kind != ScriptErrorKind::None) {
+        return rt.fatal_abort_kind;
+    }
+    if (rt.memory_limit_exceeded) {
+        rt.fatal_abort_kind = ScriptErrorKind::MemoryLimitExceeded;
+        return ScriptErrorKind::MemoryLimitExceeded;
+    }
+    if (rt.output_truncated) {
+        rt.fatal_abort_kind = ScriptErrorKind::OutputLimitExceeded;
+        return ScriptErrorKind::OutputLimitExceeded;
+    }
+    if (rt.stop_token.stop_requested()) {
+        rt.fatal_abort_kind = ScriptErrorKind::Cancelled;
+        return ScriptErrorKind::Cancelled;
+    }
+    if (rt.limits.max_instructions == 0u ||
+        rt.instructions_executed > rt.limits.max_instructions) {
+        rt.fatal_abort_kind = ScriptErrorKind::InstructionLimitExceeded;
+        return ScriptErrorKind::InstructionLimitExceeded;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - rt.start_time);
+    if (rt.limits.wall_clock_timeout.count() <= 0 ||
+        elapsed > rt.limits.wall_clock_timeout) {
+        rt.fatal_abort_kind = ScriptErrorKind::WallClockTimeout;
+        return ScriptErrorKind::WallClockTimeout;
+    }
+    return ScriptErrorKind::None;
+}
+
 bool stage_label_noexcept(ScriptRuntimeState* rt,
                           std::uint64_t va,
                           const char* ptr,
@@ -1904,11 +2106,28 @@ bool stage_label_noexcept(ScriptRuntimeState* rt,
     if (!verify_mutation_allowed_noexcept(rt, false)) {
         return false;
     }
+    constexpr std::size_t kNodeOverhead =
+        sizeof(std::pair<const std::uint64_t, std::optional<std::string>>) + (3u * sizeof(void*));
+    const auto existing = rt->transaction.staged_labels().find(va);
+    std::size_t growth = 0u;
+    if (existing == rt->transaction.staged_labels().end()) {
+        growth = (len <= std::numeric_limits<std::size_t>::max() - kNodeOverhead)
+                     ? (kNodeOverhead + len)
+                     : std::numeric_limits<std::size_t>::max();
+    } else {
+        const std::size_t old_len =
+            existing->second.has_value() ? existing->second->size() : 0u;
+        growth = (len > old_len) ? (len - old_len) : 0u;
+    }
+    if (!check_host_growth_fits_noexcept(rt, growth)) {
+        return false;
+    }
     try {
         rt->transaction.stage_label(va, std::string{ptr, len});
+        sync_host_staged_memory_noexcept(rt);
         return true;
     } catch (...) {
-        set_scratch_error(rt, "out of memory while staging label");
+        trip_host_memory_quota_noexcept(rt);
         return false;
     }
 }
@@ -1976,11 +2195,28 @@ bool stage_comment_noexcept(ScriptRuntimeState* rt,
     if (!verify_mutation_allowed_noexcept(rt, false)) {
         return false;
     }
+    constexpr std::size_t kNodeOverhead =
+        sizeof(std::pair<const std::uint64_t, std::optional<std::string>>) + (3u * sizeof(void*));
+    const auto existing = rt->transaction.staged_comments().find(va);
+    std::size_t growth = 0u;
+    if (existing == rt->transaction.staged_comments().end()) {
+        growth = (len <= std::numeric_limits<std::size_t>::max() - kNodeOverhead)
+                     ? (kNodeOverhead + len)
+                     : std::numeric_limits<std::size_t>::max();
+    } else {
+        const std::size_t old_len =
+            existing->second.has_value() ? existing->second->size() : 0u;
+        growth = (len > old_len) ? (len - old_len) : 0u;
+    }
+    if (!check_host_growth_fits_noexcept(rt, growth)) {
+        return false;
+    }
     try {
         rt->transaction.stage_comment(va, std::string{ptr, len});
+        sync_host_staged_memory_noexcept(rt);
         return true;
     } catch (...) {
-        set_scratch_error(rt, "out of memory while staging comment");
+        trip_host_memory_quota_noexcept(rt);
         return false;
     }
 }
@@ -2048,11 +2284,26 @@ bool add_bookmark_noexcept(ScriptRuntimeState* rt,
     if (!verify_mutation_allowed_noexcept(rt, false)) {
         return false;
     }
+    constexpr std::size_t kEntryOverhead = sizeof(ScriptBookmark);
+    std::size_t growth =
+        (len <= std::numeric_limits<std::size_t>::max() - kEntryOverhead)
+            ? (kEntryOverhead + len)
+            : std::numeric_limits<std::size_t>::max();
+    for (const ScriptBookmark& existing : rt->transaction.effective_bookmarks()) {
+        if (existing.virtual_address == va) {
+            growth = (len > existing.label.size()) ? (len - existing.label.size()) : 0u;
+            break;
+        }
+    }
+    if (!check_host_growth_fits_noexcept(rt, growth)) {
+        return false;
+    }
     try {
         rt->transaction.stage_bookmark(va, std::string{ptr, len});
+        sync_host_staged_memory_noexcept(rt);
         return true;
     } catch (...) {
-        set_scratch_error(rt, "out of memory while staging bookmark");
+        trip_host_memory_quota_noexcept(rt);
         return false;
     }
 }
@@ -2098,12 +2349,23 @@ int lua_peelf_bookmarks(lua_State* L) {
 
 bool prepare_scratch_patch_buffer_noexcept(ScriptRuntimeState* rt,
                                            std::size_t count) noexcept {
+    if (!check_host_growth_fits_noexcept(rt, count)) {
+        return false;
+    }
     try {
         rt->scratch_bytes.assign(count, 0u);
         return true;
     } catch (...) {
-        set_scratch_error(rt, "out of memory preparing patch byte buffer");
+        trip_host_memory_quota_noexcept(rt);
         return false;
+    }
+}
+
+void release_scratch_patch_buffer_noexcept(ScriptRuntimeState* rt) noexcept {
+    if (rt->scratch_bytes.capacity() > 4096u) {
+        std::vector<std::uint8_t>{}.swap(rt->scratch_bytes);
+    } else {
+        rt->scratch_bytes.clear();
     }
 }
 
@@ -2134,18 +2396,31 @@ bool stage_patch_bytes_noexcept(ScriptRuntimeState* rt,
             return false;
         }
 
-        const auto maybe_backing_size = static_backing_size(ctx);
-
-        // Two-pass validation so a multi-byte patch either stages completely or fails cleanly
-        // before mutating `ScriptTransaction`.
         struct ValidatedCell {
             std::uint64_t file_offset{0};
             std::uint64_t virtual_address{0};
             std::uint8_t baseline{0};
             std::uint8_t replacement{0};
         };
+
+        const std::size_t scratch_vec_bytes =
+            (len <= std::numeric_limits<std::size_t>::max() / sizeof(ValidatedCell))
+                ? (len * sizeof(ValidatedCell))
+                : std::numeric_limits<std::size_t>::max();
+        if (!check_host_growth_fits_noexcept(rt, scratch_vec_bytes)) {
+            return false;
+        }
+
+        const auto maybe_backing_size = static_backing_size(ctx);
+
+        // Build and validate all byte cells in local scratch storage before mutating
+        // `ScriptTransaction` so mid-call validation, quota, or allocation failures never
+        // leave a torn or half-written staged patch.
         std::vector<ValidatedCell> validated;
         validated.reserve(len);
+        std::size_t new_cell_count = 0u;
+        std::uint64_t prev_new_off = 0u;
+        bool has_prev_new = false;
 
         for (std::size_t i = 0u; i < len; ++i) {
             const std::uint64_t cur_va = va + static_cast<std::uint64_t>(i);
@@ -2174,6 +2449,12 @@ bool stage_patch_bytes_noexcept(ScriptRuntimeState* rt,
                 rt->scratch_error = orig_byte.error().message;
                 return false;
             }
+            if (!rt->transaction.staged_byte_at_offset(file_off).has_value() &&
+                (!has_prev_new || file_off != prev_new_off)) {
+                has_prev_new = true;
+                prev_new_off = file_off;
+                ++new_cell_count;
+            }
             validated.push_back(ValidatedCell{
                 .file_offset = file_off,
                 .virtual_address = cur_va,
@@ -2182,14 +2463,38 @@ bool stage_patch_bytes_noexcept(ScriptRuntimeState* rt,
             });
         }
 
+        constexpr std::size_t kCellNodeBytes = 48u;
+        const std::size_t host_delta =
+            (new_cell_count <= std::numeric_limits<std::size_t>::max() / kCellNodeBytes)
+                ? (new_cell_count * kCellNodeBytes)
+                : std::numeric_limits<std::size_t>::max();
+        if (!check_host_growth_fits_noexcept(rt, host_delta)) {
+            return false;
+        }
+
+        // Stage into a local transaction copy first and swap `noexcept` into `rt->transaction`
+        // so any mid-call allocation failure leaves `rt->transaction` 100% untouched.
+        ScriptTransaction staged_next = rt->transaction;
+        std::size_t added_cells = 0u;
         for (const ValidatedCell& cell : validated) {
-            rt->transaction.stage_byte(
+            const bool already_present =
+                staged_next.staged_byte_at_offset(cell.file_offset).has_value();
+            staged_next.stage_byte(
                 cell.file_offset,
                 cell.virtual_address,
                 cell.baseline,
                 cell.replacement);
+            if (!already_present) {
+                ++added_cells;
+            }
         }
+        rt->transaction = std::move(staged_next);
+        rt->staged_cell_count += added_cells;
+        sync_host_staged_memory_noexcept(rt);
         return true;
+    } catch (const std::bad_alloc&) {
+        trip_host_memory_quota_noexcept(rt);
+        return false;
     } catch (...) {
         set_scratch_error(rt, "unexpected exception while staging patch");
         return false;
@@ -2232,14 +2537,17 @@ int lua_peelf_stage_patch(lua_State* L) {
             const lua_Integer bval = lua_tointegerx(L, -1, &is_int);
             lua_pop(L, 1);
             if (is_int == 0 || bval < 0 || bval > 255) {
+                release_scratch_patch_buffer_noexcept(rt);
                 return raise_literal_error(
                     L,
                     "bad byte element in 'peelf.stage_patch' table (integer in [0, 255] expected)");
             }
             rt->scratch_bytes[i] = static_cast<std::uint8_t>(bval);
         }
-        if (!stage_patch_bytes_noexcept(
-                rt, va, rt->scratch_bytes.data(), rt->scratch_bytes.size())) {
+        const bool ok = stage_patch_bytes_noexcept(
+            rt, va, rt->scratch_bytes.data(), rt->scratch_bytes.size());
+        release_scratch_patch_buffer_noexcept(rt);
+        if (!ok) {
             return raise_scratch_error(L, rt);
         }
         return 0;
@@ -2252,6 +2560,15 @@ int lua_peelf_stage_patch(lua_State* L) {
 bool request_commit_noexcept(ScriptRuntimeState* rt,
                              const char* label_ptr,
                              std::size_t label_len) noexcept {
+    if (const ScriptErrorKind quota_err = classify_tripped_quota_noexcept(*rt);
+        quota_err != ScriptErrorKind::None) {
+        set_scratch_error(
+            rt,
+            !rt->fatal_abort_message.empty()
+                ? std::string_view{rt->fatal_abort_message}
+                : std::string_view{"cannot commit script transaction after quota/fatal abort"});
+        return false;
+    }
     const bool needs_static_patching = rt->transaction.has_staged_patches();
     if (!verify_mutation_allowed_noexcept(rt, needs_static_patching)) {
         return false;
@@ -2300,6 +2617,8 @@ int lua_peelf_commit(lua_State* L) {
 bool rollback_noexcept(ScriptRuntimeState* rt) noexcept {
     try {
         rt->transaction.rollback();
+        rt->staged_cell_count = 0u;
+        sync_host_staged_memory_noexcept(rt);
         return true;
     } catch (...) {
         set_scratch_error(rt, "unexpected exception rolling back script transaction");
@@ -2365,7 +2684,8 @@ int lua_protected_main(lua_State* L) {
     lua_pushcclosure(L, &lua_sandbox_print, 1);
     lua_setglobal(L, "print");
 
-    lua_pushcfunction(L, &lua_sandbox_load);
+    lua_pushlightuserdata(L, rt);
+    lua_pushcclosure(L, &lua_sandbox_load, 1);
     lua_setglobal(L, "load");
 
     lua_pushlightuserdata(L, rt);
@@ -2495,6 +2815,15 @@ ScriptExecutionResult LuaScriptingEngine::execute(
     rt.fatal_abort_message.reserve(256u);
     rt.scratch_error.reserve(256u);
     rt.transaction.reset(context.workspace);
+    if (context.workspace != nullptr) {
+        for (const ScriptBookmark& bm : context.workspace->bookmarks()) {
+            const std::size_t sz = sizeof(ScriptBookmark) + bm.label.size();
+            rt.baseline_bookmark_bytes =
+                (rt.baseline_bookmark_bytes <= std::numeric_limits<std::size_t>::max() - sz)
+                    ? (rt.baseline_bookmark_bytes + sz)
+                    : std::numeric_limits<std::size_t>::max();
+        }
+    }
 
     IProcessSession* active_session = active_process_session(context);
     if (context.capabilities.has_value()) {
@@ -2572,6 +2901,18 @@ ScriptExecutionResult LuaScriptingEngine::execute(
             result.error_kind = ScriptErrorKind::RuntimeError;
             result.error_message = !vm_err.empty() ? vm_err : "Lua runtime error";
         }
+        return result;
+    }
+
+    if (const ScriptErrorKind tripped_quota = classify_tripped_quota_noexcept(rt);
+        tripped_quota != ScriptErrorKind::None) {
+        result.ok = false;
+        result.committed = false;
+        result.error_kind = tripped_quota;
+        result.error_message = !rt.fatal_abort_message.empty()
+            ? rt.fatal_abort_message
+            : std::format("script quota or cancellation tripped ({}) before commit",
+                          to_string(tripped_quota));
         return result;
     }
 

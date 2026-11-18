@@ -885,3 +885,54 @@ TEST(CapabilityProvenanceTest, MachOUuidSliceEndiannessAndEmptyIdentityNonceHard
     EXPECT_FALSE(peelf::verify_backing_image_identity(id_arm64_v1, flipped_endian).matches);
 }
 
+TEST(CapabilityProvenanceTest, DeriveTargetProfilePreserves32BitSessionAddressWidth) {
+    peelf::ProcessInfo x86_info{};
+    x86_info.pid = 3201u;
+    x86_info.name = "legacy32.exe";
+    x86_info.architecture = peelf::Architecture::X86;
+    x86_info.endianness = peelf::Endianness::Little;
+    x86_info.is_64bit = false;
+
+    MockLiveProcessSession x86_session(x86_info);
+
+    const peelf::TargetProfile live_prof = peelf::derive_target_profile(
+        /*image=*/nullptr,
+        &x86_session,
+        /*active_debugger=*/false,
+        /*remote_gdb_rsp=*/false);
+    EXPECT_EQ(live_prof.architecture, peelf::Architecture::X86);
+    EXPECT_EQ(live_prof.address_width, peelf::AddressWidth::Bits32);
+    EXPECT_EQ(live_prof.pointer_byte_size() * 8u, 32u);
+
+    const peelf::TargetProfile dbg_prof = peelf::derive_target_profile(
+        /*image=*/nullptr,
+        &x86_session,
+        /*active_debugger=*/true,
+        /*remote_gdb_rsp=*/false);
+    EXPECT_EQ(dbg_prof.architecture, peelf::Architecture::X86);
+    EXPECT_EQ(dbg_prof.address_width, peelf::AddressWidth::Bits32);
+    EXPECT_EQ(dbg_prof.pointer_byte_size() * 8u, 32u);
+
+    const peelf::TargetProfile rsp_prof = peelf::derive_target_profile(
+        /*image=*/nullptr,
+        &x86_session,
+        /*active_debugger=*/true,
+        /*remote_gdb_rsp=*/true);
+    EXPECT_EQ(rsp_prof.backend, peelf::BackendKind::RemoteGdbRsp);
+    EXPECT_EQ(rsp_prof.architecture, peelf::Architecture::X86);
+    EXPECT_EQ(rsp_prof.address_width, peelf::AddressWidth::Bits32);
+    EXPECT_EQ(rsp_prof.pointer_byte_size() * 8u, 32u);
+
+    peelf::ProviderFacts facts{};
+    facts.host_os = peelf::OsKind::Linux;
+    facts.host_arch = peelf::Architecture::X86_64;
+    facts.capstone_available = true;
+    facts.remote_gdb_stub_available = true;
+    const peelf::TargetCapabilityMatrix rsp_mat = peelf::capabilities_for(rsp_prof, facts);
+    EXPECT_NE(rsp_mat.get(peelf::Operation::Disassembly).state,
+              peelf::SupportState::Unsupported);
+    EXPECT_NE(rsp_mat.get(peelf::Operation::SoftwareBreakpoints).state,
+              peelf::SupportState::Unsupported);
+}
+
+

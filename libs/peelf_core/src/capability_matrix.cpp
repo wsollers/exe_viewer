@@ -556,6 +556,29 @@ std::size_t TargetCapabilityMatrix::missing_provider_count() const noexcept {
         }));
 }
 
+namespace {
+
+[[nodiscard]] constexpr bool is_64bit_arch(Architecture arch) noexcept {
+    switch (arch) {
+        case Architecture::X86:
+        case Architecture::ARM:
+        case Architecture::RISCV32:
+        case Architecture::MIPS32:
+        case Architecture::PowerPC:
+            return false;
+        case Architecture::X86_64:
+        case Architecture::ARM64:
+        case Architecture::RISCV64:
+        case Architecture::MIPS64:
+        case Architecture::PowerPC64:
+        case Architecture::Unknown:
+            return true;
+    }
+    return true;
+}
+
+} // namespace
+
 TargetProfile derive_target_profile(
     const IBinaryImage* image,
     const IProcessSession* session,
@@ -620,6 +643,14 @@ TargetProfile derive_target_profile(
                 }
             } else {
                 p.backend = BackendKind::CrashDumpElfCore;
+                if (p.architecture == Architecture::Unknown &&
+                    session->info().architecture != Architecture::Unknown) {
+                    p.architecture = session->info().architecture;
+                    p.endianness = session->info().endianness;
+                    p.address_width = is_64bit_arch(p.architecture)
+                                          ? AddressWidth::Bits64
+                                          : AddressWidth::Bits32;
+                }
             }
         } else if (const auto* gdb = dynamic_cast<const IGdbRemoteSession*>(session);
                    gdb != nullptr) {
@@ -627,7 +658,8 @@ TargetProfile derive_target_profile(
             p.backend = BackendKind::GdbRemote;
             if (p.architecture == Architecture::Unknown) {
                 p.architecture = gp.architecture;
-                p.address_width = gp.address_width;
+                p.address_width =
+                    !is_64bit_arch(gp.architecture) ? AddressWidth::Bits32 : gp.address_width;
                 p.endianness = gp.endianness;
             }
             if (p.os == OsKind::Unknown) {
@@ -646,6 +678,9 @@ TargetProfile derive_target_profile(
                 session->info().architecture != Architecture::Unknown) {
                 p.architecture = session->info().architecture;
                 p.endianness = session->info().endianness;
+                p.address_width = is_64bit_arch(p.architecture)
+                                      ? AddressWidth::Bits64
+                                      : AddressWidth::Bits32;
             }
         } else {
             p.backend = active_debugger ? BackendKind::ActiveDebugger : BackendKind::LiveNativeReadOnly;
@@ -653,12 +688,9 @@ TargetProfile derive_target_profile(
                 session->info().architecture != Architecture::Unknown) {
                 p.architecture = session->info().architecture;
                 p.endianness = session->info().endianness;
-                const bool is32 = p.architecture == Architecture::X86 ||
-                                  p.architecture == Architecture::ARM ||
-                                  p.architecture == Architecture::RISCV32 ||
-                                  p.architecture == Architecture::MIPS32 ||
-                                  p.architecture == Architecture::PowerPC;
-                p.address_width = is32 ? AddressWidth::Bits32 : AddressWidth::Bits64;
+                p.address_width = is_64bit_arch(p.architecture)
+                                      ? AddressWidth::Bits64
+                                      : AddressWidth::Bits32;
             }
 #ifdef _WIN32
             if (p.os == OsKind::Unknown) {

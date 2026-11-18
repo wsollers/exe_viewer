@@ -113,10 +113,37 @@ namespace {
 }
 
 [[nodiscard]] constexpr bool is_rsp_error_reply(std::string_view reply) noexcept {
-    if (reply.size() == 3u && reply.front() == 'E') {
-        return hex_nibble(reply[1]).has_value() && hex_nibble(reply[2]).has_value();
+    if (reply.empty() || reply.front() != 'E') {
+        return false;
     }
-    return reply.starts_with("E.");
+    if (reply.size() == 1u || reply.starts_with("E.")) {
+        return true;
+    }
+    return reply.size() == 3u &&
+           hex_nibble(reply[1]).has_value() &&
+           hex_nibble(reply[2]).has_value();
+}
+
+[[nodiscard]] std::size_t compute_g_packet_char_offset(
+    const RspTargetDescription& desc,
+    const RspRegisterSpec& target) {
+    std::vector<std::size_t> order(desc.registers.size());
+    for (std::size_t i = 0u; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) noexcept {
+        return desc.registers[a].regnum < desc.registers[b].regnum;
+    });
+
+    std::size_t char_offset = 0u;
+    for (const std::size_t idx : order) {
+        const RspRegisterSpec& spec = desc.registers[idx];
+        if (&spec == &target) {
+            break;
+        }
+        char_offset += static_cast<std::size_t>((spec.bitsize + 7u) / 8u) * 2u;
+    }
+    return char_offset;
 }
 
 [[nodiscard]] constexpr bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
@@ -972,7 +999,7 @@ public:
                 ? static_cast<std::uint8_t>(last_stop_signal_)
                 : 0u;
         pending_single_step_ = false;
-        return send_continue_locked(sig);
+        return resume_continue_locked(active_tid_, sig);
     }
 
     [[nodiscard]] Result<void> pause_execution() override {
@@ -989,7 +1016,7 @@ public:
             return make_error("step_into requires remote target to be in Paused state");
         }
         const ThreadId target_tid = tid.value_or(active_tid_);
-        return step_into_locked(target_tid);
+        return resume_step_into_locked(target_tid);
     }
 
     [[nodiscard]] Result<void> step_over(std::optional<ThreadId> tid) override {
@@ -1030,7 +1057,7 @@ public:
             thumb_mode);
 
         if (!fallthrough.has_value()) {
-            return step_into_locked(target_tid);
+            return resume_step_into_locked(target_tid);
         }
 
         return arm_temp_breakpoint_and_continue_locked(target_tid, *fallthrough, thumb_mode);
@@ -1430,17 +1457,10 @@ public:
         }
 
         const RspRegisterSpec* target_spec = nullptr;
-        std::size_t g_char_offset = 0u;
-        bool offset_accumulating = true;
-
         for (const RspRegisterSpec& spec : target_desc_.registers) {
             if (matches_register_alias(target_profile_.architecture, spec.name, clean_name)) {
                 target_spec = &spec;
-                offset_accumulating = false;
                 break;
-            }
-            if (offset_accumulating) {
-                g_char_offset += static_cast<std::size_t>((spec.bitsize + 7u) / 8u) * 2u;
             }
         }
 
@@ -1458,64 +1478,10 @@ public:
                 target_spec->name));
         }
 
-        const auto remote_tid = resolve_or_refresh_remote_tid_locked(tid);
-        if (!remote_tid.has_value()) {
-            return make_error("Unknown GDB RSP thread ID " + std::to_string(tid));
+        auto written = write_register_spec_locked(tid, *target_spec, value_u64, /*require_thread_lookup=*/true);
+        if (!written) {
+            return std::unexpected(written.error());
         }
-        if (auto sel = client_.select_general_thread(remote_tid->wire_token); !sel) {
-            return sel;
-        }
-
-        const std::size_t byte_len = static_cast<std::size_t>((target_spec->bitsize + 7u) / 8u);
-        std::vector<std::uint8_t> encoded_bytes(byte_len, 0u);
-        if (target_desc_.endianness == Endianness::Big) {
-            for (std::size_t i = 0u; i < byte_len; ++i) {
-                const std::size_t rev = byte_len - 1u - i;
-                encoded_bytes[i] = (rev < 8u)
-                                       ? static_cast<std::uint8_t>((value_u64 >> (rev * 8u)) & 0xFFu)
-                                       : 0u;
-            }
-        } else {
-            for (std::size_t i = 0u; i < byte_len; ++i) {
-                encoded_bytes[i] = (i < 8u)
-                                       ? static_cast<std::uint8_t>((value_u64 >> (i * 8u)) & 0xFFu)
-                                       : 0u;
-            }
-        }
-        const std::string val_hex = encode_bytes_hex(encoded_bytes);
-
-        auto p_reply =
-            client_.send_command("P" + format_hex_u64(target_spec->regnum) + "=" + val_hex);
-        if (!p_reply) {
-            return std::unexpected(p_reply.error());
-        }
-
-        const std::string_view p_trimmed = trim_ascii(*p_reply);
-        if (p_trimmed.empty()) {
-            // Fallback to full 'g' read + 'G' write when single-register 'P' is unsupported.
-            auto g_reply = client_.send_command("g");
-            if (!g_reply) {
-                return std::unexpected(g_reply.error());
-            }
-            std::string g_hex(trim_ascii(*g_reply));
-            if (is_rsp_error_reply(g_hex) || g_hex.size() < g_char_offset + val_hex.size()) {
-                return make_error(
-                    "GDB RSP stub rejected 'P' (unsupported) and 'g' buffer is too short for 'G' fallback");
-            }
-            g_hex.replace(g_char_offset, val_hex.size(), val_hex);
-            auto G_reply = client_.send_command("G" + g_hex);
-            if (!G_reply) {
-                return std::unexpected(G_reply.error());
-            }
-            if (trim_ascii(*G_reply) != "OK") {
-                return make_error("GDB RSP 'G' register bank write failed with '" + *G_reply + "'");
-            }
-        } else if (p_trimmed != "OK") {
-            return make_error("GDB RSP 'P' register write failed with '" +
-                              std::string(p_trimmed) + "'");
-        }
-
-        inline_reg_overrides_[tid][target_spec->regnum] = val_hex;
         if (target_spec->category == RegisterCategory::InstructionPointer && tid == active_tid_) {
             stop_status_.instruction_pointer = value_u64;
         }
@@ -2178,6 +2144,12 @@ private:
         if (!written) {
             return written;
         }
+        const auto actual_end = checked_add_u64(address, static_cast<std::uint64_t>(*written));
+        if (!actual_end.has_value()) {
+            return make_error("GDB RSP memory write completion range overflow");
+        }
+
+        std::optional<Error> first_rearm_error{};
 
         // Update saved original_bytes for any overlapping software breakpoints, and re-arm any
         // client-side memory traps whose trap opcode bytes were overwritten by the write.
@@ -2193,7 +2165,7 @@ private:
                 continue;
             }
             const std::uint64_t ov_start = std::max(address, entry.desc.address);
-            const std::uint64_t ov_end = std::min(*write_end, *bp_end);
+            const std::uint64_t ov_end = std::min(*actual_end, *bp_end);
             if (ov_start >= ov_end) {
                 continue;
             }
@@ -2205,14 +2177,44 @@ private:
                 data.data() + data_off, len, entry.desc.original_bytes.data() + orig_off);
 
             if (entry.desc.armed_in_target && entry.used_client_memory_trap) {
-                if (auto ts = debugger::select_software_trap(
-                        target_profile_.architecture,
-                        target_profile_.endianness,
-                        entry.z_kind == 2u && target_profile_.architecture == Architecture::ARM);
-                    ts.has_value()) {
-                    (void)client_.write_memory(entry.desc.address, ts->span());
+                entry.desc.armed_in_target = false;
+                auto ts = debugger::select_software_trap(
+                    target_profile_.architecture,
+                    target_profile_.endianness,
+                    entry.z_kind == 2u && target_profile_.architecture == Architecture::ARM);
+                if (!ts.has_value()) {
+                    if (!first_rearm_error.has_value()) {
+                        first_rearm_error = ts.error();
+                    }
+                    continue;
                 }
+                auto rearm_wr = client_.write_memory(entry.desc.address, ts->span());
+                if (!rearm_wr) {
+                    if (!first_rearm_error.has_value()) {
+                        first_rearm_error = rearm_wr.error();
+                    }
+                    continue;
+                }
+                if (*rearm_wr < ts->span().size()) {
+                    if (!first_rearm_error.has_value()) {
+                        first_rearm_error =
+                            Error{"Partial software trap re-arm write in GDB RSP memory write"};
+                    }
+                    continue;
+                }
+                entry.desc.armed_in_target = true;
             }
+        }
+
+        if (first_rearm_error.has_value()) {
+            return std::unexpected(*first_rearm_error);
+        }
+        if (*written < data.size()) {
+            return make_error(std::format(
+                "Partial GDB RSP memory write at 0x{:X}: wrote {} of {} bytes",
+                address,
+                *written,
+                data.size()));
         }
 
         return written;
@@ -2648,7 +2650,7 @@ private:
                 .z_kind = 1u,
                 .original_bytes = {},
             };
-            if (auto r = send_continue_locked(0u); !r) {
+            if (auto r = resume_continue_locked(tid, 0u); !r) {
                 temp_step_bp_ = TempStepBreakpoint{};
                 return r;
             }
@@ -2701,7 +2703,7 @@ private:
             .original_bytes = std::move(orig_bytes),
         };
 
-        if (auto cont_res = send_continue_locked(0u); !cont_res) {
+        if (auto cont_res = resume_continue_locked(tid, 0u); !cont_res) {
             (void)disarm_temp_breakpoint_locked();
             return cont_res;
         }
@@ -2821,6 +2823,264 @@ private:
         state_.store(debugger::DebugSessionState::Running, std::memory_order_release);
         stop_status_.state = debugger::DebugSessionState::Running;
         return {};
+    }
+
+    enum class StepOffOutcome : std::uint8_t {
+        NoClientTrapAtPc = 0,
+        SteppedReadyToContinue,
+        StoppedImmediately,
+    };
+
+    [[nodiscard]] RemoteBreakpointEntry* find_bp_by_id_locked(debugger::BreakpointId id) noexcept {
+        for (RemoteBreakpointEntry& e : breakpoints_) {
+            if (e.desc.id == id) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    [[nodiscard]] Result<StepOffOutcome> step_off_client_trap_locked(
+        ThreadId step_tid,
+        bool stop_after_single_step) {
+        const std::uint64_t current_ip = resolve_thread_ip_locked(step_tid);
+        const std::uint64_t insn_addr =
+            (target_profile_.architecture == Architecture::ARM)
+                ? (current_ip & ~std::uint64_t{1ULL})
+                : current_ip;
+
+        RemoteBreakpointEntry* bp_at_pc = nullptr;
+        for (RemoteBreakpointEntry& e : breakpoints_) {
+            if (e.desc.kind == debugger::BreakpointKind::Software &&
+                e.desc.enabled &&
+                e.desc.armed_in_target &&
+                e.used_client_memory_trap &&
+                !e.desc.original_bytes.empty() &&
+                e.desc.address == insn_addr) {
+                bp_at_pc = &e;
+                break;
+            }
+        }
+        if (bp_at_pc == nullptr) {
+            return StepOffOutcome::NoClientTrapAtPc;
+        }
+
+        const debugger::BreakpointId bp_id = bp_at_pc->desc.id;
+        const std::uint64_t bp_addr = bp_at_pc->desc.address;
+        const bool is_arm_thumb =
+            bp_at_pc->z_kind == 2u && target_profile_.architecture == Architecture::ARM;
+        auto trap_spec = debugger::select_software_trap(
+            target_profile_.architecture, target_profile_.endianness, is_arm_thumb);
+        if (!trap_spec) {
+            return std::unexpected(trap_spec.error());
+        }
+
+        auto restore_wr = client_.write_memory(bp_addr, bp_at_pc->desc.original_bytes);
+        if (!restore_wr) {
+            return std::unexpected(restore_wr.error());
+        }
+        bp_at_pc->desc.armed_in_target = false;
+
+        auto rearm_stepped_bp = [&]() -> Result<void> {
+            auto wr = client_.write_memory(bp_addr, trap_spec->span());
+            if (!wr) {
+                return std::unexpected(wr.error());
+            }
+            if (*wr < trap_spec->span().size()) {
+                return make_error("Partial software trap re-arm write after breakpoint step-off");
+            }
+            if (RemoteBreakpointEntry* cur = find_bp_by_id_locked(bp_id); cur != nullptr) {
+                cur->desc.armed_in_target = true;
+            }
+            return {};
+        };
+
+        const int saved_stop_signal = last_stop_signal_;
+        if (auto st = step_into_locked(step_tid); !st) {
+            last_stop_signal_ = saved_stop_signal;
+            (void)rearm_stepped_bp();
+            return std::unexpected(st.error());
+        }
+
+        std::string stop_pkt;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds{5000};
+        for (;;) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                pending_single_step_ = false;
+                state_.store(debugger::DebugSessionState::Paused, std::memory_order_release);
+                stop_status_.state = debugger::DebugSessionState::Paused;
+                last_stop_signal_ = saved_stop_signal;
+                (void)rearm_stepped_bp();
+                return make_error(
+                    "Timed out waiting for single-step reply while stepping off software breakpoint");
+            }
+            const auto rem =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            auto pkt_res = client_.try_receive_packet(std::min(rem, std::chrono::milliseconds{20}));
+            if (!pkt_res) {
+                pending_single_step_ = false;
+                state_.store(debugger::DebugSessionState::Paused, std::memory_order_release);
+                stop_status_.state = debugger::DebugSessionState::Paused;
+                last_stop_signal_ = saved_stop_signal;
+                (void)rearm_stepped_bp();
+                return std::unexpected(pkt_res.error());
+            }
+            if (!pkt_res->has_value()) {
+                continue;
+            }
+            const std::string_view pkt = trim_ascii(**pkt_res);
+            if (pkt.size() >= 3u && pkt.front() == 'O' && pkt != "OK") {
+                if (const auto console_out = decode_hex_ascii(pkt.substr(1u));
+                    console_out.has_value()) {
+                    debugger::DebugEvent out_ev{};
+                    out_ev.kind = debugger::DebugEventKind::DebugOutput;
+                    out_ev.pid = process_info_.pid;
+                    out_ev.tid = active_tid_;
+                    out_ev.summary = *console_out;
+                    push_event_locked(std::move(out_ev));
+                    continue;
+                }
+            }
+            stop_pkt.assign(pkt);
+            break;
+        }
+
+        auto parsed = parse_rsp_stop_reply_packet(stop_pkt);
+        if (!parsed) {
+            pending_single_step_ = false;
+            state_.store(debugger::DebugSessionState::Paused, std::memory_order_release);
+            stop_status_.state = debugger::DebugSessionState::Paused;
+            last_stop_signal_ = saved_stop_signal;
+            (void)rearm_stepped_bp();
+            return std::unexpected(parsed.error());
+        }
+
+        if (parsed->kind == ParsedStopReply::Kind::ProcessExit ||
+            parsed->kind == ParsedStopReply::Kind::SignalTerm) {
+            if (auto hr = handle_stop_reply_locked(stop_pkt); !hr) {
+                return std::unexpected(hr.error());
+            }
+            return StepOffOutcome::StoppedImmediately;
+        }
+
+        pending_single_step_ = false;
+        ThreadId stopped_tid = active_tid_;
+        if (parsed->thread.has_value()) {
+            stopped_tid = tid_mapper_.intern(*parsed->thread);
+        }
+        active_tid_ = stopped_tid;
+        if (!parsed->inline_register_hex.empty() && stopped_tid != 0u) {
+            inline_reg_overrides_[stopped_tid] = parsed->inline_register_hex;
+        }
+        client_.reset_selected_thread();
+        const std::uint64_t new_ip = resolve_thread_ip_locked(stopped_tid);
+
+        if (auto rearm_res = rearm_stepped_bp(); !rearm_res) {
+            if (temp_step_bp_.active) {
+                (void)disarm_temp_breakpoint_locked();
+            }
+            state_.store(debugger::DebugSessionState::Paused, std::memory_order_release);
+            stop_status_.state = debugger::DebugSessionState::Paused;
+            stop_status_.active_tid = stopped_tid;
+            stop_status_.instruction_pointer = new_ip;
+            return std::unexpected(rearm_res.error());
+        }
+
+        constexpr std::uint8_t kSigTrap = 0x05u;
+        if (parsed->signal_or_exit != kSigTrap || parsed->watch_address.has_value()) {
+            pending_single_step_ = true;
+            if (auto hr = handle_stop_reply_locked(stop_pkt); !hr) {
+                return std::unexpected(hr.error());
+            }
+            return StepOffOutcome::StoppedImmediately;
+        }
+
+        const std::uint64_t new_insn_addr =
+            (target_profile_.architecture == Architecture::ARM)
+                ? (new_ip & ~std::uint64_t{1ULL})
+                : new_ip;
+
+        if (temp_step_bp_.active && new_insn_addr == temp_step_bp_.address) {
+            (void)disarm_temp_breakpoint_locked();
+            last_stop_signal_ = 0;
+            debugger::DebugEvent ev{};
+            ev.kind = debugger::DebugEventKind::SingleStepCompleted;
+            ev.pid = process_info_.pid;
+            ev.tid = stopped_tid;
+            ev.address = new_ip;
+            ev.summary = std::format("Step completed at 0x{:X}", new_ip);
+            finalize_paused_stop_locked(stopped_tid, new_ip, std::move(ev));
+            return StepOffOutcome::StoppedImmediately;
+        }
+
+        for (RemoteBreakpointEntry& e : breakpoints_) {
+            if (e.desc.armed_in_target && (e.z_type == 0u || e.z_type == 1u) &&
+                e.desc.address == new_insn_addr) {
+                if (temp_step_bp_.active) {
+                    (void)disarm_temp_breakpoint_locked();
+                }
+                last_stop_signal_ = 0;
+                ++e.desc.hit_count;
+                debugger::DebugEvent ev{};
+                ev.kind = debugger::DebugEventKind::BreakpointHit;
+                ev.pid = process_info_.pid;
+                ev.tid = stopped_tid;
+                ev.address = e.desc.address;
+                ev.breakpoint_id = e.desc.id;
+                ev.summary = std::format(
+                    "Hit {} breakpoint #{} at 0x{:X}{} (hits: {})",
+                    debugger::to_string(e.desc.kind),
+                    e.desc.id,
+                    e.desc.address,
+                    e.desc.label.empty() ? "" : (" <" + e.desc.label + ">"),
+                    e.desc.hit_count);
+                finalize_paused_stop_locked(stopped_tid, new_ip, std::move(ev));
+                return StepOffOutcome::StoppedImmediately;
+            }
+        }
+
+        if (stop_after_single_step) {
+            last_stop_signal_ = 0;
+            debugger::DebugEvent ev{};
+            ev.kind = debugger::DebugEventKind::SingleStepCompleted;
+            ev.pid = process_info_.pid;
+            ev.tid = stopped_tid;
+            ev.address = new_ip;
+            ev.summary = std::format("Step completed at 0x{:X}", new_ip);
+            finalize_paused_stop_locked(stopped_tid, new_ip, std::move(ev));
+            return StepOffOutcome::StoppedImmediately;
+        }
+
+        last_stop_signal_ = saved_stop_signal;
+        state_.store(debugger::DebugSessionState::Paused, std::memory_order_release);
+        stop_status_.state = debugger::DebugSessionState::Paused;
+        stop_status_.active_tid = stopped_tid;
+        stop_status_.instruction_pointer = new_ip;
+        return StepOffOutcome::SteppedReadyToContinue;
+    }
+
+    [[nodiscard]] Result<void> resume_continue_locked(ThreadId step_tid, std::uint8_t signal_code) {
+        auto step_off = step_off_client_trap_locked(step_tid, /*stop_after_single_step=*/false);
+        if (!step_off) {
+            return std::unexpected(step_off.error());
+        }
+        if (*step_off == StepOffOutcome::StoppedImmediately) {
+            return {};
+        }
+        return send_continue_locked(signal_code);
+    }
+
+    [[nodiscard]] Result<void> resume_step_into_locked(ThreadId target_tid) {
+        auto step_off = step_off_client_trap_locked(target_tid, /*stop_after_single_step=*/true);
+        if (!step_off) {
+            return std::unexpected(step_off.error());
+        }
+        if (*step_off == StepOffOutcome::StoppedImmediately) {
+            return {};
+        }
+        return step_into_locked(target_tid);
     }
 
     [[nodiscard]] Result<void> poll_until_stopped_locked(std::chrono::milliseconds timeout) {
@@ -2980,22 +3240,25 @@ private:
             const auto trap_spec = debugger::select_software_trap(
                 target_profile_.architecture, target_profile_.endianness, false);
 
-            RemoteBreakpointEntry* hit_bp = find_armed_breakpoint_at_pc_locked(ip, trap_spec);
+            RemoteBreakpointEntry* hit_bp =
+                find_armed_breakpoint_at_pc_locked(ip, trap_spec, !was_single_step);
             if (hit_bp != nullptr && hit_bp->used_client_memory_trap &&
                 trap_spec.has_value() && trap_spec->rewinds_pc_on_hit &&
                 ip != hit_bp->desc.address) {
-                rewind_pc_locked(stopped_tid, hit_bp->desc.address);
-                ip = hit_bp->desc.address;
+                if (rewind_pc_locked(stopped_tid, hit_bp->desc.address)) {
+                    ip = hit_bp->desc.address;
+                }
             }
 
             const bool hit_temp =
                 had_temp_bp &&
                 (ip == temp_bp_addr ||
-                 (temp_used_mem_trap && trap_spec.has_value() && trap_spec->rewinds_pc_on_hit &&
-                  ip == temp_bp_addr + trap_spec->size));
+                 (!was_single_step && temp_used_mem_trap && trap_spec.has_value() &&
+                  trap_spec->rewinds_pc_on_hit && ip == temp_bp_addr + trap_spec->size));
             if (hit_temp && temp_used_mem_trap && ip != temp_bp_addr) {
-                rewind_pc_locked(stopped_tid, temp_bp_addr);
-                ip = temp_bp_addr;
+                if (rewind_pc_locked(stopped_tid, temp_bp_addr)) {
+                    ip = temp_bp_addr;
+                }
             }
 
             if (hit_bp != nullptr) {
@@ -3054,7 +3317,8 @@ private:
 
     [[nodiscard]] RemoteBreakpointEntry* find_armed_breakpoint_at_pc_locked(
         std::uint64_t ip,
-        const Result<debugger::SoftwareTrapSpec>& trap_spec) noexcept {
+        const Result<debugger::SoftwareTrapSpec>& trap_spec,
+        bool allow_trap_rewind) noexcept {
         for (RemoteBreakpointEntry& e : breakpoints_) {
             if (!e.desc.armed_in_target) {
                 continue;
@@ -3063,7 +3327,7 @@ private:
                 if (e.desc.address == ip) {
                     return &e;
                 }
-                if (e.used_client_memory_trap && trap_spec.has_value() &&
+                if (allow_trap_rewind && e.used_client_memory_trap && trap_spec.has_value() &&
                     trap_spec->rewinds_pc_on_hit && ip >= trap_spec->size &&
                     (ip - trap_spec->size) == e.desc.address) {
                     return &e;
@@ -3073,34 +3337,89 @@ private:
         return nullptr;
     }
 
-    void rewind_pc_locked(ThreadId tid, std::uint64_t rewound_ip) {
+    [[nodiscard]] Result<std::string> write_register_spec_locked(
+        ThreadId tid,
+        const RspRegisterSpec& target_spec,
+        std::uint64_t value_u64,
+        bool require_thread_lookup) {
+        const auto remote_tid = resolve_or_refresh_remote_tid_locked(tid);
+        if (!remote_tid.has_value()) {
+            if (require_thread_lookup) {
+                return make_error("Unknown GDB RSP thread ID " + std::to_string(tid));
+            }
+        } else if (auto sel = client_.select_general_thread(remote_tid->wire_token); !sel) {
+            return std::unexpected(sel.error());
+        }
+
+        const std::size_t byte_len = static_cast<std::size_t>((target_spec.bitsize + 7u) / 8u);
+        std::vector<std::uint8_t> encoded_bytes(byte_len, 0u);
+        if (target_desc_.endianness == Endianness::Big) {
+            for (std::size_t i = 0u; i < byte_len; ++i) {
+                const std::size_t rev = byte_len - 1u - i;
+                encoded_bytes[i] = (rev < 8u)
+                                       ? static_cast<std::uint8_t>((value_u64 >> (rev * 8u)) & 0xFFu)
+                                       : 0u;
+            }
+        } else {
+            for (std::size_t i = 0u; i < byte_len; ++i) {
+                encoded_bytes[i] = (i < 8u)
+                                       ? static_cast<std::uint8_t>((value_u64 >> (i * 8u)) & 0xFFu)
+                                       : 0u;
+            }
+        }
+        std::string val_hex = encode_bytes_hex(encoded_bytes);
+
+        auto p_reply =
+            client_.send_command("P" + format_hex_u64(target_spec.regnum) + "=" + val_hex);
+        if (!p_reply) {
+            return std::unexpected(p_reply.error());
+        }
+
+        const std::string_view p_trimmed = trim_ascii(*p_reply);
+        if (p_trimmed.empty()) {
+            auto g_reply = client_.send_command("g");
+            if (!g_reply) {
+                return std::unexpected(g_reply.error());
+            }
+            std::string g_hex(trim_ascii(*g_reply));
+            const std::size_t g_char_offset =
+                compute_g_packet_char_offset(target_desc_, target_spec);
+            if (is_rsp_error_reply(g_hex) || g_hex.size() < g_char_offset + val_hex.size()) {
+                return make_error(
+                    "GDB RSP stub rejected 'P' (unsupported) and 'g' buffer is too short for 'G' fallback");
+            }
+            g_hex.replace(g_char_offset, val_hex.size(), val_hex);
+            auto g_write_reply = client_.send_command("G" + g_hex);
+            if (!g_write_reply) {
+                return std::unexpected(g_write_reply.error());
+            }
+            if (trim_ascii(*g_write_reply) != "OK") {
+                return make_error("GDB RSP 'G' register bank write failed with '" +
+                                  *g_write_reply + "'");
+            }
+        } else if (p_trimmed != "OK") {
+            return make_error("GDB RSP 'P' register write failed with '" +
+                              std::string(p_trimmed) + "'");
+        }
+
+        inline_reg_overrides_[tid][target_spec.regnum] = val_hex;
+        return val_hex;
+    }
+
+    [[nodiscard]] bool rewind_pc_locked(ThreadId tid, std::uint64_t rewound_ip) {
         for (const RspRegisterSpec& spec : target_desc_.registers) {
             if (spec.category != RegisterCategory::InstructionPointer || spec.bitsize == 0u) {
                 continue;
             }
-            const std::size_t byte_len = static_cast<std::size_t>((spec.bitsize + 7u) / 8u);
-            std::vector<std::uint8_t> enc(byte_len, 0u);
-            if (target_desc_.endianness == Endianness::Big) {
-                for (std::size_t i = 0u; i < byte_len; ++i) {
-                    const std::size_t rev = byte_len - 1u - i;
-                    enc[i] = (rev < 8u)
-                                 ? static_cast<std::uint8_t>((rewound_ip >> (rev * 8u)) & 0xFFu)
-                                 : 0u;
-                }
-            } else {
-                for (std::size_t i = 0u; i < byte_len; ++i) {
-                    enc[i] = (i < 8u) ? static_cast<std::uint8_t>((rewound_ip >> (i * 8u)) & 0xFFu)
-                                      : 0u;
-                }
+            std::uint64_t masked_ip = rewound_ip;
+            if (spec.bitsize < 64u) {
+                masked_ip &= ((std::uint64_t{1ULL} << spec.bitsize) - 1ULL);
             }
-            const std::string val_hex = encode_bytes_hex(enc);
-            if (const auto remote_tid = tid_mapper_.lookup_remote(tid); remote_tid.has_value()) {
-                (void)client_.select_general_thread(remote_tid->wire_token);
-            }
-            (void)client_.send_command("P" + format_hex_u64(spec.regnum) + "=" + val_hex);
-            inline_reg_overrides_[tid][spec.regnum] = val_hex;
-            break;
+            auto res =
+                write_register_spec_locked(tid, spec, masked_ip, /*require_thread_lookup=*/false);
+            return res.has_value();
         }
+        return false;
     }
 
     void finalize_paused_stop_locked(
