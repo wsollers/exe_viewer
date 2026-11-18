@@ -5,6 +5,7 @@
 #include "analysis/reference_index.hpp"
 #include "model/binary_model.hpp"
 #include "navigation/viewer_navigation.hpp"
+#include "panel_helpers.hpp"
 #include "ui_panel.hpp"
 
 #include <array>
@@ -16,16 +17,9 @@
 
 namespace viewer {
 
-struct ScriptStarterTemplate {
-    std::string_view title{};
-    std::string_view summary{};
-    bool requires_mutations{false};
-    std::string_view source{};
-};
-
 class ScriptingPanel final : public UiPanel {
 public:
-    static constexpr std::size_t kStarterTemplateCount = 4u;
+    static constexpr std::size_t kStarterTemplateCount = kScriptStarterTemplateCount;
 
     ScriptingPanel(BinaryModel& model,
                    AnnotationStore& annotations,

@@ -1733,6 +1733,27 @@ using detail::utf8_path;
         return result;
     }
 
+    peelf::Result<void> BinaryModel::reset_static_patches_to_baseline() {
+        if (is_live_process()) {
+            return peelf::make_error("Live process inspection is strictly read-only");
+        }
+        if (source_kind_ != BinarySourceKind::StaticFile || file_info_.path.empty()) {
+            return peelf::make_error("No static binary image is loaded");
+        }
+        const bool had_changes =
+            editable_image_.has_value() && !editable_image_->changed_intervals().empty();
+        auto reopened = peelf::PagedBinaryImage::open(utf8_path(file_info_.path));
+        if (!reopened.has_value()) {
+            return std::unexpected(reopened.error());
+        }
+        editable_image_ = std::move(*reopened);
+        patch_metadata_by_offset_.clear();
+        if (had_changes) {
+            ++edit_revision_;
+        }
+        return {};
+    }
+
     void BinaryModel::record_patch_metadata(std::uint64_t offset,
                                             std::string label,
                                             std::optional<std::string> asm_source) {
@@ -2203,9 +2224,7 @@ using detail::utf8_path;
                         std::string note{};
                         if (const auto it = preserved_va_meta.find(wbm.virtual_address);
                             it != preserved_va_meta.end()) {
-                            if (!it->second.first.empty()) {
-                                category = it->second.first;
-                            }
+                            category = it->second.first;
                             note = it->second.second;
                         }
                         add_or_update_bookmark(Bookmark{

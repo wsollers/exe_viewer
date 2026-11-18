@@ -26,12 +26,14 @@ void StructureViewPanel::apply_structure_at(std::string_view type_name,
     use_file_offset_ = model_.is_live_process() ? false : is_file_offset;
     array_count_ = static_cast<int>(std::clamp<std::uint32_t>(count, 1u, 64u));
     sync_with_selection_ = false;
+    addr_mode_warning_.clear();
     dirty_ = true;
 }
 
 void StructureViewPanel::reset_for_new_binary() {
     evaluated_.reset();
     status_error_.clear();
+    addr_mode_warning_.clear();
     selected_field_path_.clear();
     dirty_ = true;
 
@@ -319,14 +321,26 @@ void StructureViewPanel::draw_contents() {
                 if (want_off) {
                     if (const auto off = model_.virtual_address_to_offset(target_address_)) {
                         target_address_ = *off;
+                        use_file_offset_ = true;
+                        addr_mode_warning_.clear();
+                        dirty_ = true;
+                    } else {
+                        addr_mode_warning_ = std::format(
+                            "VA 0x{:X} does not map to a file offset; keeping Virtual Addr mode.",
+                            target_address_);
                     }
                 } else {
                     if (const auto va = model_.offset_to_virtual_address(target_address_)) {
                         target_address_ = *va;
+                        use_file_offset_ = false;
+                        addr_mode_warning_.clear();
+                        dirty_ = true;
+                    } else {
+                        addr_mode_warning_ = std::format(
+                            "File offset 0x{:X} is outside mapped virtual sections; keeping File Offset mode.",
+                            target_address_);
                     }
                 }
-                use_file_offset_ = want_off;
-                dirty_ = true;
             }
         }
         ImGui::SameLine();
@@ -344,20 +358,24 @@ void StructureViewPanel::draw_contents() {
                            "%" PRIX64,
                            ImGuiInputTextFlags_CharsHexadecimal)) {
         sync_with_selection_ = false;
+        addr_mode_warning_.clear();
         dirty_ = true;
     }
     ImGui::SameLine();
     if (ImGui::Button("Use Selection")) {
         if (!use_file_offset_ && selection_.virtual_address) {
             target_address_ = *selection_.virtual_address;
+            addr_mode_warning_.clear();
             dirty_ = true;
         } else if (use_file_offset_ && selection_.file_offset) {
             target_address_ = *selection_.file_offset;
+            addr_mode_warning_.clear();
             dirty_ = true;
         }
     }
     ImGui::SameLine();
     if (ImGui::Checkbox("Sync", &sync_with_selection_) && sync_with_selection_) {
+        addr_mode_warning_.clear();
         dirty_ = true;
     }
     ImGui::SameLine();
@@ -365,6 +383,10 @@ void StructureViewPanel::draw_contents() {
     if (ImGui::InputInt("Count", &array_count_)) {
         array_count_ = std::clamp(array_count_, 1, 64);
         dirty_ = true;
+    }
+
+    if (!addr_mode_warning_.empty()) {
+        ImGui::TextColored(ImVec4(0.95f, 0.72f, 0.25f, 1.0f), "%s", addr_mode_warning_.c_str());
     }
 
     // ---- Row 3: Target Layout Indicator + Pin Binding ----

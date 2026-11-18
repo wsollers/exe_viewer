@@ -208,6 +208,9 @@ void Application::init_imgui() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     imgui_.mark_context_created();
+    if (ui_) {
+        ui_->register_workspace_settings_handler();
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;

@@ -81,6 +81,11 @@ struct ProjectBinaryResolution {
     const AnalysisProject&,
     bool allow_modified_binary = false);
 
+[[nodiscard]] peelf::Result<void> replace_project_patches_from_snapshot(
+    BinaryModel&,
+    const AnalysisProject&,
+    bool allow_modified_binary = false);
+
 [[nodiscard]] peelf::Result<std::string> read_project_file(const std::filesystem::path&);
 [[nodiscard]] peelf::Result<void> write_analysis_file(const std::filesystem::path&, std::string_view);
 

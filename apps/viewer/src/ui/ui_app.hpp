@@ -92,6 +92,7 @@ namespace viewer {
 
         void request_workspace_preset(WorkspacePreset preset) noexcept;
         void request_workspace_reset() noexcept;
+        void register_workspace_settings_handler();
         [[nodiscard]] WorkspacePreset active_workspace_preset() const noexcept {
             return active_workspace_preset_;
         }
@@ -147,6 +148,7 @@ namespace viewer {
         bool focus_listing_ = false;
         WorkspacePreset active_workspace_preset_ = WorkspacePreset::StaticReverseEngineering;
         std::optional<WorkspacePreset> pending_workspace_preset_;
+        std::optional<std::string> pending_ini_layout_{};
         std::uint32_t loaded_layout_schema_version_ = 0u;
         bool workspace_layout_checked_ = false;
         std::vector<WorkspacePanelId> pending_preset_active_tabs_;
@@ -331,7 +333,8 @@ namespace viewer {
                                                       double graph_max_y,
                                                       const ImVec2& mouse_pos) const;
         void build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size);
-        void register_workspace_settings_handler();
+        void sync_workspace_ini_state() const noexcept;
+        void reset_target_dependent_state();
         void apply_workspace_preset(WorkspacePreset preset, ImGuiID dockspace_id, const ImVec2& dockspace_size);
         void set_workspace_panel_visible(WorkspacePanelId panel, bool visible) noexcept;
         [[nodiscard]] bool is_workspace_panel_visible(WorkspacePanelId panel) const noexcept;

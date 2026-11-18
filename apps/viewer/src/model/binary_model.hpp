@@ -396,7 +396,8 @@ namespace viewer {
         [[nodiscard]] bool is_byte_patched(std::uint64_t offset) const noexcept {
             return byte_patch_state_at_offset(offset) != BytePatchState::Unchanged;
         }
-        peelf::Result<void> apply_patch_set(std::span<const peelf::PatchInterval> patches);
+        [[nodiscard]] peelf::Result<void> apply_patch_set(std::span<const peelf::PatchInterval> patches);
+        [[nodiscard]] peelf::Result<void> reset_static_patches_to_baseline();
 
         // Reusable JSON Patch Bundles (.pepatch.json) — static binaries only; strictly rejected on live processes.
         void record_patch_metadata(std::uint64_t offset,

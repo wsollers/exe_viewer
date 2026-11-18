@@ -38,7 +38,11 @@ inline void load_theme(float content_scale = 0.0f) {
     GetModuleFileNameW(nullptr, executable, 32768);
     const auto directory = std::filesystem::path(executable).parent_path();
 #else
-    const auto directory = std::filesystem::canonical("/proc/self/exe").parent_path();
+    std::error_code ec;
+    const auto exe_path = std::filesystem::weakly_canonical("/proc/self/exe", ec);
+    const auto directory = (ec || exe_path.empty())
+                               ? std::filesystem::current_path(ec)
+                               : exe_path.parent_path();
 #endif
     std::ifstream input(directory / "resources" / "theme.ini");
     const auto resource = read_theme(input);

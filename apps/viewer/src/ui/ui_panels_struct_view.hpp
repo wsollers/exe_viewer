@@ -71,6 +71,7 @@ private:
 
     std::optional<EvaluatedStructure> evaluated_{};
     std::string status_error_{};
+    std::string addr_mode_warning_{};
     std::string selected_field_path_{};
 
     std::function<std::span<const DataTypeRecord>()> extra_types_provider_{};

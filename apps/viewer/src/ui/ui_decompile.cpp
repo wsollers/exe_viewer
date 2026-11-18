@@ -1,5 +1,6 @@
 #include "ui_app.hpp"
 #include "decompile/structured_decompiler.hpp"
+#include <peelf/sha256.hpp>
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -64,7 +65,10 @@ void UiApp::initialize_decompiler() {
     decompiler_directory_ = std::filesystem::path(executable).parent_path();
 #else
     std::error_code ec;
-    decompiler_directory_ = std::filesystem::canonical("/proc/self/exe", ec).parent_path();
+    const auto exe_path = std::filesystem::weakly_canonical("/proc/self/exe", ec);
+    decompiler_directory_ = (ec || exe_path.empty())
+                                ? std::filesystem::current_path(ec)
+                                : exe_path.parent_path();
 #endif
     auto settings = discover_decompilers(decompiler_directory_);
     const auto path = decompiler_directory_ / "decompiler.ini";
@@ -176,6 +180,18 @@ void UiApp::request_decompile(bool force_reanalyze) {
         resolved_root = root;
         request.thumb = image->architecture() == peelf::Architecture::ARM && thumb_mode_;
 
+        auto bytes = model_.read_virtual_bytes(extent->virtual_address, static_cast<std::size_t>(extent->size));
+        if (!bytes) {
+            decompile_controller_.reset_for_new_target();
+            decompiled_ = make_decompile_message(DecompileStatus::Failed, bytes.error().message);
+            return;
+        }
+        if (model_.is_live_process()) {
+            request.binary_sha256 = std::format("{}:livefn:{}",
+                                                request.binary_sha256,
+                                                peelf::sha256_hex(*bytes));
+        }
+
         const DecompileCacheKey cache_key = make_decompile_cache_key(request, settings);
         if (force_reanalyze) {
             decompile_cache_.invalidate_function(cache_key.binary_sha256, cache_key.function_address);
@@ -191,12 +207,6 @@ void UiApp::request_decompile(bool force_reanalyze) {
             return;
         }
 
-        auto bytes = model_.read_virtual_bytes(extent->virtual_address, static_cast<std::size_t>(extent->size));
-        if (!bytes) {
-            decompile_controller_.reset_for_new_target();
-            decompiled_ = make_decompile_message(DecompileStatus::Failed, bytes.error().message);
-            return;
-        }
         const GraphByteReader va_reader = [this](std::uint64_t va, std::size_t len)
             -> std::vector<std::uint8_t> {
             auto res = model_.read_virtual_bytes(va, len);
@@ -238,6 +248,9 @@ void UiApp::request_decompile(bool force_reanalyze) {
             return;
         }
         const std::string fn_name = std::format("live_sub_{:X}", selected_va);
+        request.binary_sha256 = std::format("{}:livefn:{}",
+                                            request.binary_sha256,
+                                            peelf::sha256_hex(*bytes));
         request.address = selected_va;
         request.architecture = model_.architecture();
         request.endianness = model_.endianness();

@@ -638,6 +638,39 @@ peelf::Result<void> restore_project_patches(BinaryModel& model,
     return model.apply_patch_set(p.patches);
 }
 
+peelf::Result<void> replace_project_patches_from_snapshot(BinaryModel& model,
+                                                          const AnalysisProject& p,
+                                                          bool allow_modified_binary) {
+    if (!allow_modified_binary) {
+        if (model.bytes().size() != p.source_size ||
+            binary_fingerprint(model.bytes()) != p.fingerprint) {
+            return peelf::make_error("Source binary differs from the saved project");
+        }
+        if (!p.source_sha256.empty() &&
+            peelf::sha256_hex(model.bytes()) != lowercase_ascii(p.source_sha256)) {
+            return peelf::make_error("Source binary SHA-256 differs from the saved project");
+        }
+    }
+    for (const auto& patch : p.patches) {
+        if (patch.offset > model.bytes().size() ||
+            patch.original.size() > model.bytes().size() - patch.offset ||
+            patch.original.size() != patch.patched.size() ||
+            !std::ranges::equal(
+                patch.original,
+                std::span(model.bytes()).subspan(static_cast<std::size_t>(patch.offset),
+                                                 patch.original.size()))) {
+            return peelf::make_error("Saved patch original bytes do not match source");
+        }
+    }
+    if (auto reset_res = model.reset_static_patches_to_baseline(); !reset_res.has_value()) {
+        return reset_res;
+    }
+    if (p.patches.empty()) {
+        return {};
+    }
+    return model.apply_patch_set(p.patches);
+}
+
 peelf::Result<std::string> read_project_file(const std::filesystem::path& path) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(path, ec) || ec) {

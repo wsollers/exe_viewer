@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels.hpp"
 
 #include <imgui.h>
@@ -204,18 +205,31 @@ void MemorySearchPanel::draw_contents() {
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(last_report_->hits.size()));
+        clipper.Begin(clamp_imgui_clipper_count(last_report_->hits.size()));
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                 const peelf::MemorySearchHit& hit = last_report_->hits[static_cast<std::size_t>(row)];
+                const std::size_t match_len = std::max<std::size_t>(
+                    1u,
+                    hit.match_length != 0u ? hit.match_length : hit.matched_bytes.size());
+                const bool has_va = model_.is_live_process() ||
+                                    model_.offset_to_virtual_address(hit.view_offset).has_value();
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::PushID(row);
-                std::array<char, 32> abuf{};
-                std::snprintf(abuf.data(), abuf.size(), "0x%016" PRIX64, hit.address);
+                std::array<char, 40> abuf{};
+                if (has_va) {
+                    std::snprintf(abuf.data(), abuf.size(), "0x%016" PRIX64, hit.address);
+                } else {
+                    std::snprintf(abuf.data(), abuf.size(), "off+0x%" PRIX64, hit.view_offset);
+                }
                 if (ImGui::Selectable(abuf.data(), false, ImGuiSelectableFlags_SpanAllColumns)) {
-                    if (on_address_activated_) {
-                        on_address_activated_(hit.address, std::max<std::size_t>(1u, hit.matched_bytes.size()));
+                    if (has_va) {
+                        if (on_address_activated_) {
+                            on_address_activated_(hit.address, match_len);
+                        }
+                    } else if (on_offset_activated_) {
+                        on_offset_activated_(hit.view_offset, match_len);
                     }
                 }
                 ImGui::PopID();

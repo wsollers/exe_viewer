@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels.hpp"
 #include "tools/shellcode_converter.hpp"
 
@@ -36,10 +37,25 @@ namespace {
     return output;
 }
 
+[[nodiscard]] std::string path_filename_utf8(const std::filesystem::path& path) {
+    const auto u8_name = path.filename().u8string();
+    return std::string(u8_name.begin(), u8_name.end());
+}
+
 } // namespace
 
 PatchSetPanel::PatchSetPanel(BinaryModel& model, ViewerSelection& selection)
     : UiPanel("Patch Set"), model_(model), selection_(selection) {}
+
+void PatchSetPanel::reset_for_new_target() {
+    reset_preview();
+    loaded_target_path_.clear();
+    bundle_path_[0] = '\0';
+    bundle_name_[0] = '\0';
+    bundle_desc_[0] = '\0';
+    asm_input_[0] = '\0';
+    status_message_.clear();
+}
 
 void PatchSetPanel::refresh_live_assembly_preview() {
     live_asm_bytes_.clear();
@@ -133,12 +149,29 @@ void PatchSetPanel::draw_contents() {
         ImGui::TextWrapped("%s", status_message_.c_str());
     }
 
-    // Default bundle path/name once a static binary is loaded
-    if (bundle_path_[0] == '\0' && !model_.file_info().path.empty()) {
-        const std::string def_path = model_.file_info().path + ".pepatch.json";
+    // Refresh default bundle path/name whenever the loaded static binary changes
+    const std::string& current_target_path = model_.file_info().path;
+    if (loaded_target_path_ != current_target_path) {
+        loaded_target_path_ = current_target_path;
+        imported_bundle_.reset();
+        imported_bundle_preview_.reset();
+        bundle_status_.clear();
+        if (!current_target_path.empty()) {
+            const std::string def_path = current_target_path + ".pepatch.json";
+            std::snprintf(bundle_path_, sizeof(bundle_path_), "%s", def_path.c_str());
+            const std::string fname = path_filename_utf8(utf8_to_filesystem_path(current_target_path));
+            std::snprintf(bundle_name_, sizeof(bundle_name_), "%s patches", fname.c_str());
+        } else {
+            bundle_path_[0] = '\0';
+            bundle_name_[0] = '\0';
+        }
+    } else if (bundle_path_[0] == '\0' && !current_target_path.empty()) {
+        const std::string def_path = current_target_path + ".pepatch.json";
         std::snprintf(bundle_path_, sizeof(bundle_path_), "%s", def_path.c_str());
-        const std::string fname = std::filesystem::path(model_.file_info().path).filename().string();
-        std::snprintf(bundle_name_, sizeof(bundle_name_), "%s patches", fname.c_str());
+        if (bundle_name_[0] == '\0') {
+            const std::string fname = path_filename_utf8(utf8_to_filesystem_path(current_target_path));
+            std::snprintf(bundle_name_, sizeof(bundle_name_), "%s patches", fname.c_str());
+        }
     }
 
     std::optional<std::uint64_t> target_offset = selection_.file_offset;
@@ -386,7 +419,8 @@ void PatchSetPanel::draw_contents() {
             if (!exported.has_value()) {
                 bundle_status_ = exported.error().message;
             } else {
-                auto saved = peelf::save_patch_bundle_file(*exported, bundle_path_);
+                const std::filesystem::path bundle_fs_path = utf8_to_filesystem_path(bundle_path_);
+                auto saved = peelf::save_patch_bundle_file(*exported, bundle_fs_path);
                 bundle_status_ = saved.has_value()
                                      ? std::format("Exported {} patch entry(ies) to '{}'.",
                                                    exported->entries.size(),
@@ -398,7 +432,8 @@ void PatchSetPanel::draw_contents() {
         ImGui::SameLine();
         ImGui::BeginDisabled(bundle_path_[0] == '\0' || !model_.has_file());
         if (ImGui::Button("Import & Preview Patch Bundle...")) {
-            auto loaded = peelf::load_patch_bundle_file(bundle_path_);
+            const std::filesystem::path bundle_fs_path = utf8_to_filesystem_path(bundle_path_);
+            auto loaded = peelf::load_patch_bundle_file(bundle_fs_path);
             if (!loaded.has_value()) {
                 imported_bundle_.reset();
                 imported_bundle_preview_.reset();

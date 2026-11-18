@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels_references.hpp"
 #include <algorithm>
 #include <array>
@@ -135,14 +136,17 @@ void ReferencesPanel::draw_contents() {
 
             std::optional<std::size_t> erase_idx;
             std::optional<Bookmark> jump_bm;
+            const bool has_filter_bm = (filter_[0] != '\0');
             for (std::size_t i = 0; i < bookmarks.size(); ++i) {
                 const Bookmark& bm = bookmarks[i];
                 const std::string addr_str = bm.is_file_offset
                                                  ? std::format("off+0x{:X}", bm.address)
                                                  : std::format("0x{:X}", bm.address);
-                const std::string search_blob =
-                    addr_str + " " + bm.category + " " + bm.label + " " + bm.note;
-                if (!symbol_name_matches(search_blob, filter_)) continue;
+                if (has_filter_bm) {
+                    const std::string search_blob =
+                        addr_str + " " + bm.category + " " + bm.label + " " + bm.note;
+                    if (!symbol_name_matches(search_blob, filter_)) continue;
+                }
 
                 ImGui::PushID(static_cast<int>(i));
                 ImGui::TableNextRow();
@@ -228,8 +232,14 @@ void ReferencesPanel::draw_contents() {
         }
     };
 
+    const bool has_filter = (filter_[0] != '\0');
+
     const auto consider_ref = [&](const Reference& ref, std::vector<const Reference*>& out) {
         if (!confidence_matches(ref.confidence)) return;
+        if (!has_filter) {
+            out.push_back(&ref);
+            return;
+        }
         const auto source = describe(ref.source), target = describe(ref.target);
         const auto* source_note = annotations_.find(ref.source);
         const auto* target_note = annotations_.find(ref.target);
@@ -255,13 +265,16 @@ void ReferencesPanel::draw_contents() {
             for (const Reference* ref : candidates) consider_ref(*ref, matches);
         }
     } else {
+        if (!has_filter && confidence_filter_ == 0) {
+            matches.reserve(index_.records().size());
+        }
         for (const auto& ref : index_.records()) {
             consider_ref(ref, matches);
         }
     }
 
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(matches.size()));
+    clipper.Begin(clamp_imgui_clipper_count(matches.size()));
     while (clipper.Step()) for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
         const auto& ref = *matches[static_cast<std::size_t>(row)];
         const auto source = describe(ref.source), target = describe(ref.target);

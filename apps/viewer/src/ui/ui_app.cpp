@@ -62,7 +62,13 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , debugger_panel_(
           model,
           [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); },
-          [this]() { on_process_attached(); },
+          [this]() {
+              if (model_.is_live_process()) {
+                  on_process_attached();
+              } else {
+                  on_file_loaded();
+              }
+          },
           [this]() { open_attach_process_modal(); })
     , capabilities_panel_(model)
     , executable_settings_panel_(
@@ -369,6 +375,9 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     memory_search_panel_.set_address_activated_callback([this](std::uint64_t va, std::size_t match_size) {
         enqueue_navigation(va, PreferredView::Hex, std::max<std::size_t>(1u, match_size));
     });
+    memory_search_panel_.set_offset_activated_callback([this](std::uint64_t off, std::size_t match_size) {
+        pending_navigations_.enqueue_offset(off, std::max<std::size_t>(1u, match_size));
+    });
     runtime_flags_panel_.set_address_activated_callback([this](std::uint64_t va, PreferredView pv) {
         enqueue_navigation(va, pv);
     });
@@ -591,6 +600,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
     });
+    register_workspace_settings_handler();
 }
 
 UiApp::~UiApp() {
@@ -967,6 +977,14 @@ void UiApp::rebuild_references() {
 }
 
 void UiApp::process_deferred_gpu_work() {
+    if (pending_ini_layout_.has_value() && ImGui::GetCurrentContext() != nullptr) {
+        register_workspace_settings_handler();
+        const std::string ini = std::move(*pending_ini_layout_);
+        pending_ini_layout_.reset();
+        ImGui::LoadIniSettingsFromMemory(ini.c_str(), ini.size());
+        workspace_layout_checked_ = true;
+        sync_workspace_ini_state();
+    }
     if (auto completed = decompile_controller_.poll_completed(current_decompile_stamp())) {
         if (completed->cache_key && completed->unit.status == DecompileStatus::Ready) {
             decompile_cache_.put(*completed->cache_key, completed->unit);
@@ -1113,18 +1131,24 @@ void UiApp::process_deferred_gpu_work() {
     }
 }
 
-    // Called after a file (PE or ELF) is loaded into the model, or after detaching.
-    void UiApp::on_file_loaded() {
+    void UiApp::reset_target_dependent_state() {
         pending_slice_selection_.reset();
         pending_navigations_.clear();
-        patch_set_panel_.reset_preview();
+        pending_ini_layout_.reset();
+        patch_set_panel_.reset_for_new_target();
+        memory_search_panel_.reset_for_new_target();
+        timeline_panel_.reset_for_new_target();
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
+        decompile_cache_.clear();
         ++file_generation_;
         decompiled_ = {};
+        decompiled_root_.reset();
+        selected_code_ranges_.clear();
+        selected_code_address_.reset();
         annotations_.clear();
-        debug_types_.clear(); ++symbol_revision_; decompiled_root_.reset();
-        selected_code_ranges_.clear(); selected_code_address_.reset();
+        debug_types_.clear();
+        ++symbol_revision_;
         reference_scanner_.cancel(&reference_index_);
         reference_index_ = {};
         references_dirty_ = true;
@@ -1134,16 +1158,34 @@ void UiApp::process_deferred_gpu_work() {
         struct_view_panel_.reset_for_new_binary();
         navigation_history_.clear();
         disassembly_location_.reset();
+        last_disasm_offset_.reset();
+        current_instructions_.clear();
+        disasm_status_.clear();
         thumb_mode_ = false;
+        active_graph_root_.reset();
+        current_call_graph_.reset();
+        current_call_graph_layout_.reset();
+        original_call_graph_layout_.reset();
+        dragged_graph_card_.reset();
+        call_graph_texture_.reset();
+        loaded_call_graph_bmp_.clear();
+        pending_call_graph_root_.reset();
+        pending_call_graph_delay_frames_ = 0;
+        pending_call_graph_request_.reset();
         current_project_path_.clear();
         current_project_saved_ms_ = 0;
         pending_recovery_project_.reset();
         pending_recovery_key_path_.clear();
         mark_autosave_baseline();
+    }
+
+    // Called after a file (PE or ELF) is loaded into the model, or after detaching.
+    void UiApp::on_file_loaded() {
         if (model_.is_live_process()) {
             on_process_attached();
             return;
         }
+        reset_target_dependent_state();
         if (!model_.file_info().path.empty()) {
             const std::filesystem::path bin_path(model_.file_info().path);
             if (auto rec = check_newer_recovery_journal(bin_path, 0)) {
@@ -1159,12 +1201,6 @@ void UiApp::process_deferred_gpu_work() {
             structure_tree_.reset();
             current_selection_ = {};
             last_navigation_selection_.reset();
-            last_disasm_offset_.reset();
-            current_instructions_.clear();
-            disasm_status_.clear();
-            pending_call_graph_root_.reset();
-            pending_call_graph_delay_frames_ = 0;
-            pending_call_graph_request_.reset();
             return;
         }
 

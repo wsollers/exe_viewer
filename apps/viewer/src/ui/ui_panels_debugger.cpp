@@ -1,6 +1,7 @@
 #include "ui_panels_debugger.hpp"
 
 #include "logger.hpp"
+#include "panel_helpers.hpp"
 
 #include <imgui.h>
 
@@ -47,40 +48,16 @@ namespace {
     return false;
 }
 
-[[nodiscard]] std::vector<std::string> split_shell_args(std::string_view raw) {
-    std::vector<std::string> out;
-    std::string cur;
-    bool in_quotes = false;
-    char quote_ch = '\0';
-    for (std::size_t i = 0; i < raw.size(); ++i) {
-        const char c = raw[i];
-        if (in_quotes) {
-            if (c == '\\' && i + 1 < raw.size() && raw[i + 1] == quote_ch) {
-                cur.push_back(raw[++i]);
-            } else if (c == quote_ch) {
-                in_quotes = false;
-            } else {
-                cur.push_back(c);
-            }
-        } else {
-            if (c == '"' || c == '\'') {
-                in_quotes = true;
-                quote_ch = c;
-            } else if (std::isspace(static_cast<unsigned char>(c))) {
-                if (!cur.empty()) {
-                    out.push_back(std::move(cur));
-                    cur.clear();
-                }
-            } else {
-                cur.push_back(c);
-            }
-        }
-    }
-    if (!cur.empty()) {
-        out.push_back(std::move(cur));
-    }
-    return out;
-}
+class ScopedDisabled final {
+public:
+    explicit ScopedDisabled(bool disabled) noexcept { ImGui::BeginDisabled(disabled); }
+    ~ScopedDisabled() noexcept { ImGui::EndDisabled(); }
+
+    ScopedDisabled(const ScopedDisabled&) = delete;
+    ScopedDisabled& operator=(const ScopedDisabled&) = delete;
+    ScopedDisabled(ScopedDisabled&&) = delete;
+    ScopedDisabled& operator=(ScopedDisabled&&) = delete;
+};
 
 [[nodiscard]] ImVec4 state_badge_color(peelf::debugger::DebugSessionState state) noexcept {
     using peelf::debugger::DebugSessionState;
@@ -123,41 +100,32 @@ void DebuggerPanel::open_opt_in_modal() {
 void DebuggerPanel::refresh_modal_process_list() {
     if (auto listed = model_.list_processes(); listed.has_value()) {
         cached_processes_ = std::move(*listed);
+        if (selected_pid_.has_value()) {
+            const bool still_valid = std::ranges::any_of(
+                cached_processes_,
+                [this](const peelf::ProcessInfo& proc) noexcept {
+                    if (proc.pid != *selected_pid_) {
+                        return false;
+                    }
+                    if (!attach_accessible_only_) {
+                        return true;
+                    }
+                    return proc.access == peelf::ProcessAccessStatus::Accessible ||
+                           proc.access == peelf::ProcessAccessStatus::ReadOnly;
+                });
+            if (!still_valid) {
+                selected_pid_.reset();
+            }
+        }
+    } else {
+        cached_processes_.clear();
+        selected_pid_.reset();
+        modal_error_ = listed.error().message;
     }
 }
 
 std::optional<std::uint64_t> DebuggerPanel::parse_address_or_symbol(std::string_view raw) const {
-    const std::string_view expr = trim_ws(raw);
-    if (expr.empty()) {
-        return std::nullopt;
-    }
-
-    std::string_view hex_part = expr;
-    if (hex_part.starts_with("0x") || hex_part.starts_with("0X")) {
-        hex_part.remove_prefix(2);
-    }
-    if (!hex_part.empty()) {
-        std::uint64_t val = 0;
-        const auto [ptr, ec] = std::from_chars(hex_part.data(), hex_part.data() + hex_part.size(), val, 16);
-        if (ec == std::errc{} && ptr == hex_part.data() + hex_part.size()) {
-            return val;
-        }
-    }
-
-    const bool demangle = model_.demangle_symbols();
-    for (const SymbolRecord& sym : model_.symbol_index().records()) {
-        if (!sym.virtual_address.has_value()) continue;
-        if (sym.name == expr || sym.display_name(demangle) == expr) {
-            return *sym.virtual_address;
-        }
-    }
-    for (const SymbolRecord& sym : model_.symbol_index().records()) {
-        if (!sym.virtual_address.has_value()) continue;
-        if (icontains_ascii(sym.name, expr) || icontains_ascii(sym.display_name(demangle), expr)) {
-            return *sym.virtual_address;
-        }
-    }
-    return std::nullopt;
+    return resolve_breakpoint_target(raw, model_.symbol_index(), model_.demangle_symbols());
 }
 
 void DebuggerPanel::render_opt_in_modal() {
@@ -203,26 +171,34 @@ void DebuggerPanel::render_opt_in_modal() {
             ImGui::InputText("Working Directory", launch_cwd_buf_.data(), launch_cwd_buf_.size());
             ImGui::Spacing();
 
-            const bool has_exe = trim_ws(launch_exe_buf_.data()).size() > 0u;
-            ImGui::BeginDisabled(!has_exe);
-            if (ImGui::Button("Launch Active Debugger (Opt-In)", ImVec2(250.0f, 0.0f))) {
-                const std::filesystem::path exe_p(std::string(trim_ws(launch_exe_buf_.data())));
-                const std::vector<std::string> args = split_shell_args(launch_args_buf_.data());
-                const std::string_view cwd_sv = trim_ws(launch_cwd_buf_.data());
-                const std::filesystem::path cwd_p = cwd_sv.empty()
-                    ? std::filesystem::path{}
-                    : std::filesystem::path(std::string(cwd_sv));
-                if (auto res = model_.launch_debug_process(exe_p, args, cwd_p); res.has_value()) {
-                    set_visible(true);
-                    status_msg_ = std::format("Launched PID {} under opt-in debugger (paused at entry/loader).",
-                                              model_.process_session() ? model_.process_session()->pid() : 0u);
-                    if (on_session_changed_) on_session_changed_();
-                    ImGui::CloseCurrentPopup();
-                } else {
-                    modal_error_ = res.error().message;
+            const bool has_exe = !trim_ws(launch_exe_buf_.data()).empty();
+            {
+                const ScopedDisabled launch_guard{!has_exe};
+                if (ImGui::Button("Launch Active Debugger (Opt-In)", ImVec2(250.0f, 0.0f))) {
+                    const auto args_res = tokenize_launch_arguments(launch_args_buf_.data());
+                    if (!args_res.has_value()) {
+                        modal_error_ = args_res.error().message;
+                    } else {
+                        const std::filesystem::path exe_p =
+                            utf8_to_filesystem_path(trim_ws(launch_exe_buf_.data()));
+                        const std::string_view cwd_sv = trim_ws(launch_cwd_buf_.data());
+                        const std::filesystem::path cwd_p =
+                            cwd_sv.empty() ? std::filesystem::path{} : utf8_to_filesystem_path(cwd_sv);
+                        if (auto res = model_.launch_debug_process(exe_p, *args_res, cwd_p);
+                            res.has_value()) {
+                            modal_error_.clear();
+                            set_visible(true);
+                            status_msg_ = std::format(
+                                "Launched PID {} under opt-in debugger (paused at entry/loader).",
+                                model_.process_session() ? model_.process_session()->pid() : 0u);
+                            deferred_session_changed = true;
+                            ImGui::CloseCurrentPopup();
+                        } else {
+                            modal_error_ = res.error().message;
+                        }
+                    }
                 }
             }
-            ImGui::EndDisabled();
             ImGui::EndTabItem();
         }
 
@@ -235,7 +211,19 @@ void DebuggerPanel::render_opt_in_modal() {
             ImGui::InputTextWithHint("##DbgProcFilter", "Filter PID / name / cmd...",
                                      attach_filter_buf_.data(), attach_filter_buf_.size());
             ImGui::SameLine();
-            ImGui::Checkbox("Accessible only", &attach_accessible_only_);
+            if (ImGui::Checkbox("Accessible only", &attach_accessible_only_) &&
+                attach_accessible_only_ && selected_pid_.has_value()) {
+                const bool still_accessible = std::ranges::any_of(
+                    cached_processes_,
+                    [this](const peelf::ProcessInfo& proc) noexcept {
+                        return proc.pid == *selected_pid_ &&
+                               (proc.access == peelf::ProcessAccessStatus::Accessible ||
+                                proc.access == peelf::ProcessAccessStatus::ReadOnly);
+                    });
+                if (!still_accessible) {
+                    selected_pid_.reset();
+                }
+            }
             ImGui::SameLine();
             ImGui::SetNextItemWidth(100.0f);
             ImGui::InputTextWithHint("##DbgManualPid", "PID",
@@ -248,9 +236,10 @@ void DebuggerPanel::render_opt_in_modal() {
                 const auto [p, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), pid, 10);
                 if (ec == std::errc{} && p == sv.data() + sv.size() && pid > 0) {
                     if (auto res = model_.attach_debug_process(pid); res.has_value()) {
+                        modal_error_.clear();
                         set_visible(true);
                         status_msg_ = std::format("Attached opt-in debugger to PID {}.", pid);
-                        if (on_session_changed_) on_session_changed_();
+                        deferred_session_changed = true;
                         ImGui::CloseCurrentPopup();
                     } else {
                         modal_error_ = res.error().message;
@@ -318,27 +307,30 @@ void DebuggerPanel::render_opt_in_modal() {
 
             if (pending_attach_pid.has_value()) {
                 if (auto res = model_.attach_debug_process(*pending_attach_pid); res.has_value()) {
+                    modal_error_.clear();
                     set_visible(true);
                     status_msg_ = std::format("Attached opt-in debugger to PID {}.", *pending_attach_pid);
-                    if (on_session_changed_) on_session_changed_();
-                    ImGui::CloseCurrentPopup();
-                } else {
-                    modal_error_ = res.error().message;
-                }
-            }
-
-            ImGui::BeginDisabled(!selected_pid_.has_value());
-            if (ImGui::Button("Attach Active Debugger (Opt-In)", ImVec2(240.0f, 0.0f)) && selected_pid_) {
-                if (auto res = model_.attach_debug_process(*selected_pid_); res.has_value()) {
-                    set_visible(true);
-                    status_msg_ = std::format("Attached opt-in debugger to PID {}.", *selected_pid_);
                     deferred_session_changed = true;
                     ImGui::CloseCurrentPopup();
                 } else {
                     modal_error_ = res.error().message;
                 }
             }
-            ImGui::EndDisabled();
+
+            {
+                const ScopedDisabled attach_guard{!selected_pid_.has_value()};
+                if (ImGui::Button("Attach Active Debugger (Opt-In)", ImVec2(240.0f, 0.0f)) && selected_pid_) {
+                    if (auto res = model_.attach_debug_process(*selected_pid_); res.has_value()) {
+                        modal_error_.clear();
+                        set_visible(true);
+                        status_msg_ = std::format("Attached opt-in debugger to PID {}.", *selected_pid_);
+                        deferred_session_changed = true;
+                        ImGui::CloseCurrentPopup();
+                    } else {
+                        modal_error_ = res.error().message;
+                    }
+                }
+            }
             ImGui::EndTabItem();
         }
 
@@ -504,75 +496,84 @@ void DebuggerPanel::draw_transport_bar() {
     const bool is_active = is_paused || is_running;
 
     ImGui::SameLine();
-    ImGui::BeginDisabled(!is_paused);
-    if (ImGui::Button("Continue (F5)")) {
-        if (auto r = dbg->continue_execution(pass_signal_on_continue_); !r.has_value()) {
-            status_msg_ = r.error().message;
-        } else {
-            status_msg_ = "Resumed debuggee execution.";
+    {
+        const ScopedDisabled paused_guard{!is_paused};
+        if (ImGui::Button("Continue (F5)")) {
+            if (auto r = dbg->continue_execution(pass_signal_on_continue_); !r.has_value()) {
+                status_msg_ = r.error().message;
+            } else {
+                status_msg_ = "Resumed debuggee execution.";
+            }
         }
     }
-    ImGui::EndDisabled();
 
     ImGui::SameLine();
-    ImGui::BeginDisabled(!is_running);
-    if (ImGui::Button("Pause")) {
-        if (auto r = dbg->pause_execution(); !r.has_value()) {
-            status_msg_ = r.error().message;
-        } else {
-            status_msg_ = "Requested pause...";
+    {
+        const ScopedDisabled running_guard{!is_running};
+        if (ImGui::Button("Pause")) {
+            if (auto r = dbg->pause_execution(); !r.has_value()) {
+                status_msg_ = r.error().message;
+            } else {
+                status_msg_ = "Requested pause...";
+            }
         }
     }
-    ImGui::EndDisabled();
 
     ImGui::SameLine();
-    ImGui::BeginDisabled(!is_paused);
-    if (ImGui::Button("Step Into (F11)")) {
-        if (auto r = dbg->step_into(model_.selected_thread_id()); !r.has_value()) {
-            status_msg_ = r.error().message;
+    {
+        const ScopedDisabled step_guard{!is_paused};
+        if (ImGui::Button("Step Into (F11)")) {
+            if (auto r = dbg->step_into(model_.selected_thread_id()); !r.has_value()) {
+                status_msg_ = r.error().message;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Step Over (F10)")) {
+            if (auto r = dbg->step_over(model_.selected_thread_id()); !r.has_value()) {
+                status_msg_ = r.error().message;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Step Out (Shift+F11)")) {
+            if (auto r = dbg->step_out(model_.selected_thread_id()); !r.has_value()) {
+                status_msg_ = r.error().message;
+            }
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Step Over (F10)")) {
-        if (auto r = dbg->step_over(model_.selected_thread_id()); !r.has_value()) {
-            status_msg_ = r.error().message;
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Step Out (Shift+F11)")) {
-        if (auto r = dbg->step_out(model_.selected_thread_id()); !r.has_value()) {
-            status_msg_ = r.error().message;
-        }
-    }
-    ImGui::EndDisabled();
 
     ImGui::SameLine();
-    ImGui::BeginDisabled(!is_active);
-    if (ImGui::Button("Detach Cleanly")) {
-        model_.cancel_and_join_workers();
-        if (auto r = dbg->detach(); !r.has_value()) {
-            model_.refresh_debug_breakpoints();
-            status_msg_ = r.error().message;
-        } else {
-            model_.detach_process();
-            status_msg_ = "Disarmed all breakpoints and detached cleanly.";
-            if (on_session_changed_) on_session_changed_();
-            return;
+    bool ended_session = false;
+    {
+        const ScopedDisabled active_guard{!is_active};
+        if (ImGui::Button("Detach Cleanly")) {
+            model_.cancel_and_join_workers();
+            if (auto r = dbg->detach(); !r.has_value()) {
+                model_.refresh_debug_breakpoints();
+                status_msg_ = r.error().message;
+            } else {
+                model_.detach_process();
+                status_msg_ = "Disarmed all breakpoints and detached cleanly.";
+                ended_session = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Terminate") && !ended_session) {
+            model_.cancel_and_join_workers();
+            if (auto r = dbg->terminate(); !r.has_value()) {
+                status_msg_ = r.error().message;
+            } else {
+                model_.detach_process();
+                status_msg_ = "Terminated debugged target.";
+                ended_session = true;
+            }
         }
     }
-    ImGui::SameLine();
-    if (ImGui::Button("Terminate")) {
-        model_.cancel_and_join_workers();
-        if (auto r = dbg->terminate(); !r.has_value()) {
-            status_msg_ = r.error().message;
-        } else {
-            model_.detach_process();
-            status_msg_ = "Terminated debugged target.";
-            if (on_session_changed_) on_session_changed_();
-            return;
+    if (ended_session) {
+        if (on_session_changed_) {
+            on_session_changed_();
         }
+        return;
     }
-    ImGui::EndDisabled();
 
     // Status strip
     const auto state_sv = peelf::debugger::to_string(stop.state);

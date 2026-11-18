@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels.hpp"
 
 #include <imgui.h>
@@ -82,12 +83,15 @@ void SymbolsPanel::draw_contents() {
                 (library_filter_.empty() || records[i].library == library_filter_) &&
                 (!functions_only_ || records[i].source == SymbolSource::Import ||
                  (model_.image() && symbol_has_code(*model_.image(), records[i])))) {
-                if (selected_index == i) selected_row = static_cast<int>(matches.size());
+                if (selected_index == i &&
+                    matches.size() < static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+                    selected_row = static_cast<int>(matches.size());
+                }
                 matches.push_back(i);
             }
         std::optional<PendingEntityContextAction> pending_ctx_action;
         ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(matches.size()));
+        clipper.Begin(clamp_imgui_clipper_count(matches.size()));
         if (selected_row && last_scrolled_selected_ != selected_index)
             clipper.IncludeItemByIndex(*selected_row);
         while (clipper.Step()) {

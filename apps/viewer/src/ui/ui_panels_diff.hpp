@@ -81,6 +81,7 @@ private:
 
     std::optional<peelf::BinaryDiffReport> static_report_{};
     std::optional<peelf::LiveModuleIntegrityReport> live_report_{};
+    std::optional<std::uint64_t> captured_revision_token_{};
 
     // Synchronized Side-by-Side Hex & Disassembly cursor state
     bool lockstep_scroll_{true};
@@ -93,6 +94,7 @@ private:
 
     std::vector<std::uint8_t> sbs_lhs_slice_{};
     std::vector<std::uint8_t> sbs_rhs_slice_{};
+    std::vector<std::uint8_t> sbs_rhs_valid_{};
     Disassembler lhs_disasm_{};
     Disassembler rhs_disasm_{};
     std::vector<Instruction> sbs_lhs_insns_{};

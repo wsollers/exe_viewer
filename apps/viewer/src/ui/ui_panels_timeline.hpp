@@ -21,6 +21,7 @@ public:
 
     explicit ExecutionTimelinePanel(BinaryModel& model,
                                     NavigateTargetCallback on_navigate = {});
+    void reset_for_new_target() noexcept;
 
 protected:
     void draw_contents() override;

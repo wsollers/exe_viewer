@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels_diff.hpp"
 #include "ui_panels_capabilities.hpp"
 
@@ -105,12 +106,18 @@ void BinaryDiffPanel::invalidate() noexcept {
     mode_ = ActiveDiffMode::None;
     static_report_.reset();
     live_report_.reset();
+    captured_revision_token_.reset();
     lhs_bytes_.clear();
     rhs_bytes_.clear();
     lhs_owned_image_.reset();
     rhs_owned_image_.reset();
+    sbs_lhs_va_ = 0;
+    sbs_rhs_va_ = 0;
+    sbs_lhs_file_off_.reset();
+    sbs_rhs_file_off_.reset();
     sbs_lhs_slice_.clear();
     sbs_rhs_slice_.clear();
+    sbs_rhs_valid_.clear();
     sbs_lhs_insns_.clear();
     sbs_rhs_insns_.clear();
     status_message_.clear();
@@ -228,6 +235,8 @@ void BinaryDiffPanel::poll_async_completion() {
         return;
     }
 
+    captured_revision_token_ = model_.active_revision_token();
+
     if (finished->kind == AsyncDiffKind::TwoBinaries && finished->static_report.has_value()) {
         lhs_bytes_ = std::move(finished->lhs_bytes);
         lhs_owned_image_ = std::move(finished->lhs_image);
@@ -316,8 +325,8 @@ void BinaryDiffPanel::focus_pair_cursor(std::optional<std::uint64_t> lhs_va,
                                         std::size_t window_hint,
                                         bool also_jump_main_view) {
     sbs_window_bytes_ = std::clamp<std::size_t>(window_hint, 64u, 2048u);
-    if (lhs_va.has_value()) sbs_lhs_va_ = *lhs_va;
-    if (rhs_va.has_value()) sbs_rhs_va_ = *rhs_va;
+    sbs_lhs_va_ = lhs_va.value_or(0u);
+    sbs_rhs_va_ = rhs_va.value_or(0u);
     sbs_lhs_file_off_ = lhs_file_off;
     sbs_rhs_file_off_ = rhs_file_off;
 
@@ -341,6 +350,7 @@ void BinaryDiffPanel::focus_pair_cursor(std::optional<std::uint64_t> lhs_va,
 void BinaryDiffPanel::refresh_side_by_side_slices() {
     sbs_lhs_slice_.clear();
     sbs_rhs_slice_.clear();
+    sbs_rhs_valid_.clear();
     sbs_lhs_insns_.clear();
     sbs_rhs_insns_.clear();
 
@@ -358,20 +368,30 @@ void BinaryDiffPanel::refresh_side_by_side_slices() {
             sbs_rhs_slice_.assign(rhs_bytes_.begin() + static_cast<std::ptrdiff_t>(*sbs_rhs_file_off_),
                                   rhs_bytes_.begin() + static_cast<std::ptrdiff_t>(*sbs_rhs_file_off_ + take));
         }
+        sbs_rhs_valid_.assign(sbs_rhs_slice_.size(), 1u);
     } else if (mode_ == ActiveDiffMode::DiskVsLiveRam &&
                model_.is_live_process() && model_.process_session() != nullptr && sbs_rhs_va_ != 0u) {
         const auto samp = peelf::read_memory_tolerant(
             *model_.process_session(), model_.memory_regions(), sbs_rhs_va_, sbs_window_bytes_);
         sbs_rhs_slice_ = samp.bytes;
+        sbs_rhs_valid_ = samp.valid;
+        if (sbs_rhs_valid_.size() < sbs_rhs_slice_.size()) {
+            sbs_rhs_valid_.resize(sbs_rhs_slice_.size(), 0u);
+        }
     }
 
     if (!sbs_lhs_slice_.empty() && lhs_disasm_.is_initialized()) {
         sbs_lhs_insns_ = lhs_disasm_.disassemble(
             sbs_lhs_slice_.data(), sbs_lhs_slice_.size(), sbs_lhs_va_);
     }
-    if (!sbs_rhs_slice_.empty() && rhs_disasm_.is_initialized()) {
+    std::size_t readable_rhs_len = 0u;
+    while (readable_rhs_len < sbs_rhs_slice_.size() &&
+           (readable_rhs_len >= sbs_rhs_valid_.size() || sbs_rhs_valid_[readable_rhs_len] != 0u)) {
+        ++readable_rhs_len;
+    }
+    if (readable_rhs_len > 0u && rhs_disasm_.is_initialized()) {
         sbs_rhs_insns_ = rhs_disasm_.disassemble(
-            sbs_rhs_slice_.data(), sbs_rhs_slice_.size(), sbs_rhs_va_);
+            sbs_rhs_slice_.data(), readable_rhs_len, sbs_rhs_va_);
     }
 }
 
@@ -396,7 +416,7 @@ void BinaryDiffPanel::draw_contents() {
     }
     ImGui::SameLine();
     if (ImGui::Button("Compare File") && comparison_path_buf_[0] != '\0') {
-        if (auto res = compare_with_file(comparison_path_buf_.data()); !res) {
+        if (auto res = compare_with_file(utf8_to_filesystem_path(comparison_path_buf_.data())); !res) {
             Log().error("Binary Diff: {}", res.error().message);
         }
     }
@@ -441,6 +461,28 @@ void BinaryDiffPanel::draw_contents() {
     if (!status_message_.empty()) {
         ImGui::TextWrapped("%s", status_message_.c_str());
     }
+
+    const bool diff_is_stale =
+        mode_ != ActiveDiffMode::None &&
+        captured_revision_token_.has_value() &&
+        *captured_revision_token_ != model_.active_revision_token();
+    if (diff_is_stale) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.74f, 0.24f, 1.0f));
+        ImGui::TextWrapped(
+            "[STALE] Staged patches or target state changed since this diff ran — results may not match current bytes.");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(prog.running);
+        if (ImGui::SmallButton("Re-run Diff")) {
+            if (mode_ == ActiveDiffMode::TwoBinaries && comparison_path_buf_[0] != '\0') {
+                (void)compare_with_file(utf8_to_filesystem_path(comparison_path_buf_.data()));
+            } else if (mode_ == ActiveDiffMode::DiskVsLiveRam) {
+                (void)compare_active_live_module_vs_disk();
+            }
+        }
+        ImGui::EndDisabled();
+    }
+
     ImGui::Separator();
 
     if (mode_ == ActiveDiffMode::None) {
@@ -931,14 +973,24 @@ void BinaryDiffPanel::draw_side_by_side_tab() {
             for (std::size_t row_off = 0; row_off < max_bytes; row_off += 16u) {
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%" PRIX64, sbs_lhs_va_ + row_off);
+                if (row_off < sbs_lhs_slice_.size() || sbs_lhs_va_ != 0u || sbs_lhs_file_off_.has_value()) {
+                    const std::uint64_t lhs_base =
+                        sbs_lhs_va_ != 0u ? sbs_lhs_va_ : sbs_lhs_file_off_.value_or(0u);
+                    ImGui::Text(sbs_lhs_va_ != 0u ? "0x%" PRIX64 : "off+0x%" PRIX64,
+                                lhs_base + row_off);
+                } else {
+                    ImGui::TextDisabled("-");
+                }
 
                 ImGui::TableNextColumn();
                 for (std::size_t b = 0; b < 16u && (row_off + b) < sbs_lhs_slice_.size(); ++b) {
                     if (b > 0u) ImGui::SameLine(0.0f, 4.0f);
-                    const std::uint8_t lv = sbs_lhs_slice_[row_off + b];
-                    const bool diff = (row_off + b) >= sbs_rhs_slice_.size() ||
-                                      sbs_rhs_slice_[row_off + b] != lv;
+                    const std::size_t cell = row_off + b;
+                    const std::uint8_t lv = sbs_lhs_slice_[cell];
+                    const bool has_r = cell < sbs_rhs_slice_.size();
+                    const bool r_valid = has_r &&
+                                         (cell >= sbs_rhs_valid_.size() || sbs_rhs_valid_[cell] != 0u);
+                    const bool diff = !has_r || !r_valid || (sbs_rhs_slice_[cell] != lv);
                     if (diff) {
                         ImGui::TextColored(ImVec4(0.98f, 0.72f, 0.25f, 1.0f), "%02X", lv);
                     } else {
@@ -947,18 +999,32 @@ void BinaryDiffPanel::draw_side_by_side_tab() {
                 }
 
                 ImGui::TableNextColumn();
-                ImGui::Text("0x%" PRIX64, sbs_rhs_va_ + row_off);
+                if (row_off < sbs_rhs_slice_.size() || sbs_rhs_va_ != 0u || sbs_rhs_file_off_.has_value()) {
+                    const std::uint64_t rhs_base =
+                        sbs_rhs_va_ != 0u ? sbs_rhs_va_ : sbs_rhs_file_off_.value_or(0u);
+                    ImGui::Text(sbs_rhs_va_ != 0u ? "0x%" PRIX64 : "off+0x%" PRIX64,
+                                rhs_base + row_off);
+                } else {
+                    ImGui::TextDisabled("-");
+                }
 
                 ImGui::TableNextColumn();
                 for (std::size_t b = 0; b < 16u && (row_off + b) < sbs_rhs_slice_.size(); ++b) {
                     if (b > 0u) ImGui::SameLine(0.0f, 4.0f);
-                    const std::uint8_t rv = sbs_rhs_slice_[row_off + b];
-                    const bool diff = (row_off + b) >= sbs_lhs_slice_.size() ||
-                                      sbs_lhs_slice_[row_off + b] != rv;
-                    if (diff) {
-                        ImGui::TextColored(ImVec4(0.98f, 0.38f, 0.38f, 1.0f), "%02X", rv);
+                    const std::size_t cell = row_off + b;
+                    const bool r_valid =
+                        cell >= sbs_rhs_valid_.size() || sbs_rhs_valid_[cell] != 0u;
+                    if (!r_valid) {
+                        ImGui::TextColored(ImVec4(0.85f, 0.45f, 0.45f, 1.0f), "??");
                     } else {
-                        ImGui::TextDisabled("%02X", rv);
+                        const std::uint8_t rv = sbs_rhs_slice_[cell];
+                        const bool diff = cell >= sbs_lhs_slice_.size() ||
+                                          sbs_lhs_slice_[cell] != rv;
+                        if (diff) {
+                            ImGui::TextColored(ImVec4(0.98f, 0.38f, 0.38f, 1.0f), "%02X", rv);
+                        } else {
+                            ImGui::TextDisabled("%02X", rv);
+                        }
                     }
                 }
             }

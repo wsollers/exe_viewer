@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels_timeline.hpp"
 
 #include <imgui.h>
@@ -9,9 +10,11 @@
 #include <cstring>
 #include <format>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -158,6 +161,20 @@ constexpr std::array<KindChipSpec, peelf::kTimelineEventKindCount> kKindChipSpec
     return 1u;
 }
 
+struct TidEpochKey {
+    peelf::ThreadId tid{0};
+    std::uint64_t epoch{0};
+    bool operator==(const TidEpochKey&) const noexcept = default;
+};
+
+struct TidEpochKeyHash {
+    std::size_t operator()(const TidEpochKey& key) const noexcept {
+        const std::size_t h1 = std::hash<peelf::ThreadId>{}(key.tid);
+        const std::size_t h2 = std::hash<std::uint64_t>{}(key.epoch);
+        return h1 ^ (h2 + 0x9E3779B97F4A7C15ULL + (h1 << 6u) + (h1 >> 2u));
+    }
+};
+
 } // namespace
 
 ExecutionTimelinePanel::ExecutionTimelinePanel(BinaryModel& model,
@@ -167,6 +184,18 @@ ExecutionTimelinePanel::ExecutionTimelinePanel(BinaryModel& model,
       on_navigate_(std::move(on_navigate)) {
     visible_ = false;
     kind_enabled_.fill(true);
+}
+
+void ExecutionTimelinePanel::reset_for_new_target() noexcept {
+    selected_sequence_.reset();
+    pending_navigation_.reset();
+    pending_select_tid_.reset();
+    lane_filter_.reset();
+    global_lane_only_ = false;
+    pending_record_snapshot_delta_ = false;
+    pending_clear_timeline_ = false;
+    pending_capacity_change_.reset();
+    status_message_.clear();
 }
 
 bool ExecutionTimelinePanel::passes_filter(const peelf::TimelineEvent& ev) const {
@@ -475,7 +504,38 @@ void ExecutionTimelinePanel::draw_swimlanes_tab(
     }
     const std::uint64_t seq_span = (max_seq > min_seq) ? (max_seq - min_seq) : 1u;
 
-    const auto lane_count = timeline.thread_lanes().size();
+    const auto& lanes = timeline.thread_lanes();
+    const auto lane_count = lanes.size();
+    std::unordered_map<TidEpochKey, std::vector<std::size_t>, TidEpochKeyHash> lanes_by_tid_epoch;
+    lanes_by_tid_epoch.reserve(lane_count);
+    for (std::size_t li = 0u; li < lane_count; ++li) {
+        lanes_by_tid_epoch[TidEpochKey{lanes[li].identity.tid, lanes[li].identity.epoch}]
+            .push_back(li);
+    }
+
+    std::vector<const peelf::TimelineEvent*> band_events;
+    std::vector<const peelf::TimelineEvent*> global_events;
+    std::vector<std::vector<const peelf::TimelineEvent*>> lane_events(lane_count);
+    for (const peelf::TimelineEvent* ev : filtered_events) {
+        if (ev->kind == peelf::TimelineEventKind::DroppedEvents ||
+            ev->kind == peelf::TimelineEventKind::SamplingGap) {
+            band_events.push_back(ev);
+        }
+        if (!ev->thread.has_value()) {
+            global_events.push_back(ev);
+            continue;
+        }
+        if (const auto it = lanes_by_tid_epoch.find(
+                TidEpochKey{ev->thread->tid, ev->thread->epoch});
+            it != lanes_by_tid_epoch.end()) {
+            for (const std::size_t li : it->second) {
+                if (ev->thread->same_lane(lanes[li].identity)) {
+                    lane_events[li].push_back(ev);
+                }
+            }
+        }
+    }
+
     constexpr float kLaneRowHeight = 30.0f;
     constexpr float kLabelColWidth = 235.0f;
     constexpr float kTrackPadX = 16.0f;
@@ -503,6 +563,7 @@ void ExecutionTimelinePanel::draw_swimlanes_tab(
 
         auto render_lane_row = [&](std::string_view lane_title,
                                    const std::optional<peelf::TimelineLane>& lane_meta,
+                                   std::span<const peelf::TimelineEvent* const> row_events,
                                    std::size_t row_idx) {
             ImGui::TableNextRow(ImGuiTableRowFlags_None, kLaneRowHeight);
             ImGui::TableSetColumnIndex(0);
@@ -558,37 +619,36 @@ void ExecutionTimelinePanel::draw_swimlanes_tab(
 
             dl->AddLine(ImVec2(x_left, cy), ImVec2(x_right, cy), IM_COL32(90, 96, 110, 140), 1.0f);
 
-            const peelf::TimelineEvent* hovered_ev = nullptr;
-            float best_hover_dist = 9.0f;
+            const auto x_for_sequence = [&](std::uint64_t seq) noexcept {
+                const float t = (max_seq == min_seq)
+                                    ? 0.5f
+                                    : static_cast<float>(seq - min_seq) /
+                                          static_cast<float>(seq_span);
+                return x_left + t * usable_w;
+            };
 
-            for (const peelf::TimelineEvent* ev : filtered_events) {
+            // Draw global SamplingGap / DroppedEvents vertical callout bands across all lanes.
+            for (const peelf::TimelineEvent* ev : band_events) {
                 const bool belongs_here =
                     lane_meta.has_value()
                         ? (ev->thread.has_value() && ev->thread->same_lane(lane_meta->identity))
                         : (!ev->thread.has_value());
+                const float x = x_for_sequence(ev->sequence);
+                const ImU32 band_col =
+                    ev->kind == peelf::TimelineEventKind::DroppedEvents
+                        ? IM_COL32(255, 85, 85, belongs_here ? 95 : 42)
+                        : IM_COL32(255, 195, 65, belongs_here ? 95 : 42);
+                dl->AddRectFilled(ImVec2(x - 3.0f, p0.y + 1.0f),
+                                  ImVec2(x + 3.0f, p1.y - 1.0f),
+                                  band_col,
+                                  2.0f);
+            }
 
-                const float t = (max_seq == min_seq)
-                                    ? 0.5f
-                                    : static_cast<float>(ev->sequence - min_seq) /
-                                          static_cast<float>(seq_span);
-                const float x = x_left + t * usable_w;
+            const peelf::TimelineEvent* hovered_ev = nullptr;
+            float best_hover_dist = 9.0f;
 
-                // Draw global SamplingGap / DroppedEvents vertical callout bands across all lanes.
-                if (ev->kind == peelf::TimelineEventKind::DroppedEvents ||
-                    ev->kind == peelf::TimelineEventKind::SamplingGap) {
-                    const ImU32 band_col =
-                        ev->kind == peelf::TimelineEventKind::DroppedEvents
-                            ? IM_COL32(255, 85, 85, belongs_here ? 95 : 42)
-                            : IM_COL32(255, 195, 65, belongs_here ? 95 : 42);
-                    dl->AddRectFilled(ImVec2(x - 3.0f, p0.y + 1.0f),
-                                      ImVec2(x + 3.0f, p1.y - 1.0f),
-                                      band_col,
-                                      2.0f);
-                }
-
-                if (!belongs_here) {
-                    continue;
-                }
+            for (const peelf::TimelineEvent* ev : row_events) {
+                const float x = x_for_sequence(ev->sequence);
 
                 const ImVec4 kind_col = event_kind_color(ev->kind);
                 const bool is_selected =
@@ -674,19 +734,17 @@ void ExecutionTimelinePanel::draw_swimlanes_tab(
         };
 
         if (!lane_filter_.has_value()) {
-            render_lane_row("Process / Global", std::nullopt, 0u);
+            render_lane_row("Process / Global", std::nullopt, global_events, 0u);
         }
 
         if (!global_lane_only_) {
-            std::size_t idx = 1u;
-            for (const peelf::TimelineLane& lane : timeline.thread_lanes()) {
+            for (std::size_t li = 0u; li < lane_count; ++li) {
+                const peelf::TimelineLane& lane = lanes[li];
                 if (lane_filter_.has_value() && !lane.identity.same_lane(*lane_filter_)) {
-                    ++idx;
                     continue;
                 }
                 const std::string title = format_lane_title(lane);
-                render_lane_row(title, lane, idx);
-                ++idx;
+                render_lane_row(title, lane, lane_events[li], li + 1u);
             }
         }
 
@@ -728,12 +786,8 @@ void ExecutionTimelinePanel::draw_event_table_tab(
         ImGui::TableSetupColumn("Summary & Navigate", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
-        const int clipped_count =
-            filtered_events.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())
-                ? std::numeric_limits<int>::max()
-                : static_cast<int>(filtered_events.size());
         ImGuiListClipper clipper;
-        clipper.Begin(clipped_count);
+        clipper.Begin(clamp_imgui_clipper_count(filtered_events.size()));
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                 const peelf::TimelineEvent& ev =

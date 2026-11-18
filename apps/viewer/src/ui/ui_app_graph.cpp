@@ -9,6 +9,8 @@
 #include <imgui_internal.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -16,8 +18,10 @@
 #include <format>
 #include <fstream>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -113,6 +117,74 @@ struct GraphLayoutBounds {
     return std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size());
 }
 
+class ScopedGraphvizTempDir final {
+public:
+    ScopedGraphvizTempDir() noexcept = default;
+    ~ScopedGraphvizTempDir() noexcept {
+        if (!dir_.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(dir_, ec);
+        }
+    }
+
+    ScopedGraphvizTempDir(const ScopedGraphvizTempDir&) = delete;
+    ScopedGraphvizTempDir& operator=(const ScopedGraphvizTempDir&) = delete;
+    ScopedGraphvizTempDir(ScopedGraphvizTempDir&& other) noexcept
+        : dir_(std::move(other.dir_)) {
+        other.dir_.clear();
+    }
+    ScopedGraphvizTempDir& operator=(ScopedGraphvizTempDir&& other) noexcept {
+        if (this != &other) {
+            if (!dir_.empty()) {
+                std::error_code ec;
+                std::filesystem::remove_all(dir_, ec);
+            }
+            dir_ = std::move(other.dir_);
+            other.dir_.clear();
+        }
+        return *this;
+    }
+
+    [[nodiscard]] static peelf::Result<ScopedGraphvizTempDir> create() {
+        std::error_code ec;
+        const std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+        if (ec || base.empty()) {
+            return peelf::make_error("Unable to resolve temporary directory for Graphviz layout");
+        }
+
+        static std::atomic<std::uint64_t> s_seq{0u};
+        std::random_device rd;
+        for (int attempt = 0; attempt < 16; ++attempt) {
+            const auto now_ticks = static_cast<std::uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::uint64_t nonce =
+                (static_cast<std::uint64_t>(rd()) << 32u) ^ static_cast<std::uint64_t>(rd());
+            const std::uint64_t seq = s_seq.fetch_add(1u, std::memory_order_relaxed);
+            const std::filesystem::path candidate =
+                base / std::format("peelf_gv_{:x}_{:016x}_{:x}", now_ticks, nonce, seq);
+
+            std::error_code mkdir_ec;
+            if (std::filesystem::create_directory(candidate, mkdir_ec) && !mkdir_ec) {
+                std::error_code perm_ec;
+                std::filesystem::permissions(
+                    candidate,
+                    std::filesystem::perms::owner_all,
+                    std::filesystem::perm_options::replace,
+                    perm_ec);
+                ScopedGraphvizTempDir guard{};
+                guard.dir_ = candidate;
+                return guard;
+            }
+        }
+        return peelf::make_error("Failed to create unique temporary directory for Graphviz layout");
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return dir_; }
+
+private:
+    std::filesystem::path dir_{};
+};
+
 [[nodiscard]] const char* graph_bmp_name(UiApp::CallGraphSample sample) {
     switch (sample) {
         case UiApp::CallGraphSample::LoadedImage:
@@ -182,7 +254,16 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
     current_call_graph_layout_.reset();
     original_call_graph_layout_.reset();
     dragged_graph_card_.reset();
-    const std::filesystem::path plain_path = std::filesystem::temp_directory_path() / (output_name.string() + ".plain");
+    loaded_call_graph_bmp_.clear();
+
+    auto temp_dir_res = ScopedGraphvizTempDir::create();
+    if (!temp_dir_res.has_value()) {
+        call_graph_status_ = temp_dir_res.error().message;
+        return;
+    }
+    const std::filesystem::path stem =
+        output_name.filename().empty() ? std::filesystem::path{"layout"} : output_name.filename();
+    const std::filesystem::path plain_path = temp_dir_res->path() / (stem.string() + ".plain");
     const DefaultProcessRunner runner;
     const GraphRenderResult render_result =
         render_graph_with_graphviz(graph, plain_path, GraphRenderFormat::Plain, runner);
@@ -193,19 +274,18 @@ void UiApp::load_call_graph_from_graph(CallGraph graph, const std::filesystem::p
 
     const std::optional<std::string> plain_text = read_text_file(plain_path);
     if (!plain_text) {
-        call_graph_status_ = "Failed to load rendered graph layout: " + plain_path.string();
+        call_graph_status_ = "Failed to load rendered graph layout";
         return;
     }
 
     current_call_graph_layout_ = parse_graphviz_plain_layout(*plain_text);
     if (!current_call_graph_layout_) {
-        call_graph_status_ = "Graphviz produced an unreadable graph layout: " + plain_path.string();
+        call_graph_status_ = "Graphviz produced an unreadable graph layout";
         return;
     }
 
     call_graph_texture_.reset();
 
-    loaded_call_graph_bmp_ = plain_path;
     original_call_graph_layout_ = current_call_graph_layout_;
     current_call_graph_ = std::move(graph);
     center_graph_selection_ = current_selection_.virtual_address.has_value();

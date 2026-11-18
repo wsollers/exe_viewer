@@ -200,6 +200,7 @@ namespace viewer {
             replacement_[0] = 0;
             status_.clear();
         }
+        void reset_for_new_target();
         void set_patch_activated_callback(std::function<void(const ViewerSelection&)> cb) {
             on_patch_activated_ = std::move(cb);
         }
@@ -233,6 +234,7 @@ namespace viewer {
         std::string bundle_status_;
         std::optional<peelf::PatchBundle> imported_bundle_;
         std::optional<peelf::PatchBundlePreview> imported_bundle_preview_;
+        std::string loaded_target_path_{};
         std::string status_message_;
         std::function<void(const ViewerSelection&)> on_patch_activated_;
         std::function<void()> on_patch_mutated_;
@@ -433,9 +435,17 @@ namespace viewer {
     class MemorySearchPanel : public UiPanel {
     public:
         explicit MemorySearchPanel(BinaryModel& model);
+        void reset_for_new_target() noexcept {
+            last_report_.reset();
+            error_message_.clear();
+        }
         void set_address_activated_callback(
             std::function<void(std::uint64_t virtual_address, std::size_t size)> cb) {
             on_address_activated_ = std::move(cb);
+        }
+        void set_offset_activated_callback(
+            std::function<void(std::uint64_t file_offset, std::size_t size)> cb) {
+            on_offset_activated_ = std::move(cb);
         }
     protected:
         void draw_contents() override;
@@ -451,6 +461,7 @@ namespace viewer {
         std::optional<peelf::MemorySearchReport> last_report_;
         std::string error_message_;
         std::function<void(std::uint64_t, std::size_t)> on_address_activated_;
+        std::function<void(std::uint64_t, std::size_t)> on_offset_activated_;
 
         void run_search();
     };

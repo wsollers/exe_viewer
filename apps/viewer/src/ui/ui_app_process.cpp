@@ -94,9 +94,28 @@ void UiApp::refresh_process_list() {
     if (!listed) {
         attach_error_message_ = "Failed to enumerate processes: " + listed.error().message;
         cached_process_list_.clear();
+        selected_attach_pid_.reset();
         return;
     }
     cached_process_list_ = std::move(*listed);
+    if (selected_attach_pid_.has_value()) {
+        const peelf::ProcessId wanted = *selected_attach_pid_;
+        const bool still_present = std::ranges::any_of(
+            cached_process_list_,
+            [this, wanted](const peelf::ProcessInfo& proc) {
+                if (proc.pid != wanted) {
+                    return false;
+                }
+                if (!process_accessible_only_) {
+                    return true;
+                }
+                return proc.access == peelf::ProcessAccessStatus::Accessible ||
+                       proc.access == peelf::ProcessAccessStatus::ReadOnly;
+            });
+        if (!still_present) {
+            selected_attach_pid_.reset();
+        }
+    }
 }
 
 void UiApp::open_gdb_remote_modal(bool debug_opt_in) {
@@ -330,7 +349,20 @@ void UiApp::render_attach_process_modal() {
         try_attach_pid(peelf::current_process_id());
     }
     ImGui::SameLine();
-    ImGui::Checkbox("Accessible only", &process_accessible_only_);
+    if (ImGui::Checkbox("Accessible only", &process_accessible_only_) &&
+        process_accessible_only_ && selected_attach_pid_.has_value()) {
+        const peelf::ProcessId wanted = *selected_attach_pid_;
+        const bool still_accessible = std::ranges::any_of(
+            cached_process_list_,
+            [wanted](const peelf::ProcessInfo& proc) {
+                return proc.pid == wanted &&
+                       (proc.access == peelf::ProcessAccessStatus::Accessible ||
+                        proc.access == peelf::ProcessAccessStatus::ReadOnly);
+            });
+        if (!still_accessible) {
+            selected_attach_pid_.reset();
+        }
+    }
 
     ImGui::SetNextItemWidth(140.0f);
     ImGui::InputTextWithHint("##ManualPid", "PID...", manual_pid_buf_, sizeof(manual_pid_buf_), ImGuiInputTextFlags_CharsDecimal);
@@ -517,10 +549,8 @@ void UiApp::render_attach_process_modal() {
         if (!model_.is_live_process() || model_.process_session() == nullptr) {
             return;
         }
-        pending_navigations_.clear();
-        binary_diff_panel_.invalidate();
+        reset_target_dependent_state();
         sync_live_process_view(true);
-        struct_view_panel_.reset_for_new_binary();
         Log().info("Attached to PID {} ({}): {} regions, {} modules, {} symbols",
                    model_.process_session()->pid(),
                    model_.process_session()->info().name,

@@ -54,6 +54,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels.hpp
         src/ui/workspace_layout.hpp
         src/ui/workspace_layout.cpp
+        src/ui/panel_helpers.hpp
+        src/ui/panel_helpers.cpp
         src/ui/context_actions.hpp
         src/ui/context_actions.cpp
         src/ui/ui_context_menu.hpp

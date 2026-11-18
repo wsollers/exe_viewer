@@ -143,6 +143,7 @@ void UiApp::register_workspace_settings_handler() {
     if (ImGui::FindSettingsHandler("WorkspaceLayout") != nullptr) {
         return;
     }
+    g_workspace_ini_state = {};
     ImGuiSettingsHandler handler{};
     handler.TypeName = "WorkspaceLayout";
     handler.TypeHash = ImHashStr("WorkspaceLayout");
@@ -150,6 +151,12 @@ void UiApp::register_workspace_settings_handler() {
     handler.ReadLineFn = workspace_settings_read_line;
     handler.WriteAllFn = workspace_settings_write_all;
     ImGui::AddSettingsHandler(&handler);
+}
+
+void UiApp::sync_workspace_ini_state() const noexcept {
+    g_workspace_ini_state.saw_ini_section = true;
+    g_workspace_ini_state.loaded_schema_version = loaded_layout_schema_version_;
+    g_workspace_ini_state.active_preset = active_workspace_preset_;
 }
 
 void UiApp::request_workspace_preset(WorkspacePreset preset) noexcept {

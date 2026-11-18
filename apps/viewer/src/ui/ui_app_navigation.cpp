@@ -463,16 +463,19 @@ void UiApp::dispatch_entity_context_action(
                 }
                 const bool is_off = !has_va && has_off;
                 const std::uint64_t addr = has_va ? *entity.va : *entity.file_offset;
+                const Bookmark* existing = model_.find_bookmark(addr, is_off);
                 std::string label = entity.symbol_or_label;
                 if (label.empty()) {
-                    label = is_off ? std::format("off_{:X}", addr) : std::format("loc_{:X}", addr);
+                    label = existing != nullptr && !existing->label.empty()
+                                ? existing->label
+                                : (is_off ? std::format("off_{:X}", addr) : std::format("loc_{:X}", addr));
                 }
                 model_.add_or_update_bookmark(Bookmark{
                     .address = addr,
                     .is_file_offset = is_off,
                     .label = std::move(label),
-                    .category = "User",
-                    .note = {},
+                    .category = existing != nullptr ? existing->category : std::string{"User"},
+                    .note = existing != nullptr ? existing->note : std::string{},
                 });
                 open_references();
                 Log().info("Added bookmark at {}{:X}", is_off ? "off+0x" : "0x", addr);

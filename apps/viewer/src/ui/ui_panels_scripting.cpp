@@ -25,124 +25,6 @@ constexpr std::uint64_t kMaxMemoryQuotaBytes = 256ull * 1024ull * 1024ull;
 constexpr std::uint64_t kMinTimeoutMs = 25u;
 constexpr std::uint64_t kMaxTimeoutMs = 300'000u;
 
-constexpr std::array<ScriptStarterTemplate, ScriptingPanel::kStarterTemplateCount>
-    kStarterTemplates{{
-        ScriptStarterTemplate{
-            .title = "Inspect Target & Sections",
-            .summary = "Read-only summary of target profile, capabilities, and mapped sections.",
-            .requires_mutations = false,
-            .source =
-                "-- Inspect Target & Sections (Read-Only)\n"
-                "local info = peelf.target_info()\n"
-                "peelf.log(string.format(\"Target: %s | %s | %d-bit | %s | entry=0x%x\",\n"
-                "  info.format, info.arch, info.bitness, info.endianness, info.entry_point))\n"
-                "local secs = peelf.sections()\n"
-                "peelf.log(string.format(\"Sections (%d):\", #secs))\n"
-                "for i, s in ipairs(secs) do\n"
-                "  local perms = (s.readable and \"R\" or \"-\")\n"
-                "             .. (s.writable and \"W\" or \"-\")\n"
-                "             .. (s.executable and \"X\" or \"-\")\n"
-                "  peelf.log(string.format(\"  [%2d] %-16s va=0x%x size=0x%x file_off=0x%x %s\",\n"
-                "    i, s.name, s.virtual_address, s.virtual_size, s.file_offset, perms))\n"
-                "end\n"
-                "local caps = peelf.capabilities()\n"
-                "if caps.StaticPatching then\n"
-                "  peelf.log(string.format(\"StaticPatching: %s (can_execute=%s)\",\n"
-                "    caps.StaticPatching.state, tostring(caps.StaticPatching.can_execute)))\n"
-                "end\n",
-        },
-        ScriptStarterTemplate{
-            .title = "Scan High-Entropy / RWX Sections",
-            .summary = "Flags W+X sections and runs peelf.security_audit() rules.",
-            .requires_mutations = false,
-            .source =
-                "-- Scan High-Entropy / RWX Sections & Security Findings (Read-Only)\n"
-                "local secs = peelf.sections()\n"
-                "local rwx_count = 0\n"
-                "for _, s in ipairs(secs) do\n"
-                "  if s.writable and s.executable then\n"
-                "    rwx_count = rwx_count + 1\n"
-                "    peelf.log(string.format(\"[W+X] section '%s' at VA 0x%x (0x%x bytes)\",\n"
-                "      s.name, s.virtual_address, s.virtual_size))\n"
-                "  end\n"
-                "end\n"
-                "local audit = peelf.security_audit()\n"
-                "peelf.log(string.format(\n"
-                "  \"Security Audit (%s): %d error(s), %d warning(s), %d note(s), %d pass(es)\",\n"
-                "  audit.format, audit.error_count, audit.warning_count, audit.note_count, audit.pass_count))\n"
-                "for _, f in ipairs(audit.findings) do\n"
-                "  if f.severity == \"Error\" or f.severity == \"Warning\" then\n"
-                "    peelf.log(string.format(\"  [%s] %s (%s): %s\",\n"
-                "      f.severity, f.rule_id, f.subject, f.summary))\n"
-                "  end\n"
-                "end\n"
-                "peelf.log(string.format(\"Total W+X sections: %d\", rwx_count))\n",
-        },
-        ScriptStarterTemplate{
-            .title = "Auto-Label Entry & Exports (Dry-Run)",
-            .summary =
-                "Stages entry/export labels & bookmarks without calling peelf.commit() (dry-run).",
-            .requires_mutations = true,
-            .source =
-                "-- Auto-Label Entry & Exports (Dry-Run)\n"
-                "-- Enable 'Allow Target Mutations' above. Because peelf.commit() is omitted,\n"
-                "-- staged labels/comments/bookmarks appear in the table below and roll back cleanly.\n"
-                "local info = peelf.target_info()\n"
-                "assert(info.allow_mutations, \"Enable 'Allow Target Mutations' to stage dry-run annotations\")\n"
-                "if info.entry_point ~= 0 then\n"
-                "  peelf.set_label(info.entry_point, \"script_entry_point\")\n"
-                "  peelf.set_comment(info.entry_point, \"Auto-labeled entry point (dry-run)\")\n"
-                "  peelf.add_bookmark(info.entry_point, \"Entry point candidate\")\n"
-                "  peelf.log(string.format(\"Staged entry label at 0x%x\", info.entry_point))\n"
-                "end\n"
-                "local exps = peelf.exports()\n"
-                "local limit = math.min(#exps, 32)\n"
-                "local count = 0\n"
-                "for i = 1, limit do\n"
-                "  local e = exps[i]\n"
-                "  if e.virtual_address ~= 0 and #e.name > 0 then\n"
-                "    peelf.set_label(e.virtual_address, \"exp_\" .. e.name)\n"
-                "    peelf.set_comment(e.virtual_address, \"Exported symbol: \" .. e.name)\n"
-                "    count = count + 1\n"
-                "  end\n"
-                "end\n"
-                "peelf.log(string.format(\"Dry-run staged %d export annotation(s) (rolled back on exit).\", count))\n",
-        },
-        ScriptStarterTemplate{
-            .title = "Stage NOP Patch + Commit",
-            .summary =
-                "Disassembles entry point, stages architecture NOP bytes + bookmark, and commits.",
-            .requires_mutations = true,
-            .source =
-                "-- Stage NOP Patch + Commit (Transactional)\n"
-                "-- Requires 'Allow Target Mutations' on an editable static binary.\n"
-                "local info = peelf.target_info()\n"
-                "assert(info.allow_mutations, \"Enable 'Allow Target Mutations' to stage and commit patches\")\n"
-                "assert(info.entry_point ~= 0, \"Binary has no non-zero entry_point\")\n"
-                "local insns = peelf.disassemble(info.entry_point, 1)\n"
-                "assert(#insns >= 1, \"Unable to disassemble first instruction at entry_point\")\n"
-                "local first = insns[1]\n"
-                "peelf.log(string.format(\"Entry 0x%x: %s (%d byte(s))\", first.address, first.text, first.size))\n"
-                "local nop_bytes = {}\n"
-                "if info.arch == \"ARM64\" and first.size == 4 then\n"
-                "  if info.endianness == \"Big\" then\n"
-                "    nop_bytes = { 0xD5, 0x03, 0x20, 0x1F }\n"
-                "  else\n"
-                "    nop_bytes = { 0x1F, 0x20, 0x03, 0xD5 }\n"
-                "  end\n"
-                "elseif info.arch == \"x86\" or info.arch == \"x86-64\" then\n"
-                "  for i = 1, first.size do nop_bytes[i] = 0x90 end\n"
-                "else\n"
-                "  error(\"Unsupported architecture for starter NOP template: \" .. info.arch)\n"
-                "end\n"
-                "peelf.stage_patch(first.address, nop_bytes)\n"
-                "peelf.set_comment(first.address, \"NOP-patched via Lua scripting console\")\n"
-                "peelf.add_bookmark(first.address, \"Scripted NOP patch\")\n"
-                "peelf.commit(\"NOP entry instruction\")\n"
-                "peelf.log(\"Committed transactional NOP patch + annotations.\")\n",
-        },
-    }};
-
 int resize_std_string_callback(ImGuiInputTextCallbackData* data) {
     if (data != nullptr && data->EventFlag == ImGuiInputTextFlags_CallbackResize) {
         auto* str = static_cast<std::string*>(data->UserData);
@@ -183,15 +65,16 @@ ScriptingPanel::ScriptingPanel(BinaryModel& model,
 }
 
 std::span<const ScriptStarterTemplate> ScriptingPanel::starter_templates() noexcept {
-    return kStarterTemplates;
+    return scripting_starter_templates();
 }
 
 void ScriptingPanel::load_starter_template(std::size_t index) {
-    if (index >= kStarterTemplates.size()) {
+    const auto templates = starter_templates();
+    if (index >= templates.size()) {
         return;
     }
     selected_template_index_ = index;
-    script_buffer_.assign(kStarterTemplates[index].source);
+    script_buffer_.assign(templates[index].source);
     editor_modified_ = false;
     launch_error_.clear();
 }
@@ -250,11 +133,12 @@ void ScriptingPanel::draw_toolbar_and_limits(const ScriptMutationEligibility& el
     ImGui::TextUnformatted("Template");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(ImGui::GetFontSize() * 19.0f);
-    const char* preview_title = kStarterTemplates[selected_template_index_].title.data();
+    const auto templates = starter_templates();
+    const char* preview_title = templates[selected_template_index_].title.data();
     if (ImGui::BeginCombo("##ScriptStarterTemplate", preview_title)) {
-        for (std::size_t i = 0u; i < kStarterTemplates.size(); ++i) {
+        for (std::size_t i = 0u; i < templates.size(); ++i) {
             const bool is_selected = (i == selected_template_index_);
-            if (ImGui::Selectable(kStarterTemplates[i].title.data(), is_selected)) {
+            if (ImGui::Selectable(templates[i].title.data(), is_selected)) {
                 selected_template_index_ = i;
                 if (!editor_modified_) {
                     load_starter_template(i);
@@ -262,8 +146,8 @@ void ScriptingPanel::draw_toolbar_and_limits(const ScriptMutationEligibility& el
             }
             if (ImGui::IsItemHovered()) {
                 ImGui::SetTooltip("%.*s",
-                                  static_cast<int>(kStarterTemplates[i].summary.size()),
-                                  kStarterTemplates[i].summary.data());
+                                  static_cast<int>(templates[i].summary.size()),
+                                  templates[i].summary.data());
             }
             if (is_selected) {
                 ImGui::SetItemDefaultFocus();

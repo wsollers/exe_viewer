@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels.hpp"
 
 #include <imgui.h>
@@ -572,8 +573,10 @@ void MemoryMapPanel::draw_contents() {
                         if (!attr.empty()) {
                             ImGui::Text("Attribution: %s", attr.c_str());
                         }
+                        const std::string safe_strip_path =
+                            sanitize_single_line_control_chars(reg.pathname);
                         ImGui::TextDisabled("%s",
-                                            reg.pathname.empty() ? "<anonymous>" : reg.pathname.c_str());
+                                            safe_strip_path.empty() ? "<anonymous>" : safe_strip_path.c_str());
                         ImGui::EndTooltip();
                         if (strip_clicked && on_region_activated_) {
                             on_region_activated_(r_idx, true);
@@ -600,7 +603,8 @@ void MemoryMapPanel::draw_contents() {
         std::string preview = "<Standalone Memory Region>";
         if (active_mod && *active_mod < modules.size()) {
             const auto& m = modules[*active_mod];
-            const std::string mod_display = m.name.empty() ? m.path.string() : m.name;
+            const std::string mod_display = sanitize_single_line_control_chars(
+                m.name.empty() ? m.path.string() : m.name);
             std::array<char, 256> pbuf{};
             std::snprintf(pbuf.data(),
                           pbuf.size(),
@@ -615,7 +619,8 @@ void MemoryMapPanel::draw_contents() {
         if (ImGui::BeginCombo("##ActiveModuleCombo", preview.c_str())) {
             for (std::size_t i = 0; i < modules.size(); ++i) {
                 const auto& m = modules[i];
-                const std::string mod_display = m.name.empty() ? m.path.string() : m.name;
+                const std::string mod_display = sanitize_single_line_control_chars(
+                    m.name.empty() ? m.path.string() : m.name);
                 std::array<char, 320> item_label{};
                 std::snprintf(item_label.data(),
                               item_label.size(),
@@ -750,27 +755,39 @@ void MemoryMapPanel::draw_contents() {
                 const auto& rb = regions[b];
                 auto cmp = [&](auto va, auto vb) { return asc ? (va < vb) : (va > vb); };
                 switch (sp.ColumnUserID) {
-                    case kColStart: return cmp(ra.start_address, rb.start_address);
-                    case kColEnd:   return cmp(ra.end_address, rb.end_address);
-                    case kColSize:  return cmp(ra.size(), rb.size());
-                    case kColRss:   return cmp(ra.usage.rss_bytes.value_or(0), rb.usage.rss_bytes.value_or(0));
-                    case kColPss:   return cmp(ra.usage.pss_bytes.value_or(0), rb.usage.pss_bytes.value_or(0));
-                    case kColPriv:  return cmp(ra.usage.private_bytes().value_or(0), rb.usage.private_bytes().value_or(0));
-                    case kColSwap:  return cmp(ra.usage.swap_bytes.value_or(0), rb.usage.swap_bytes.value_or(0));
-                    case kColKind:  return cmp(peelf::to_string(ra.kind), peelf::to_string(rb.kind));
-                    case kColOwner: return cmp(ra.usage.owner_tid.value_or(0), rb.usage.owner_tid.value_or(0));
-                    case kColPath:  return cmp(ra.pathname, rb.pathname);
-                    default:        return cmp(ra.start_address, rb.start_address);
+                    case kColStart:   return cmp(ra.start_address, rb.start_address);
+                    case kColEnd:     return cmp(ra.end_address, rb.end_address);
+                    case kColSize:    return cmp(ra.size(), rb.size());
+                    case kColRss:     return cmp(ra.usage.rss_bytes.value_or(0), rb.usage.rss_bytes.value_or(0));
+                    case kColPss:     return cmp(ra.usage.pss_bytes.value_or(0), rb.usage.pss_bytes.value_or(0));
+                    case kColPriv:    return cmp(ra.usage.private_bytes().value_or(0), rb.usage.private_bytes().value_or(0));
+                    case kColSwap:    return cmp(ra.usage.swap_bytes.value_or(0), rb.usage.swap_bytes.value_or(0));
+                    case kColPerms:   return cmp(peelf::format_protection(ra.protection),
+                                                 peelf::format_protection(rb.protection));
+                    case kColKind:    return cmp(peelf::to_string(ra.kind), peelf::to_string(rb.kind));
+                    case kColOwner:   return cmp(ra.usage.owner_tid.value_or(0), rb.usage.owner_tid.value_or(0));
+                    case kColFileOff: {
+                        const bool a_has = (ra.file_offset != 0 || !ra.pathname.empty());
+                        const bool b_has = (rb.file_offset != 0 || !rb.pathname.empty());
+                        if (a_has != b_has) {
+                            return a_has;
+                        }
+                        return cmp(ra.file_offset, rb.file_offset);
+                    }
+                    case kColPath:    return cmp(sanitize_single_line_control_chars(ra.pathname),
+                                                 sanitize_single_line_control_chars(rb.pathname));
+                    default:          return cmp(ra.start_address, rb.start_address);
                 }
             });
         }
 
         ImGuiListClipper clipper;
-        clipper.Begin(static_cast<int>(visible.size()));
+        clipper.Begin(clamp_imgui_clipper_count(visible.size()));
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
                 const std::size_t i = visible[static_cast<std::size_t>(row)];
                 const peelf::MemoryRegion& reg = regions[i];
+                const std::string safe_pathname = sanitize_single_line_control_chars(reg.pathname);
 
                 std::array<char, 40> start_hex{};
                 std::snprintf(start_hex.data(), start_hex.size(), "0x%016" PRIX64, reg.start_address);
@@ -804,17 +821,17 @@ void MemoryMapPanel::draw_contents() {
                     }
                     ImGui::Separator();
                     const bool has_backing_file =
-                        !reg.pathname.empty() && reg.pathname.front() != '[';
+                        !safe_pathname.empty() && safe_pathname.front() != '[';
                     const InspectableEntity reg_entity{
                         .va = reg.start_address,
                         .file_offset = has_backing_file
                             ? std::optional<std::uint64_t>(reg.file_offset)
                             : std::nullopt,
                         .size = reg.size(),
-                        .symbol_or_label = !reg.pathname.empty()
-                            ? reg.pathname
+                        .symbol_or_label = !safe_pathname.empty()
+                            ? safe_pathname
                             : std::string("<anonymous>"),
-                        .module_name = has_backing_file ? reg.pathname : std::string{},
+                        .module_name = has_backing_file ? safe_pathname : std::string{},
                         .extra_json_fields = {
                             {"end_va", std::format("0x{:X}", reg.end_address)},
                             {"permissions", peelf::format_protection(reg.protection)},
@@ -868,8 +885,8 @@ void MemoryMapPanel::draw_contents() {
                 }
 
                 ImGui::TableNextColumn();
-                if (!reg.pathname.empty()) {
-                    ImGui::TextUnformatted(reg.pathname.c_str());
+                if (!safe_pathname.empty()) {
+                    ImGui::TextUnformatted(safe_pathname.c_str());
                 } else if (reg.usage.is_reserved_only) {
                     ImGui::TextDisabled("<reserved>");
                 } else {

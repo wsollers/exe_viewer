@@ -133,6 +133,7 @@ void UiApp::apply_loaded_project_metadata(const AnalysisProject& project) {
     if (!project.layout.empty()) {
         const PersistedWorkspaceLayoutMetadata meta = parse_workspace_layout_metadata(project.layout);
         if (should_migrate_workspace_layout_ini(project.layout)) {
+            pending_ini_layout_.reset();
             active_workspace_preset_ = meta.active_preset;
             pending_workspace_preset_ = meta.active_preset;
             loaded_layout_schema_version_ = kWorkspaceLayoutSchemaVersion;
@@ -144,9 +145,7 @@ void UiApp::apply_loaded_project_metadata(const AnalysisProject& project) {
         } else {
             active_workspace_preset_ = meta.active_preset;
             loaded_layout_schema_version_ = meta.schema_version;
-            if (ImGui::GetCurrentContext() != nullptr) {
-                ImGui::LoadIniSettingsFromMemory(project.layout.c_str(), project.layout.size());
-            }
+            pending_ini_layout_ = project.layout;
         }
     }
     focus_workspace_ = false;
@@ -279,10 +278,15 @@ void UiApp::render_recovery_banner() {
         ImGui::SameLine(0.0f, 16.0f);
         if (ImGui::Button("Restore Autosave")) {
             const AnalysisProject rec = *pending_recovery_project_;
-            if (!rec.patches.empty() && model_.changed_intervals().empty()) {
-                (void)restore_project_patches(model_, rec, true);
+            if (!model_.is_live_process()) {
+                if (auto patch_res = replace_project_patches_from_snapshot(model_, rec, true);
+                    !patch_res.has_value()) {
+                    Log().warn("Failed to restore crash-recovery patches: {}",
+                               patch_res.error().message);
+                }
             }
             apply_loaded_project_metadata(rec);
+            refresh_disassembly();
             mark_autosave_baseline();
             pending_recovery_project_.reset();
             Log().info("Restored crash-recovery autosave session");
