@@ -208,6 +208,27 @@ struct ImageDeleter {
 struct DeviceMemoryDeleter {
     void operator()(VkDevice d, VkDeviceMemory h) const noexcept { vkFreeMemory(d, h, nullptr); }
 };
+struct ShaderModuleDeleter {
+    void operator()(VkDevice d, VkShaderModule h) const noexcept {
+        vkDestroyShaderModule(d, h, nullptr);
+    }
+};
+struct DescriptorSetLayoutDeleter {
+    void operator()(VkDevice d, VkDescriptorSetLayout h) const noexcept {
+        vkDestroyDescriptorSetLayout(d, h, nullptr);
+    }
+};
+struct PipelineLayoutDeleter {
+    void operator()(VkDevice d, VkPipelineLayout h) const noexcept {
+        vkDestroyPipelineLayout(d, h, nullptr);
+    }
+};
+struct PipelineDeleter {
+    void operator()(VkDevice d, VkPipeline h) const noexcept { vkDestroyPipeline(d, h, nullptr); }
+};
+struct SamplerDeleter {
+    void operator()(VkDevice d, VkSampler h) const noexcept { vkDestroySampler(d, h, nullptr); }
+};
 
 using UniqueVkRenderPass = ScopedVkDeviceHandle<VkRenderPass, RenderPassDeleter>;
 using UniqueVkSwapchain = ScopedVkDeviceHandle<VkSwapchainKHR, SwapchainDeleter>;
@@ -220,6 +241,12 @@ using UniqueVkFence = ScopedVkDeviceHandle<VkFence, FenceDeleter>;
 using UniqueVkBuffer = ScopedVkDeviceHandle<VkBuffer, BufferDeleter>;
 using UniqueVkImage = ScopedVkDeviceHandle<VkImage, ImageDeleter>;
 using UniqueVkDeviceMemory = ScopedVkDeviceHandle<VkDeviceMemory, DeviceMemoryDeleter>;
+using UniqueVkShaderModule = ScopedVkDeviceHandle<VkShaderModule, ShaderModuleDeleter>;
+using UniqueVkDescriptorSetLayout =
+    ScopedVkDeviceHandle<VkDescriptorSetLayout, DescriptorSetLayoutDeleter>;
+using UniqueVkPipelineLayout = ScopedVkDeviceHandle<VkPipelineLayout, PipelineLayoutDeleter>;
+using UniqueVkPipeline = ScopedVkDeviceHandle<VkPipeline, PipelineDeleter>;
+using UniqueVkSampler = ScopedVkDeviceHandle<VkSampler, SamplerDeleter>;
 
 } // namespace detail
 
@@ -293,6 +320,7 @@ public:
     void shutdown() noexcept;
 
     [[nodiscard]] bool begin_frame();
+    void begin_swapchain_render_pass() noexcept;
     void end_frame();
 
     void wait_idle() noexcept;
@@ -305,7 +333,12 @@ public:
                                                            uint32_t height);
     void destroy_texture(Texture& texture) noexcept;
 
-    // Accessors for ImGui initialization
+    [[nodiscard]] detail::UniqueVkShaderModule create_shader_module(
+        std::span<const std::uint32_t> spirv_words) const;
+    [[nodiscard]] uint32_t find_memory_type(uint32_t type_filter,
+                                            VkMemoryPropertyFlags properties) const;
+
+    // Accessors for ImGui & GPU viewport infrastructure
     [[nodiscard]] uint32_t api_version() const noexcept { return api_version_; }
     [[nodiscard]] VkInstance instance() const noexcept { return instance_.get(); }
     [[nodiscard]] VkPhysicalDevice physical_device() const noexcept { return physical_device_; }
@@ -318,10 +351,26 @@ public:
     [[nodiscard]] uint32_t image_count() const noexcept {
         return static_cast<uint32_t>(swapchain_.images.size());
     }
+    [[nodiscard]] std::size_t current_frame_index() const noexcept {
+        return static_cast<std::size_t>(current_frame_);
+    }
     [[nodiscard]] VkCommandBuffer current_command_buffer() const noexcept {
         return frames_[current_frame_].command_buffer;
     }
     [[nodiscard]] VkExtent2D swapchain_extent() const noexcept { return swapchain_extent_; }
+    [[nodiscard]] bool swapchain_render_pass_active() const noexcept {
+        return swapchain_render_pass_active_;
+    }
+    [[nodiscard]] bool supports_compute() const noexcept { return supports_compute_; }
+    [[nodiscard]] bool supports_rgba8_storage_image() const noexcept {
+        return supports_rgba8_storage_image_;
+    }
+    [[nodiscard]] bool supports_rgba8_color_attachment() const noexcept {
+        return supports_rgba8_color_attachment_;
+    }
+    [[nodiscard]] uint32_t max_image_dimension_2d() const noexcept {
+        return max_image_dimension_2d_;
+    }
 
 private:
     struct SwapchainState {
@@ -355,8 +404,6 @@ private:
     void create_descriptor_pool();
     void create_sync_objects();
 
-    [[nodiscard]] uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const;
-
     // Vulkan handles ordered in acquisition order so reverse destruction tears down
     // child objects before device, surface, and instance even on partial-init failure.
     uint32_t api_version_ = VK_API_VERSION_1_0;
@@ -364,6 +411,10 @@ private:
     detail::VkSurfaceOwner surface_;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     uint32_t graphics_family_ = 0;
+    bool supports_compute_ = false;
+    bool supports_rgba8_storage_image_ = false;
+    bool supports_rgba8_color_attachment_ = false;
+    uint32_t max_image_dimension_2d_ = 4096;
     detail::VkDeviceOwner device_;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
 
@@ -381,6 +432,8 @@ private:
     uint32_t current_image_index_ = 0;
     GLFWwindow* window_ = nullptr;
     bool swapchain_dirty_ = false;
+    bool frame_recording_active_ = false;
+    bool swapchain_render_pass_active_ = false;
 };
 
 } // namespace viewer

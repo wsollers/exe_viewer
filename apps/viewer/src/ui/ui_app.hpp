@@ -43,8 +43,13 @@ namespace viewer {
         UiApp(const UiApp&) = delete;
         UiApp& operator=(const UiApp&) = delete;
 
+        using PrePassRecorderCallback = std::function<void(VkCommandBuffer, std::size_t)>;
+
         void render(); // call each frame from Application::render_ui()
         void process_deferred_gpu_work();
+        void record_pre_pass_vulkan_work(VkCommandBuffer cmd, std::size_t frame_index);
+        void register_pre_pass_recorder(PrePassRecorderCallback recorder);
+        void clear_pre_pass_recorders() noexcept;
 
         void set_open_file_callback(std::function<void()> cb) { on_open_file_ = std::move(cb); }
         void set_open_debug_symbols_callback(std::function<void()> cb) { on_open_debug_symbols_ = std::move(cb); }
@@ -216,6 +221,7 @@ namespace viewer {
         std::function<void()> on_save_patched_as_;
         std::function<void()> on_exit_;
         std::function<void(int)> on_analysis_file_;
+        std::vector<PrePassRecorderCallback> pre_pass_recorders_;
 
         viewer::Disassembler disasm_;
         bool file_loaded_ = false;

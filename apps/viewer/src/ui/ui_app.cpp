@@ -604,12 +604,34 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
 }
 
 UiApp::~UiApp() {
+    clear_pre_pass_recorders();
     model_.set_session_teardown_hook({});
     annotations_.set_on_changed({});
     reference_scanner_.cancel(&reference_index_);
     binary_diff_panel_.invalidate();
     decompile_controller_.shutdown();
     call_graph_texture_.reset();
+}
+
+void UiApp::register_pre_pass_recorder(PrePassRecorderCallback recorder) {
+    if (recorder) {
+        pre_pass_recorders_.push_back(std::move(recorder));
+    }
+}
+
+void UiApp::clear_pre_pass_recorders() noexcept {
+    pre_pass_recorders_.clear();
+}
+
+void UiApp::record_pre_pass_vulkan_work(VkCommandBuffer cmd, std::size_t frame_index) {
+    if (cmd == VK_NULL_HANDLE || frame_index >= VulkanManager::kMaxFramesInFlight) {
+        return;
+    }
+    for (const auto& recorder : pre_pass_recorders_) {
+        if (recorder) {
+            recorder(cmd, frame_index);
+        }
+    }
 }
 
 void UiApp::render() {

@@ -46,6 +46,8 @@ add_library(peelf_gui SHARED
         src/application.cpp
         src/vulkan/vulkan_manager.h
         src/vulkan/vulkan_manager.cpp
+        src/vulkan/viewport_camera_2d.cpp
+        src/vulkan/gpu_offscreen_canvas.cpp
         src/model/binary_model.hpp
         src/model/binary_model_internal.hpp
         src/model/binary_model.cpp

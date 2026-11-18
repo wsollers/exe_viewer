@@ -331,6 +331,17 @@ void Application::run() {
         render_ui();
 
         ImGui::Render();
+
+        try {
+            ui_->record_pre_pass_vulkan_work(vulkan_.current_command_buffer(),
+                                             vulkan_.current_frame_index());
+        } catch (const std::exception& e) {
+            Log().error("Pre-pass Vulkan recording failed: {}", e.what());
+        } catch (...) {
+            Log().error("Pre-pass Vulkan recording failed with an unknown exception");
+        }
+
+        vulkan_.begin_swapchain_render_pass();
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), vulkan_.current_command_buffer());
 
         vulkan_.end_frame();

@@ -1,10 +1,13 @@
 #include "vulkan_manager.h"
 
+#include "vulkan/spirv_validation.hpp"
+
 #include <algorithm>
 #include <cstring>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -142,6 +145,10 @@ void VulkanManager::shutdown() noexcept {
     device_.reset();
     physical_device_ = VK_NULL_HANDLE;
     graphics_family_ = 0;
+    supports_compute_ = false;
+    supports_rgba8_storage_image_ = false;
+    supports_rgba8_color_attachment_ = false;
+    max_image_dimension_2d_ = 4096;
     surface_.reset();
     instance_.reset();
 
@@ -149,6 +156,8 @@ void VulkanManager::shutdown() noexcept {
     current_frame_ = 0;
     current_image_index_ = 0;
     swapchain_dirty_ = false;
+    frame_recording_active_ = false;
+    swapchain_render_pass_active_ = false;
 }
 
 void VulkanManager::create_instance(const VulkanConfig& cfg) {
@@ -201,25 +210,136 @@ void VulkanManager::select_physical_device() {
     check_vk(vkEnumeratePhysicalDevices(instance_.get(), &count, devs.data()),
              "vkEnumeratePhysicalDevices failed");
 
+    struct Candidate {
+        VkPhysicalDevice device = VK_NULL_HANDLE;
+        uint32_t queue_family = 0;
+        int score = -1;
+        bool has_compute = false;
+        bool has_rgba8_storage = false;
+        bool has_rgba8_color = false;
+        uint32_t max_dim_2d = 4096;
+    };
+
+    Candidate best{};
+
     for (VkPhysicalDevice d : devs) {
+        uint32_t ext_count = 0;
+        if (vkEnumerateDeviceExtensionProperties(d, nullptr, &ext_count, nullptr) != VK_SUCCESS ||
+            ext_count == 0) {
+            continue;
+        }
+        std::vector<VkExtensionProperties> ext_props(ext_count);
+        if (vkEnumerateDeviceExtensionProperties(d, nullptr, &ext_count, ext_props.data()) !=
+            VK_SUCCESS) {
+            continue;
+        }
+        const bool has_swapchain_ext = std::any_of(
+            ext_props.begin(), ext_props.end(), [](const VkExtensionProperties& ep) {
+                return std::string_view(ep.extensionName) ==
+                       std::string_view(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+            });
+        if (!has_swapchain_ext) {
+            continue;
+        }
+
+        uint32_t format_count = 0;
+        if (vkGetPhysicalDeviceSurfaceFormatsKHR(d, surface_.get(), &format_count, nullptr) !=
+                VK_SUCCESS ||
+            format_count == 0) {
+            continue;
+        }
+
         uint32_t qcount = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(d, &qcount, nullptr);
         std::vector<VkQueueFamilyProperties> qf(qcount);
         vkGetPhysicalDeviceQueueFamilyProperties(d, &qcount, qf.data());
+
+        bool found_family = false;
+        uint32_t chosen_family = 0;
+        bool chosen_has_compute = false;
 
         for (uint32_t i = 0; i < qcount; ++i) {
             VkBool32 present = VK_FALSE;
             check_vk(vkGetPhysicalDeviceSurfaceSupportKHR(d, i, surface_.get(), &present),
                      "vkGetPhysicalDeviceSurfaceSupportKHR failed");
             if ((qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0 && present != VK_FALSE) {
-                physical_device_ = d;
-                graphics_family_ = i;
-                return;
+                const bool family_compute = (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0;
+                if (!found_family || (family_compute && !chosen_has_compute)) {
+                    found_family = true;
+                    chosen_family = i;
+                    chosen_has_compute = family_compute;
+                }
             }
+        }
+        if (!found_family) {
+            continue;
+        }
+
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(d, &props);
+
+        int device_score = 100;
+        switch (props.deviceType) {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+                device_score += 10000;
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+                device_score += 5000;
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+                device_score += 2000;
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_CPU:
+            case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+            default:
+                device_score += 500;
+                break;
+        }
+        if (chosen_has_compute) {
+            device_score += 1000;
+        }
+
+        VkFormatProperties rgba8_props{};
+        vkGetPhysicalDeviceFormatProperties(d, VK_FORMAT_R8G8B8A8_UNORM, &rgba8_props);
+        constexpr VkFormatFeatureFlags kStorageAndSampled =
+            VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        constexpr VkFormatFeatureFlags kColorAndSampled =
+            VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+
+        const bool has_rgba8_storage =
+            (rgba8_props.optimalTilingFeatures & kStorageAndSampled) == kStorageAndSampled;
+        const bool has_rgba8_color =
+            (rgba8_props.optimalTilingFeatures & kColorAndSampled) == kColorAndSampled;
+
+        if (has_rgba8_storage) {
+            device_score += 250;
+        }
+        if (has_rgba8_color) {
+            device_score += 250;
+        }
+
+        if (device_score > best.score) {
+            best.device = d;
+            best.queue_family = chosen_family;
+            best.score = device_score;
+            best.has_compute = chosen_has_compute;
+            best.has_rgba8_storage = has_rgba8_storage;
+            best.has_rgba8_color = has_rgba8_color;
+            best.max_dim_2d =
+                props.limits.maxImageDimension2D > 0 ? props.limits.maxImageDimension2D : 4096u;
         }
     }
 
-    throw std::runtime_error("No suitable GPU found");
+    if (best.device == VK_NULL_HANDLE) {
+        throw std::runtime_error("No suitable GPU found");
+    }
+
+    physical_device_ = best.device;
+    graphics_family_ = best.queue_family;
+    supports_compute_ = best.has_compute;
+    supports_rgba8_storage_image_ = best.has_rgba8_storage;
+    supports_rgba8_color_attachment_ = best.has_rgba8_color;
+    max_image_dimension_2d_ = best.max_dim_2d;
 }
 
 void VulkanManager::create_logical_device() {
@@ -453,16 +573,19 @@ void VulkanManager::create_command_buffers() {
 }
 
 void VulkanManager::create_descriptor_pool() {
-    constexpr std::array<VkDescriptorPoolSize, 3> pool_sizes{{
-        {VK_DESCRIPTOR_TYPE_SAMPLER, 64},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 64},
-        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 64},
+    constexpr std::array<VkDescriptorPoolSize, 6> pool_sizes{{
+        {VK_DESCRIPTOR_TYPE_SAMPLER, 256},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 512},
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 512},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 512},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256},
     }};
 
     VkDescriptorPoolCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     ci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    ci.maxSets = 192;
+    ci.maxSets = 1024;
     ci.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
     ci.pPoolSizes = pool_sizes.data();
 
@@ -470,6 +593,26 @@ void VulkanManager::create_descriptor_pool() {
     check_vk(vkCreateDescriptorPool(device_.get(), &ci, nullptr, &raw_pool),
              "vkCreateDescriptorPool failed");
     descriptor_pool_.reset(device_.get(), raw_pool);
+}
+
+detail::UniqueVkShaderModule VulkanManager::create_shader_module(
+    std::span<const std::uint32_t> spirv_words) const {
+    if (!device_) {
+        throw std::runtime_error("Vulkan device is not initialized");
+    }
+    if (!validate_spirv_words(spirv_words)) {
+        throw std::runtime_error("Invalid SPIR-V module rejected prior to vkCreateShaderModule");
+    }
+
+    VkShaderModuleCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ci.codeSize = spirv_words.size_bytes();
+    ci.pCode = spirv_words.data();
+
+    VkShaderModule raw_module = VK_NULL_HANDLE;
+    check_vk(vkCreateShaderModule(device_.get(), &ci, nullptr, &raw_module),
+             "vkCreateShaderModule failed");
+    return detail::UniqueVkShaderModule(device_.get(), raw_module);
 }
 
 void VulkanManager::create_sync_objects() {
@@ -789,6 +932,17 @@ bool VulkanManager::begin_frame() {
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check_vk(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer failed");
 
+    frame_recording_active_ = true;
+    swapchain_render_pass_active_ = false;
+    return true;
+}
+
+void VulkanManager::begin_swapchain_render_pass() noexcept {
+    if (!frame_recording_active_ || swapchain_render_pass_active_) {
+        return;
+    }
+    const VkCommandBuffer cmd = frames_[current_frame_].command_buffer;
+
     VkClearValue clear{};
     clear.color = {{0.1f, 0.1f, 0.1f, 1.0f}};
 
@@ -801,7 +955,7 @@ bool VulkanManager::begin_frame() {
     rp.pClearValues = &clear;
 
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    return true;
+    swapchain_render_pass_active_ = true;
 }
 
 void VulkanManager::end_frame() {
@@ -809,7 +963,12 @@ void VulkanManager::end_frame() {
     FrameSyncSlot& frame = frames_[current_frame_];
     const VkCommandBuffer cmd = frame.command_buffer;
 
+    if (!swapchain_render_pass_active_) {
+        begin_swapchain_render_pass();
+    }
     vkCmdEndRenderPass(cmd);
+    swapchain_render_pass_active_ = false;
+    frame_recording_active_ = false;
     check_vk(vkEndCommandBuffer(cmd), "vkEndCommandBuffer failed");
 
     const std::array<VkSemaphore, 1> wait{frame.image_available_semaphore.get()};

@@ -87,7 +87,9 @@ add_executable(peelf_tests
   workspace_context_actions_test.cpp
   scripting_test.cpp
   ui_panel_helpers_test.cpp
+  vulkan_viewport_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/ui/workspace_layout.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/ui/panel_helpers.cpp
