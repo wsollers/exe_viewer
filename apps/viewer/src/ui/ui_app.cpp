@@ -40,6 +40,28 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
           [this](ContextActionKind kind, const InspectableEntity& entity) {
               dispatch_entity_context_action(kind, entity);
           })
+    , byte_viz_panel_(
+          model,
+          vulkan,
+          current_selection_,
+          pending_navigations_,
+          [this](ContextActionKind kind, const InspectableEntity& entity) {
+              dispatch_entity_context_action(kind, entity);
+          },
+          [this](bool /*prefer_virtual_addresses*/) -> ActiveDiffOverlaySnapshot {
+              ActiveDiffOverlaySnapshot overlay{};
+              overlay.revision = binary_diff_panel_.diff_revision();
+              if (model_.is_live_process()) {
+                  if (const auto& live_report = binary_diff_panel_.active_live_report();
+                      live_report.has_value()) {
+                      overlay.ranges = peelf::extract_byte_viz_diff_ranges(*live_report);
+                  }
+              } else if (const auto& static_report = binary_diff_panel_.active_static_report();
+                         static_report.has_value()) {
+                  overlay.ranges = peelf::extract_byte_viz_diff_ranges(*static_report, true);
+              }
+              return overlay;
+          })
     , structure_panel_(structure_tree_, current_selection_)
     , details_panel_(current_selection_, &model)
     , sections_panel_(model)
@@ -605,12 +627,14 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     });
     model_.set_session_teardown_hook([this]() noexcept {
         memory_heatmap_panel_.cancel_and_reset();
+        byte_viz_panel_.cancel_and_reset();
         reference_scanner_.cancel(&reference_index_);
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
     });
     register_pre_pass_recorder([this](VkCommandBuffer cmd, std::size_t frame_index) {
         memory_heatmap_panel_.record_pre_pass(cmd, frame_index);
+        byte_viz_panel_.record_pre_pass(cmd, frame_index);
     });
     register_workspace_settings_handler();
 }
@@ -620,6 +644,7 @@ UiApp::~UiApp() {
     model_.set_session_teardown_hook({});
     annotations_.set_on_changed({});
     memory_heatmap_panel_.shutdown();
+    byte_viz_panel_.shutdown();
     reference_scanner_.cancel(&reference_index_);
     binary_diff_panel_.invalidate();
     decompile_controller_.shutdown();
@@ -840,6 +865,7 @@ void UiApp::render() {
     file_panel_.draw();
     memory_map_panel_.draw();
     memory_heatmap_panel_.draw();
+    byte_viz_panel_.draw();
     structure_panel_.draw();
     details_panel_.draw();
     sections_panel_.draw();
@@ -1173,6 +1199,7 @@ void UiApp::process_deferred_gpu_work() {
         pending_ini_layout_.reset();
         patch_set_panel_.reset_for_new_target();
         memory_heatmap_panel_.cancel_and_reset();
+        byte_viz_panel_.cancel_and_reset();
         memory_search_panel_.reset_for_new_target();
         timeline_panel_.reset_for_new_target();
         binary_diff_panel_.invalidate();

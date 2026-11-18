@@ -103,9 +103,13 @@ BinaryDiffPanel::BinaryDiffPanel(BinaryModel& model,
 void BinaryDiffPanel::invalidate() noexcept {
     differ_.cancel();
     differ_.wait_for_idle();
+    const bool had_report = static_report_.has_value() || live_report_.has_value();
     mode_ = ActiveDiffMode::None;
     static_report_.reset();
     live_report_.reset();
+    if (had_report) {
+        ++diff_revision_;
+    }
     captured_revision_token_.reset();
     lhs_bytes_.clear();
     rhs_bytes_.clear();
@@ -245,6 +249,7 @@ void BinaryDiffPanel::poll_async_completion() {
 
         live_report_.reset();
         static_report_ = std::move(finished->static_report);
+        ++diff_revision_;
         mode_ = ActiveDiffMode::TwoBinaries;
         selected_hunk_index_ = 0;
 
@@ -287,6 +292,7 @@ void BinaryDiffPanel::poll_async_completion() {
 
         static_report_.reset();
         live_report_ = std::move(finished->live_report);
+        ++diff_revision_;
         mode_ = ActiveDiffMode::DiskVsLiveRam;
         selected_hunk_index_ = 0;
 

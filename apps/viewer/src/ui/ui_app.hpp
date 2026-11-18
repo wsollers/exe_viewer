@@ -29,6 +29,7 @@
 #include "ui_panels_timeline.hpp"
 #include "ui_panels_scripting.hpp"
 #include "ui_panels_memory_heatmap.hpp"
+#include "ui_panels_byte_viz.hpp"
 #include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
 #include "graph/call_graph.hpp"
@@ -187,6 +188,7 @@ namespace viewer {
         FilePanel       file_panel_;
         MemoryMapPanel  memory_map_panel_;
         MemoryHeatmapPanel memory_heatmap_panel_;
+        ByteEntropyVizPanel byte_viz_panel_;
         StructureNavigatorPanel structure_panel_;
         SelectionDetailsPanel details_panel_;
         SectionsPanel   sections_panel_;

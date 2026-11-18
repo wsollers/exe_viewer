@@ -111,6 +111,9 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_memory_heatmap.hpp
         src/ui/ui_panels_memory_heatmap.cpp
         src/vulkan/shaders/memory_heatmap_comp_spirv.hpp
+        src/ui/ui_panels_byte_viz.hpp
+        src/ui/ui_panels_byte_viz.cpp
+        src/vulkan/shaders/byte_viz_comp_spirv.hpp
         src/analysis/async_binary_diff.hpp
         src/analysis/async_binary_diff.cpp
         src/analysis/function_index.hpp

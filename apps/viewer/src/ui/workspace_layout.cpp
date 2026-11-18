@@ -15,6 +15,7 @@ constexpr std::array<WorkspacePanelId, kWorkspacePanelCount> kAllPanels{{
     WorkspacePanelId::FileInfo,
     WorkspacePanelId::MemoryMap,
     WorkspacePanelId::MemoryHeatmap,
+    WorkspacePanelId::ByteEntropyViz,
     WorkspacePanelId::Structure,
     WorkspacePanelId::Details,
     WorkspacePanelId::Sections,
@@ -186,6 +187,7 @@ std::string_view workspace_panel_window_name(WorkspacePanelId panel) noexcept {
         case WorkspacePanelId::FileInfo:           return "File Info";
         case WorkspacePanelId::MemoryMap:          return "Memory Map";
         case WorkspacePanelId::MemoryHeatmap:      return "Memory Heatmap";
+        case WorkspacePanelId::ByteEntropyViz:     return "Entropy & Digram";
         case WorkspacePanelId::Structure:          return "Structure";
         case WorkspacePanelId::Details:            return "Details";
         case WorkspacePanelId::Sections:           return "Sections";
@@ -294,7 +296,7 @@ WorkspacePresetSpec build_workspace_preset(WorkspacePreset preset) {
                 {P::Disassembly, P::FlowGraph, P::Decompiler},
                 P::Disassembly);
             auto center_bottom = DockNodeSpec::make_leaf(
-                {P::HexView, P::MemoryHeatmap, P::ReferencesAndNotes, P::Strings, P::PatchSet, P::Shellcode, P::Scripting, P::MemorySearch},
+                {P::HexView, P::MemoryHeatmap, P::ByteEntropyViz, P::ReferencesAndNotes, P::Strings, P::PatchSet, P::Shellcode, P::Scripting, P::MemorySearch},
                 P::HexView);
             auto right = DockNodeSpec::make_leaf(
                 {P::Details, P::FileInfo, P::ExecutableSettings, P::TargetCapabilities,
@@ -319,7 +321,7 @@ WorkspacePresetSpec build_workspace_preset(WorkspacePreset preset) {
                 {P::Structure, P::Dependencies, P::FileInfo, P::ExecutableSettings, P::TargetCapabilities},
                 P::Structure);
             auto center_top = DockNodeSpec::make_leaf(
-                {P::MemoryMap, P::MemoryHeatmap},
+                {P::MemoryMap, P::MemoryHeatmap, P::ByteEntropyViz},
                 P::MemoryMap);
             auto center_bottom = DockNodeSpec::make_leaf(
                 {P::HexView, P::Disassembly, P::MemorySearch, P::ExecutionTimeline},
@@ -376,7 +378,7 @@ WorkspacePresetSpec build_workspace_preset(WorkspacePreset preset) {
                 {P::BinaryDiff, P::Disassembly, P::Decompiler},
                 P::BinaryDiff);
             auto center_bottom = DockNodeSpec::make_leaf(
-                {P::HexView, P::ReferencesAndNotes, P::PatchSet},
+                {P::HexView, P::ByteEntropyViz, P::ReferencesAndNotes, P::PatchSet},
                 P::HexView);
             auto right = DockNodeSpec::make_leaf(
                 {P::Details, P::FileInfo, P::ExecutableSettings, P::Dependencies, P::TargetCapabilities},

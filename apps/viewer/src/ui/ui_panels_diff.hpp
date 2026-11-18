@@ -34,6 +34,14 @@ public:
     [[nodiscard]] peelf::Result<void> compare_active_live_module_vs_disk();
     void invalidate() noexcept;
 
+    [[nodiscard]] std::uint64_t diff_revision() const noexcept { return diff_revision_; }
+    [[nodiscard]] const std::optional<peelf::BinaryDiffReport>& active_static_report() const noexcept {
+        return static_report_;
+    }
+    [[nodiscard]] const std::optional<peelf::LiveModuleIntegrityReport>& active_live_report() const noexcept {
+        return live_report_;
+    }
+
 protected:
     void draw_contents() override;
 
@@ -82,6 +90,7 @@ private:
     std::optional<peelf::BinaryDiffReport> static_report_{};
     std::optional<peelf::LiveModuleIntegrityReport> live_report_{};
     std::optional<std::uint64_t> captured_revision_token_{};
+    std::uint64_t diff_revision_{0};
 
     // Synchronized Side-by-Side Hex & Disassembly cursor state
     bool lockstep_scroll_{true};

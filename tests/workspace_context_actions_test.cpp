@@ -63,9 +63,9 @@ TEST(WorkspaceLayoutTest, AllFivePresetsPassStructuralValidationAndCopyMoveClean
     }
 }
 
-TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll37Panels) {
-    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 10u);
-    EXPECT_EQ(kWorkspacePanelCount, 37u);
+TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll38Panels) {
+    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 11u);
+    EXPECT_EQ(kWorkspacePanelCount, 38u);
     const std::span<const WorkspacePanelId> panels = all_workspace_panels();
     EXPECT_EQ(panels.size(), kWorkspacePanelCount);
 
@@ -90,6 +90,8 @@ TEST(WorkspaceLayoutTest, PresetsCoverExpectedDomainPanels) {
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::Decompiler));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::FlowGraph));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::HexView));
+        EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::MemoryHeatmap));
+        EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::ByteEntropyViz));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::StructureView));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::TargetCapabilities));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::Scripting));
@@ -99,6 +101,7 @@ TEST(WorkspaceLayoutTest, PresetsCoverExpectedDomainPanels) {
             build_workspace_preset(WorkspacePreset::LiveProcessAndVmmap);
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::MemoryMap));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::MemoryHeatmap));
+        EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ByteEntropyViz));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ProcessInternals));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ExecutionTimeline));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ThreadsAndStack));
@@ -115,6 +118,7 @@ TEST(WorkspaceLayoutTest, PresetsCoverExpectedDomainPanels) {
     {
         const WorkspacePresetSpec diff = build_workspace_preset(WorkspacePreset::BinaryDiff);
         EXPECT_TRUE(contains_panel(diff.visible_panels, WorkspacePanelId::BinaryDiff));
+        EXPECT_TRUE(contains_panel(diff.visible_panels, WorkspacePanelId::ByteEntropyViz));
         EXPECT_TRUE(contains_panel(diff.visible_panels, WorkspacePanelId::ExecutableSettings));
         EXPECT_TRUE(contains_panel(diff.visible_panels, WorkspacePanelId::Disassembly));
         EXPECT_TRUE(contains_panel(diff.visible_panels, WorkspacePanelId::HexView));
