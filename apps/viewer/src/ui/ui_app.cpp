@@ -32,6 +32,14 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , vulkan_(vulkan)
     , file_panel_(model)
     , memory_map_panel_(model, current_selection_)
+    , memory_heatmap_panel_(
+          model,
+          vulkan,
+          current_selection_,
+          pending_navigations_,
+          [this](ContextActionKind kind, const InspectableEntity& entity) {
+              dispatch_entity_context_action(kind, entity);
+          })
     , structure_panel_(structure_tree_, current_selection_)
     , details_panel_(current_selection_, &model)
     , sections_panel_(model)
@@ -596,9 +604,13 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         model_.bump_annotation_revision();
     });
     model_.set_session_teardown_hook([this]() noexcept {
+        memory_heatmap_panel_.cancel_and_reset();
         reference_scanner_.cancel(&reference_index_);
         binary_diff_panel_.invalidate();
         decompile_controller_.reset_for_new_target();
+    });
+    register_pre_pass_recorder([this](VkCommandBuffer cmd, std::size_t frame_index) {
+        memory_heatmap_panel_.record_pre_pass(cmd, frame_index);
     });
     register_workspace_settings_handler();
 }
@@ -607,6 +619,7 @@ UiApp::~UiApp() {
     clear_pre_pass_recorders();
     model_.set_session_teardown_hook({});
     annotations_.set_on_changed({});
+    memory_heatmap_panel_.shutdown();
     reference_scanner_.cancel(&reference_index_);
     binary_diff_panel_.invalidate();
     decompile_controller_.shutdown();
@@ -826,6 +839,7 @@ void UiApp::render() {
 
     file_panel_.draw();
     memory_map_panel_.draw();
+    memory_heatmap_panel_.draw();
     structure_panel_.draw();
     details_panel_.draw();
     sections_panel_.draw();
@@ -1158,6 +1172,7 @@ void UiApp::process_deferred_gpu_work() {
         pending_navigations_.clear();
         pending_ini_layout_.reset();
         patch_set_panel_.reset_for_new_target();
+        memory_heatmap_panel_.cancel_and_reset();
         memory_search_panel_.reset_for_new_target();
         timeline_panel_.reset_for_new_target();
         binary_diff_panel_.invalidate();

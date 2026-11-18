@@ -88,6 +88,7 @@ add_executable(peelf_tests
   scripting_test.cpp
   ui_panel_helpers_test.cpp
   vulkan_viewport_test.cpp
+  memory_heatmap_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp

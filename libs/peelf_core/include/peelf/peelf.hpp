@@ -13,6 +13,7 @@
 #include <peelf/binary_image.hpp>
 #include <peelf/process.hpp>
 #include <peelf/patching.hpp>
+#include <peelf/memory_heatmap.hpp>
 
 #include <pe/pe_definitions.h>
 #include <elf/elf_definitions.h>

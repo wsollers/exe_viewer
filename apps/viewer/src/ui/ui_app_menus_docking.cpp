@@ -172,6 +172,7 @@ void UiApp::set_workspace_panel_visible(WorkspacePanelId panel, bool visible) no
     switch (panel) {
         case WorkspacePanelId::FileInfo:           file_panel_.set_visible(visible); break;
         case WorkspacePanelId::MemoryMap:          memory_map_panel_.set_visible(visible); break;
+        case WorkspacePanelId::MemoryHeatmap:      memory_heatmap_panel_.set_visible(visible); break;
         case WorkspacePanelId::Structure:          structure_panel_.set_visible(visible); break;
         case WorkspacePanelId::Details:            details_panel_.set_visible(visible); break;
         case WorkspacePanelId::Sections:           sections_panel_.set_visible(visible); break;
@@ -213,6 +214,7 @@ bool UiApp::is_workspace_panel_visible(WorkspacePanelId panel) const noexcept {
     switch (panel) {
         case WorkspacePanelId::FileInfo:           return file_panel_.visible();
         case WorkspacePanelId::MemoryMap:          return memory_map_panel_.visible();
+        case WorkspacePanelId::MemoryHeatmap:      return memory_heatmap_panel_.visible();
         case WorkspacePanelId::Structure:          return structure_panel_.visible();
         case WorkspacePanelId::Details:            return details_panel_.visible();
         case WorkspacePanelId::Sections:           return sections_panel_.visible();
@@ -461,6 +463,10 @@ void UiApp::render_main_menu() {
             timeline_panel_.set_visible(true);
             activate_panel(timeline_panel_.name().c_str());
         }
+        if (ImGui::MenuItem("Memory Heatmap")) {
+            memory_heatmap_panel_.set_visible(true);
+            activate_panel(memory_heatmap_panel_.name().c_str());
+        }
         if (ImGui::MenuItem("References & Notes", "X", false, model_.has_file())) open_references();
         if (ImGui::MenuItem("Bookmark selection", "Ctrl+B", false, model_.has_file())) {
             toggle_bookmark_at_selection();
@@ -577,6 +583,12 @@ void UiApp::render_main_menu() {
             bool v = memory_map_panel_.visible();
             if (ImGui::MenuItem(memory_map_panel_.name().c_str(), nullptr, &v))
                 memory_map_panel_.set_visible(v);
+        }
+
+        {
+            bool v = memory_heatmap_panel_.visible();
+            if (ImGui::MenuItem(memory_heatmap_panel_.name().c_str(), nullptr, &v))
+                memory_heatmap_panel_.set_visible(v);
         }
 
         {
@@ -741,7 +753,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV9");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV10");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     const bool missing_dockspace = (ImGui::DockBuilderGetNode(dockspace_id) == nullptr);

@@ -63,9 +63,9 @@ TEST(WorkspaceLayoutTest, AllFivePresetsPassStructuralValidationAndCopyMoveClean
     }
 }
 
-TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll36Panels) {
-    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 9u);
-    EXPECT_EQ(kWorkspacePanelCount, 36u);
+TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll37Panels) {
+    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 10u);
+    EXPECT_EQ(kWorkspacePanelCount, 37u);
     const std::span<const WorkspacePanelId> panels = all_workspace_panels();
     EXPECT_EQ(panels.size(), kWorkspacePanelCount);
 
@@ -98,6 +98,7 @@ TEST(WorkspaceLayoutTest, PresetsCoverExpectedDomainPanels) {
         const WorkspacePresetSpec live =
             build_workspace_preset(WorkspacePreset::LiveProcessAndVmmap);
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::MemoryMap));
+        EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::MemoryHeatmap));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ProcessInternals));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ExecutionTimeline));
         EXPECT_TRUE(contains_panel(live.visible_panels, WorkspacePanelId::ThreadsAndStack));
