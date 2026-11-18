@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string>
 #include <string_view>
@@ -649,4 +650,156 @@ TEST(StructureInterpreterTest, RejectsOverflowingArrayCountsAndGuardsNearUint64M
     ASSERT_NE(text_field, nullptr);
     EXPECT_EQ(text_field->string_preview, "L\"\xF0\x9F\x9A\x80\xEF\xBF\xBD!\"");
 }
+
+TEST(StructureInterpreterTest, PeSectionVaAvoidsDoubleImageBaseClampsBssZeroFillAndBoundsArrayCount) {
+    // Construct a minimal valid PE32+ (x64) image with:
+    //   ImageBase = 0x140000000
+    //   Section 0 (".data"): VirtualAddress = 0x2000 (VA = 0x140002000),
+    //                        VirtualSize = 16, SizeOfRawData = 8, PointerToRawData = 0x200
+    std::vector<std::uint8_t> pe_bytes(0x208u, 0u);
+    const auto w16 = [&](std::size_t off, std::uint16_t v) {
+        pe_bytes[off + 0] = static_cast<std::uint8_t>(v & 0xFFu);
+        pe_bytes[off + 1] = static_cast<std::uint8_t>((v >> 8u) & 0xFFu);
+    };
+    const auto w32 = [&](std::size_t off, std::uint32_t v) {
+        for (std::size_t i = 0; i < 4u; ++i) {
+            pe_bytes[off + i] = static_cast<std::uint8_t>((v >> (i * 8u)) & 0xFFu);
+        }
+    };
+    const auto w64 = [&](std::size_t off, std::uint64_t v) {
+        for (std::size_t i = 0; i < 8u; ++i) {
+            pe_bytes[off + i] = static_cast<std::uint8_t>((v >> (i * 8u)) & 0xFFu);
+        }
+    };
+
+    // DOS header + PE signature at 0x80
+    w16(0x00, 0x5A4Du);
+    w32(0x3C, 0x80u);
+    pe_bytes[0x80] = 'P';
+    pe_bytes[0x81] = 'E';
+
+    // COFF File Header at 0x84 (20 bytes)
+    w16(0x84, 0x8664u); // IMAGE_FILE_MACHINE_AMD64
+    w16(0x86, 1u);      // NumberOfSections = 1
+    w16(0x94, 0xF0u);   // SizeOfOptionalHeader = 240
+    w16(0x96, 0x0022u); // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE
+
+    // OptionalHeader64 at 0x98 (240 bytes -> ends at 0x188)
+    constexpr std::uint64_t kImageBase = 0x140000000ULL;
+    constexpr std::uint64_t kDataSectionVa = kImageBase + 0x2000ULL;
+    w16(0x98 + 0x00, 0x020Bu); // PE32+
+    w32(0x98 + 0x10, 0x2000u); // AddressOfEntryPoint
+    w64(0x98 + 0x18, kImageBase);
+    w32(0x98 + 0x20, 0x1000u); // SectionAlignment
+    w32(0x98 + 0x24, 0x200u);  // FileAlignment
+    w16(0x98 + 0x30, 6u);      // MajorSubsystemVersion
+    w32(0x98 + 0x38, 0x3000u); // SizeOfImage
+    w32(0x98 + 0x3C, 0x200u);  // SizeOfHeaders
+    w16(0x98 + 0x44, 3u);      // IMAGE_SUBSYSTEM_WINDOWS_CUI
+    w32(0x98 + 0x6C, 16u);     // NumberOfRvaAndSizes
+
+    // Section Header[0] ".data" at 0x188 (40 bytes)
+    std::memcpy(pe_bytes.data() + 0x188, ".data", 5u);
+    w32(0x188 + 0x08, 16u);         // VirtualSize = 16 (8 file-backed + 8 BSS zero-fill)
+    w32(0x188 + 0x0C, 0x2000u);     // VirtualAddress (RVA)
+    w32(0x188 + 0x10, 8u);          // SizeOfRawData = 8
+    w32(0x188 + 0x14, 0x200u);      // PointerToRawData = 0x200
+    w32(0x188 + 0x24, 0xC0000040u); // INITIALIZED_DATA | READ | WRITE
+
+    // Store a pointer to `.data + 4` (`0x140002004`) in the 8 file-backed bytes at file offset 0x200.
+    w64(0x200, kDataSectionVa + 4ULL);
+
+    const auto parsed_pe = peelf::parse_image(pe_bytes);
+    ASSERT_TRUE(parsed_pe.has_value()) << parsed_pe.error().message;
+    ASSERT_EQ((*parsed_pe)->sections().size(), 1u);
+    EXPECT_EQ((*parsed_pe)->sections()[0].virtual_address, kDataSectionVa);
+
+    DataTypeRecord pe_probe{};
+    pe_probe.name = "PeBssProbe";
+    pe_probe.size = 20;
+    pe_probe.members = {
+        {.name = "ptr", .type = "void*", .offset = 0, .size = 8},
+        {.name = "bss_tail", .type = "uint64_t", .offset = 8, .size = 8},
+        {.name = "past_virtual_size", .type = "uint32_t", .offset = 16, .size = 4},
+    };
+
+    DataTypeRecord capped_arr{};
+    capped_arr.name = "DeclaredSizeCappedArray";
+    capped_arr.size = 12;
+    capped_arr.members = {
+        // Declared member byte_size = 12 must clamp uint32_t[100] (stride 4) to 3 elements!
+        {.name = "items", .type = "uint32_t[100]", .offset = 0, .size = 12},
+    };
+
+    const std::array<DataTypeRecord, 2> defs{{pe_probe, capped_arr}};
+    const StructureCatalog catalog = StructureCatalog::build(defs, {}, false);
+    StructureEvalOptions opts{
+        .layout = peelf::TargetLayout{
+            .architecture = peelf::Architecture::X86_64,
+            .address_width = peelf::AddressWidth::Bits64,
+            .endianness = peelf::Endianness::Little,
+        },
+        .count = 1,
+    };
+
+    // 1. StaticImageStructureByteSource reads PE section VA without double-adding ImageBase,
+    //    resolves pointer target ".data+0x4", zero-fills [file_size, virtual_size), and leaves >= virtual_size unreadable.
+    StaticImageStructureByteSource static_src(**parsed_pe, pe_bytes);
+    EXPECT_EQ(static_src.describe_pointer(kDataSectionVa + 4ULL), ".data+0x4");
+
+    const auto static_eval = evaluate_structure(catalog, "PeBssProbe", kDataSectionVa, false, static_src, opts);
+    ASSERT_TRUE(static_eval.has_value()) << static_eval.error().message;
+    const auto* f_ptr = find_field(static_eval->fields, "ptr");
+    const auto* f_bss = find_field(static_eval->fields, "bss_tail");
+    const auto* f_past = find_field(static_eval->fields, "past_virtual_size");
+    ASSERT_NE(f_ptr, nullptr);
+    ASSERT_NE(f_bss, nullptr);
+    ASSERT_NE(f_past, nullptr);
+    EXPECT_EQ(f_ptr->availability, peelf::Availability::Available);
+    EXPECT_EQ(f_ptr->pointer_target_va, std::optional<std::uint64_t>{kDataSectionVa + 4ULL});
+    EXPECT_NE(f_ptr->decoded_value.find(".data+0x4"), std::string::npos);
+    EXPECT_EQ(f_bss->availability, peelf::Availability::Available);
+    EXPECT_EQ(f_bss->decoded_value, "0x0000000000000000 (0)");
+    EXPECT_EQ(f_past->availability, peelf::Availability::Unavailable);
+    EXPECT_EQ(f_past->decoded_value, "<unreadable>");
+
+    // 2. Truncated file-backed bytes (< file_size) must NOT be falsely zero-filled as BSS.
+    const std::vector<std::uint8_t> truncated_pe(pe_bytes.begin(), pe_bytes.begin() + 0x204);
+    StaticImageStructureByteSource trunc_src(**parsed_pe, truncated_pe);
+    const peelf::MemorySample trunc_sample = trunc_src.read_bytes(kDataSectionVa, false, 16u);
+    ASSERT_EQ(trunc_sample.valid.size(), 16u);
+    // [0..4) present in file, [4..8) missing file-backed bytes (invalid!), [8..16) BSS zero-fill (valid!).
+    EXPECT_EQ(trunc_sample.valid[0], 1u);
+    EXPECT_EQ(trunc_sample.valid[3], 1u);
+    EXPECT_EQ(trunc_sample.valid[4], 0u);
+    EXPECT_EQ(trunc_sample.valid[7], 0u);
+    EXPECT_EQ(trunc_sample.valid[8], 1u);
+    EXPECT_EQ(trunc_sample.valid[15], 1u);
+
+    // 3. BinaryModelStructureByteSource also resolves PE pointer descriptions without double ImageBase
+    //    and clamps oversized array element_count against declared field byte_size.
+    const std::filesystem::path tmp_pe =
+        std::filesystem::temp_directory_path() / "peelf-fbf05a-synth-pe64.exe";
+    {
+        std::ofstream out(tmp_pe, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.write(reinterpret_cast<const char*>(pe_bytes.data()),
+                  static_cast<std::streamsize>(pe_bytes.size()));
+    }
+    BinaryModel pe_model;
+    ASSERT_TRUE(pe_model.load_file(tmp_pe.string()));
+    BinaryModelStructureByteSource model_src(pe_model);
+    EXPECT_EQ(model_src.describe_pointer(kDataSectionVa + 4ULL), ".data+0x4");
+
+    const auto arr_eval =
+        evaluate_structure(catalog, "DeclaredSizeCappedArray", kDataSectionVa, false, model_src, opts);
+    ASSERT_TRUE(arr_eval.has_value()) << arr_eval.error().message;
+    const auto* f_items = find_field(arr_eval->fields, "items");
+    ASSERT_NE(f_items, nullptr);
+    EXPECT_EQ(f_items->children.size(), 3u);
+
+    std::error_code ec;
+    std::filesystem::remove(tmp_pe, ec);
+}
+
 

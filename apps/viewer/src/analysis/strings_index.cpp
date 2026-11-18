@@ -145,10 +145,13 @@ void scan_utf16_orientation(
     const StringEncoding enc = little_endian ? StringEncoding::Utf16Le : StringEncoding::Utf16Be;
 
     for (std::size_t parity = 0; parity < 2u; ++parity) {
+        if (stop.stop_requested()) {
+            return;
+        }
         std::size_t pos = parity;
         std::size_t step_counter = 0;
         while (pos + 2u <= bytes.size()) {
-            if ((++step_counter & 0x3FFFu) == 0u && stop.stop_requested()) {
+            if ((++step_counter & 0xFFFu) == 0u && stop.stop_requested()) {
                 return;
             }
             if (byte_claimed[pos] != 0 || byte_claimed[pos + 1u] != 0) {
@@ -173,6 +176,9 @@ void scan_utf16_orientation(
             std::string preview;
 
             while (pos + 2u <= bytes.size()) {
+                if ((++step_counter & 0xFFFu) == 0u && stop.stop_requested()) {
+                    return;
+                }
                 if (byte_claimed[pos] != 0 || byte_claimed[pos + 1u] != 0) {
                     break;
                 }
@@ -230,37 +236,42 @@ void scan_utf16_orientation(
                 }
             }
 
-            if (char_count >= min_len && graphic_count >= min_graphic) {
-                const bool nul_term = (pos + 2u <= bytes.size() &&
-                                       read_u16(bytes.data() + pos, little_endian) == 0x0000u);
-                const bool aligned_va = (((base_va + run_start) & 1ULL) == 0ULL);
+            if (char_count >= min_len && graphic_count >= min_graphic && pos > run_start) {
+                const auto run_va = peelf::checked_add_u64(base_va, run_start);
+                const std::size_t run_byte_len = pos - run_start;
+                if (run_va.has_value() &&
+                    peelf::checked_add_u64(*run_va, run_byte_len - 1u).has_value()) {
+                    const bool nul_term = (pos + 2u <= bytes.size() &&
+                                           read_u16(bytes.data() + pos, little_endian) == 0x0000u);
+                    const bool aligned_va = ((*run_va & 1ULL) == 0ULL);
 
-                bool accept = false;
-                if (wide_ascii_or_latin_count >= min_len ||
-                    wide_ascii_or_latin_count * 2u >= char_count) {
-                    // High byte 0x00..0x02 across >= min_len units has negligible false-positive rate.
-                    accept = !is_executable_code || wide_ascii_or_latin_count >= min_len;
-                } else if (!is_executable_code) {
-                    // Non-Latin Unicode (Cyrillic, CJK, Kana, Hangul, Emoji):
-                    // require script coherence plus either BOM, NUL termination, surrogate pair,
-                    // or narrow-range script (Greek/Cyrillic/Kana) at 2-byte alignment.
-                    const bool narrow_script =
-                        (dominant_script == 2 || dominant_script == 3 || dominant_script == 4);
-                    accept = script_coherent &&
-                             (has_bom || nul_term || surrogate_count > 0 ||
-                              (narrow_script && (aligned_va || run_start == 0)));
-                }
+                    bool accept = false;
+                    if (wide_ascii_or_latin_count >= min_len ||
+                        wide_ascii_or_latin_count * 2u >= char_count) {
+                        // High byte 0x00..0x02 across >= min_len units has negligible false-positive rate.
+                        accept = !is_executable_code || wide_ascii_or_latin_count >= min_len;
+                    } else if (!is_executable_code) {
+                        // Non-Latin Unicode (Cyrillic, CJK, Kana, Hangul, Emoji):
+                        // require script coherence plus either BOM, NUL termination, surrogate pair,
+                        // or narrow-range script (Greek/Cyrillic/Kana) at 2-byte alignment.
+                        const bool narrow_script =
+                            (dominant_script == 2 || dominant_script == 3 || dominant_script == 4);
+                        accept = script_coherent &&
+                                 (has_bom || nul_term || surrogate_count > 0 ||
+                                  (narrow_script && (aligned_va || run_start == 0)));
+                    }
 
-                if (accept) {
-                    out_candidates.push_back(Utf16Candidate{
-                        .start_offset = run_start,
-                        .byte_length = pos - run_start,
-                        .char_length = char_count,
-                        .encoding = enc,
-                        .nul_terminated = nul_term,
-                        .has_bom = has_bom,
-                        .preview = std::move(preview),
-                    });
+                    if (accept) {
+                        out_candidates.push_back(Utf16Candidate{
+                            .start_offset = run_start,
+                            .byte_length = run_byte_len,
+                            .char_length = char_count,
+                            .encoding = enc,
+                            .nul_terminated = nul_term,
+                            .has_bom = has_bom,
+                            .preview = std::move(preview),
+                        });
+                    }
                 }
             }
 
@@ -271,7 +282,7 @@ void scan_utf16_orientation(
     }
 }
 
-void extract_slice_into(
+bool extract_slice_into(
     std::span<const std::uint8_t> bytes,
     std::uint64_t base_va,
     std::optional<std::uint64_t> base_file_offset,
@@ -282,7 +293,14 @@ void extract_slice_into(
     std::stop_token stop,
     std::vector<ExtractedString>& out) {
     if (bytes.empty() || stop.stop_requested()) {
-        return;
+        return false;
+    }
+
+    bool va_clamped = false;
+    const std::uint64_t max_va_offset = std::numeric_limits<std::uint64_t>::max() - base_va;
+    if (static_cast<std::uint64_t>(bytes.size() - 1u) > max_va_offset) {
+        bytes = bytes.first(static_cast<std::size_t>(max_va_offset + 1ULL));
+        va_clamped = true;
     }
 
     const std::size_t min_len = std::max<std::size_t>(options.min_length, 1u);
@@ -293,8 +311,8 @@ void extract_slice_into(
     std::size_t pos = 0;
     std::size_t iter = 0;
     while (pos < bytes.size()) {
-        if ((++iter & 0x3FFFu) == 0u && stop.stop_requested()) {
-            return;
+        if ((++iter & 0xFFFu) == 0u && stop.stop_requested()) {
+            return va_clamped;
         }
         const auto first = decode_printable_utf8(bytes, pos);
         if (!first) {
@@ -310,6 +328,9 @@ void extract_slice_into(
         std::string preview;
 
         while (pos < bytes.size()) {
+            if ((++iter & 0xFFFu) == 0u && stop.stop_requested()) {
+                return va_clamped;
+            }
             const auto dec = decode_printable_utf8(bytes, pos);
             if (!dec) {
                 break;
@@ -329,7 +350,7 @@ void extract_slice_into(
             }
         }
 
-        if (char_count >= min_len && graphic_count >= min_graphic) {
+        if (char_count >= min_len && graphic_count >= min_graphic && pos > start) {
             const bool nul_terminated = (pos < bytes.size() && bytes[pos] == 0x00u);
             // Guard against x86 `ret; nop` (C3 90 = U+00D0) merging onto 3 opcode bytes in .text.
             const bool utf8_plausible = (non_ascii_count == 0u) ||
@@ -337,14 +358,16 @@ void extract_slice_into(
                                         non_ascii_count >= 2u ||
                                         ascii_count >= min_len ||
                                         nul_terminated;
-            if (utf8_plausible) {
+            const auto entry_va = peelf::checked_add_u64(base_va, start);
+            if (utf8_plausible && entry_va.has_value() &&
+                peelf::checked_add_u64(*entry_va, (pos - start) - 1u).has_value()) {
                 std::fill(byte_claimed.begin() + static_cast<std::ptrdiff_t>(start),
                           byte_claimed.begin() + static_cast<std::ptrdiff_t>(pos),
                           std::uint8_t{1u});
                 out.push_back(ExtractedString{
-                    .virtual_address = base_va + start,
+                    .virtual_address = *entry_va,
                     .file_offset = base_file_offset
-                        ? std::optional<std::uint64_t>(*base_file_offset + start)
+                        ? peelf::checked_add_u64(*base_file_offset, start)
                         : std::nullopt,
                     .byte_length = pos - start,
                     .char_length = char_count,
@@ -357,7 +380,7 @@ void extract_slice_into(
     }
 
     if (stop.stop_requested()) {
-        return;
+        return va_clamped;
     }
 
     // 2. Scan UTF-16LE and UTF-16BE runs and resolve shifted LE/BE overlaps.
@@ -366,7 +389,7 @@ void extract_slice_into(
     scan_utf16_orientation(bytes, byte_claimed, false, base_va, options, is_executable_code, stop, utf16_candidates);
 
     if (utf16_candidates.empty() || stop.stop_requested()) {
-        return;
+        return va_clamped;
     }
 
     const StringEncoding preferred_enc =
@@ -376,8 +399,10 @@ void extract_slice_into(
         if (a.char_length != b.char_length) return a.char_length > b.char_length;
         if (a.has_bom != b.has_bom) return a.has_bom > b.has_bom;
         if (a.nul_terminated != b.nul_terminated) return a.nul_terminated > b.nul_terminated;
-        const bool a_aligned = (((base_va + a.start_offset) & 1ULL) == 0ULL);
-        const bool b_aligned = (((base_va + b.start_offset) & 1ULL) == 0ULL);
+        const auto a_va = peelf::checked_add_u64(base_va, a.start_offset);
+        const auto b_va = peelf::checked_add_u64(base_va, b.start_offset);
+        const bool a_aligned = a_va.has_value() && ((*a_va & 1ULL) == 0ULL);
+        const bool b_aligned = b_va.has_value() && ((*b_va & 1ULL) == 0ULL);
         if (a_aligned != b_aligned) return a_aligned > b_aligned;
         const bool a_native = (a.encoding == preferred_enc);
         const bool b_native = (b.encoding == preferred_enc);
@@ -387,6 +412,9 @@ void extract_slice_into(
 
     std::vector<std::uint8_t> utf16_claimed(bytes.size(), 0u);
     for (auto& cand : utf16_candidates) {
+        if ((++iter & 0xFFFu) == 0u && stop.stop_requested()) {
+            return va_clamped;
+        }
         bool overlaps = false;
         for (std::size_t k = cand.start_offset; k < cand.start_offset + cand.byte_length; ++k) {
             if (utf16_claimed[k] != 0u) {
@@ -397,13 +425,18 @@ void extract_slice_into(
         if (overlaps) {
             continue;
         }
+        const auto cand_va = peelf::checked_add_u64(base_va, cand.start_offset);
+        if (!cand_va.has_value() || cand.byte_length == 0u ||
+            !peelf::checked_add_u64(*cand_va, cand.byte_length - 1u).has_value()) {
+            continue;
+        }
         std::fill(utf16_claimed.begin() + static_cast<std::ptrdiff_t>(cand.start_offset),
                   utf16_claimed.begin() + static_cast<std::ptrdiff_t>(cand.start_offset + cand.byte_length),
                   std::uint8_t{1u});
         out.push_back(ExtractedString{
-            .virtual_address = base_va + cand.start_offset,
+            .virtual_address = *cand_va,
             .file_offset = base_file_offset
-                ? std::optional<std::uint64_t>(*base_file_offset + cand.start_offset)
+                ? peelf::checked_add_u64(*base_file_offset, cand.start_offset)
                 : std::nullopt,
             .byte_length = cand.byte_length,
             .char_length = cand.char_length,
@@ -412,6 +445,7 @@ void extract_slice_into(
             .preview = std::move(cand.preview),
         });
     }
+    return va_clamped;
 }
 
 void finalize_sorted_strings(std::vector<ExtractedString>& entries) {
@@ -422,14 +456,19 @@ void finalize_sorted_strings(std::vector<ExtractedString>& entries) {
     });
     std::vector<ExtractedString> deduped;
     deduped.reserve(entries.size());
-    std::array<std::uint64_t, 4> max_end_by_enc{0, 0, 0, 0};
+    std::array<std::optional<std::uint64_t>, 4> max_last_by_enc{};
     for (auto& entry : entries) {
-        const auto enc_idx = static_cast<std::size_t>(entry.encoding);
-        const std::uint64_t end_va = entry.virtual_address + entry.byte_length;
-        if (end_va <= max_end_by_enc[enc_idx]) {
+        if (entry.byte_length == 0u) {
             continue;
         }
-        max_end_by_enc[enc_idx] = end_va;
+        const auto enc_idx = static_cast<std::size_t>(entry.encoding);
+        const std::uint64_t last_va = peelf::checked_add_u64(
+            entry.virtual_address,
+            entry.byte_length - 1u).value_or(std::numeric_limits<std::uint64_t>::max());
+        if (max_last_by_enc[enc_idx].has_value() && last_va <= *max_last_by_enc[enc_idx]) {
+            continue;
+        }
+        max_last_by_enc[enc_idx] = last_va;
         deduped.push_back(std::move(entry));
     }
     entries = std::move(deduped);
@@ -485,11 +524,28 @@ void finalize_sorted_strings(std::vector<ExtractedString>& entries) {
 } // namespace
 
 std::string format_single_line_string_preview(std::string_view utf8_text, std::size_t max_bytes) {
+    if (max_bytes == 0u) {
+        return utf8_text.empty() ? std::string{} : std::string{"..."};
+    }
     std::string out;
     out.reserve(std::min(utf8_text.size(), max_bytes) + 8u);
-    for (const char ch : utf8_text) {
-        if (out.size() >= max_bytes) {
-            out += "...";
+    bool truncated = false;
+    for (std::size_t i = 0; i < utf8_text.size(); ++i) {
+        const char ch = utf8_text[i];
+        const bool is_escaped = (ch == '\n' || ch == '\r' || ch == '\t');
+        const std::size_t add_len = is_escaped ? 2u : 1u;
+        if (out.size() + add_len > max_bytes) {
+            if ((static_cast<std::uint8_t>(ch) & 0xC0u) == 0x80u) {
+                while (!out.empty() &&
+                       (static_cast<std::uint8_t>(out.back()) & 0xC0u) == 0x80u) {
+                    out.pop_back();
+                }
+                if (!out.empty() &&
+                    (static_cast<std::uint8_t>(out.back()) & 0x80u) != 0u) {
+                    out.pop_back();
+                }
+            }
+            truncated = true;
             break;
         }
         switch (ch) {
@@ -498,6 +554,9 @@ std::string format_single_line_string_preview(std::string_view utf8_text, std::s
         case '\t': out += "\\t"; break;
         default:   out.push_back(ch); break;
         }
+    }
+    if (truncated) {
+        out += "...";
     }
     return out;
 }
@@ -515,16 +574,18 @@ StringsIndex StringsIndex::extract_from_buffer(
     index.min_length_ = std::max<std::size_t>(options.min_length, 1u);
     const std::size_t cap = std::min(bytes.size(), options.byte_budget);
     index.incomplete_ = cap < bytes.size();
-    extract_slice_into(
-        bytes.first(cap),
-        base_virtual_address,
-        base_file_offset,
-        section_or_region_name,
-        hint_endian,
-        options,
-        is_executable_code,
-        stop,
-        index.entries_);
+    if (extract_slice_into(
+            bytes.first(cap),
+            base_virtual_address,
+            base_file_offset,
+            section_or_region_name,
+            hint_endian,
+            options,
+            is_executable_code,
+            stop,
+            index.entries_)) {
+        index.incomplete_ = true;
+    }
     if (stop.stop_requested()) {
         index.incomplete_ = true;
     }
@@ -578,16 +639,18 @@ StringsIndex StringsIndex::extract(
         }
         const std::string label = sec.name.empty() ? std::format("section_{}", idx) : sec.name;
         const std::uint64_t base_va = sec.virtual_address != 0 ? sec.virtual_address : sec.file_offset;
-        extract_slice_into(
-            bytes.subspan(static_cast<std::size_t>(sec.file_offset), take),
-            base_va,
-            sec.file_offset,
-            label,
-            image.endianness(),
-            options,
-            sec.executable,
-            stop,
-            index.entries_);
+        if (extract_slice_into(
+                bytes.subspan(static_cast<std::size_t>(sec.file_offset), take),
+                base_va,
+                sec.file_offset,
+                label,
+                image.endianness(),
+                options,
+                sec.executable,
+                stop,
+                index.entries_)) {
+            index.incomplete_ = true;
+        }
         remaining_budget -= take;
     }
 
@@ -623,16 +686,18 @@ StringsIndex StringsIndex::extract(
                 index.incomplete_ = true;
             }
             const std::string label = std::format("PT_LOAD[{}]", idx);
-            extract_slice_into(
-                bytes.subspan(static_cast<std::size_t>(seg.file_offset), take),
-                seg.virtual_address,
-                seg.file_offset,
-                label,
-                image.endianness(),
-                options,
-                seg.executable,
-                stop,
-                index.entries_);
+            if (extract_slice_into(
+                    bytes.subspan(static_cast<std::size_t>(seg.file_offset), take),
+                    seg.virtual_address,
+                    seg.file_offset,
+                    label,
+                    image.endianness(),
+                    options,
+                    seg.executable,
+                    stop,
+                    index.entries_)) {
+                index.incomplete_ = true;
+            }
             remaining_budget -= take;
         }
     }
@@ -684,11 +749,17 @@ StringsIndex StringsIndex::extract_live(
             const std::uint64_t mod_start = *active_module_base;
             std::uint64_t mod_end = mod_start;
             for (const auto& sec : active_image->sections()) {
-                const std::uint64_t sec_end = sec.virtual_address + std::max(sec.virtual_size, sec.file_size);
+                const std::uint64_t sec_end = peelf::checked_add_u64(
+                    sec.virtual_address,
+                    std::max(sec.virtual_size, sec.file_size))
+                    .value_or(std::numeric_limits<std::uint64_t>::max());
                 mod_end = std::max(mod_end, sec_end);
             }
             for (const auto& seg : active_image->segments()) {
-                const std::uint64_t seg_end = seg.virtual_address + std::max(seg.virtual_size, seg.file_size);
+                const std::uint64_t seg_end = peelf::checked_add_u64(
+                    seg.virtual_address,
+                    std::max(seg.virtual_size, seg.file_size))
+                    .value_or(std::numeric_limits<std::uint64_t>::max());
                 mod_end = std::max(mod_end, seg_end);
             }
             if (mod_end > mod_start &&
@@ -732,16 +803,18 @@ StringsIndex StringsIndex::extract_live(
                 buffer.resize(*read_res);
                 const std::optional<std::uint64_t> slice_file_off =
                     active_image != nullptr ? active_image->virtual_address_to_file_offset(slice_va) : std::nullopt;
-                extract_slice_into(
-                    buffer,
-                    slice_va,
-                    slice_file_off,
-                    region_label,
-                    endian,
-                    options,
-                    region.protection.executable,
-                    stop,
-                    index.entries_);
+                if (extract_slice_into(
+                        buffer,
+                        slice_va,
+                        slice_file_off,
+                        region_label,
+                        endian,
+                        options,
+                        region.protection.executable,
+                        stop,
+                        index.entries_)) {
+                    index.incomplete_ = true;
+                }
                 const std::size_t consumed = std::min<std::size_t>(
                     *read_res,
                     static_cast<std::size_t>(to_advance));

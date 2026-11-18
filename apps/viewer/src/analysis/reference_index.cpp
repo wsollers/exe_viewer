@@ -313,6 +313,9 @@ struct RecentInsn {
     std::uint8_t arm64_add_ext_bytes = 0;
 
     int clobbered_reg = -1;
+    int clobbered_reg2 = -1;
+    bool clobbers_flags = false;
+    bool is_call = false;
 };
 
 using ReadVaFn = std::function<bool(std::uint64_t va, std::span<std::uint8_t> out)>;
@@ -327,7 +330,9 @@ using ResolveSlotFn = std::function<std::optional<std::string>(std::uint64_t va)
     bool strict_above = true;
 
     for (auto it = history.rbegin(); it != history.rend(); ++it) {
-        if (it->is_unconditional_stop) break;
+        if (it->is_unconditional_stop || it->is_call) break;
+        const bool clobbers_tracked =
+            (it->clobbered_reg == tracked_idx || it->clobbered_reg2 == tracked_idx);
         if (!saw_guard) {
             if (it->is_unsigned_upper_guard) {
                 saw_guard = true;
@@ -336,17 +341,31 @@ using ResolveSlotFn = std::function<std::optional<std::string>(std::uint64_t va)
             }
             if (it->mov_dst == tracked_idx && it->mov_src >= 0) {
                 tracked_idx = it->mov_src;
+                continue;
+            }
+            if (clobbers_tracked) {
+                break;
             }
         } else {
             if (it->has_cmp_imm && it->cmp_reg == tracked_idx) {
+                if (strict_above && it->cmp_imm == std::numeric_limits<std::uint64_t>::max()) {
+                    return std::nullopt;
+                }
                 const std::uint64_t count = strict_above ? (it->cmp_imm + 1u) : it->cmp_imm;
                 if (count >= 1u && count <= 256u) {
                     return static_cast<std::size_t>(count);
                 }
                 return std::nullopt;
             }
+            if (it->clobbers_flags) {
+                break;
+            }
             if (it->mov_dst == tracked_idx && it->mov_src >= 0) {
                 tracked_idx = it->mov_src;
+                continue;
+            }
+            if (clobbers_tracked) {
+                break;
             }
         }
     }
@@ -364,9 +383,9 @@ using ResolveSlotFn = std::function<std::optional<std::string>(std::uint64_t va)
     std::size_t idx = 0;
     for (auto it = history.rbegin(); it != history.rend(); ++it, ++idx) {
         if (idx < start_from_back) continue;
-        if (it->is_unconditional_stop) break;
+        if (it->is_unconditional_stop || it->is_call) break;
         if (it->adr_dst == target_reg) {
-            return it->adr_target + pending_add.value_or(0ULL);
+            return peelf::checked_add_u64(it->adr_target, pending_add.value_or(0ULL));
         }
         if (!pending_add && it->add_imm_dst == target_reg && it->add_imm_base >= 0) {
             pending_add = it->add_imm_val;
@@ -401,6 +420,10 @@ SliceScanResult scan_code_slice(
     std::stop_token stop = {}) {
 
     SliceScanResult status{};
+    if (stop.stop_requested()) {
+        status.cancelled = true;
+        return status;
+    }
     Decoder decoder;
     if (!open_decoder(decoder, architecture, endian, thumb)) {
         status.decode_incomplete = true;
@@ -423,7 +446,7 @@ SliceScanResult scan_code_slice(
     std::size_t step_counter = 0;
 
     while (remaining > 0 && status.bytes_consumed < max_consume_bytes) {
-        if ((++step_counter & 0x3FFu) == 0 && stop.stop_requested()) {
+        if ((++step_counter & 0x3Fu) == 0 && stop.stop_requested()) {
             status.cancelled = true;
             break;
         }
@@ -508,6 +531,7 @@ SliceScanResult scan_code_slice(
         RecentInsn recent{
             .address = insn.address,
             .size = insn.size,
+            .is_call = call,
         };
 
         std::optional<std::uint64_t> immediate;
@@ -573,9 +597,23 @@ SliceScanResult scan_code_slice(
                 }
             }
 
-            if (x86.op_count >= 1 && x86.operands[0].type == X86_OP_REG && insn.id != X86_INS_CMP && insn.id != X86_INS_TEST) {
+            if (x86.op_count >= 1 && x86.operands[0].type == X86_OP_REG &&
+                insn.id != X86_INS_CMP && insn.id != X86_INS_TEST &&
+                insn.id != X86_INS_PUSH && !call && !branch) {
                 recent.clobbered_reg = norm_x86_gpr(x86.operands[0].reg);
+                if (insn.id == X86_INS_XCHG && x86.op_count == 2 && x86.operands[1].type == X86_OP_REG) {
+                    recent.clobbered_reg2 = norm_x86_gpr(x86.operands[1].reg);
+                }
             }
+            const std::string_view x86_mnem(insn.mnemonic);
+            recent.clobbers_flags =
+                !(insn.id == X86_INS_MOV || insn.id == X86_INS_MOVABS ||
+                  insn.id == X86_INS_MOVZX || insn.id == X86_INS_MOVSX ||
+                  insn.id == X86_INS_MOVSXD || insn.id == X86_INS_LEA ||
+                  insn.id == X86_INS_NOP || insn.id == X86_INS_PUSH ||
+                  insn.id == X86_INS_POP || insn.id == X86_INS_XCHG ||
+                  insn.id == X86_INS_ENDBR64 || insn.id == X86_INS_ENDBR32 ||
+                  x86_mnem.starts_with("cmov") || (branch && !call));
 
             if (insn.id == X86_INS_CMP && x86.op_count == 2 &&
                 x86.operands[0].type == X86_OP_REG && x86.operands[1].type == X86_OP_IMM &&
@@ -663,12 +701,12 @@ SliceScanResult scan_code_slice(
 
                 std::size_t pos = 0;
                 for (auto it = history.rbegin(); it != history.rend(); ++it, ++pos) {
-                    if (it->is_unconditional_stop) break;
+                    if (it->is_unconditional_stop || it->is_call) break;
                     if (cand_a < 0) {
                         if (it->add_reg_dst == jmp_reg && it->add_reg_a >= 0 && it->add_reg_b >= 0) {
                             cand_a = it->add_reg_a;
                             cand_b = it->add_reg_b;
-                        } else if (it->clobbered_reg == jmp_reg) {
+                        } else if (it->clobbered_reg == jmp_reg || it->clobbered_reg2 == jmp_reg) {
                             break;
                         }
                     } else {
@@ -682,6 +720,10 @@ SliceScanResult scan_code_slice(
                             found_movsxd = true;
                             break;
                         }
+                        if (it->clobbered_reg == cand_a || it->clobbered_reg == cand_b ||
+                            it->clobbered_reg2 == cand_a || it->clobbered_reg2 == cand_b) {
+                            break;
+                        }
                     }
                 }
 
@@ -690,12 +732,12 @@ SliceScanResult scan_code_slice(
                     std::size_t p2 = 0;
                     for (auto it = history.rbegin(); it != history.rend(); ++it, ++p2) {
                         if (p2 <= movsxd_hist_pos) continue;
-                        if (it->is_unconditional_stop) break;
+                        if (it->is_unconditional_stop || it->is_call) break;
                         if (it->lea_rip_dst == matched_base) {
                             anchor_va = it->lea_rip_target;
                             break;
                         }
-                        if (it->clobbered_reg == matched_base) break;
+                        if (it->clobbered_reg == matched_base || it->clobbered_reg2 == matched_base) break;
                     }
 
                     // Search for bounds guard before or around lea using a sub-history slice up to movsxd
@@ -762,6 +804,19 @@ SliceScanResult scan_code_slice(
                 }
             }
 
+            const std::string_view arm_mnem(insn.mnemonic);
+            if (arm.op_count >= 1 && arm.operands[0].type == ARM_OP_REG &&
+                insn.id != ARM_INS_CMP && insn.id != ARM_INS_CMN &&
+                insn.id != ARM_INS_TST && insn.id != ARM_INS_TEQ &&
+                !arm_mnem.starts_with("str") && !arm_mnem.starts_with("stm") &&
+                !arm_mnem.starts_with("push") && !call && !branch) {
+                recent.clobbered_reg = norm_arm_gpr(arm.operands[0].reg);
+            }
+            recent.clobbers_flags =
+                arm.update_flags || call ||
+                insn.id == ARM_INS_CMP || insn.id == ARM_INS_CMN ||
+                insn.id == ARM_INS_TST || insn.id == ARM_INS_TEQ;
+
             if (insn.id == ARM_INS_CMP && arm.op_count == 2 &&
                 arm.operands[0].type == ARM_OP_REG && arm.operands[1].type == ARM_OP_IMM &&
                 arm.operands[1].imm >= 0) {
@@ -818,11 +873,20 @@ SliceScanResult scan_code_slice(
             const auto& a64 = detail.arm64;
             scan_immediates(a64, ARM64_OP_IMM);
 
+            const std::string_view a64_mnem(insn.mnemonic);
             if (a64.op_count >= 1 && a64.operands[0].type == ARM64_OP_REG &&
-                insn.id != ARM64_INS_CMP && insn.id != ARM64_INS_CMN && insn.id != ARM64_INS_TST) {
+                insn.id != ARM64_INS_CMP && insn.id != ARM64_INS_CMN && insn.id != ARM64_INS_TST &&
+                insn.id != ARM64_INS_CBZ && insn.id != ARM64_INS_CBNZ &&
+                insn.id != ARM64_INS_TBZ && insn.id != ARM64_INS_TBNZ &&
+                !a64_mnem.starts_with("st") && !call && !branch) {
                 const int d = norm_arm64_gpr(a64.operands[0].reg);
                 if (d != 31) recent.clobbered_reg = d;
             }
+            recent.clobbers_flags =
+                a64.update_flags || call ||
+                insn.id == ARM64_INS_CMP || insn.id == ARM64_INS_CMN ||
+                insn.id == ARM64_INS_TST || insn.id == ARM64_INS_SUBS ||
+                insn.id == ARM64_INS_ADDS || insn.id == ARM64_INS_ANDS;
 
             if ((insn.id == ARM64_INS_CMP && a64.op_count >= 2 &&
                  a64.operands[0].type == ARM64_OP_REG && a64.operands[1].type == ARM64_OP_IMM &&
@@ -931,7 +995,7 @@ SliceScanResult scan_code_slice(
                     // Check PC-relative offset jump table: add xTarget, xAnchor, xOff, shift; ldr* xOff, [xBase, xIdx]
                     std::size_t pos = 0;
                     for (auto it = history.rbegin(); it != history.rend(); ++it, ++pos) {
-                        if (it->is_unconditional_stop) break;
+                        if (it->is_unconditional_stop || it->is_call) break;
                         if (it->arm64_add_dst == target_reg) {
                             const int anchor_r = it->arm64_add_anchor;
                             const int off_r = it->arm64_add_off;
@@ -941,7 +1005,7 @@ SliceScanResult scan_code_slice(
 
                             std::size_t load_pos = pos + 1u;
                             for (auto lit = std::next(it); lit != history.rend(); ++lit, ++load_pos) {
-                                if (lit->is_unconditional_stop) break;
+                                if (lit->is_unconditional_stop || lit->is_call) break;
                                 if (lit->table_load_dst == off_r && lit->table_entry_bytes != 0 &&
                                     lit->table_entry_bytes <= 4) {
                                     const auto table_va = resolve_arm64_reg_va(history, load_pos + 1u, lit->table_load_base);
@@ -1051,7 +1115,7 @@ SliceScanResult scan_code_slice(
 
                 if (!resolved_table) {
                     for (auto it = history.rbegin(); it != history.rend(); ++it) {
-                        if (it->is_unconditional_stop) break;
+                        if (it->is_unconditional_stop || it->is_call) break;
                         if (it->ptr_slot_dst == target_reg) {
                             emit(it->ptr_slot_va,
                                  insn.id == ARM64_INS_BLR ? ReferenceKind::Call : ReferenceKind::Branch,
@@ -1417,6 +1481,24 @@ bool ReferenceScanJob::incomplete() const noexcept {
     return snapshot_->truncated_input || decode_incomplete_ || (scanned_bytes_ < total_executable_bytes_);
 }
 
+ReferenceScanJob::Cursor ReferenceScanJob::cursor() const noexcept {
+    return Cursor{
+        .scanned_bytes = scanned_bytes_,
+        .span_index = span_index_,
+        .offset_in_span = offset_in_span_,
+        .decode_incomplete = decode_incomplete_,
+        .finished = finished_,
+    };
+}
+
+void ReferenceScanJob::set_cursor(const Cursor& cursor) noexcept {
+    scanned_bytes_ = cursor.scanned_bytes;
+    span_index_ = cursor.span_index;
+    offset_in_span_ = cursor.offset_in_span;
+    decode_incomplete_ = cursor.decode_incomplete;
+    finished_ = cursor.finished;
+}
+
 std::optional<ReferenceScanChunk> ReferenceScanJob::step(std::stop_token stop) {
     if (stop.stop_requested()) {
         return std::nullopt;
@@ -1498,11 +1580,14 @@ std::optional<ReferenceScanChunk> ReferenceScanJob::step(std::stop_token stop) {
         resolve_slot,
         stop);
 
-    if (res.cancelled) {
+    if (res.cancelled || stop.stop_requested()) {
         return std::nullopt;
     }
 
     finalize_snapshot_references(*snapshot_, chunk.references);
+    if (stop.stop_requested()) {
+        return std::nullopt;
+    }
 
     const std::size_t advance = res.bytes_consumed > 0 ? res.bytes_consumed : target_consume;
     offset_in_span_ += advance;
@@ -1582,6 +1667,7 @@ void AsyncReferenceScanner::start(ReferenceIndex& target,
         pending_chunks_.clear();
         last_error_ = std::move(reserved_error);
         job_ = std::move(next_job);
+        committed_cursor_ = job_.cursor();
         desired_budget_ = byte_budget;
         job_scanned_bytes_ = 0;
         job_total_bytes_ = total_exec;
@@ -1613,6 +1699,8 @@ void AsyncReferenceScanner::start(ReferenceIndex& target,
             : self(s), target_index(t) {}
         LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
         LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard(LaunchRollbackGuard&&) = delete;
+        LaunchRollbackGuard& operator=(LaunchRollbackGuard&&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (!committed) {
                 {
@@ -1695,6 +1783,8 @@ void AsyncReferenceScanner::resume(ReferenceIndex& target) {
             : self(s), target_index(t), restore_paused(rp), armed(arm) {}
         LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
         LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard(LaunchRollbackGuard&&) = delete;
+        LaunchRollbackGuard& operator=(LaunchRollbackGuard&&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (armed && !committed) {
                 {
@@ -1793,6 +1883,8 @@ void AsyncReferenceScanner::scan_full(ReferenceIndex& target) {
               armed(arm) {}
         LaunchRollbackGuard(const LaunchRollbackGuard&) = delete;
         LaunchRollbackGuard& operator=(const LaunchRollbackGuard&) = delete;
+        LaunchRollbackGuard(LaunchRollbackGuard&&) = delete;
+        LaunchRollbackGuard& operator=(LaunchRollbackGuard&&) = delete;
         ~LaunchRollbackGuard() noexcept {
             if (armed && !committed) {
                 {
@@ -1845,6 +1937,9 @@ void AsyncReferenceScanner::cancel(ReferenceIndex* target) noexcept {
     {
         std::scoped_lock lock(mutex_);
         pending_chunks_.clear();
+        job_.set_cursor(committed_cursor_);
+        job_scanned_bytes_ = committed_cursor_.scanned_bytes;
+        job_finished_ = committed_cursor_.finished;
         pending_failure_incomplete_ = false;
         paused_.store(false, std::memory_order_release);
         active_.store(false, std::memory_order_release);
@@ -1855,20 +1950,23 @@ void AsyncReferenceScanner::cancel(ReferenceIndex* target) noexcept {
 }
 
 std::size_t AsyncReferenceScanner::poll(ReferenceIndex& target) {
-    std::deque<ReferenceScanChunk> ready;
+    std::deque<PendingChunk> ready;
     bool now_paused = false;
     bool now_active = false;
     bool mark_failed = false;
     {
         std::scoped_lock lock(mutex_);
         ready.swap(pending_chunks_);
+        if (!ready.empty()) {
+            committed_cursor_ = ready.back().cursor_after;
+        }
         mark_failed = std::exchange(pending_failure_incomplete_, false);
         now_paused = paused_.load(std::memory_order_acquire);
         now_active = active_.load(std::memory_order_acquire);
     }
     const std::size_t count = ready.size();
     while (!ready.empty()) {
-        target.append_chunk(std::move(ready.front()));
+        target.append_chunk(std::move(ready.front().chunk));
         ready.pop_front();
     }
     if (mark_failed) {
@@ -1974,11 +2072,17 @@ void AsyncReferenceScanner::worker_loop(std::stop_token stop, std::uint64_t gene
             return;
         }
 
+        const auto cursor_before = job_.cursor();
+
         // Disassemble one 256 KiB slice outside mutex_ so UI poll() never contends on Capstone.
         auto chunk = job_.step(stop);
         if (!chunk) {
             std::scoped_lock lock(mutex_);
-            job_scanned_bytes_ = job_.scanned_bytes();
+            if (generation_ == generation) {
+                job_.set_cursor(cursor_before);
+                job_scanned_bytes_ = cursor_before.scanned_bytes;
+                job_finished_ = cursor_before.finished;
+            }
             active_.store(false, std::memory_order_release);
             cv_.notify_all();
             return;
@@ -1986,8 +2090,12 @@ void AsyncReferenceScanner::worker_loop(std::stop_token stop, std::uint64_t gene
 
         {
             std::scoped_lock lock(mutex_);
-            job_scanned_bytes_ = job_.scanned_bytes();
-            if (generation_ != generation) {
+            if (stop.stop_requested() || generation_ != generation) {
+                if (generation_ == generation) {
+                    job_.set_cursor(cursor_before);
+                    job_scanned_bytes_ = cursor_before.scanned_bytes;
+                    job_finished_ = cursor_before.finished;
+                }
                 active_.store(false, std::memory_order_release);
                 cv_.notify_all();
                 return;
@@ -1999,8 +2107,13 @@ void AsyncReferenceScanner::worker_loop(std::stop_token stop, std::uint64_t gene
                     chunk->incomplete = true;
                 }
             }
+            const auto cursor_after = job_.cursor();
+            job_scanned_bytes_ = cursor_after.scanned_bytes;
             const bool done = chunk->finished;
-            pending_chunks_.push_back(std::move(*chunk));
+            pending_chunks_.push_back(PendingChunk{
+                .chunk = std::move(*chunk),
+                .cursor_after = cursor_after,
+            });
             if (done) {
                 job_finished_ = true;
                 active_.store(false, std::memory_order_release);
@@ -2011,7 +2124,6 @@ void AsyncReferenceScanner::worker_loop(std::stop_token stop, std::uint64_t gene
     }
     {
         std::scoped_lock lock(mutex_);
-        job_scanned_bytes_ = job_.scanned_bytes();
         active_.store(false, std::memory_order_release);
     }
     cv_.notify_all();

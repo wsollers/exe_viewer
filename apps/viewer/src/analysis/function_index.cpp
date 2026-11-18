@@ -6,6 +6,7 @@
 #include <peelf/endian_reader.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <format>
@@ -302,6 +303,246 @@ constexpr std::uint64_t kElfDtPreinitArraySz = 33u;
     return last;
 }
 
+[[nodiscard]] std::string_view trim_ascii_ws(std::string_view s) noexcept {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front())) != 0) {
+        s.remove_prefix(1u);
+    }
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back())) != 0) {
+        s.remove_suffix(1u);
+    }
+    return s;
+}
+
+[[nodiscard]] std::optional<int> parse_riscv_gpr(std::string_view token) noexcept {
+    token = trim_ascii_ws(token);
+    if (token.empty()) {
+        return std::nullopt;
+    }
+    if (token.front() == 'x' && token.size() >= 2u && token.size() <= 3u) {
+        int reg = -1;
+        const auto* begin = token.data() + 1;
+        const auto* end = token.data() + token.size();
+        const auto [ptr, ec] = std::from_chars(begin, end, reg, 10);
+        if (ec == std::errc{} && ptr == end && reg >= 0 && reg <= 31) {
+            return reg;
+        }
+        return std::nullopt;
+    }
+    if (token == "zero") return 0;
+    if (token == "ra") return 1;
+    if (token == "sp") return 2;
+    if (token == "gp") return 3;
+    if (token == "tp") return 4;
+    if (token == "t0") return 5;
+    if (token == "t1") return 6;
+    if (token == "t2") return 7;
+    if (token == "s0" || token == "fp") return 8;
+    if (token == "s1") return 9;
+    if (token == "a0") return 10;
+    if (token == "a1") return 11;
+    if (token == "a2") return 12;
+    if (token == "a3") return 13;
+    if (token == "a4") return 14;
+    if (token == "a5") return 15;
+    if (token == "a6") return 16;
+    if (token == "a7") return 17;
+    if (token == "s2") return 18;
+    if (token == "s3") return 19;
+    if (token == "s4") return 20;
+    if (token == "s5") return 21;
+    if (token == "s6") return 22;
+    if (token == "s7") return 23;
+    if (token == "s8") return 24;
+    if (token == "s9") return 25;
+    if (token == "s10") return 26;
+    if (token == "s11") return 27;
+    if (token == "t3") return 28;
+    if (token == "t4") return 29;
+    if (token == "t5") return 30;
+    if (token == "t6") return 31;
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::int64_t> parse_riscv_signed_imm(std::string_view token) noexcept {
+    token = trim_ascii_ws(token);
+    if (token.empty()) {
+        return std::nullopt;
+    }
+    bool neg = false;
+    if (token.front() == '-' || token.front() == '+') {
+        neg = (token.front() == '-');
+        token.remove_prefix(1u);
+    }
+    if (token.starts_with("0x") || token.starts_with("0X")) {
+        const auto mag = parse_hex_token(token);
+        if (!mag.has_value() || *mag > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return std::nullopt;
+        }
+        const auto val = static_cast<std::int64_t>(*mag);
+        return neg ? -val : val;
+    }
+    std::uint64_t mag = 0;
+    const auto* begin = token.data();
+    const auto* end = token.data() + token.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, mag, 10);
+    if (ec != std::errc{} || ptr != end ||
+        mag > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        return std::nullopt;
+    }
+    const auto val = static_cast<std::int64_t>(mag);
+    return neg ? -val : val;
+}
+
+[[nodiscard]] std::size_t split_riscv_operands(
+    std::string_view ops,
+    std::array<std::string_view, 4>& out) noexcept {
+    std::size_t count = 0;
+    while (!ops.empty() && count < out.size()) {
+        const std::size_t comma = ops.find(',');
+        if (comma == std::string_view::npos) {
+            out[count++] = trim_ascii_ws(ops);
+            break;
+        }
+        out[count++] = trim_ascii_ws(ops.substr(0u, comma));
+        ops.remove_prefix(comma + 1u);
+    }
+    return count;
+}
+
+[[nodiscard]] bool is_riscv_store_mnemonic(std::string_view m) noexcept {
+    return m == "sb" || m == "sh" || m == "sw" || m == "sd" ||
+           m == "c.sw" || m == "c.sd" || m == "c.swsp" || m == "c.sdsp" ||
+           m == "sc.w" || m == "sc.d" || m == "fsw" || m == "fsd" || m == "fsq";
+}
+
+[[nodiscard]] bool is_riscv_barrier_mnemonic(const Instruction& insn) noexcept {
+    if (insn.flow != InstructionFlow::Normal) {
+        return true;
+    }
+    const std::string_view m = insn.mnemonic;
+    return m == "jal" || m == "c.jal" || m == "jalr" || m == "c.jalr" ||
+           m == "j" || m == "c.j" || m == "jr" || m == "c.jr" ||
+           m == "call" || m == "tail" || m == "ret" ||
+           m == "ecall" || m == "ebreak" || m == "c.ebreak" ||
+           m == "mret" || m == "sret" || m == "uret" ||
+           m.starts_with("beq") || m.starts_with("bne") ||
+           m.starts_with("blt") || m.starts_with("bge") ||
+           m.starts_with("ble") || m.starts_with("bgt") ||
+           m == "c.beqz" || m == "c.bnez";
+}
+
+using RiscvAuipcState = std::array<std::optional<std::uint64_t>, 32>;
+
+[[nodiscard]] std::optional<std::uint64_t> step_riscv_auipc_tracker(
+    const Instruction& insn,
+    peelf::Architecture arch,
+    RiscvAuipcState& state) noexcept {
+    if (arch != peelf::Architecture::RISCV32 && arch != peelf::Architecture::RISCV64) {
+        return std::nullopt;
+    }
+    const peelf::AddressWidth width = (arch == peelf::Architecture::RISCV32)
+        ? peelf::AddressWidth::Bits32
+        : peelf::AddressWidth::Bits64;
+    const std::string_view m = insn.mnemonic;
+    std::array<std::string_view, 4> ops{};
+    const std::size_t op_count = split_riscv_operands(insn.operands, ops);
+
+    if (m == "auipc" && op_count == 2u) {
+        const auto rd = parse_riscv_gpr(ops[0]);
+        const auto imm = parse_riscv_signed_imm(ops[1]);
+        if (rd.has_value() && *rd > 0) {
+            std::optional<std::uint64_t> computed;
+            if (imm.has_value() && *imm >= -0x80000LL && *imm <= 0xFFFFFLL) {
+                const std::int64_t hi20 = (*imm >= 0x80000LL) ? (*imm - 0x100000LL) : *imm;
+                if (const auto scaled = peelf::checked_scale_signed_displacement(hi20, 12u)) {
+                    computed = peelf::checked_apply_signed_displacement(insn.address, *scaled, width);
+                }
+            }
+            state[static_cast<std::size_t>(*rd)] = computed;
+        }
+        return std::nullopt;
+    }
+
+    if ((m == "addi" && op_count == 3u) ||
+        (m == "c.addi" && op_count == 2u) ||
+        ((m == "mv" || m == "c.mv") && op_count == 2u)) {
+        const auto rd = parse_riscv_gpr(ops[0]);
+        const auto rs1 = (m == "c.addi") ? rd : parse_riscv_gpr(ops[1]);
+        const std::optional<std::int64_t> lo = (m == "mv" || m == "c.mv")
+            ? std::optional<std::int64_t>{0}
+            : parse_riscv_signed_imm(m == "c.addi" ? ops[1] : ops[2]);
+        if (rd.has_value() && *rd > 0) {
+            if (rs1.has_value() && *rs1 > 0 && lo.has_value() &&
+                state[static_cast<std::size_t>(*rs1)].has_value()) {
+                state[static_cast<std::size_t>(*rd)] = peelf::checked_apply_signed_displacement(
+                    *state[static_cast<std::size_t>(*rs1)],
+                    *lo,
+                    width);
+            } else {
+                state[static_cast<std::size_t>(*rd)] = std::nullopt;
+            }
+        }
+        return std::nullopt;
+    }
+
+    if (m == "jalr" || m == "c.jalr") {
+        std::optional<int> rs1;
+        std::optional<std::int64_t> lo{0};
+
+        const auto parse_mem_operand = [](std::string_view mem_tok,
+                                          std::optional<int>& out_rs1,
+                                          std::optional<std::int64_t>& out_lo) noexcept -> bool {
+            const std::size_t lparen = mem_tok.find('(');
+            const std::size_t rparen = mem_tok.find(')');
+            if (lparen == std::string_view::npos || rparen == std::string_view::npos || rparen <= lparen) {
+                return false;
+            }
+            const std::string_view disp_str = trim_ascii_ws(mem_tok.substr(0u, lparen));
+            out_rs1 = parse_riscv_gpr(mem_tok.substr(lparen + 1u, rparen - lparen - 1u));
+            out_lo = disp_str.empty() ? std::optional<std::int64_t>{0} : parse_riscv_signed_imm(disp_str);
+            return out_rs1.has_value() && out_lo.has_value();
+        };
+
+        if (op_count == 1u) {
+            if (!parse_mem_operand(ops[0], rs1, lo)) {
+                rs1 = parse_riscv_gpr(ops[0]);
+                lo = 0;
+            }
+        } else if (op_count == 2u) {
+            if (!parse_mem_operand(ops[1], rs1, lo)) {
+                rs1 = parse_riscv_gpr(ops[1]);
+                lo = 0;
+            }
+        } else if (op_count == 3u) {
+            rs1 = parse_riscv_gpr(ops[1]);
+            lo = parse_riscv_signed_imm(ops[2]);
+        }
+
+        std::optional<std::uint64_t> resolved;
+        if (rs1.has_value() && *rs1 > 0 && lo.has_value() &&
+            state[static_cast<std::size_t>(*rs1)].has_value()) {
+            resolved = peelf::checked_apply_signed_displacement(
+                *state[static_cast<std::size_t>(*rs1)],
+                *lo,
+                width);
+        }
+        state.fill(std::nullopt);
+        return resolved;
+    }
+
+    if (is_riscv_barrier_mnemonic(insn)) {
+        state.fill(std::nullopt);
+        return std::nullopt;
+    }
+
+    if (!is_riscv_store_mnemonic(m) && op_count >= 1u) {
+        if (const auto rd = parse_riscv_gpr(ops[0]); rd.has_value() && *rd > 0) {
+            state[static_cast<std::size_t>(*rd)] = std::nullopt;
+        }
+    }
+    return std::nullopt;
+}
+
 [[nodiscard]] std::optional<std::uint64_t> parse_immediate_call_operand(
     const Instruction& insn,
     peelf::Architecture arch) noexcept {
@@ -312,6 +553,9 @@ constexpr std::uint64_t kElfDtPreinitArraySz = 33u;
     if (ops.find('[') != std::string_view::npos || ops.find('(') != std::string_view::npos) {
         return std::nullopt;
     }
+    const peelf::AddressWidth width = (arch == peelf::Architecture::RISCV32)
+        ? peelf::AddressWidth::Bits32
+        : peelf::AddressWidth::Bits64;
     if (const std::size_t hex_pos = ops.find("0x"); hex_pos != std::string_view::npos) {
         // Ensure not negative relative offset like -0x20 unless RISC-V/MIPS PC-relative.
         if (hex_pos == 0u || ops[hex_pos - 1u] != '-') {
@@ -320,12 +564,11 @@ constexpr std::uint64_t kElfDtPreinitArraySz = 33u;
                 ++end;
             }
             if (const auto parsed = parse_hex_token(ops.substr(hex_pos, end - hex_pos))) {
-                if (arch == peelf::Architecture::RISCV32 || arch == peelf::Architecture::RISCV64) {
-                    std::uint64_t target = insn.address + *parsed;
-                    if (arch == peelf::Architecture::RISCV32) {
-                        target &= 0xFFFF'FFFFULL;
-                    }
-                    return target;
+                if (arch == peelf::Architecture::RISCV32) {
+                    return (insn.address + *parsed) & 0xFFFF'FFFFULL;
+                }
+                if (arch == peelf::Architecture::RISCV64) {
+                    return peelf::checked_add_u64(insn.address, *parsed);
                 }
                 return parsed;
             }
@@ -336,35 +579,12 @@ constexpr std::uint64_t kElfDtPreinitArraySz = 33u;
         return std::nullopt;
     }
     if (arch == peelf::Architecture::RISCV32 || arch == peelf::Architecture::RISCV64) {
-        const std::uint64_t target =
-            insn.address + static_cast<std::uint64_t>(*dec);
-        return arch == peelf::Architecture::RISCV32 ? (target & 0xFFFF'FFFFULL) : target;
+        return peelf::checked_apply_signed_displacement(insn.address, *dec, width);
     }
     if (*dec <= 0) {
         return std::nullopt;
     }
     return static_cast<std::uint64_t>(*dec);
-}
-
-[[nodiscard]] std::optional<std::uint64_t> resolve_auipc_jalr_pair(
-    const Instruction& prev,
-    const Instruction& curr,
-    peelf::Architecture arch) noexcept {
-    if ((arch != peelf::Architecture::RISCV32 && arch != peelf::Architecture::RISCV64) ||
-        prev.mnemonic != "auipc" || curr.mnemonic != "jalr") {
-        return std::nullopt;
-    }
-    const auto hi = parse_last_signed_integer(prev.operands);
-    const auto lo = parse_last_signed_integer(curr.operands);
-    if (!hi || !lo) {
-        return std::nullopt;
-    }
-    const std::uint64_t page = static_cast<std::uint64_t>(*hi) << 12u;
-    std::uint64_t target = prev.address + page + static_cast<std::uint64_t>(*lo);
-    if (arch == peelf::Architecture::RISCV32) {
-        target &= 0xFFFF'FFFFULL;
-    }
-    return target;
 }
 
 [[nodiscard]] bool is_direct_call_mnemonic(const Instruction& insn) noexcept {
@@ -896,12 +1116,10 @@ FunctionIndex FunctionIndex::discover(
                             continue;
                         }
 
-                        const Instruction* prev = nullptr;
+                        RiscvAuipcState riscv_auipc_regs{};
                         for (const Instruction& insn : insns) {
-                            std::optional<std::uint64_t> target_va;
-                            if (prev != nullptr) {
-                                target_va = resolve_auipc_jalr_pair(*prev, insn, image.architecture());
-                            }
+                            std::optional<std::uint64_t> target_va =
+                                step_riscv_auipc_tracker(insn, image.architecture(), riscv_auipc_regs);
                             if (!target_va.has_value() && is_direct_call_mnemonic(insn)) {
                                 target_va = parse_immediate_call_operand(insn, image.architecture());
                             }
@@ -911,12 +1129,13 @@ FunctionIndex FunctionIndex::discover(
                                 if (image.architecture() == peelf::Architecture::ARM) {
                                     callee_va &= ~std::uint64_t{1u};
                                 }
-                                const std::uint64_t next_va =
-                                    insn.address + static_cast<std::uint64_t>(insn.bytes.size());
+                                const std::optional<std::uint64_t> next_va =
+                                    peelf::checked_add_u64(insn.address, insn.bytes.size());
                                 // Ignore x86 PIC `call $+5` instruction-pointer reads and self-loops.
                                 const bool x86_get_pc_idiom =
                                     image.architecture() == peelf::Architecture::X86 &&
-                                    callee_va == next_va;
+                                    next_va.has_value() &&
+                                    callee_va == *next_va;
                                 if (callee_va != 0u &&
                                     callee_va != insn.address &&
                                     !x86_get_pc_idiom &&
@@ -935,7 +1154,6 @@ FunctionIndex FunctionIndex::discover(
                                             FunctionOrigin::CallTargetDiscovery));
                                 }
                             }
-                            prev = &insn;
                         }
 
                         const Instruction& last = insns.back();

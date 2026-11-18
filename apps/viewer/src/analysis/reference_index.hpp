@@ -119,6 +119,14 @@ struct ReferenceScanSnapshot;
 // or driven on a background std::jthread by AsyncReferenceScanner.
 class ReferenceScanJob {
 public:
+    struct Cursor {
+        std::size_t scanned_bytes = 0;
+        std::size_t span_index = 0;
+        std::size_t offset_in_span = 0;
+        bool decode_incomplete = false;
+        bool finished = true;
+    };
+
     ReferenceScanJob() = default;
     ReferenceScanJob(const peelf::IBinaryImage& image,
                      std::vector<std::uint8_t> bytes,
@@ -133,6 +141,8 @@ public:
     [[nodiscard]] std::size_t scanned_bytes() const noexcept { return scanned_bytes_; }
     [[nodiscard]] bool finished() const noexcept { return finished_; }
     [[nodiscard]] bool incomplete() const noexcept;
+    [[nodiscard]] Cursor cursor() const noexcept;
+    void set_cursor(const Cursor& cursor) noexcept;
 
     // Advances by at most one chunk (default 256 KiB). Returns std::nullopt if cancelled via stop_token.
     [[nodiscard]] std::optional<ReferenceScanChunk> step(std::stop_token stop = {});
@@ -160,6 +170,8 @@ public:
 
     AsyncReferenceScanner(const AsyncReferenceScanner&) = delete;
     AsyncReferenceScanner& operator=(const AsyncReferenceScanner&) = delete;
+    AsyncReferenceScanner(AsyncReferenceScanner&&) = delete;
+    AsyncReferenceScanner& operator=(AsyncReferenceScanner&&) = delete;
 
     void start(ReferenceIndex& target,
                const peelf::IBinaryImage& image,
@@ -188,13 +200,19 @@ public:
     [[nodiscard]] std::string last_error() const;
 
 private:
+    struct PendingChunk {
+        ReferenceScanChunk chunk{};
+        ReferenceScanJob::Cursor cursor_after{};
+    };
+
     void worker_loop(std::stop_token stop, std::uint64_t generation);
     void record_worker_failure(std::uint64_t generation, bool is_oom, const char* what_msg) noexcept;
 
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
     ReferenceScanJob job_;
-    std::deque<ReferenceScanChunk> pending_chunks_;
+    ReferenceScanJob::Cursor committed_cursor_{};
+    std::deque<PendingChunk> pending_chunks_;
     std::string last_error_;
     std::size_t desired_budget_ = 0;
     std::size_t job_scanned_bytes_ = 0;
@@ -208,4 +226,5 @@ private:
     std::jthread worker_;
 };
 
-} // namespace viewe
+} // namespace viewer
+

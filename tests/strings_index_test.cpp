@@ -566,3 +566,48 @@ TEST(StringsIndexTest, LiveFailedReadConsumesBudgetCapsSyscallsAndMarksIncomplet
     }
 }
 
+TEST(StringsIndexTest, TruncatesMultiByteUtf8OnCodepointBoundariesAndGuardsUint64MaxWraparound) {
+    // 2-byte UTF-8: "A" (1) + "é" (C3 A9, 2) + "Z" (1) = 4 bytes
+    const std::string two_byte = "A\xC3\xA9Z";
+    EXPECT_EQ(viewer::format_single_line_string_preview(two_byte, 1u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(two_byte, 2u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(two_byte, 3u), "A\xC3\xA9...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(two_byte, 4u), two_byte);
+
+    // 3-byte UTF-8: "A" (1) + "€" (E2 82 AC, 3) + "Z" (1) = 5 bytes
+    const std::string three_byte = "A\xE2\x82\xACZ";
+    EXPECT_EQ(viewer::format_single_line_string_preview(three_byte, 2u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(three_byte, 3u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(three_byte, 4u), "A\xE2\x82\xAC...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(three_byte, 5u), three_byte);
+
+    // 4-byte UTF-8: "A" (1) + "🚀" (F0 9F 9A 80, 4) + "Z" (1) = 6 bytes
+    const std::string four_byte = "A\xF0\x9F\x9A\x80Z";
+    EXPECT_EQ(viewer::format_single_line_string_preview(four_byte, 2u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(four_byte, 3u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(four_byte, 4u), "A...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(four_byte, 5u), "A\xF0\x9F\x9A\x80...");
+    EXPECT_EQ(viewer::format_single_line_string_preview(four_byte, 6u), four_byte);
+
+    // String ending right at UINT64_MAX ([0xFFFF'FFFF'FFFF'FFFC .. 0xFFFF'FFFF'FFFF'FFFF], 4 bytes):
+    // must NOT wrap `va + byte_length` to 0 and drop the entry!
+    constexpr std::uint64_t kNearMaxVa = 0xFFFF'FFFF'FFFF'FFFCULL;
+    const std::array<std::uint8_t, 4> exact_tail{'E', 'D', 'G', 'E'};
+    const viewer::StringsIndex exact_idx =
+        viewer::StringsIndex::extract_from_buffer(exact_tail, kNearMaxVa, 0u, ".high");
+    ASSERT_EQ(exact_idx.size(), 1u);
+    EXPECT_EQ(exact_idx.entries()[0].virtual_address, kNearMaxVa);
+    EXPECT_EQ(exact_idx.entries()[0].preview, "EDGE");
+    EXPECT_NE(exact_idx.find_containing(0xFFFF'FFFF'FFFF'FFFFULL), nullptr);
+
+    // Buffer whose length would wrap past UINT64_MAX clamps cleanly and marks incomplete().
+    const std::array<std::uint8_t, 8> wrap_buf{'E', 'D', 'G', 'E', 'W', 'R', 'A', 'P'};
+    const viewer::StringsIndex clamped_idx =
+        viewer::StringsIndex::extract_from_buffer(wrap_buf, kNearMaxVa, 0u, ".high");
+    EXPECT_TRUE(clamped_idx.incomplete());
+    for (const auto& entry : clamped_idx.entries()) {
+        EXPECT_GE(entry.virtual_address, kNearMaxVa);
+    }
+}
+
+

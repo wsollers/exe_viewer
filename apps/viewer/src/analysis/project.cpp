@@ -6,24 +6,28 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 namespace viewer {
 namespace {
 
-constexpr std::size_t max_file = 64 * 1024 * 1024;
 constexpr std::size_t max_items = 100000;
 
 void optional_address(std::ostream& out, std::optional<std::uint64_t> value) {
@@ -351,7 +355,7 @@ std::string encode_project(const AnalysisProject& p) {
 }
 
 peelf::Result<AnalysisProject> decode_project(std::string_view text) {
-    if (text.size() > max_file) return peelf::make_error("Project exceeds 64 MiB limit");
+    if (text.size() > kMaxProjectFileBytes) return peelf::make_error("Project exceeds 64 MiB limit");
     std::istringstream in{std::string(text)};
     AnalysisProject p;
     std::string magic;
@@ -435,9 +439,39 @@ ProjectBinaryResolution resolve_project_binary_path(
     const std::filesystem::path& manual_relocated_path) {
     ProjectBinaryResolution res;
     const std::filesystem::path base_dir = peproj_path.parent_path();
+    std::string expected_sha = lowercase_ascii(project.source_sha256);
+    if (!normalize_sha256_hex(expected_sha)) {
+        expected_sha.clear();
+    }
 
+    std::filesystem::path target_filename = std::filesystem::path(project.source).filename();
+    if (target_filename.empty() && !project.relative_source.empty()) {
+        target_filename = std::filesystem::path(project.relative_source).filename();
+    }
+
+    std::error_code dir_ec;
     if (!manual_relocated_path.empty()) {
-        add_unique_candidate(res.tried_paths, manual_relocated_path);
+        if (std::filesystem::is_directory(manual_relocated_path, dir_ec) && !dir_ec) {
+            if (!target_filename.empty()) {
+                add_unique_candidate(res.tried_paths, manual_relocated_path / target_filename);
+            }
+            if (!expected_sha.empty()) {
+                std::size_t scanned_entries = 0;
+                for (std::filesystem::directory_iterator it(manual_relocated_path, dir_ec), end;
+                     !dir_ec && it != end && scanned_entries < 256u;
+                     it.increment(dir_ec), ++scanned_entries) {
+                    std::error_code entry_ec;
+                    if (!it->is_regular_file(entry_ec) || entry_ec) continue;
+                    if (project.source_size != 0) {
+                        const auto entry_sz = it->file_size(entry_ec);
+                        if (entry_ec || entry_sz != project.source_size) continue;
+                    }
+                    add_unique_candidate(res.tried_paths, it->path());
+                }
+            }
+        } else {
+            add_unique_candidate(res.tried_paths, manual_relocated_path);
+        }
     } else {
         if (!project.relative_source.empty()) {
             const std::filesystem::path rel(project.relative_source);
@@ -449,86 +483,125 @@ ProjectBinaryResolution resolve_project_binary_path(
             add_unique_candidate(res.tried_paths,
                                  (!base_dir.empty() && src.is_relative()) ? (base_dir / src) : src);
         }
-    }
-
-    std::error_code ec;
-    for (const auto& cand : res.tried_paths) {
-        if (std::filesystem::is_regular_file(cand, ec)) {
-            res.resolved_path = cand;
-            break;
+        if (!base_dir.empty() && !target_filename.empty()) {
+            add_unique_candidate(res.tried_paths, base_dir / target_filename);
         }
     }
 
-    if (res.resolved_path.empty()) {
-        res.status = ProjectBinaryMatchStatus::RelocationNeeded;
-        std::string list;
-        for (std::size_t i = 0; i < res.tried_paths.size(); ++i) {
-            if (i > 0) list += ", ";
-            list += res.tried_paths[i].string();
+    auto evaluate_candidate = [&](const std::filesystem::path& cand) -> ProjectBinaryResolution {
+        ProjectBinaryResolution eval;
+        eval.resolved_path = cand;
+
+        std::ifstream in(cand, std::ios::binary);
+        if (!in) {
+            eval.status = ProjectBinaryMatchStatus::ReadError;
+            eval.diagnostic = std::format("Cannot open target binary: {}", cand.string());
+            return eval;
         }
-        res.diagnostic = list.empty()
-                             ? "Project does not specify a valid target binary path"
-                             : std::format("Target binary not found (searched: {})", list);
-        return res;
-    }
 
-    std::ifstream in(res.resolved_path, std::ios::binary);
-    if (!in) {
-        res.status = ProjectBinaryMatchStatus::ReadError;
-        res.diagnostic = std::format("Cannot open target binary: {}", res.resolved_path.string());
-        return res;
-    }
-
-    peelf::Sha256Hasher hasher;
-    std::uint64_t fp = 14695981039346656037ULL;
-    std::uint64_t total_bytes = 0;
-    std::array<std::uint8_t, 65536> buf{};
-    while (in) {
-        in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
-        const auto got = static_cast<std::size_t>(in.gcount());
-        if (got == 0) break;
-        const auto chunk = std::span<const std::uint8_t>(buf.data(), got);
-        hasher.update(chunk);
-        for (auto b : chunk) {
-            fp ^= b;
-            fp *= 1099511628211ULL;
+        peelf::Sha256Hasher hasher;
+        std::uint64_t fp = 14695981039346656037ULL;
+        std::uint64_t total_bytes = 0;
+        std::array<std::uint8_t, 65536> buf{};
+        while (in) {
+            in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+            const auto got = static_cast<std::size_t>(in.gcount());
+            if (got == 0) break;
+            const auto chunk = std::span<const std::uint8_t>(buf.data(), got);
+            hasher.update(chunk);
+            for (const auto b : chunk) {
+                fp ^= b;
+                fp *= 1099511628211ULL;
+            }
+            total_bytes += got;
         }
-        total_bytes += got;
-    }
-    if (!in.eof() && in.fail()) {
-        res.status = ProjectBinaryMatchStatus::ReadError;
-        res.diagnostic = std::format("Read failure while verifying binary: {}", res.resolved_path.string());
-        return res;
-    }
+        if (!in.eof() && in.fail()) {
+            eval.status = ProjectBinaryMatchStatus::ReadError;
+            eval.diagnostic = std::format("Read failure while verifying binary: {}", cand.string());
+            return eval;
+        }
 
-    res.actual_size = total_bytes;
-    res.actual_sha256 = hasher.finalize_hex();
-    res.actual_fingerprint = fp;
+        eval.actual_size = total_bytes;
+        eval.actual_sha256 = hasher.finalize_hex();
+        eval.actual_fingerprint = fp;
 
-    const bool size_ok = (res.actual_size == project.source_size);
-    const std::string expected_sha = lowercase_ascii(project.source_sha256);
-    const bool sha_ok = expected_sha.empty() || (res.actual_sha256 == expected_sha);
-    const bool fp_ok = (project.fingerprint == 0) || (res.actual_fingerprint == project.fingerprint);
+        const bool size_ok = (project.source_size == 0 && !expected_sha.empty())
+                                 ? true
+                                 : (eval.actual_size == project.source_size);
+        const bool sha_ok = expected_sha.empty() || (eval.actual_sha256 == expected_sha);
+        const bool fp_ok = (project.fingerprint == 0) || (eval.actual_fingerprint == project.fingerprint);
 
-    if (size_ok && sha_ok && (expected_sha.empty() ? fp_ok : true)) {
-        res.status = ProjectBinaryMatchStatus::ExactMatch;
-        res.diagnostic = "Target binary verified (exact SHA-256 & size match)";
-    } else {
-        res.status = ProjectBinaryMatchStatus::ModifiedMismatch;
-        if (!size_ok) {
-            res.diagnostic = std::format(
-                "Target binary size changed (expected {} bytes, found {} bytes)",
-                project.source_size,
-                res.actual_size);
-        } else if (!expected_sha.empty() && !sha_ok) {
-            res.diagnostic = std::format(
-                "Target binary SHA-256 mismatch (expected {}..., found {}...)",
-                expected_sha.substr(0, 16),
-                res.actual_sha256.substr(0, 16));
+        if (size_ok && sha_ok && (expected_sha.empty() ? fp_ok : true)) {
+            eval.status = ProjectBinaryMatchStatus::ExactMatch;
+            eval.diagnostic = "Target binary verified (exact SHA-256 & size match)";
         } else {
-            res.diagnostic = "Target binary fingerprint differs from saved project";
+            eval.status = ProjectBinaryMatchStatus::ModifiedMismatch;
+            if (!size_ok) {
+                eval.diagnostic = std::format(
+                    "Target binary size changed (expected {} bytes, found {} bytes)",
+                    project.source_size,
+                    eval.actual_size);
+            } else if (!expected_sha.empty() && !sha_ok) {
+                eval.diagnostic = std::format(
+                    "Target binary SHA-256 mismatch (expected {}..., found {}...)",
+                    expected_sha.substr(0, 16),
+                    eval.actual_sha256.substr(0, 16));
+            } else {
+                eval.diagnostic = "Target binary fingerprint differs from saved project";
+            }
+        }
+        return eval;
+    };
+
+    std::optional<ProjectBinaryResolution> first_sha_match;
+    std::optional<ProjectBinaryResolution> first_modified;
+    std::optional<ProjectBinaryResolution> first_read_error;
+
+    for (const auto& cand : res.tried_paths) {
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(cand, ec) || ec) {
+            continue;
+        }
+        ProjectBinaryResolution eval = evaluate_candidate(cand);
+        if (eval.status == ProjectBinaryMatchStatus::ExactMatch) {
+            eval.tried_paths = std::move(res.tried_paths);
+            return eval;
+        }
+        if (!expected_sha.empty() && eval.actual_sha256 == expected_sha && !first_sha_match.has_value()) {
+            first_sha_match = std::move(eval);
+            continue;
+        }
+        if (eval.status == ProjectBinaryMatchStatus::ModifiedMismatch) {
+            if (!first_modified.has_value()) {
+                first_modified = std::move(eval);
+            }
+        } else if (!first_read_error.has_value()) {
+            first_read_error = std::move(eval);
         }
     }
+
+    if (first_sha_match.has_value()) {
+        first_sha_match->tried_paths = std::move(res.tried_paths);
+        return *first_sha_match;
+    }
+    if (first_modified.has_value()) {
+        first_modified->tried_paths = std::move(res.tried_paths);
+        return *first_modified;
+    }
+    if (first_read_error.has_value()) {
+        first_read_error->tried_paths = std::move(res.tried_paths);
+        return *first_read_error;
+    }
+
+    res.status = ProjectBinaryMatchStatus::RelocationNeeded;
+    std::string list;
+    for (std::size_t i = 0; i < res.tried_paths.size(); ++i) {
+        if (i > 0) list += ", ";
+        list += res.tried_paths[i].string();
+    }
+    res.diagnostic = list.empty()
+                         ? "Project does not specify a valid target binary path"
+                         : std::format("Target binary not found (searched: {})", list);
     return res;
 }
 
@@ -566,76 +639,230 @@ peelf::Result<void> restore_project_patches(BinaryModel& model,
 }
 
 peelf::Result<std::string> read_project_file(const std::filesystem::path& path) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) return peelf::make_error("Cannot open project");
-    const auto size = in.tellg();
-    if (size < 0 || size > static_cast<std::streamoff>(max_file)) {
-        return peelf::make_error("Project exceeds size limit");
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || ec) {
+        return peelf::make_error("Cannot open project");
     }
-    std::string text(static_cast<std::size_t>(size), '\0');
-    in.seekg(0);
-    if (size > 0 && !in.read(text.data(), size)) {
+    const std::uintmax_t disk_size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return peelf::make_error("Cannot open project");
+    }
+    if (disk_size > kMaxProjectFileBytes) {
+        return peelf::make_error("Project exceeds 64 MiB limit");
+    }
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return peelf::make_error("Cannot open project");
+    }
+    std::string text;
+    text.reserve(static_cast<std::size_t>(disk_size));
+    std::array<char, 65536> buf{};
+    while (in) {
+        in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+        const auto got = static_cast<std::size_t>(in.gcount());
+        if (got == 0) break;
+        if (got > kMaxProjectFileBytes - text.size()) {
+            return peelf::make_error("Project exceeds 64 MiB limit");
+        }
+        text.append(buf.data(), got);
+    }
+    if (!in.eof() && in.fail()) {
         return peelf::make_error("Cannot read project");
     }
     return text;
 }
 
 peelf::Result<void> write_analysis_file(const std::filesystem::path& path, std::string_view text) {
+    if (path.empty() || path.filename().empty()) {
+        return peelf::make_error("Invalid analysis file path");
+    }
+    if (text.size() > kMaxProjectFileBytes) {
+        return peelf::make_error("Project exceeds 64 MiB limit");
+    }
+
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty()) {
+        std::error_code dir_ec;
+        std::filesystem::create_directories(parent, dir_ec);
+        if (dir_ec) {
+            return peelf::make_error("Cannot create analysis directory");
+        }
+    }
+
+    std::error_code base_ec;
+    const std::filesystem::path base_dir =
+        parent.empty() ? std::filesystem::current_path(base_ec) : parent;
+    if (base_ec) {
+        return peelf::make_error("Cannot resolve analysis directory");
+    }
+
     struct TempFileGuard {
-        std::filesystem::path path;
-        bool active{true};
-        explicit TempFileGuard(std::filesystem::path p) : path(std::move(p)) {}
+        std::filesystem::path temp_path;
+#ifdef _WIN32
+        HANDLE handle{INVALID_HANDLE_VALUE};
+#else
+        int fd{-1};
+#endif
+        bool committed{false};
+
+        TempFileGuard() = default;
         TempFileGuard(const TempFileGuard&) = delete;
         TempFileGuard& operator=(const TempFileGuard&) = delete;
-        ~TempFileGuard() {
-            if (active && !path.empty()) {
-                std::error_code rm_ec;
-                std::filesystem::remove(path, rm_ec);
+        TempFileGuard(TempFileGuard&&) = delete;
+        TempFileGuard& operator=(TempFileGuard&&) = delete;
+
+        ~TempFileGuard() noexcept {
+#ifdef _WIN32
+            if (handle != INVALID_HANDLE_VALUE) {
+                (void)::CloseHandle(handle);
+                handle = INVALID_HANDLE_VALUE;
             }
+            if (!committed && !temp_path.empty()) {
+                (void)::DeleteFileW(temp_path.c_str());
+            }
+#else
+            if (fd >= 0) {
+                (void)::close(fd);
+                fd = -1;
+            }
+            if (!committed && !temp_path.empty()) {
+                (void)::unlink(temp_path.c_str());
+            }
+#endif
         }
-        void release() noexcept { active = false; }
     };
 
     static std::atomic<std::uint64_t> tmp_counter{0};
-    std::error_code dir_ec;
-    if (path.has_parent_path() && !path.parent_path().empty()) {
-        std::filesystem::create_directories(path.parent_path(), dir_ec);
-    }
-
     const std::uint64_t pid =
 #ifdef _WIN32
-        static_cast<std::uint64_t>(GetCurrentProcessId());
+        static_cast<std::uint64_t>(::GetCurrentProcessId());
 #else
         static_cast<std::uint64_t>(::getpid());
 #endif
-    auto tmp = path;
-    tmp += std::format(".{}-{}-{}.tmp",
-                       pid,
-                       std::chrono::steady_clock::now().time_since_epoch().count(),
-                       ++tmp_counter);
-    TempFileGuard tmp_guard{tmp};
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return peelf::make_error("Cannot create analysis file");
-        out.write(text.data(), static_cast<std::streamsize>(text.size()));
-        out.flush();
-        out.close();
-        if (!out) {
+
+    TempFileGuard guard;
+#ifndef _WIN32
+    mode_t preserved_mode = 0666;
+    bool has_preserved_mode = false;
+    struct stat existing_st {};
+    if (::stat(path.c_str(), &existing_st) == 0 && S_ISREG(existing_st.st_mode)) {
+        preserved_mode = static_cast<mode_t>(existing_st.st_mode & 07777);
+        has_preserved_mode = true;
+    }
+#endif
+
+    constexpr std::uint32_t kMaxCreateAttempts = 128;
+    bool opened = false;
+    for (std::uint32_t attempt = 0; attempt < kMaxCreateAttempts; ++attempt) {
+        std::filesystem::path candidate = base_dir / path.filename();
+        candidate += std::format(".{}-{}-{}.tmp",
+                                 pid,
+                                 std::chrono::steady_clock::now().time_since_epoch().count(),
+                                 tmp_counter.fetch_add(1, std::memory_order_relaxed) + 1u);
+#ifdef _WIN32
+        const HANDLE h = ::CreateFileW(
+            candidate.c_str(),
+            GENERIC_WRITE,
+            0u,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            guard.temp_path = std::move(candidate);
+            guard.handle = h;
+            opened = true;
+            break;
+        }
+        const DWORD last_err = ::GetLastError();
+        if (last_err == ERROR_FILE_EXISTS || last_err == ERROR_ALREADY_EXISTS) {
+            continue;
+        }
+        return peelf::make_error("Cannot create analysis file");
+#else
+        int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        int fd = -1;
+        do {
+            fd = ::open(candidate.c_str(), flags, 0666);
+        } while (fd < 0 && errno == EINTR);
+        if (fd >= 0) {
+            if (has_preserved_mode) {
+                (void)::fchmod(fd, preserved_mode);
+            }
+            guard.temp_path = std::move(candidate);
+            guard.fd = fd;
+            opened = true;
+            break;
+        }
+        if (errno == EEXIST) {
+            continue;
+        }
+        return peelf::make_error("Cannot create analysis file");
+#endif
+    }
+
+    if (!opened) {
+        return peelf::make_error("Cannot create unique temporary analysis file");
+    }
+
+#ifdef _WIN32
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        const std::size_t remaining = text.size() - offset;
+        const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 64u * 1024u * 1024u));
+        DWORD written = 0;
+        if (!::WriteFile(guard.handle, text.data() + offset, chunk, &written, nullptr) || written == 0) {
             return peelf::make_error("Cannot write analysis file");
         }
+        offset += static_cast<std::size_t>(written);
     }
-    std::error_code ec;
-#ifdef _WIN32
-    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+    if (!::FlushFileBuffers(guard.handle)) {
+        return peelf::make_error("Cannot flush analysis file");
     }
-#else
-    std::filesystem::rename(tmp, path, ec);
-#endif
-    if (ec) {
+    const HANDLE closing = guard.handle;
+    guard.handle = INVALID_HANDLE_VALUE;
+    if (!::CloseHandle(closing)) {
+        return peelf::make_error("Cannot close analysis file");
+    }
+    if (!::MoveFileExW(guard.temp_path.c_str(),
+                       path.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         return peelf::make_error("Cannot replace analysis file");
     }
-    tmp_guard.release();
+#else
+    std::size_t offset = 0;
+    while (offset < text.size()) {
+        const std::size_t remaining = text.size() - offset;
+        const std::size_t chunk = std::min<std::size_t>(remaining, 64u * 1024u * 1024u);
+        const ssize_t written = ::write(guard.fd, text.data() + offset, chunk);
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return peelf::make_error("Cannot write analysis file");
+        }
+        if (written == 0) {
+            return peelf::make_error("Cannot write analysis file");
+        }
+        offset += static_cast<std::size_t>(written);
+    }
+    while (::fsync(guard.fd) != 0) {
+        if (errno == EINTR) continue;
+        return peelf::make_error("Cannot flush analysis file");
+    }
+    const int closing = guard.fd;
+    guard.fd = -1;
+    if (::close(closing) != 0 && errno != EINTR) {
+        return peelf::make_error("Cannot close analysis file");
+    }
+    if (::rename(guard.temp_path.c_str(), path.c_str()) != 0) {
+        return peelf::make_error("Cannot replace analysis file");
+    }
+#endif
+
+    guard.committed = true;
     return {};
 }
 
@@ -700,7 +927,11 @@ std::optional<AnalysisProject> check_newer_recovery_journal(
     const std::filesystem::path& recovery_dir) {
     const auto journal_path = project_recovery_journal_path(key_path, recovery_dir);
     std::error_code ec;
-    if (!std::filesystem::is_regular_file(journal_path, ec)) {
+    if (!std::filesystem::is_regular_file(journal_path, ec) || ec) {
+        return std::nullopt;
+    }
+    const std::uintmax_t journal_size = std::filesystem::file_size(journal_path, ec);
+    if (ec || journal_size > kMaxProjectFileBytes) {
         return std::nullopt;
     }
     auto text = read_project_file(journal_path);

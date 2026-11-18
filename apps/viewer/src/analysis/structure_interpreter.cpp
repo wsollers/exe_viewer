@@ -1095,22 +1095,36 @@ peelf::MemorySample StaticImageStructureByteSource::read_bytes(std::uint64_t add
             continue;
         }
 
-        if (const auto foff = image_.virtual_address_to_file_offset(cur); foff && *foff < file_bytes_.size()) {
-            sample.bytes[i] = file_bytes_[static_cast<std::size_t>(*foff)];
-            sample.valid[i] = 1u;
-            ++sample.readable_count;
+    if (const auto foff = image_.virtual_address_to_file_offset(cur)) {
+            if (*foff < file_bytes_.size()) {
+                sample.bytes[i] = file_bytes_[static_cast<std::size_t>(*foff)];
+                sample.valid[i] = 1u;
+                ++sample.readable_count;
+            }
             continue;
         }
 
-        // Check zero-filled BSS virtual range in sections or segments
+        // Check zero-filled BSS virtual range ([file_size, virtual_size) when virtual_size > file_size).
         bool in_bss = false;
-        const std::uint64_t base = image_.image_base();
         for (const peelf::Section& sec : image_.sections()) {
-            const std::uint64_t sec_va =
-                (image_.format() == peelf::Format::PE) ? (base + sec.virtual_address) : sec.virtual_address;
-            if (cur >= sec_va && cur - sec_va < sec.virtual_size) {
-                in_bss = true;
-                break;
+            const std::uint64_t sec_va = sec.virtual_address;
+            if (sec.virtual_size > sec.file_size && cur >= sec_va) {
+                const std::uint64_t offset_in_sec = cur - sec_va;
+                if (offset_in_sec >= sec.file_size && offset_in_sec < sec.virtual_size) {
+                    in_bss = true;
+                    break;
+                }
+            }
+        }
+        if (!in_bss && image_.sections().empty()) {
+            for (const peelf::Segment& seg : image_.segments()) {
+                if (seg.virtual_size > seg.file_size && cur >= seg.virtual_address) {
+                    const std::uint64_t offset_in_seg = cur - seg.virtual_address;
+                    if (offset_in_seg >= seg.file_size && offset_in_seg < seg.virtual_size) {
+                        in_bss = true;
+                        break;
+                    }
+                }
             }
         }
         if (in_bss) {
@@ -1152,11 +1166,10 @@ std::string StaticImageStructureByteSource::describe_pointer(std::uint64_t targe
             return s;
         }
     }
-    const std::uint64_t base = image_.image_base();
     for (const peelf::Section& sec : image_.sections()) {
-        const std::uint64_t sec_va =
-            (image_.format() == peelf::Format::PE) ? (base + sec.virtual_address) : sec.virtual_address;
-        if (target_va >= sec_va && target_va - sec_va < std::max(sec.virtual_size, sec.file_size)) {
+        const std::uint64_t sec_va = sec.virtual_address;
+        const std::uint64_t mapped_sz = sec.virtual_size != 0u ? sec.virtual_size : sec.file_size;
+        if (target_va >= sec_va && target_va - sec_va < mapped_sz) {
             return std::format("{}+0x{:X}", sec.name, target_va - sec_va);
         }
     }
@@ -1285,24 +1298,69 @@ peelf::MemorySample BinaryModelStructureByteSource::read_bytes(std::uint64_t add
         return sample;
     }
 
-    if (auto vb = model_.read_virtual_bytes(address, size)) {
-        sample.bytes = std::move(*vb);
-        sample.valid.assign(sample.bytes.size(), 1u);
-        sample.readable_count = sample.bytes.size();
+    if (const peelf::IBinaryImage* img = model_.image()) {
+        std::size_t i = 0;
+        while (i < size) {
+            if (address > std::numeric_limits<std::uint64_t>::max() - i) {
+                break;
+            }
+            const std::uint64_t cur = address + i;
+            if (const auto foff = img->virtual_address_to_file_offset(cur)) {
+                std::size_t run_len = 1;
+                while (i + run_len < size &&
+                       cur <= std::numeric_limits<std::uint64_t>::max() - run_len) {
+                    const auto next_foff = img->virtual_address_to_file_offset(cur + run_len);
+                    if (!next_foff.has_value() || *next_foff != *foff + run_len) {
+                        break;
+                    }
+                    ++run_len;
+                }
+                if (auto win = model_.read_window_sample(*foff, run_len)) {
+                    const std::size_t got = std::min(run_len, win->bytes.size());
+                    for (std::size_t k = 0; k < got; ++k) {
+                        if (k < win->valid.size() && win->valid[k] != 0u) {
+                            sample.bytes[i + k] = win->bytes[k];
+                            sample.valid[i + k] = 1u;
+                            ++sample.readable_count;
+                        }
+                    }
+                }
+                i += run_len;
+                continue;
+            }
+
+            bool in_bss = false;
+            for (const peelf::Section& sec : img->sections()) {
+                const std::uint64_t sec_va = sec.virtual_address;
+                if (sec.virtual_size > sec.file_size && cur >= sec_va) {
+                    const std::uint64_t offset_in_sec = cur - sec_va;
+                    if (offset_in_sec >= sec.file_size && offset_in_sec < sec.virtual_size) {
+                        in_bss = true;
+                        break;
+                    }
+                }
+            }
+            if (!in_bss && img->sections().empty()) {
+                for (const peelf::Segment& seg : img->segments()) {
+                    if (seg.virtual_size > seg.file_size && cur >= seg.virtual_address) {
+                        const std::uint64_t offset_in_seg = cur - seg.virtual_address;
+                        if (offset_in_seg >= seg.file_size && offset_in_seg < seg.virtual_size) {
+                            in_bss = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (in_bss) {
+                sample.bytes[i] = 0u;
+                sample.valid[i] = 1u;
+                ++sample.readable_count;
+            }
+            ++i;
+        }
         return sample;
     }
 
-    // Partial VA read fallback (e.g., struct crossing end of section)
-    for (std::size_t i = 0; i < size; ++i) {
-        if (address > std::numeric_limits<std::uint64_t>::max() - i) {
-            break;
-        }
-        if (auto b = model_.read_virtual_bytes(address + i, 1); b && b->size() == 1) {
-            sample.bytes[i] = (*b)[0];
-            sample.valid[i] = 1u;
-            ++sample.readable_count;
-        }
-    }
     return sample;
 }
 
@@ -1345,11 +1403,10 @@ std::string BinaryModelStructureByteSource::describe_pointer(std::uint64_t targe
             }
         }
     } else if (const peelf::IBinaryImage* img = model_.image()) {
-        const std::uint64_t base = img->image_base();
         for (const peelf::Section& sec : img->sections()) {
-            const std::uint64_t sec_va =
-                (img->format() == peelf::Format::PE) ? (base + sec.virtual_address) : sec.virtual_address;
-            if (target_va >= sec_va && target_va - sec_va < std::max(sec.virtual_size, sec.file_size)) {
+            const std::uint64_t sec_va = sec.virtual_address;
+            const std::uint64_t mapped_sz = sec.virtual_size != 0u ? sec.virtual_size : sec.file_size;
+            if (target_va >= sec_va && target_va - sec_va < mapped_sz) {
                 return std::format("{}+0x{:X}", sec.name, target_va - sec_va);
             }
         }
@@ -1607,6 +1664,7 @@ void populate_record_children(EvalContext& ctx,
 
     // 2. Fixed-size array `T[N]`
     if (parsed.kind == ParsedTypeExpr::Kind::Array) {
+        constexpr std::uint64_t kMaxArrayElements = 4096u;
         field.is_aggregate = true;
         if (parsed.array_count_overflow) {
             field.size = declared_size;
@@ -1632,10 +1690,19 @@ void populate_record_children(EvalContext& ctx,
             field.decoded_value = "<array size overflow>";
             return field;
         }
-        field.size = declared_size != 0 ? declared_size : *total_arr_sz;
+        std::uint64_t element_count = parsed.array_count;
+        if (declared_size > 0 && elem_sz > 0) {
+            element_count = std::min<std::uint64_t>(element_count, declared_size / elem_sz);
+        }
+        element_count = std::min<std::uint64_t>(element_count, kMaxArrayElements);
+        const std::uint64_t bounded_arr_bytes = elem_sz * element_count;
+        field.size = declared_size != 0 ? declared_size : bounded_arr_bytes;
 
         const std::size_t preview_bytes =
-            static_cast<std::size_t>(std::min<std::uint64_t>(field.size, 256u));
+            static_cast<std::size_t>(std::min<std::uint64_t>(
+                declared_size != 0 ? std::min<std::uint64_t>(declared_size, bounded_arr_bytes > 0 ? bounded_arr_bytes : declared_size)
+                                   : bounded_arr_bytes,
+                256u));
         const peelf::MemorySample sample =
             ctx.source.read_bytes(address, is_file_offset, preview_bytes);
         field.raw_bytes_hex = format_raw_hex(sample);
@@ -1659,9 +1726,11 @@ void populate_record_children(EvalContext& ctx,
             }
         }
 
-        if (depth < ctx.options.max_depth && elem_sz > 0 && parsed.array_count > 0) {
-            const std::size_t cap = static_cast<std::size_t>(
-                std::min<std::uint64_t>(parsed.array_count, ctx.options.max_array_elements));
+        if (depth < ctx.options.max_depth && elem_sz > 0 && element_count > 0) {
+            const std::uint64_t max_elems =
+                std::min<std::uint64_t>(ctx.options.max_array_elements, kMaxArrayElements);
+            const std::size_t cap =
+                static_cast<std::size_t>(std::min<std::uint64_t>(element_count, max_elems));
             field.children.reserve(cap);
             for (std::size_t idx = 0; idx < cap; ++idx) {
                 const auto elem_off = peelf::checked_mul_u64(static_cast<std::uint64_t>(idx), elem_sz);
@@ -1706,9 +1775,9 @@ void populate_record_children(EvalContext& ctx,
                     if (i > 0) arr_summary += ", ";
                     arr_summary += field.children[i].decoded_value;
                 }
-                if (parsed.array_count > show_n) {
+                if (element_count > show_n) {
                     if (show_n > 0) arr_summary += ", ";
-                    arr_summary += std::format("... ({} items)", parsed.array_count);
+                    arr_summary += std::format("... ({} items)", element_count);
                 }
                 arr_summary += "]";
                 field.decoded_value = std::move(arr_summary);

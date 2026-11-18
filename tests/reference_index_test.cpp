@@ -1,11 +1,14 @@
+#include "analysis/function_index.hpp"
 #include "analysis/reference_index.hpp"
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <thread>
 
 namespace {
 using viewer::ReferenceIndex;
@@ -400,3 +403,171 @@ TEST(ReferenceIndex, RecoversRipRelativeJumpTablesAndIatIndirectCallsWithConfide
     });
     EXPECT_TRUE(found_iat_call);
 }
+
+TEST(ReferenceIndex, PauseAndCancelWithUnmergedPendingChunksResumeWithoutDroppingChunks) {
+    constexpr std::size_t kChunkBytes = 4096u;
+    constexpr std::size_t kChunkCount = 16u;
+    constexpr std::size_t kTotalCodeBytes = kChunkBytes * kChunkCount;
+    // Add an extra 4 KiB target area so every chunk's call lands in valid executable .text.
+    auto elf = make_synthetic_elf64(kTotalCodeBytes + 4096u);
+
+    // Place a unique 5-byte `call rel32` inside each of the 16 chunks targeting `callee_base + c * 16`.
+    const std::uint64_t callee_base = elf.text_va + kTotalCodeBytes;
+    for (std::size_t c = 0; c < kChunkCount; ++c) {
+        const std::size_t call_off = c * kChunkBytes + 64u;
+        const std::uint64_t call_va = elf.text_va + call_off;
+        const std::uint64_t target_va = callee_base + c * 16u;
+        const auto rel32 = static_cast<std::uint32_t>(
+            static_cast<std::int32_t>(static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(call_va + 5u)));
+        elf.bytes[elf.text_offset + call_off + 0] = 0xE8u;
+        elf.bytes[elf.text_offset + call_off + 1] = static_cast<std::uint8_t>(rel32 & 0xFFu);
+        elf.bytes[elf.text_offset + call_off + 2] = static_cast<std::uint8_t>((rel32 >> 8u) & 0xFFu);
+        elf.bytes[elf.text_offset + call_off + 3] = static_cast<std::uint8_t>((rel32 >> 16u) & 0xFFu);
+        elf.bytes[elf.text_offset + call_off + 4] = static_cast<std::uint8_t>((rel32 >> 24u) & 0xFFu);
+    }
+
+    auto parsed = peelf::parse_image(elf.bytes);
+    ASSERT_TRUE(parsed.has_value());
+    const auto& image = **parsed;
+
+    ReferenceIndex idx;
+    viewer::AsyncReferenceScanner scanner;
+    scanner.start(idx, image, elf.bytes, false, kTotalCodeBytes + 4096u, nullptr, kChunkBytes);
+
+    // Let the background worker enqueue pending chunks without calling `poll(idx)` on the UI thread,
+    // then cancel(&idx): un-polled pending chunks are discarded, so `committed_cursor_` MUST roll back
+    // `job_` to the last merged cursor (0 bytes) rather than losing those chunks forever!
+    for (int spin = 0; spin < 200 && scanner.is_scanning(); ++spin) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    scanner.cancel(&idx);
+    EXPECT_EQ(idx.scanned_bytes(), 0u);
+    EXPECT_TRUE(scanner.has_resumable_work());
+
+    // Now exercise pause() + poll() + resume() + wait() and verify all 16 chunks are present.
+    scanner.resume(idx);
+    scanner.pause();
+    (void)scanner.poll(idx);
+    if (scanner.has_resumable_work()) {
+        scanner.resume(idx);
+    }
+    scanner.wait(idx);
+
+    EXPECT_EQ(idx.scanned_bytes(), kTotalCodeBytes + 4096u);
+    EXPECT_FALSE(idx.incomplete());
+    for (std::size_t c = 0; c < kChunkCount; ++c) {
+        const std::uint64_t target_va = callee_base + c * 16u;
+        EXPECT_EQ(idx.incoming(target_va).size(), 1u) << "Missing call from chunk " << c;
+    }
+}
+
+TEST(ReferenceIndex, JumpTableBackwardScanStopsOnClobbersAndRiscvFunctionIndexChecksAuipcRegisters) {
+    const auto write_i32 = [](std::vector<std::uint8_t>& buf, std::size_t off, std::int32_t val) {
+        const auto u = static_cast<std::uint32_t>(val);
+        buf[off + 0] = static_cast<std::uint8_t>(u & 0xFFu);
+        buf[off + 1] = static_cast<std::uint8_t>((u >> 8u) & 0xFFu);
+        buf[off + 2] = static_cast<std::uint8_t>((u >> 16u) & 0xFFu);
+        buf[off + 3] = static_cast<std::uint8_t>((u >> 24u) & 0xFFu);
+    };
+
+    // 1a) Clobbering index register `edi` (`add edi, 1` = 83 C7 01) between `ja` and `movsxd` invalidates bounds!
+    {
+        auto clobber_idx_elf = make_synthetic_elf64(0x100, 0x40);
+        const std::array<std::uint8_t, 36> code_reg_clobber{
+            0x83, 0xFF, 0x01,                   // 0x401000: cmp edi, 1
+            0x77, 0x1E,                         // 0x401003: ja  0x401023
+            0x83, 0xC7, 0x01,                   // 0x401005: add edi, 1  (CLOBBERS edi!)
+            0x48, 0x8D, 0x0D, 0xF1, 0x00, 0x00, 0x00, // 0x401008: lea rcx, [rip + 0xF1] -> 0x401100
+            0x48, 0x63, 0x04, 0xB9,             // 0x40100F: movsxd rax, dword ptr [rcx + rdi*4]
+            0x48, 0x01, 0xC8,                   // 0x401013: add rax, rcx
+            0xFF, 0xE0,                         // 0x401016: jmp rax
+            0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, // 0x401018: case 0
+            0x31, 0xC0, 0xC3,                   // 0x40101E: case 1
+            0x90, 0x90, 0xC3,                   // 0x401021: default
+        };
+        std::ranges::copy(code_reg_clobber,
+                          clobber_idx_elf.bytes.begin() + static_cast<std::ptrdiff_t>(clobber_idx_elf.text_offset));
+        write_i32(clobber_idx_elf.bytes, clobber_idx_elf.rodata_offset + 0, static_cast<std::int32_t>(0x401018 - 0x401100));
+        write_i32(clobber_idx_elf.bytes, clobber_idx_elf.rodata_offset + 4, static_cast<std::int32_t>(0x40101E - 0x401100));
+
+        const auto parsed = peelf::parse_image(clobber_idx_elf.bytes);
+        ASSERT_TRUE(parsed.has_value());
+        const auto refs = ReferenceIndex::build(**parsed, clobber_idx_elf.bytes);
+        EXPECT_TRUE(refs.incoming(0x401018).empty());
+    }
+
+    // 1b) Clobbering flags (`test eax, eax` = 85 C0) between `cmp edi, 1` and `ja` invalidates flag linkage!
+    {
+        auto clobber_flags_elf = make_synthetic_elf64(0x100, 0x40);
+        const std::array<std::uint8_t, 35> code_flag_clobber{
+            0x83, 0xFF, 0x01,                   // 0x401000: cmp edi, 1
+            0x85, 0xC0,                         // 0x401003: test eax, eax (CLOBBERS EFLAGS!)
+            0x77, 0x1B,                         // 0x401005: ja  0x401022
+            0x48, 0x8D, 0x0D, 0xF2, 0x00, 0x00, 0x00, // 0x401007: lea rcx, [rip + 0xF2] -> 0x401100
+            0x48, 0x63, 0x04, 0xB9,             // 0x40100E: movsxd rax, dword ptr [rcx + rdi*4]
+            0x48, 0x01, 0xC8,                   // 0x401012: add rax, rcx
+            0xFF, 0xE0,                         // 0x401015: jmp rax
+            0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, // 0x401017: case 0
+            0x31, 0xC0, 0xC3,                   // 0x40101D: case 1
+            0x90, 0x90, 0xC3,                   // 0x401020: default
+        };
+        std::ranges::copy(code_flag_clobber,
+                          clobber_flags_elf.bytes.begin() + static_cast<std::ptrdiff_t>(clobber_flags_elf.text_offset));
+        write_i32(clobber_flags_elf.bytes, clobber_flags_elf.rodata_offset + 0, static_cast<std::int32_t>(0x401017 - 0x401100));
+        write_i32(clobber_flags_elf.bytes, clobber_flags_elf.rodata_offset + 4, static_cast<std::int32_t>(0x40101D - 0x401100));
+
+        const auto parsed = peelf::parse_image(clobber_flags_elf.bytes);
+        ASSERT_TRUE(parsed.has_value());
+        const auto refs = ReferenceIndex::build(**parsed, clobber_flags_elf.bytes);
+        EXPECT_TRUE(refs.incoming(0x401017).empty());
+    }
+
+    // 2) RISC-V64 FunctionIndex `auipc` + `addi` + `jalr` enforces `rs1 == rd` and invalidates clobbered `rd`!
+    {
+        auto rv_elf = make_synthetic_elf64(0x100);
+        // Set Elf64_Ehdr::e_machine = EM_RISCV (243)
+        rv_elf.bytes[18] = 243u;
+        rv_elf.bytes[19] = 0u;
+
+        const auto w32_code = [&](std::size_t code_off, std::uint32_t insn) {
+            const std::size_t off = rv_elf.text_offset + code_off;
+            rv_elf.bytes[off + 0] = static_cast<std::uint8_t>(insn & 0xFFu);
+            rv_elf.bytes[off + 1] = static_cast<std::uint8_t>((insn >> 8u) & 0xFFu);
+            rv_elf.bytes[off + 2] = static_cast<std::uint8_t>((insn >> 16u) & 0xFFu);
+            rv_elf.bytes[off + 3] = static_cast<std::uint8_t>((insn >> 24u) & 0xFFu);
+        };
+        for (std::size_t off = 0; off + 4u <= 0x100u; off += 4u) {
+            w32_code(off, 0x00000013u); // nop (addi x0, x0, 0)
+        }
+
+        // Valid: auipc t1, 0 (0x401000) -> addi t1, t1, 0x80 -> jalr ra, 0(t1) => target 0x401080
+        w32_code(0x00, 0x00000317u); // auipc t1, 0
+        w32_code(0x04, 0x08030313u); // addi  t1, t1, 0x80
+        w32_code(0x08, 0x000300E7u); // jalr  ra, 0(t1)
+
+        // Mismatched rs1: auipc t1, 0 (0x40100C) -> jalr ra, 0x90(t2) (t2 != t1 => MUST NOT target 0x40109C!)
+        w32_code(0x0C, 0x00000317u); // auipc t1, 0
+        w32_code(0x10, 0x090380E7u); // jalr  ra, 0x90(t2)
+
+        // Clobbered rd: auipc t1, 0 (0x401014) -> lui t1, 1 -> jalr ra, 0xA0(t1) (MUST NOT target 0x4010B4!)
+        w32_code(0x14, 0x00000317u); // auipc t1, 0
+        w32_code(0x18, 0x00001337u); // lui   t1, 1 (clobbers t1)
+        w32_code(0x1C, 0x0A0300E7u); // jalr  ra, 0xA0(t1)
+        w32_code(0x20, 0x00008067u); // ret
+
+        w32_code(0x80, 0x00008067u); // valid callee at 0x401080
+        w32_code(0x9C, 0x00008067u); // unreferenced stub at 0x40109C
+        w32_code(0xB4, 0x00008067u); // unreferenced stub at 0x4010B4
+
+        const auto parsed = peelf::parse_image(rv_elf.bytes);
+        ASSERT_TRUE(parsed.has_value());
+        ASSERT_EQ((*parsed)->architecture(), peelf::Architecture::RISCV64);
+
+        auto sym_idx = viewer::SymbolIndex::build(**parsed);
+        const auto fn_idx = viewer::FunctionIndex::discover(**parsed, sym_idx, rv_elf.bytes);
+        EXPECT_NE(fn_idx.find_exact(0x401080ULL), nullptr);
+        EXPECT_EQ(fn_idx.find_exact(0x40109CULL), nullptr);
+        EXPECT_EQ(fn_idx.find_exact(0x4010B4ULL), nullptr);
+    }
+}
+

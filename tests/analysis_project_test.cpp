@@ -269,3 +269,92 @@ TEST(AnalysisProject, AutosaveCrashRecoveryJournalLifecycleStaysOffMntC) {
 
     fs::remove_all(rec_dir, ec);
 }
+
+TEST(AnalysisProject, PrefersSha256MatchingCandidateAndSavesNonDestructively) {
+    namespace fs = std::filesystem;
+    const fs::path fixture = fs::path(PEELF_TEST_FIXTURES_DIR) / "known-win-x64.exe";
+    const fs::path scratch = fs::temp_directory_path() / "peelf-fbf05a-project-test";
+    std::error_code ec;
+    fs::remove_all(scratch, ec);
+
+    const fs::path orig_dir = scratch / "orig";
+    const fs::path stale_rel_dir = scratch / "workspace" / "bin";
+    const fs::path proj_dir = scratch / "workspace" / "sessions";
+    const fs::path manual_dir = scratch / "manual_drop";
+    ASSERT_TRUE(fs::create_directories(orig_dir, ec));
+    ASSERT_TRUE(fs::create_directories(stale_rel_dir, ec));
+    ASSERT_TRUE(fs::create_directories(proj_dir, ec));
+    ASSERT_TRUE(fs::create_directories(manual_dir, ec));
+
+    const fs::path orig_bin = orig_dir / "known-win-x64.exe";
+    const fs::path stale_rel_bin = stale_rel_dir / "known-win-x64.exe";
+    const fs::path sibling_match_bin = proj_dir / "known-win-x64.exe";
+    const fs::path manual_match_bin = manual_dir / "known-win-x64.exe";
+    ASSERT_TRUE(fs::copy_file(fixture, orig_bin, fs::copy_options::overwrite_existing, ec));
+    ASSERT_TRUE(fs::copy_file(fixture, stale_rel_bin, fs::copy_options::overwrite_existing, ec));
+    ASSERT_TRUE(fs::copy_file(fixture, sibling_match_bin, fs::copy_options::overwrite_existing, ec));
+    ASSERT_TRUE(fs::copy_file(fixture, manual_match_bin, fs::copy_options::overwrite_existing, ec));
+
+    viewer::BinaryModel m;
+    ASSERT_TRUE(m.load_file(orig_bin.string()));
+
+    const fs::path peproj_path = proj_dir / "session.peproj";
+    viewer::AnalysisProject proj = viewer::build_analysis_project(m, peproj_path);
+    proj.relative_source = "../bin/known-win-x64.exe";
+    proj.layout = "preserved-v1-layout";
+
+    // Mutate BOTH earlier candidates (`orig_bin` and `stale_rel_bin`) while keeping `sibling_match_bin` intact.
+    for (const fs::path& mutated : {orig_bin, stale_rel_bin}) {
+        std::fstream mut(mutated, std::ios::in | std::ios::out | std::ios::binary);
+        ASSERT_TRUE(mut.is_open());
+        mut.seekg(0x40);
+        char byte_val = 0;
+        mut.read(&byte_val, 1);
+        byte_val ^= static_cast<char>(0x5Au);
+        mut.seekp(0x40);
+        mut.write(&byte_val, 1);
+    }
+
+    // Resolution must skip the modified earlier candidates and select the SHA-256-matching sibling binary.
+    const auto resolved_sibling = viewer::resolve_project_binary_path(proj, peproj_path);
+    EXPECT_EQ(resolved_sibling.status, viewer::ProjectBinaryMatchStatus::ExactMatch);
+    EXPECT_EQ(fs::weakly_canonical(resolved_sibling.resolved_path, ec),
+              fs::weakly_canonical(sibling_match_bin, ec));
+    EXPECT_EQ(resolved_sibling.actual_sha256, proj.source_sha256);
+
+    // Passing a directory as `manual_relocated_path` also resolves `manual_dir / filename` with SHA-256 match.
+    const auto resolved_manual_dir = viewer::resolve_project_binary_path(proj, peproj_path, manual_dir);
+    EXPECT_EQ(resolved_manual_dir.status, viewer::ProjectBinaryMatchStatus::ExactMatch);
+    EXPECT_EQ(fs::weakly_canonical(resolved_manual_dir.resolved_path, ec),
+              fs::weakly_canonical(manual_match_bin, ec));
+
+    // Non-destructive atomic save: write valid v1, then attempt an oversized (> 64 MiB) save and confirm
+    // the existing `.peproj` on disk is completely untouched and zero `.tmp` files remain.
+    ASSERT_TRUE(viewer::write_analysis_file(peproj_path, viewer::encode_project(proj)));
+    const std::string oversized_payload(viewer::kMaxProjectFileBytes + 1024u, 'X');
+    EXPECT_FALSE(viewer::write_analysis_file(peproj_path, oversized_payload));
+
+    const auto preserved_text = viewer::read_project_file(peproj_path);
+    ASSERT_TRUE(preserved_text.has_value()) << preserved_text.error().message;
+    const auto preserved_proj = viewer::decode_project(*preserved_text);
+    ASSERT_TRUE(preserved_proj.has_value()) << preserved_proj.error().message;
+    EXPECT_EQ(preserved_proj->layout, "preserved-v1-layout");
+
+    for (const auto& entry : fs::directory_iterator(proj_dir, ec)) {
+        EXPECT_EQ(entry.path().filename().string().find(".tmp."), std::string::npos);
+    }
+
+    // Also verify `read_project_file` rejects an oversized file on disk before allocating/reading it.
+    const fs::path huge_file = scratch / "oversized.peproj";
+    {
+        std::ofstream out(huge_file, std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(out.is_open());
+        out.put('P');
+    }
+    fs::resize_file(huge_file, viewer::kMaxProjectFileBytes + 1u, ec);
+    ASSERT_FALSE(ec);
+    EXPECT_FALSE(viewer::read_project_file(huge_file).has_value());
+
+    fs::remove_all(scratch, ec);
+}
+

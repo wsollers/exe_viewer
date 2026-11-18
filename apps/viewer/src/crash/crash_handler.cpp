@@ -85,24 +85,32 @@ void ensure_crash_directory() noexcept {
     CreateDirectoryW(L"crashes", nullptr);
 }
 
-std::wstring make_dump_path() noexcept {
+void make_dump_path(wchar_t (&out_path)[MAX_PATH]) noexcept {
     ensure_crash_directory();
     SYSTEMTIME local_time{};
     GetLocalTime(&local_time);
 
-    wchar_t path[MAX_PATH]{};
-    std::swprintf(path,
-                  sizeof(path) / sizeof(path[0]),
-                  L"crashes\\peelf_viewer-%04hu%02hu%02hu-%02hu%02hu%02hu-p%lu-t%lu.dmp",
-                  local_time.wYear,
-                  local_time.wMonth,
-                  local_time.wDay,
-                  local_time.wHour,
-                  local_time.wMinute,
-                  local_time.wSecond,
-                  GetCurrentProcessId(),
-                  GetCurrentThreadId());
-    return path;
+    const int written = std::swprintf(
+        out_path,
+        MAX_PATH,
+        L"crashes\\peelf_viewer-%04hu%02hu%02hu-%02hu%02hu%02hu-p%lu-t%lu.dmp",
+        local_time.wYear,
+        local_time.wMonth,
+        local_time.wDay,
+        local_time.wHour,
+        local_time.wMinute,
+        local_time.wSecond,
+        GetCurrentProcessId(),
+        GetCurrentThreadId());
+    if (written < 0) {
+        constexpr wchar_t kFallbackPath[] = L"crashes\\peelf_viewer-crash.dmp";
+        static_assert((sizeof(kFallbackPath) / sizeof(kFallbackPath[0])) <= MAX_PATH);
+        for (std::size_t i = 0; i < (sizeof(kFallbackPath) / sizeof(kFallbackPath[0])); ++i) {
+            out_path[i] = kFallbackPath[i];
+        }
+    } else {
+        out_path[MAX_PATH - 1] = L'\0';
+    }
 }
 
 void print_stack_trace_addresses() noexcept {
@@ -120,8 +128,9 @@ bool write_minidump(EXCEPTION_POINTERS* exception_pointers) noexcept {
         return false;
     }
 
-    const std::wstring dump_path = make_dump_path();
-    HANDLE dump_file = CreateFileW(dump_path.c_str(),
+    wchar_t dump_path[MAX_PATH]{};
+    make_dump_path(dump_path);
+    HANDLE dump_file = CreateFileW(dump_path,
                                    GENERIC_WRITE,
                                    FILE_SHARE_READ,
                                    nullptr,
@@ -159,7 +168,7 @@ bool write_minidump(EXCEPTION_POINTERS* exception_pointers) noexcept {
 
     crash_printf(kCrashLogPath,
                  "Minidump: %ls (%s, GetLastError=%lu)\n",
-                 dump_path.c_str(),
+                 dump_path,
                  ok ? "written" : "failed",
                  ok ? 0UL : error);
     return ok == TRUE;
@@ -467,10 +476,17 @@ void signal_handler(int signal, siginfo_t* info, void* context) noexcept {
     struct sigaction action {};
     action.sa_handler = SIG_DFL;
     sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
     ::sigaction(signal, &action, nullptr);
+
+    sigset_t unblock_set{};
+    sigemptyset(&unblock_set);
+    sigaddset(&unblock_set, signal);
+    ::sigprocmask(SIG_UNBLOCK, &unblock_set, nullptr);
+
     errno = saved_errno;
     ::raise(signal);
-    ::_exit(128 + (signal & 0x7F));
+    ::_Exit(128 + (signal & 0x7F));
 }
 
 void install_signal_handler(int signal) noexcept {

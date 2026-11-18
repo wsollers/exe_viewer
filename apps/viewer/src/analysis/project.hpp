@@ -14,6 +14,8 @@
 
 namespace viewer {
 
+inline constexpr std::size_t kMaxProjectFileBytes = 64u * 1024u * 1024u;
+
 struct AnalysisProject {
     static constexpr int kCurrentSchemaVersion = 2;
 
