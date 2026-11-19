@@ -431,6 +431,9 @@ using detail::utf8_path;
         active_debug_types_.clear();
         active_source_lines_.clear();
         applied_structures_.clear();
+        custom_c_types_source_.clear();
+        custom_c_types_abi_ = CTypeAbiMode::AutoTarget;
+        custom_types_.clear();
         bookmarks_.clear();
         patch_metadata_by_offset_.clear();
         ++structure_binding_revision_;
@@ -1287,6 +1290,74 @@ using detail::utf8_path;
         }
     }
 
+    CLongModel BinaryModel::effective_c_long_model(CTypeAbiMode abi_mode) const noexcept {
+        if (format_ == BinaryFormat::PE) {
+            return CLongModel::LLP64;
+        }
+        const bool is_64 = (abi_mode == CTypeAbiMode::Bits64) ||
+                           (abi_mode == CTypeAbiMode::AutoTarget && target_layout().is_64bit());
+        return is_64 ? CLongModel::LP64 : CLongModel::LLP64;
+    }
+
+    CTypeParseResult BinaryModel::compile_and_set_custom_c_types(
+        std::string source,
+        CTypeAbiMode abi_mode,
+        std::span<const DataTypeRecord> extra_known_types) {
+        std::vector<DataTypeRecord> combined_known;
+        std::span<const DataTypeRecord> known_span = active_debug_types_;
+        if (!extra_known_types.empty()) {
+            combined_known.reserve(active_debug_types_.size() + extra_known_types.size());
+            combined_known.insert(
+                combined_known.end(), active_debug_types_.begin(), active_debug_types_.end());
+            combined_known.insert(
+                combined_known.end(), extra_known_types.begin(), extra_known_types.end());
+            known_span = combined_known;
+        }
+
+        peelf::TargetLayout eff_layout = target_layout();
+        if (abi_mode == CTypeAbiMode::Bits64) {
+            eff_layout.address_width = peelf::AddressWidth::Bits64;
+        } else if (abi_mode == CTypeAbiMode::Bits32) {
+            eff_layout.address_width = peelf::AddressWidth::Bits32;
+        }
+
+        const CTypeParseOptions opts{
+            .layout = eff_layout,
+            .long_model = effective_c_long_model(abi_mode),
+            .external_types = known_span,
+        };
+        CTypeParseResult res = parse_c_types(source, opts);
+        if (res.ok()) {
+            custom_c_types_source_ = std::move(source);
+            custom_c_types_abi_ = abi_mode;
+            custom_types_ = res.types;
+            ++structure_binding_revision_;
+        }
+        return res;
+    }
+
+    void BinaryModel::set_custom_c_types(std::string source,
+                                         std::vector<DataTypeRecord> types,
+                                         CTypeAbiMode abi_mode) {
+        for (DataTypeRecord& rec : types) {
+            rec.is_custom_c = true;
+        }
+        custom_c_types_source_ = std::move(source);
+        custom_c_types_abi_ = abi_mode;
+        custom_types_ = std::move(types);
+        ++structure_binding_revision_;
+    }
+
+    void BinaryModel::clear_custom_c_types() noexcept {
+        if (!custom_c_types_source_.empty() || !custom_types_.empty() ||
+            custom_c_types_abi_ != CTypeAbiMode::AutoTarget) {
+            custom_c_types_source_.clear();
+            custom_c_types_abi_ = CTypeAbiMode::AutoTarget;
+            custom_types_.clear();
+            ++structure_binding_revision_;
+        }
+    }
+
     void BinaryModel::add_or_update_bookmark(Bookmark bookmark) {
         for (Bookmark& existing : bookmarks_) {
             if (existing.address == bookmark.address &&
@@ -1571,6 +1642,9 @@ using detail::utf8_path;
         if (!applied_structures_.empty()) {
             applied_structures_.clear();
             ++structure_binding_revision_;
+        }
+        if (!custom_c_types_source_.empty() && custom_c_types_abi_ == CTypeAbiMode::AutoTarget) {
+            (void)compile_and_set_custom_c_types(custom_c_types_source_, custom_c_types_abi_);
         }
         if (!bookmarks_.empty()) {
             bookmarks_.clear();

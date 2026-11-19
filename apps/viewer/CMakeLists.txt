@@ -126,6 +126,8 @@ add_library(peelf_gui SHARED
         src/analysis/reference_index.cpp
         src/analysis/strings_index.hpp
         src/analysis/strings_index.cpp
+        src/analysis/c_type_parser.hpp
+        src/analysis/c_type_parser.cpp
         src/analysis/structure_interpreter.hpp
         src/analysis/structure_interpreter.cpp
         src/analysis/patch_preview.cpp

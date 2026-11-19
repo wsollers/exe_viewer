@@ -28,6 +28,7 @@ enum class StructureSchemaOrigin : std::uint8_t {
     BuiltinWin32Runtime = 2,
     BuiltinElf = 3,
     BuiltinLinuxRuntime = 4,
+    CustomUserC = 5,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(StructureSchemaOrigin origin) noexcept {
@@ -37,6 +38,7 @@ enum class StructureSchemaOrigin : std::uint8_t {
         case StructureSchemaOrigin::BuiltinWin32Runtime: return "Win32 Runtime";
         case StructureSchemaOrigin::BuiltinElf:          return "ELF Header";
         case StructureSchemaOrigin::BuiltinLinuxRuntime: return "Linux Runtime";
+        case StructureSchemaOrigin::CustomUserC:         return "Custom C";
     }
     return "Debug / User";
 }
@@ -46,7 +48,8 @@ struct CatalogTypeEntry {
     StructureSchemaOrigin origin = StructureSchemaOrigin::UserOrDebug;
 
     [[nodiscard]] constexpr bool is_builtin() const noexcept {
-        return origin != StructureSchemaOrigin::UserOrDebug;
+        return origin != StructureSchemaOrigin::UserOrDebug &&
+               origin != StructureSchemaOrigin::CustomUserC;
     }
 };
 
@@ -59,6 +62,12 @@ public:
     StructureCatalog() = default;
 
     [[nodiscard]] static StructureCatalog build(
+        std::span<const DataTypeRecord> primary_user_types = {},
+        std::span<const DataTypeRecord> secondary_user_types = {},
+        bool include_builtins = true);
+
+    [[nodiscard]] static StructureCatalog build_with_custom(
+        std::span<const DataTypeRecord> custom_c_types,
         std::span<const DataTypeRecord> primary_user_types = {},
         std::span<const DataTypeRecord> secondary_user_types = {},
         bool include_builtins = true);

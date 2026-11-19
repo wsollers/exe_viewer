@@ -1,5 +1,6 @@
 #pragma once
 
+#include "analysis/c_type_parser.hpp"
 #include "analysis/structure_interpreter.hpp"
 #include "model/binary_model.hpp"
 #include "navigation/viewer_navigation.hpp"
@@ -12,12 +13,21 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
+
+struct ImFont;
 
 namespace viewer {
 
 class StructureViewPanel : public UiPanel {
 public:
     StructureViewPanel(BinaryModel& model, const ViewerSelection& selection);
+
+    void set_code_font(ImFont* font) noexcept { code_font_ = font; }
+    void open_custom_c_editor() noexcept {
+        show_custom_c_editor_ = true;
+        focus_custom_c_editor_ = true;
+    }
 
     void set_extra_types_provider(std::function<std::span<const DataTypeRecord>()> provider) {
         extra_types_provider_ = std::move(provider);
@@ -46,6 +56,8 @@ protected:
 
 private:
     void ensure_default_type_selected(const StructureCatalog& catalog);
+    void sync_custom_c_editor_from_model();
+    void draw_custom_c_editor(std::span<const DataTypeRecord> extra_types);
     void reevaluate(const StructureCatalog& catalog);
     void draw_field_rows(std::span<const EvaluatedField> fields,
                          const StructureCatalog& catalog,
@@ -53,6 +65,7 @@ private:
 
     BinaryModel& model_;
     const ViewerSelection& selection_;
+    ImFont* code_font_ = nullptr;
 
     char type_filter_[128] = {};
     std::string selected_type_name_{};
@@ -64,9 +77,18 @@ private:
     int width_override_ = 0;  // 0 = Auto (Target), 1 = 32-bit, 2 = 64-bit
     char binding_label_[128] = {};
 
+    bool show_custom_c_editor_ = false;
+    bool focus_custom_c_editor_ = false;
+    bool custom_c_editor_dirty_ = false;
+    std::string custom_c_buffer_{};
+    int custom_c_abi_mode_ = 0; // 0 = Auto from Target, 1 = 64-bit, 2 = 32-bit
+    std::vector<CTypeParseDiagnostic> custom_c_diagnostics_{};
+    std::string custom_c_status_{};
+
     std::uint64_t last_synced_selection_addr_ = 0;
     bool last_synced_selection_is_off_ = false;
     std::uint64_t last_eval_revision_ = 0;
+    std::uint64_t last_synced_structure_revision_ = 0;
     bool dirty_ = true;
 
     std::optional<EvaluatedStructure> evaluated_{};

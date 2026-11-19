@@ -32,6 +32,9 @@ struct AnalysisProject {
     std::vector<DebugSymbol> symbols;
     std::vector<Bookmark> bookmarks;
     std::vector<AppliedStructureBinding> structure_bindings;
+    std::string custom_c_types_source;
+    std::uint32_t custom_c_types_abi = 0;
+    std::vector<DataTypeRecord> custom_types;
     std::vector<ViewerSelection> history;
     std::size_t cursor{};
     std::string layout;

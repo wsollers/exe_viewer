@@ -167,7 +167,7 @@ bool read_patches_annotations_symbols(std::istream& in, AnalysisProject& p) {
     return true;
 }
 
-bool read_history_and_layout(std::istream& in, AnalysisProject& p) {
+bool read_history_and_layout(std::istream& in, AnalysisProject& p, bool require_eof = true) {
     std::size_t count = 0;
     if (!(in >> count >> p.cursor) || count > 256 || (count ? p.cursor >= count : p.cursor != 0)) {
         return false;
@@ -203,6 +203,73 @@ bool read_history_and_layout(std::istream& in, AnalysisProject& p) {
         p.history.push_back(std::move(s));
     }
     if (!(in >> std::quoted(p.layout))) return false;
+    if (!require_eof) return true;
+    in >> std::ws;
+    return in.eof();
+}
+
+bool read_custom_c_types_extension(std::istream& in, AnalysisProject& p) {
+    std::string ext_tag;
+    int ext_ver = 0;
+    std::uint32_t abi_u32 = 0;
+    std::size_t rec_count = 0;
+    if (!(in >> ext_tag >> ext_ver >> abi_u32 >> std::quoted(p.custom_c_types_source) >> rec_count) ||
+        ext_tag != "CUSTOM_C_TYPES" || ext_ver != 1 || abi_u32 > 2u ||
+        p.custom_c_types_source.size() > kMaxCTypeSourceBytes || rec_count > 16384u) {
+        return false;
+    }
+    p.custom_c_types_abi = abi_u32;
+    p.custom_types.reserve(rec_count);
+    for (std::size_t i = 0; i < rec_count; ++i) {
+        DataTypeRecord rec{};
+        std::uint32_t flags = 0;
+        std::size_t alias_count = 0;
+        std::size_t member_count = 0;
+        std::size_t enum_count = 0;
+        if (!(in >> std::quoted(rec.name) >> rec.size >> flags >> std::quoted(rec.underlying_type) >>
+              alias_count >> member_count >> enum_count) ||
+            rec.name.empty() || alias_count > 1024u || member_count > 16384u || enum_count > 65536u) {
+            return false;
+        }
+        rec.is_union = (flags & 1u) != 0u;
+        rec.is_enum = (flags & 2u) != 0u;
+        rec.is_enum_signed = (flags & 4u) != 0u;
+        rec.is_custom_c = true;
+
+        rec.aliases.reserve(alias_count);
+        for (std::size_t a = 0; a < alias_count; ++a) {
+            std::string alias;
+            if (!(in >> std::quoted(alias)) || alias.empty()) {
+                return false;
+            }
+            rec.aliases.push_back(std::move(alias));
+        }
+
+        rec.members.reserve(member_count);
+        for (std::size_t m = 0; m < member_count; ++m) {
+            DataMember mem{};
+            unsigned bw = 0;
+            unsigned bo = 0;
+            if (!(in >> std::quoted(mem.name) >> std::quoted(mem.type) >> mem.offset >> mem.size >> bw >> bo) ||
+                mem.name.empty() || mem.type.empty() || bw > 64u || bo >= 64u) {
+                return false;
+            }
+            mem.bit_width = static_cast<std::uint8_t>(bw);
+            mem.bit_offset = static_cast<std::uint8_t>(bo);
+            rec.members.push_back(std::move(mem));
+        }
+
+        rec.enum_constants.reserve(enum_count);
+        for (std::size_t e = 0; e < enum_count; ++e) {
+            DataEnumEnumerator ec{};
+            if (!(in >> std::quoted(ec.name) >> ec.value) || ec.name.empty()) {
+                return false;
+            }
+            rec.enum_constants.push_back(std::move(ec));
+        }
+
+        p.custom_types.push_back(std::move(rec));
+    }
     in >> std::ws;
     return in.eof();
 }
@@ -295,6 +362,9 @@ AnalysisProject build_analysis_project(const BinaryModel& model,
     p.symbols.assign(symbols.begin(), symbols.end());
     p.bookmarks.assign(model.bookmarks().begin(), model.bookmarks().end());
     p.structure_bindings.assign(model.applied_structures().begin(), model.applied_structures().end());
+    p.custom_c_types_source = model.custom_c_types_source();
+    p.custom_c_types_abi = static_cast<std::uint32_t>(model.custom_c_types_abi());
+    p.custom_types.assign(model.custom_types().begin(), model.custom_types().end());
     p.history.assign(history.begin(), history.end());
     p.cursor = p.history.empty() ? 0 : std::min(cursor, p.history.size() - 1);
     p.layout = std::move(layout);
@@ -351,6 +421,36 @@ std::string encode_project(const AnalysisProject& p) {
 
     write_history(out, p.history, p.cursor);
     out << std::quoted(p.layout) << '\n';
+    if (!p.custom_c_types_source.empty() || !p.custom_types.empty() || p.custom_c_types_abi != 0u) {
+        const std::uint32_t abi_u32 = p.custom_c_types_abi <= 2u ? p.custom_c_types_abi : 0u;
+        out << "CUSTOM_C_TYPES 1 " << abi_u32 << ' '
+            << std::quoted(p.custom_c_types_source) << ' '
+            << p.custom_types.size() << '\n';
+        for (const DataTypeRecord& rec : p.custom_types) {
+            const std::uint32_t flags =
+                (rec.is_union ? 1u : 0u) |
+                (rec.is_enum ? 2u : 0u) |
+                (rec.is_enum_signed ? 4u : 0u) |
+                (rec.is_custom_c ? 8u : 0u);
+            out << std::quoted(rec.name) << ' ' << rec.size << ' ' << flags << ' '
+                << std::quoted(rec.underlying_type) << ' '
+                << rec.aliases.size() << ' '
+                << rec.members.size() << ' '
+                << rec.enum_constants.size() << '\n';
+            for (const std::string& alias : rec.aliases) {
+                out << std::quoted(alias) << '\n';
+            }
+            for (const DataMember& mem : rec.members) {
+                out << std::quoted(mem.name) << ' ' << std::quoted(mem.type) << ' '
+                    << mem.offset << ' ' << mem.size << ' '
+                    << static_cast<unsigned>(mem.bit_width) << ' '
+                    << static_cast<unsigned>(mem.bit_offset) << '\n';
+            }
+            for (const DataEnumEnumerator& ec : rec.enum_constants) {
+                out << std::quoted(ec.name) << ' ' << ec.value << '\n';
+            }
+        }
+    }
     return out.str();
 }
 
@@ -429,7 +529,11 @@ peelf::Result<AnalysisProject> decode_project(std::string_view text) {
         p.structure_bindings.push_back(std::move(sb));
     }
 
-    if (!read_history_and_layout(in, p)) return invalid();
+    if (!read_history_and_layout(in, p, false)) return invalid();
+    in >> std::ws;
+    if (!in.eof() && !read_custom_c_types_extension(in, p)) {
+        return invalid();
+    }
     return p;
 }
 

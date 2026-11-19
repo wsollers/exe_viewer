@@ -199,6 +199,7 @@ enum class PaletteCommandId : std::uint8_t {
     ResetWorkspaceLayout,
     GoToEntryPoint,
     GoToAddressPrompt,
+    DefineCustomCTypes,
 };
 
 enum class PaletteActionKind : std::uint8_t {
@@ -259,6 +260,7 @@ struct PaletteDataSources {
     const AnnotationStore* annotations = nullptr;
     const StringsIndex* strings = nullptr;
     const StructureCatalog* structure_catalog = nullptr;
+    std::span<const DataTypeRecord> custom_types{};
     std::span<const DataTypeRecord> debug_types{};
     std::span<const DataTypeRecord> secondary_types{};
     std::span<const Bookmark> bookmarks{};

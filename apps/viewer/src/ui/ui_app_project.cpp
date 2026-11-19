@@ -114,6 +114,21 @@ void UiApp::apply_loaded_project_metadata(const AnalysisProject& project) {
     for (const AppliedStructureBinding& sb : project.structure_bindings) {
         model_.add_applied_structure(sb);
     }
+    const CTypeAbiMode restored_abi = project.custom_c_types_abi <= 2u
+        ? static_cast<CTypeAbiMode>(project.custom_c_types_abi)
+        : CTypeAbiMode::AutoTarget;
+    if (!project.custom_types.empty()) {
+        model_.set_custom_c_types(project.custom_c_types_source, project.custom_types, restored_abi);
+        if (!project.custom_c_types_source.empty() && restored_abi == CTypeAbiMode::AutoTarget) {
+            (void)model_.compile_and_set_custom_c_types(
+                project.custom_c_types_source, restored_abi, debug_types_);
+        }
+    } else if (!project.custom_c_types_source.empty()) {
+        (void)model_.compile_and_set_custom_c_types(
+            project.custom_c_types_source, restored_abi, debug_types_);
+    } else {
+        model_.clear_custom_c_types();
+    }
     symbol_index_ = model_.symbol_index();
     annotations_.clear();
     for (const auto& [address, note] : project.annotations) {

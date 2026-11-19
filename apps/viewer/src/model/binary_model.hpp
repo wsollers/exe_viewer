@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#include "analysis/c_type_parser.hpp"
 #include "analysis/function_index.hpp"
 #include "symbols/data_types.hpp"
 #include "symbols/debug_symbols.hpp"
@@ -279,6 +280,26 @@ namespace viewer {
         [[nodiscard]] std::uint64_t structure_binding_revision() const noexcept {
             return structure_binding_revision_;
         }
+
+        // User-authored custom C struct / union / enum / typedef declarations (WU-37).
+        [[nodiscard]] const std::string& custom_c_types_source() const noexcept {
+            return custom_c_types_source_;
+        }
+        [[nodiscard]] CTypeAbiMode custom_c_types_abi() const noexcept {
+            return custom_c_types_abi_;
+        }
+        [[nodiscard]] std::span<const DataTypeRecord> custom_types() const noexcept {
+            return custom_types_;
+        }
+        [[nodiscard]] CLongModel effective_c_long_model(CTypeAbiMode abi_mode) const noexcept;
+        [[nodiscard]] CTypeParseResult compile_and_set_custom_c_types(
+            std::string source,
+            CTypeAbiMode abi_mode = CTypeAbiMode::AutoTarget,
+            std::span<const DataTypeRecord> extra_known_types = {});
+        void set_custom_c_types(std::string source,
+                                std::vector<DataTypeRecord> types,
+                                CTypeAbiMode abi_mode = CTypeAbiMode::AutoTarget);
+        void clear_custom_c_types() noexcept;
 
         [[nodiscard]] std::span<const Bookmark> bookmarks() const noexcept { return bookmarks_; }
         void add_or_update_bookmark(Bookmark bookmark);
@@ -568,6 +589,9 @@ namespace viewer {
         };
 
         std::vector<AppliedStructureBinding> applied_structures_;
+        std::string custom_c_types_source_;
+        CTypeAbiMode custom_c_types_abi_ = CTypeAbiMode::AutoTarget;
+        std::vector<DataTypeRecord> custom_types_;
         std::vector<Bookmark> bookmarks_;
         std::map<std::uint64_t, PatchEntryMetadata> patch_metadata_by_offset_;
         std::uint64_t structure_binding_revision_ = 0;

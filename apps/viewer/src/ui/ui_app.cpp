@@ -953,6 +953,7 @@ void UiApp::render() {
     if (show_data_types_) render_data_types();
     references_panel_.draw();
     strings_panel_.draw();
+    struct_view_panel_.set_code_font(code_font_);
     struct_view_panel_.draw();
     process_internals_panel_.draw();
     dependencies_panel_.draw();

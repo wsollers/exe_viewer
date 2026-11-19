@@ -467,10 +467,15 @@ void UiApp::render_data_types() {
                 open_structure_view();
             }
             ImGui::SameLine();
-            ImGui::TextDisabled("(Built-in PE/ELF/Win32/Linux runtime schemas + loaded debug types)");
-            if (debug_types_.empty() && decompiled_.types.empty())
-                ImGui::TextWrapped("No PDB/DWARF/Ghidra types loaded; built-in PE/ELF/runtime schemas remain available in Structure View.");
-            auto draw=[&](const DataTypeRecord& type) {
+            if (ImGui::SmallButton("Define / Import C Types...")) {
+                open_structure_view();
+                struct_view_panel_.open_custom_c_editor();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(Built-in PE/ELF/runtime schemas + Custom C + loaded debug types)");
+            if (model_.custom_types().empty() && debug_types_.empty() && decompiled_.types.empty())
+                ImGui::TextWrapped("No custom C or PDB/DWARF/Ghidra types loaded; built-in PE/ELF/runtime schemas remain available in Structure View.");
+            auto draw=[&](const DataTypeRecord& type, std::string_view tag = {}) {
                 if (!type_matches(type,data_type_filter_)) return;
                 ImGui::PushID(type.name.c_str());
                 if (ImGui::SmallButton("Apply")) {
@@ -486,17 +491,46 @@ void UiApp::render_data_types() {
                     ImGui::SetTooltip("Apply %s at current selection in Structure View", type.name.c_str());
                 }
                 ImGui::SameLine();
-                const auto label=std::format("{} {} ({} bytes)",type.is_union ? "union" : "struct",type.name,type.size);
+                const char* kind_kw = type.is_enum ? "enum" : (type.is_union ? "union" : "struct");
+                const auto label = tag.empty()
+                    ? std::format("{} {} ({} bytes)", kind_kw, type.name, type.size)
+                    : std::format("{} {} ({} bytes) [{}]", kind_kw, type.name, type.size, tag);
                 if (ImGui::TreeNodeEx("##type",ImGuiTreeNodeFlags_SpanAvailWidth,"%s",label.c_str())) {
-                    if (ImGui::BeginTable("members",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_Resizable)) {
+                    if (type.is_enum) {
+                        if (ImGui::BeginTable("enum_vals",2,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_Resizable)) {
+                            ImGui::TableSetupColumn("Enumerator");
+                            ImGui::TableSetupColumn("Value");
+                            ImGui::TableHeadersRow();
+                            for (const auto& ec : type.enum_constants) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(ec.name.c_str());
+                                ImGui::TableSetColumnIndex(1);
+                                if (ec.value < 0) {
+                                    ImGui::Text("%" PRId64 " (0x%" PRIX64 ")", ec.value, static_cast<std::uint64_t>(ec.value));
+                                } else {
+                                    ImGui::Text("0x%" PRIX64 " (%" PRId64 ")", static_cast<std::uint64_t>(ec.value), ec.value);
+                                }
+                            }
+                            ImGui::EndTable();
+                        }
+                    } else if (ImGui::BeginTable("members",4,ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_Resizable)) {
                         for (const auto* name : {"Offset","Size","Member","Type"}) ImGui::TableSetupColumn(name);
                         ImGui::TableHeadersRow();
                         for (const auto& member : type.members) {
                             ImGui::TableNextRow();
                             ImGui::TableSetColumnIndex(0);
-                            ImGui::Text("0x%" PRIX64, member.offset);
+                            if (member.bit_width > 0) {
+                                ImGui::Text("0x%" PRIX64 ".b%u", member.offset, static_cast<unsigned>(member.bit_offset));
+                            } else {
+                                ImGui::Text("0x%" PRIX64, member.offset);
+                            }
                             ImGui::TableSetColumnIndex(1);
-                            ImGui::Text("%" PRIu64, member.size);
+                            if (member.bit_width > 0) {
+                                ImGui::Text("%u bits", static_cast<unsigned>(member.bit_width));
+                            } else {
+                                ImGui::Text("%" PRIu64, member.size);
+                            }
                             ImGui::TableSetColumnIndex(2); ImGui::TextUnformatted(member.name.c_str());
                             ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(member.type.c_str());
                         }
@@ -506,9 +540,13 @@ void UiApp::render_data_types() {
                 }
                 ImGui::PopID();
             };
-            for (const auto& type : debug_types_) draw(type);
+            const auto custom_span = model_.custom_types();
+            for (const auto& type : custom_span) draw(type, "Custom C");
+            for (const auto& type : debug_types_)
+                if (std::ranges::none_of(custom_span,[&](const auto& known){return known.name==type.name;})) draw(type);
             for (const auto& type : decompiled_.types)
-                if (std::ranges::none_of(debug_types_,[&](const auto& known){return known.name==type.name;})) draw(type);
+                if (std::ranges::none_of(custom_span,[&](const auto& known){return known.name==type.name;}) &&
+                    std::ranges::none_of(debug_types_,[&](const auto& known){return known.name==type.name;})) draw(type);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Data symbols")) {

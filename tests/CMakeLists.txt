@@ -95,6 +95,7 @@ add_executable(peelf_tests
   call_graph_galaxy_test.cpp
   linear_disassembly_test.cpp
   command_palette_test.cpp
+  c_type_parser_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/disasm/linear_disassembly.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
@@ -113,6 +114,7 @@ add_executable(peelf_tests
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/function_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/reference_index.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/strings_index.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/c_type_parser.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/structure_interpreter.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/patch_preview.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/analysis/project.cpp

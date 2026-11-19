@@ -1110,6 +1110,10 @@ void UiApp::enqueue_palette_action(const PaletteAction& action) {
                     case PaletteCommandId::GoToAddressPrompt:
                         open_command_palette(":");
                         break;
+                    case PaletteCommandId::DefineCustomCTypes:
+                        open_structure_view();
+                        struct_view_panel_.open_custom_c_editor();
+                        break;
                 }
             });
             break;

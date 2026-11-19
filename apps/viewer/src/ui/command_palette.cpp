@@ -1551,6 +1551,7 @@ PaletteDataSources make_palette_data_sources(
     src.symbols = (ui_symbols != nullptr) ? ui_symbols : &model.symbol_index();
     src.annotations = annotations;
     src.strings = strings;
+    src.custom_types = model.custom_types();
     src.debug_types = !ui_debug_types.empty()
                           ? ui_debug_types
                           : std::span<const DataTypeRecord>(model.debug_types());
@@ -1575,7 +1576,7 @@ struct BuiltinCommandSpec {
     bool requires_file = false;
 };
 
-constexpr std::array<BuiltinCommandSpec, 14> kBuiltinCommands{{
+constexpr std::array<BuiltinCommandSpec, 15> kBuiltinCommands{{
     {PaletteCommandId::OpenBinary,
      "cmd:open_binary",
      "Open Binary...",
@@ -1674,6 +1675,13 @@ constexpr std::array<BuiltinCommandSpec, 14> kBuiltinCommands{{
      "G",
      "g2va goto virtual address rva offset expression",
      false},
+    {PaletteCommandId::DefineCustomCTypes,
+     "cmd:define_custom_c_types",
+     "Define / Import Custom C Types...",
+     "Author or paste C struct, union, enum, and typedef declarations in Structure View",
+     "",
+     "c header struct union enum typedef pragma pack custom types",
+     false},
 }};
 
 [[nodiscard]] constexpr std::string_view panel_id_slug(WorkspacePanelId panel) noexcept {
@@ -1760,6 +1768,7 @@ enum class CandidateKind : std::uint8_t {
     Annotation,
     String,
     CatalogType,
+    CustomCType,
     PrimaryDebugType,
     SecondaryDebugType,
     Bookmark,
@@ -2389,9 +2398,56 @@ PaletteQueryResult CommandPalette::query(
         }
 
         if (sources.structure_catalog == nullptr) {
+            const auto has_custom_type = [&sources](std::string_view name) noexcept {
+                for (const auto& ct : sources.custom_types) {
+                    if (iequals_ascii(ct.name, name)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            for (std::size_t i = 0u; i < sources.custom_types.size(); ++i) {
+                const auto& ct = sources.custom_types[i];
+                if (ct.name.empty()) {
+                    continue;
+                }
+                std::optional<int> sc = filter.empty()
+                    ? std::optional<int>(30)
+                    : score_with_keywords(ct.name, "Custom C");
+                if (!sc.has_value() && !filter.empty()) {
+                    for (const auto& alias : ct.aliases) {
+                        if (const auto asc = fuzzy_match_score(filter, alias, nullptr)) {
+                            sc = asc;
+                            break;
+                        }
+                    }
+                }
+                if (!sc.has_value()) {
+                    continue;
+                }
+                int boost = 0;
+                std::uint64_t seq = 0u;
+                if (has_mru) {
+                    std::array<char, 96> id_buf{};
+                    const auto r = std::format_to_n(
+                        id_buf.data(), id_buf.size(), "type:{}", ct.name);
+                    const std::string_view id_sv(
+                        id_buf.data(),
+                        std::min<std::size_t>(static_cast<std::size_t>(r.size), id_buf.size()));
+                    boost = mru_boost_for(id_sv);
+                    seq = mru_sequence_for(id_sv);
+                }
+                collector.push(CandidateHit{
+                    .kind = CandidateKind::CustomCType,
+                    .index = i,
+                    .score = *sc + 32 + boost,
+                    .mru_seq = seq,
+                });
+            }
             for (std::size_t i = 0u; i < sources.debug_types.size(); ++i) {
                 const auto& dt = sources.debug_types[i];
-                if (dt.name.empty() || has_catalog_type(dt.name)) {
+                if (dt.name.empty() || has_catalog_type(dt.name) || has_custom_type(dt.name)) {
                     continue;
                 }
                 const auto sc = filter.empty()
@@ -2408,7 +2464,7 @@ PaletteQueryResult CommandPalette::query(
             }
             for (std::size_t i = 0u; i < sources.secondary_types.size(); ++i) {
                 const auto& dt = sources.secondary_types[i];
-                if (dt.name.empty() || has_catalog_type(dt.name)) {
+                if (dt.name.empty() || has_catalog_type(dt.name) || has_custom_type(dt.name)) {
                     continue;
                 }
                 const auto sc = filter.empty()
@@ -2680,6 +2736,7 @@ PaletteQueryResult CommandPalette::query(
                 break;
             }
             case CandidateKind::CatalogType:
+            case CandidateKind::CustomCType:
             case CandidateKind::PrimaryDebugType:
             case CandidateKind::SecondaryDebugType: {
                 const DataTypeRecord* rec = nullptr;
@@ -2687,6 +2744,9 @@ PaletteQueryResult CommandPalette::query(
                 if (hit.kind == CandidateKind::CatalogType) {
                     rec = &cat_entries[hit.index].record;
                     origin_sv = to_string(cat_entries[hit.index].origin);
+                } else if (hit.kind == CandidateKind::CustomCType) {
+                    rec = &sources.custom_types[hit.index];
+                    origin_sv = "Custom C";
                 } else if (hit.kind == CandidateKind::PrimaryDebugType) {
                     rec = &sources.debug_types[hit.index];
                     origin_sv = "PDB / DWARF Debug Type";
@@ -2697,12 +2757,20 @@ PaletteQueryResult CommandPalette::query(
                 item.id = std::format("type:{}", rec->name);
                 item.category = PaletteCategory::Type;
                 item.title = rec->name;
-                item.subtitle = std::format(
-                    "{} · {} bytes · {} fields · {}",
-                    rec->is_union ? "union" : "struct",
-                    rec->size,
-                    rec->members.size(),
-                    origin_sv);
+                if (rec->is_enum) {
+                    item.subtitle = std::format(
+                        "enum · {} bytes · {} constants · {}",
+                        rec->size,
+                        rec->enum_constants.size(),
+                        origin_sv);
+                } else {
+                    item.subtitle = std::format(
+                        "{} · {} bytes · {} fields · {}",
+                        rec->is_union ? "union" : "struct",
+                        rec->size,
+                        rec->members.size(),
+                        origin_sv);
+                }
                 item.right_badge = std::format("{} B", rec->size);
                 item.primary_action = PaletteAction{
                     .kind = PaletteActionKind::OpenStructureView,
