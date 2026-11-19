@@ -991,6 +991,7 @@ void UiApp::render() {
     }
     if (show_demo_window_)
         ImGui::ShowDemoWindow(&show_demo_window_);
+    render_command_palette_overlay();
     apply_structure_selection_navigation();
     drain_pending_navigations();
     if (pending_slice_selection_.has_value()) {

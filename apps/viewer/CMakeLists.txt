@@ -60,6 +60,8 @@ add_library(peelf_gui SHARED
         src/ui/panel_helpers.cpp
         src/ui/context_actions.hpp
         src/ui/context_actions.cpp
+        src/ui/command_palette.hpp
+        src/ui/command_palette.cpp
         src/ui/ui_context_menu.hpp
         src/ui/ui_context_menu.cpp
         src/ui/ui_app.hpp

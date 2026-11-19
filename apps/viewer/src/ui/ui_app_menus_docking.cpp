@@ -9,10 +9,13 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <format>
+#include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -310,6 +313,14 @@ void UiApp::render_main_menu() {
         if (ImGui::IsKeyChordPressed(ImGuiMod_Alt | ImGuiKey_RightArrow) ||
             ImGui::IsKeyChordPressed(ImGuiMod_Shift | ImGuiKey_Backspace)) navigate_history(true);
     }
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_K, ImGuiInputFlags_RouteGlobal) ||
+        ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_P, ImGuiInputFlags_RouteGlobal)) {
+        open_command_palette();
+    }
+    if (!ImGui::GetIO().WantTextInput &&
+        ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_G, ImGuiInputFlags_RouteGlobal)) {
+        open_command_palette(":");
+    }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal) && on_open_file_) on_open_file_();
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal) && model_.has_file() && on_save_patched_as_) on_save_patched_as_();
     if (!ImGui::BeginMainMenuBar())
@@ -421,6 +432,13 @@ void UiApp::render_main_menu() {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Navigate")) {
+        if (ImGui::MenuItem("Command Palette / Omni-Search...", "Ctrl+K")) {
+            open_command_palette();
+        }
+        if (ImGui::MenuItem("Go to Address / Expression...", "Ctrl+G")) {
+            open_command_palette(":");
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Back", "Alt+Left", false, navigation_history_.can_back())) navigate_history(false);
         if (ImGui::MenuItem("Forward", "Alt+Right", false, navigation_history_.can_forward())) navigate_history(true);
         ImGui::Separator();
@@ -853,6 +871,558 @@ void UiApp::apply_workspace_preset(
 
 void UiApp::build_default_dock_layout(ImGuiID dockspace_id, const ImVec2& dockspace_size) {
     apply_workspace_preset(WorkspacePreset::StaticReverseEngineering, dockspace_id, dockspace_size);
+}
+
+namespace {
+
+int command_palette_input_callback(ImGuiInputTextCallbackData* /*data*/) {
+    // Consume history callback so Up/Down arrow keys move list selection without clearing InputText.
+    return 0;
+}
+
+[[nodiscard]] ImVec4 palette_category_badge_color(PaletteCategory cat) noexcept {
+    switch (cat) {
+        case PaletteCategory::GoTo:     return ImVec4(0.22f, 0.56f, 0.36f, 0.95f);
+        case PaletteCategory::Command:  return ImVec4(0.24f, 0.44f, 0.68f, 0.95f);
+        case PaletteCategory::Panel:    return ImVec4(0.30f, 0.38f, 0.54f, 0.95f);
+        case PaletteCategory::Preset:   return ImVec4(0.46f, 0.34f, 0.64f, 0.95f);
+        case PaletteCategory::Function: return ImVec4(0.62f, 0.42f, 0.18f, 0.95f);
+        case PaletteCategory::Symbol:   return ImVec4(0.52f, 0.46f, 0.22f, 0.95f);
+        case PaletteCategory::String:   return ImVec4(0.20f, 0.52f, 0.52f, 0.95f);
+        case PaletteCategory::Type:     return ImVec4(0.54f, 0.28f, 0.48f, 0.95f);
+        case PaletteCategory::Bookmark: return ImVec4(0.64f, 0.48f, 0.16f, 0.95f);
+        case PaletteCategory::Rule:     return ImVec4(0.66f, 0.26f, 0.26f, 0.95f);
+    }
+    return ImVec4(0.30f, 0.38f, 0.54f, 0.95f);
+}
+
+void render_highlighted_palette_title(
+    std::string_view title,
+    std::span<const FuzzyMatchSpan> spans,
+    bool enabled) {
+    const ImVec4 normal_col = enabled
+                                  ? ImGui::GetStyleColorVec4(ImGuiCol_Text)
+                                  : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+    const ImVec4 match_col = enabled
+                                 ? ImVec4(0.98f, 0.82f, 0.32f, 1.0f)
+                                 : ImVec4(0.72f, 0.62f, 0.32f, 0.85f);
+
+    if (spans.empty() || title.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, normal_col);
+        ImGui::TextUnformatted(title.data(), title.data() + title.size());
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    std::size_t cursor = 0u;
+    bool first_piece = true;
+    for (const FuzzyMatchSpan span : spans) {
+        const std::size_t start = std::min<std::size_t>(span.offset, title.size());
+        const std::size_t end =
+            std::min<std::size_t>(start + static_cast<std::size_t>(span.length), title.size());
+        if (start > cursor) {
+            if (!first_piece) {
+                ImGui::SameLine(0.0f, 0.0f);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, normal_col);
+            ImGui::TextUnformatted(title.data() + cursor, title.data() + start);
+            ImGui::PopStyleColor();
+            first_piece = false;
+        }
+        if (end > start) {
+            if (!first_piece) {
+                ImGui::SameLine(0.0f, 0.0f);
+            }
+            ImGui::PushStyleColor(ImGuiCol_Text, match_col);
+            ImGui::TextUnformatted(title.data() + start, title.data() + end);
+            ImGui::PopStyleColor();
+            first_piece = false;
+            cursor = end;
+        }
+    }
+    if (cursor < title.size()) {
+        if (!first_piece) {
+            ImGui::SameLine(0.0f, 0.0f);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, normal_col);
+        ImGui::TextUnformatted(title.data() + cursor, title.data() + title.size());
+        ImGui::PopStyleColor();
+    }
+}
+
+} // namespace
+
+void UiApp::open_command_palette(std::string_view initial_query) {
+    command_palette_query_buf_.fill('\0');
+    if (!initial_query.empty()) {
+        const std::size_t copy_len =
+            std::min(initial_query.size(), command_palette_query_buf_.size() - 1u);
+        std::copy_n(initial_query.data(), copy_len, command_palette_query_buf_.data());
+    }
+    command_palette_last_query_.assign(command_palette_query_buf_.data());
+    command_palette_selected_idx_ = 0u;
+    command_palette_scroll_to_selection_ = true;
+    open_command_palette_next_frame_ = true;
+    command_palette_focus_input_ = true;
+}
+
+void UiApp::enqueue_palette_action(const PaletteAction& action) {
+    if (!action.valid()) {
+        return;
+    }
+    if (auto nav_req = build_palette_navigation_request(action); nav_req.has_value()) {
+        pending_navigations_.enqueue(std::move(*nav_req));
+        return;
+    }
+
+    switch (action.kind) {
+        case PaletteActionKind::FocusPanel: {
+            const WorkspacePanelId panel = action.panel_id;
+            pending_navigations_.enqueue_custom([this, panel]() {
+                if (panel == WorkspacePanelId::Strings && model_.has_file()) {
+                    open_strings();
+                    return;
+                }
+                if (panel == WorkspacePanelId::ReferencesAndNotes && model_.has_file()) {
+                    open_references();
+                    return;
+                }
+                set_workspace_panel_visible(panel, true);
+                const std::string wname(workspace_panel_window_name(panel));
+                activate_panel(wname.c_str());
+            });
+            break;
+        }
+        case PaletteActionKind::TogglePanel: {
+            const WorkspacePanelId panel = action.panel_id;
+            pending_navigations_.enqueue_custom([this, panel]() {
+                const bool next = !is_workspace_panel_visible(panel);
+                set_workspace_panel_visible(panel, next);
+                if (next) {
+                    const std::string wname(workspace_panel_window_name(panel));
+                    activate_panel(wname.c_str());
+                }
+            });
+            break;
+        }
+        case PaletteActionKind::ApplyWorkspacePreset: {
+            const WorkspacePreset preset = action.preset;
+            pending_navigations_.enqueue_custom([this, preset]() {
+                request_workspace_preset(preset);
+            });
+            break;
+        }
+        case PaletteActionKind::OpenStructureView: {
+            const std::string type_name = action.type_name;
+            pending_navigations_.enqueue_custom([this, type_name]() {
+                open_structure_view(type_name);
+            });
+            break;
+        }
+        case PaletteActionKind::RunCommand: {
+            const PaletteCommandId cmd = action.command_id;
+            pending_navigations_.enqueue_custom([this, cmd]() {
+                switch (cmd) {
+                    case PaletteCommandId::OpenBinary:
+                        if (on_open_file_) {
+                            on_open_file_();
+                        }
+                        break;
+                    case PaletteCommandId::AttachToProcess:
+                        open_attach_process_modal();
+                        break;
+                    case PaletteCommandId::ConnectGdbRemote:
+                        open_gdb_remote_modal(false);
+                        break;
+                    case PaletteCommandId::OpenCrashDump:
+                        if (on_analysis_file_) {
+                            on_analysis_file_(4);
+                        }
+                        break;
+                    case PaletteCommandId::OpenDebugSymbols:
+                        if (model_.image() != nullptr && on_open_debug_symbols_) {
+                            on_open_debug_symbols_();
+                        }
+                        break;
+                    case PaletteCommandId::SaveProject:
+                        if (model_.has_file() && on_analysis_file_) {
+                            on_analysis_file_(1);
+                        }
+                        break;
+                    case PaletteCommandId::SavePatchedAs:
+                        if (!model_.is_live_process() && model_.editable_image() != nullptr &&
+                            on_save_patched_as_) {
+                            on_save_patched_as_();
+                        }
+                        break;
+                    case PaletteCommandId::DecompileCurrentFunction:
+                        if (model_.has_file()) {
+                            request_decompile();
+                        }
+                        break;
+                    case PaletteCommandId::ScanFullReferences:
+                        if (model_.has_file()) {
+                            open_references();
+                            if (reference_scanner_.has_resumable_work()) {
+                                reference_scanner_.scan_full(reference_index_);
+                            } else if (const auto* image = model_.image()) {
+                                std::vector<std::uint8_t> snapshot;
+                                if (model_.changed_intervals().empty()) {
+                                    const auto span = model_.analysis_image_bytes();
+                                    snapshot.assign(span.begin(), span.end());
+                                } else if (auto patched =
+                                               model_.read_effective_bytes(0, model_.bytes().size())) {
+                                    snapshot = std::move(*patched);
+                                }
+                                if (!snapshot.empty()) {
+                                    reference_scanner_.start(
+                                        reference_index_,
+                                        *image,
+                                        std::move(snapshot),
+                                        thumb_mode_,
+                                        std::numeric_limits<std::size_t>::max(),
+                                        &symbol_index_);
+                                }
+                            }
+                        }
+                        break;
+                    case PaletteCommandId::ToggleDemangleSymbols:
+                        model_.set_demangle_symbols(!model_.demangle_symbols());
+                        ++symbol_revision_;
+                        break;
+                    case PaletteCommandId::SwitchFlowGraphGalaxy:
+                        show_call_graph_panel_ = true;
+                        call_galaxy_.enabled = !call_galaxy_.enabled;
+                        if (call_galaxy_.enabled) {
+                            call_galaxy_.dirty = true;
+                            call_galaxy_.fit_requested = true;
+                        }
+                        activate_panel("Flow Graph");
+                        break;
+                    case PaletteCommandId::ResetWorkspaceLayout:
+                        request_workspace_reset();
+                        break;
+                    case PaletteCommandId::GoToEntryPoint:
+                        if (model_.image() != nullptr) {
+                            navigate_to_address(model_.image()->entry_point());
+                        }
+                        break;
+                    case PaletteCommandId::GoToAddressPrompt:
+                        open_command_palette(":");
+                        break;
+                }
+            });
+            break;
+        }
+        case PaletteActionKind::None:
+        case PaletteActionKind::NavigateAddress:
+        case PaletteActionKind::NavigateFileOffset:
+            break;
+    }
+}
+
+void UiApp::render_command_palette_overlay() {
+    if (open_command_palette_next_frame_) {
+        ImGui::OpenPopup("##CommandPalettePopup");
+        open_command_palette_next_frame_ = false;
+    }
+
+    ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float palette_width =
+        std::clamp(viewport->WorkSize.x * 0.56f, 520.0f, 880.0f);
+    const ImVec2 popup_pos(
+        viewport->WorkPos.x + (viewport->WorkSize.x - palette_width) * 0.5f,
+        viewport->WorkPos.y + viewport->WorkSize.y * 0.08f);
+
+    ImGui::SetNextWindowPos(popup_pos, ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(
+        ImVec2(palette_width, 160.0f),
+        ImVec2(palette_width, std::max(320.0f, viewport->WorkSize.y * 0.68f)));
+
+    const ImGuiWindowFlags popup_flags =
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_AlwaysAutoResize;
+
+    if (!ImGui::BeginPopup("##CommandPalettePopup", popup_flags)) {
+        return;
+    }
+
+    const std::string_view current_raw_query(command_palette_query_buf_.data());
+    const ParsedPaletteQuery parsed_preview = parse_palette_query(current_raw_query);
+
+    // Lazily populate strings index when user explicitly searches `#` Strings on a static file.
+    if (strings_dirty_ && model_.has_file() && !model_.is_live_process() &&
+        (parsed_preview.mode == PalettePrefixMode::Strings ||
+         (parsed_preview.mode == PalettePrefixMode::Omni && !parsed_preview.filter.empty()))) {
+        rebuild_strings();
+    }
+
+    // Merge UI debug types with BinaryModel debug types if both are populated.
+    std::vector<DataTypeRecord> merged_types{};
+    std::span<const DataTypeRecord> effective_debug_types = debug_types_;
+    if (effective_debug_types.empty()) {
+        effective_debug_types = model_.debug_types();
+    } else if (!model_.debug_types().empty()) {
+        merged_types.reserve(debug_types_.size() + model_.debug_types().size());
+        merged_types.insert(merged_types.end(), debug_types_.begin(), debug_types_.end());
+        merged_types.insert(
+            merged_types.end(), model_.debug_types().begin(), model_.debug_types().end());
+        effective_debug_types = merged_types;
+    }
+
+    PaletteDataSources sources = make_palette_data_sources(
+        model_,
+        &symbol_index_,
+        &annotations_,
+        &strings_index_,
+        effective_debug_types,
+        decompiled_.types);
+    sources.active_preset = active_workspace_preset_;
+    sources.flow_galaxy_enabled = call_galaxy_.enabled;
+    sources.has_panel_visibility = true;
+    for (const WorkspacePanelId panel : all_workspace_panels()) {
+        sources.panel_visibility[static_cast<std::size_t>(panel)] =
+            is_workspace_panel_visible(panel);
+    }
+
+    // Search Input Bar
+    if (command_palette_focus_input_) {
+        ImGui::SetKeyboardFocusHere();
+        command_palette_focus_input_ = false;
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint(
+        "##CommandPaletteSearchInput",
+        "Omni-search commands (>), symbols (@), strings (#), types (type:), rules (?), or expression (:main+0x20)...",
+        command_palette_query_buf_.data(),
+        command_palette_query_buf_.size(),
+        ImGuiInputTextFlags_CallbackHistory,
+        command_palette_input_callback);
+
+    const std::string_view updated_query(command_palette_query_buf_.data());
+    if (updated_query != command_palette_last_query_) {
+        command_palette_last_query_.assign(updated_query);
+        command_palette_selected_idx_ = 0u;
+        command_palette_scroll_to_selection_ = true;
+    }
+
+    // Prefix Shortcut Hint Bar (`>?@#`)
+    {
+        const auto set_prefix = [this](std::string_view pfx) {
+            command_palette_query_buf_.fill('\0');
+            std::copy_n(pfx.data(), pfx.size(), command_palette_query_buf_.data());
+            command_palette_last_query_.assign(pfx);
+            command_palette_selected_idx_ = 0u;
+            command_palette_scroll_to_selection_ = true;
+            command_palette_focus_input_ = true;
+        };
+        ImGui::TextDisabled("Mode:");
+        ImGui::SameLine(0.0f, 6.0f);
+        if (ImGui::SmallButton("All")) set_prefix("");
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::SmallButton("> Commands")) set_prefix(">");
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::SmallButton("@ Symbols")) set_prefix("@");
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::SmallButton("# Strings")) set_prefix("#");
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::SmallButton(": GoTo Expr")) set_prefix(":");
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::SmallButton("type: Structs")) set_prefix("type:");
+        ImGui::SameLine(0.0f, 4.0f);
+        if (ImGui::SmallButton("? Rules/Marks")) set_prefix("?");
+    }
+
+    const PaletteQueryResult result = command_palette_.query(updated_query, sources);
+    if (command_palette_selected_idx_ >= result.items.size()) {
+        command_palette_selected_idx_ =
+            result.items.empty() ? 0u : (result.items.size() - 1u);
+    }
+
+    // Keyboard Handling (`Up`/`Down`, `Ctrl+P`/`Ctrl+N`, `Enter`/`Shift+Enter`/`Ctrl+Enter`, `Esc`)
+    const ImGuiIO& io = ImGui::GetIO();
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        return;
+    }
+
+    const bool move_down =
+        ImGui::IsKeyPressed(ImGuiKey_DownArrow) ||
+        (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_N));
+    const bool move_up =
+        ImGui::IsKeyPressed(ImGuiKey_UpArrow) ||
+        (io.KeyCtrl && !io.KeyShift && !io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_P));
+
+    if (!result.items.empty()) {
+        if (move_down) {
+            command_palette_selected_idx_ =
+                (command_palette_selected_idx_ + 1u) % result.items.size();
+            command_palette_scroll_to_selection_ = true;
+        } else if (move_up) {
+            command_palette_selected_idx_ =
+                (command_palette_selected_idx_ == 0u)
+                    ? (result.items.size() - 1u)
+                    : (command_palette_selected_idx_ - 1u);
+            command_palette_scroll_to_selection_ = true;
+        }
+    }
+
+    bool should_close = false;
+    const auto trigger_item = [&](const PaletteItem& item, bool force_hex, bool force_decompile) {
+        if (!item.enabled) {
+            return;
+        }
+        command_palette_.record_execution(item.id);
+        if (item.primary_action.kind == PaletteActionKind::RunCommand &&
+            item.primary_action.command_id == PaletteCommandId::GoToAddressPrompt) {
+            open_command_palette(":");
+            open_command_palette_next_frame_ = false;
+            return;
+        }
+        if (force_decompile && item.tertiary_decompile_action.valid()) {
+            enqueue_palette_action(item.tertiary_decompile_action);
+        } else if (force_hex && item.secondary_hex_action.valid()) {
+            enqueue_palette_action(item.secondary_hex_action);
+        } else {
+            enqueue_palette_action(item.primary_action);
+        }
+        should_close = true;
+    };
+
+    const bool enter_pressed =
+        ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false);
+    if (enter_pressed && command_palette_selected_idx_ < result.items.size()) {
+        trigger_item(
+            result.items[command_palette_selected_idx_],
+            io.KeyShift,
+            io.KeyCtrl);
+    }
+
+    ImGui::Separator();
+
+    if (!result.expression_error.empty()) {
+        ImGui::TextColored(
+            ImVec4(0.95f, 0.48f, 0.40f, 1.0f),
+            "Expression: %s",
+            result.expression_error.c_str());
+    } else if (result.resolved_expression.has_value()) {
+        ImGui::TextColored(
+            ImVec4(0.48f, 0.88f, 0.62f, 1.0f),
+            "Resolved: %s",
+            result.resolved_expression->canonical_summary.c_str());
+    }
+
+    // Results List
+    const float row_height = ImGui::GetTextLineHeightWithSpacing() * 2.05f + 4.0f;
+    const float list_height = std::clamp(
+        static_cast<float>(std::max<std::size_t>(1u, result.items.size())) * row_height + 8.0f,
+        72.0f,
+        std::max(220.0f, viewport->WorkSize.y * 0.48f));
+
+    if (ImGui::BeginChild(
+            "##CommandPaletteResults",
+            ImVec2(palette_width - ImGui::GetStyle().WindowPadding.x * 2.0f, list_height),
+            ImGuiChildFlags_Borders)) {
+        if (result.items.empty()) {
+            ImGui::Spacing();
+            ImGui::TextDisabled(
+                "%s",
+                result.parsed_query.mode == PalettePrefixMode::GoToAddress
+                    ? "Type a VA, rva:0x1000, off:0x400, $entry, .text+0x20, or symbol+offset..."
+                    : "No matching commands, symbols, strings, types, or rules.");
+        }
+
+        for (std::size_t i = 0u; i < result.items.size(); ++i) {
+            const PaletteItem& item = result.items[i];
+            const bool is_selected = (i == command_palette_selected_idx_);
+            ImGui::PushID(static_cast<int>(i));
+
+            const ImVec2 row_start = ImGui::GetCursorPos();
+            if (ImGui::Selectable(
+                    "##PaletteRow",
+                    is_selected,
+                    ImGuiSelectableFlags_AllowOverlap,
+                    ImVec2(0.0f, row_height - 2.0f))) {
+                command_palette_selected_idx_ = i;
+                trigger_item(item, io.KeyShift, io.KeyCtrl);
+            }
+            if (is_selected && command_palette_scroll_to_selection_) {
+                ImGui::SetScrollHereY(0.35f);
+                command_palette_scroll_to_selection_ = false;
+            }
+
+            const float content_right = ImGui::GetContentRegionAvail().x + row_start.x;
+            ImGui::SetCursorPos(ImVec2(row_start.x + 6.0f, row_start.y + 2.0f));
+
+            // Category Badge
+            const std::string_view cat_str = to_string(item.category);
+            ImGui::PushStyleColor(ImGuiCol_Button, palette_category_badge_color(item.category));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, palette_category_badge_color(item.category));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, palette_category_badge_color(item.category));
+            ImGui::SmallButton(std::string(cat_str).c_str());
+            ImGui::PopStyleColor(3);
+
+            ImGui::SameLine(0.0f, 8.0f);
+            render_highlighted_palette_title(
+                item.title, item.title_match.highlight_spans(), item.enabled);
+
+            // Right-aligned VA/RVA/Shortcut Badge + quick Hex/Decompile buttons on selected row
+            float right_cursor = content_right - 6.0f;
+            if (is_selected && item.enabled) {
+                if (item.tertiary_decompile_action.valid()) {
+                    const float btn_w = ImGui::CalcTextSize("Decompile").x +
+                                        ImGui::GetStyle().FramePadding.x * 2.0f;
+                    right_cursor -= btn_w;
+                    ImGui::SetCursorPos(ImVec2(right_cursor, row_start.y + 2.0f));
+                    if (ImGui::SmallButton("Decompile")) {
+                        trigger_item(item, false, true);
+                    }
+                    right_cursor -= 4.0f;
+                }
+                if (item.secondary_hex_action.valid() &&
+                    item.secondary_hex_action.kind != PaletteActionKind::TogglePanel) {
+                    const float btn_w = ImGui::CalcTextSize("Hex").x +
+                                        ImGui::GetStyle().FramePadding.x * 2.0f;
+                    right_cursor -= btn_w;
+                    ImGui::SetCursorPos(ImVec2(right_cursor, row_start.y + 2.0f));
+                    if (ImGui::SmallButton("Hex")) {
+                        trigger_item(item, true, false);
+                    }
+                    right_cursor -= 6.0f;
+                }
+            }
+
+            if (!item.right_badge.empty()) {
+                const float badge_w = ImGui::CalcTextSize(item.right_badge.c_str()).x;
+                if (right_cursor > row_start.x + badge_w + 120.0f) {
+                    ImGui::SetCursorPos(ImVec2(right_cursor - badge_w, row_start.y + 3.0f));
+                    ImGui::TextDisabled("%s", item.right_badge.c_str());
+                }
+            }
+
+            // Subtitle provenance line
+            ImGui::SetCursorPos(
+                ImVec2(row_start.x + 10.0f,
+                       row_start.y + ImGui::GetTextLineHeightWithSpacing() + 3.0f));
+            ImGui::TextDisabled("%s", item.subtitle.c_str());
+
+            ImGui::SetCursorPos(ImVec2(row_start.x, row_start.y + row_height));
+            ImGui::PopID();
+        }
+    }
+    ImGui::EndChild();
+
+    ImGui::TextDisabled(
+        "Enter: Open  |  Shift+Enter: Hex View  |  Ctrl+Enter: Decompile  |  Up/Down (Ctrl+P/N): Navigate  |  Esc: Close");
+
+    if (should_close) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 } // namespace viewer

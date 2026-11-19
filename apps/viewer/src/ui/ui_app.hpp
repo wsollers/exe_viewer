@@ -18,6 +18,7 @@
 #include "model/binary_model.hpp"
 #include "model/recent_binaries.hpp"
 #include "ui_panels.hpp"
+#include "ui/command_palette.hpp"
 #include "ui/context_actions.hpp"
 #include "ui/workspace_layout.hpp"
 #include "ui_panels_references.hpp"
@@ -257,6 +258,14 @@ namespace viewer {
         bool show_disassembly_panel_ = true;
         bool show_call_graph_panel_ = false;
 
+        CommandPalette command_palette_{};
+        bool open_command_palette_next_frame_ = false;
+        bool command_palette_focus_input_ = false;
+        std::array<char, 512> command_palette_query_buf_{};
+        std::string command_palette_last_query_{};
+        std::size_t command_palette_selected_idx_ = 0u;
+        bool command_palette_scroll_to_selection_ = false;
+
         // .peproj v2 relocation, bookmarks, and autosave crash-recovery state
         std::filesystem::path current_project_path_;
         std::uint64_t current_project_saved_ms_ = 0;
@@ -474,6 +483,9 @@ namespace viewer {
         void apply_workspace_preset(WorkspacePreset preset, ImGuiID dockspace_id, const ImVec2& dockspace_size);
         void set_workspace_panel_visible(WorkspacePanelId panel, bool visible) noexcept;
         [[nodiscard]] bool is_workspace_panel_visible(WorkspacePanelId panel) const noexcept;
+        void open_command_palette(std::string_view initial_query = {});
+        void render_command_palette_overlay();
+        void enqueue_palette_action(const PaletteAction& action);
         void apply_structure_selection_navigation();
 
 

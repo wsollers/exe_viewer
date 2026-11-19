@@ -175,6 +175,31 @@ std::optional<std::uint64_t> UiApp::resolve_disasm_goto_query(std::string_view q
         }
     }
 
+    if (const auto expr_res = evaluate_address_expression(
+            query, make_address_expression_context(model_, &symbol_index_, &annotations_));
+        expr_res.has_value()) {
+        if (expr_res->virtual_address.has_value()) {
+            const std::uint64_t candidate_va = normalize_va(*expr_res->virtual_address);
+            if (model_.virtual_address_to_offset(candidate_va).has_value() ||
+                model_.is_live_process()) {
+                return candidate_va;
+            }
+            if (base_va != 0u && *expr_res->virtual_address < base_va &&
+                *expr_res->virtual_address <= std::numeric_limits<std::uint64_t>::max() - base_va) {
+                const std::uint64_t rva_candidate =
+                    normalize_va(base_va + *expr_res->virtual_address);
+                if (model_.virtual_address_to_offset(rva_candidate).has_value()) {
+                    return rva_candidate;
+                }
+            }
+        }
+        if (expr_res->file_offset.has_value()) {
+            if (const auto mapped_va = model_.offset_to_virtual_address(*expr_res->file_offset)) {
+                return normalize_va(*mapped_va);
+            }
+        }
+    }
+
     if (query.starts_with("off:") || query.starts_with("OFF:") ||
         query.starts_with("offset:") || query.starts_with("OFFSET:")) {
         const std::size_t colon = query.find(':');
@@ -535,14 +560,14 @@ std::optional<std::uint64_t> UiApp::resolve_disasm_goto_query(std::string_view q
         open_disasm_goto_popup_ = false;
     }
     if (ImGui::BeginPopup("DisasmGotoPopup")) {
-        ImGui::TextUnformatted("Go to Virtual Address, +RVA, off:Offset, or Symbol:");
+        ImGui::TextUnformatted("Go to Address / Expression (VA, rva:0x..., off:0x..., Symbol+Offset):");
         if (ImGui::IsWindowAppearing()) {
             ImGui::SetKeyboardFocusHere();
         }
-        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 24.0f);
+        ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
         const bool submitted = ImGui::InputTextWithHint(
             "##PopupDisasmGoto",
-            "e.g. 0x140001000, +0x1000, main",
+            "e.g. 0x140001000, main+0x20, .text+0x40, rva:0x1000",
             disasm_goto_buf_,
             sizeof(disasm_goto_buf_),
             ImGuiInputTextFlags_EnterReturnsTrue);
