@@ -505,8 +505,24 @@ void UiApp::render_attach_process_modal() {
             : sess->info().architecture;
         if (const std::optional<viewer::Architecture> arch = to_disassembler_architecture(target_arch)) {
             file_loaded_ = disasm_.init(*arch, to_disassembler_endianness(model_.endianness()));
+            thumb_mode_user_forced_ = false;
+            if (file_loaded_) {
+                (void)linear_disasm_.sync_with_model(model_, false, false);
+                if (*arch == Architecture::ARM32) {
+                    const std::uint64_t ep = model_.image() != nullptr
+                        ? model_.image()->entry_point()
+                        : model_.view_base_address();
+                    thumb_mode_ = ((ep & 1u) != 0u) || linear_disasm_.resolve_thumb_at_address(ep);
+                    (void)disasm_.set_thumb_mode(thumb_mode_);
+                    model_.set_analysis_thumb_mode(thumb_mode_);
+                    linear_disasm_.set_thumb_mode(thumb_mode_, false);
+                }
+            } else {
+                linear_disasm_.clear();
+            }
         } else {
             file_loaded_ = false;
+            linear_disasm_.clear();
         }
 
         if (navigate_to_entry) {

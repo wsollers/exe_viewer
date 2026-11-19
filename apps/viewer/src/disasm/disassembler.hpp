@@ -209,11 +209,11 @@ public:
                 break;
             case Architecture::RISCV32:
                 cs_architecture = CS_ARCH_RISCV;
-                cs_mode_flags = CS_MODE_RISCV32;
+                cs_mode_flags = static_cast<cs_mode>(CS_MODE_RISCV32 | CS_MODE_RISCVC);
                 break;
             case Architecture::RISCV64:
                 cs_architecture = CS_ARCH_RISCV;
-                cs_mode_flags = CS_MODE_RISCV64;
+                cs_mode_flags = static_cast<cs_mode>(CS_MODE_RISCV64 | CS_MODE_RISCVC);
                 break;
             default:
                 return false;

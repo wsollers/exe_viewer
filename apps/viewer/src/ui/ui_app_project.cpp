@@ -97,8 +97,11 @@ void UiApp::poll_project_autosave(bool force_now) {
 
 void UiApp::apply_loaded_project_metadata(const AnalysisProject& project) {
     thumb_mode_ = project.thumb;
+    thumb_mode_user_forced_ = project.thumb;
     if (model_.image() != nullptr && model_.image()->architecture() == peelf::Architecture::ARM) {
         disasm_.set_thumb_mode(thumb_mode_);
+        model_.set_analysis_thumb_mode(thumb_mode_);
+        linear_disasm_.set_thumb_mode(thumb_mode_, thumb_mode_user_forced_);
     }
     if (!project.symbols.empty()) {
         model_.add_debug_symbols(project.symbols);

@@ -14,6 +14,7 @@
 #include "symbols/symbol_index.hpp"
 #include "tools/shellcode_converter.hpp"
 #include "ui_panel.hpp"
+#include "disasm/linear_disassembly.hpp"
 #include "ui/logger.hpp"
 #include "ui/ui_context_menu.hpp"
 #include "analysis/patch_preview.hpp"
@@ -141,6 +142,11 @@ namespace viewer {
         void navigate_to_range(std::uint64_t file_offset, std::uint64_t size);
         void navigate_to_ranges(std::span<const ByteRange> ranges);
         void clear_selection() noexcept;
+        void set_unavailable_reason(std::string reason);
+        void clear_unavailable_reason() noexcept { unavailable_reason_.clear(); }
+        [[nodiscard]] const std::string& unavailable_reason() const noexcept { return unavailable_reason_; }
+        void set_address_display_mode(AddressDisplayMode mode) noexcept { address_mode_ = mode; }
+        [[nodiscard]] AddressDisplayMode address_display_mode() const noexcept { return address_mode_; }
     protected:
         void draw_contents() override;
     private:
@@ -152,6 +158,8 @@ namespace viewer {
         std::optional<std::uint64_t> pending_scroll_offset_;
         std::size_t bytes_per_row_ = 16;
         std::uint64_t goto_offset_ = 0;
+        AddressDisplayMode address_mode_ = AddressDisplayMode::FileOffset;
+        std::string unavailable_reason_{};
         char edit_bytes_[4096] = {};
         std::string edit_status_;
         std::function<void(std::uint64_t, std::uint64_t)> on_byte_activated_;

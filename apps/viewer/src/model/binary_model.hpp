@@ -393,6 +393,7 @@ namespace viewer {
         [[nodiscard]] std::vector<peelf::PatchInterval> staged_live_patches() const;
         [[nodiscard]] std::vector<peelf::PatchInterval> committed_live_patches() const;
         [[nodiscard]] BytePatchState byte_patch_state_at_offset(std::uint64_t offset) const noexcept;
+        [[nodiscard]] std::optional<std::uint8_t> original_byte_at_offset(std::uint64_t offset) const;
         [[nodiscard]] bool is_byte_patched(std::uint64_t offset) const noexcept {
             return byte_patch_state_at_offset(offset) != BytePatchState::Unchanged;
         }

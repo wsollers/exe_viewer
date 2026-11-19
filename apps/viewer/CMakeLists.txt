@@ -117,6 +117,8 @@ add_library(peelf_gui SHARED
         src/vulkan/shaders/byte_viz_comp_spirv.hpp
         src/analysis/async_binary_diff.hpp
         src/analysis/async_binary_diff.cpp
+        src/disasm/linear_disassembly.hpp
+        src/disasm/linear_disassembly.cpp
         src/analysis/function_index.hpp
         src/analysis/function_index.cpp
         src/analysis/reference_index.cpp

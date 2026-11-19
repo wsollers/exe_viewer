@@ -59,8 +59,7 @@ void draw_permissions(bool readable, bool writable, bool executable) {
 
             const std::uint64_t range_size = s.file_size != 0 ? s.file_size : s.virtual_size;
             const bool can_navigate =
-                s.file_size != 0 &&
-                s.file_offset <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()) &&
+                (s.file_size != 0 || s.virtual_size != 0) &&
                 range_size <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max());
 
             ImGui::PushID(static_cast<int>(section_index));

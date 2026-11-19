@@ -22,6 +22,10 @@ public:
     void set_pause_callback(std::function<void()> callback) { pause_ = std::move(callback); }
     void set_resume_callback(std::function<void()> callback) { resume_ = std::move(callback); }
     void set_scan_full_callback(std::function<void()> callback) { scan_full_ = std::move(callback); }
+    void focus_incoming_to_selection() noexcept {
+        direction_ = 1;
+        filter_[0] = '\0';
+    }
 protected:
     void draw_contents() override;
 private:

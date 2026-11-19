@@ -1961,6 +1961,38 @@ using detail::utf8_path;
         return BytePatchState::Unchanged;
     }
 
+    std::optional<std::uint8_t> BinaryModel::original_byte_at_offset(std::uint64_t offset) const {
+        if (is_live_process()) {
+            if (offset >= live_window_size_ ||
+                offset > std::numeric_limits<std::uint64_t>::max() - live_window_base_) {
+                return std::nullopt;
+            }
+            const std::uint64_t va = live_window_base_ + offset;
+            for (const peelf::PatchInterval& iv : live_patches_.staged_intervals()) {
+                if (va >= iv.offset && va - iv.offset < iv.original.size()) {
+                    return iv.original[static_cast<std::size_t>(va - iv.offset)];
+                }
+            }
+            for (const peelf::CommittedPatchInterval& ci : live_patches_.committed_intervals()) {
+                if (va >= ci.address && va - ci.address < ci.original.size()) {
+                    return ci.original[static_cast<std::size_t>(va - ci.address)];
+                }
+            }
+            return std::nullopt;
+        }
+
+        if (offset < bytes_.size()) {
+            return bytes_[static_cast<std::size_t>(offset)];
+        }
+        if (editable_image_) {
+            if (const auto orig = editable_image_->read_original(offset, 1u);
+                orig.has_value() && !orig->empty()) {
+                return (*orig)[0];
+            }
+        }
+        return std::nullopt;
+    }
+
     const std::string& BinaryModel::content_sha256() const {
         if (cached_sha256_generation_ == content_generation_ &&
             cached_sha256_revision_ == edit_revision_) {

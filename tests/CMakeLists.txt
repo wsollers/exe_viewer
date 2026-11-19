@@ -93,7 +93,9 @@ add_executable(peelf_tests
   byte_viz_test.cpp
   timeline_viewport_test.cpp
   call_graph_galaxy_test.cpp
+  linear_disassembly_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/disasm/linear_disassembly.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/ui/workspace_layout.cpp

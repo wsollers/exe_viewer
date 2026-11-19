@@ -35,6 +35,7 @@
 #include "ui_panels_byte_viz.hpp"
 #include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
+#include "disasm/linear_disassembly.hpp"
 #include "graph/call_graph.hpp"
 #include "graph/call_graph_galaxy.hpp"
 #include "symbols/symbol_index.hpp"
@@ -235,8 +236,22 @@ namespace viewer {
         std::vector<PrePassRecorderCallback> pre_pass_recorders_;
 
         viewer::Disassembler disasm_;
+        LinearDisassemblyView linear_disasm_;
         bool file_loaded_ = false;
         bool thumb_mode_ = false;
+        bool thumb_mode_user_forced_ = false;
+        AddressDisplayMode disasm_address_mode_ = AddressDisplayMode::VirtualAddress;
+        bool disasm_follow_hex_ = true;
+        bool disasm_show_source_lines_ = true;
+        char disasm_goto_buf_[256] = {};
+        std::string disasm_goto_status_{};
+        bool open_disasm_goto_popup_ = false;
+        bool open_disasm_rename_popup_ = false;
+        bool open_disasm_comment_popup_ = false;
+        std::uint64_t disasm_modal_target_va_ = 0;
+        char disasm_rename_buf_[256] = {};
+        char disasm_comment_buf_[2048] = {};
+        std::optional<std::uint64_t> pending_disasm_scroll_va_{};
         bool reset_dock_layout_ = false;
         std::optional<bool> compact_dock_layout_;
         bool show_disassembly_panel_ = true;
@@ -414,6 +429,8 @@ namespace viewer {
         void open_structure_view(std::string_view type_name = {},
                                  std::optional<std::uint64_t> address = std::nullopt,
                                  bool is_file_offset = false);
+        [[nodiscard]] std::optional<std::uint64_t> resolve_disasm_goto_query(
+            std::string_view query) const;
         void render_dockspace();
         void render_attach_process_modal();
         void render_gdb_remote_modal();

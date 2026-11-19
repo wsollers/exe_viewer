@@ -447,18 +447,49 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
         [this](const peelf::Section& section, std::uint64_t object_index) {
             const peelf::Section section_copy = section;
             pending_navigations_.enqueue_custom([this, section_copy, object_index]() {
+                const std::uint64_t range_size =
+                    section_copy.file_size != 0 ? section_copy.file_size : section_copy.virtual_size;
+                if (!model_.is_live_process()) {
+                    const HexAvailabilityStatus avail =
+                        evaluate_section_hex_availability(section_copy, model_.view_size());
+                    if (!avail.available) {
+                        current_selection_ = ViewerSelection{
+                            .kind = SelectionKind::Section,
+                            .label = section_copy.name,
+                            .file_offset = std::nullopt,
+                            .virtual_address = section_copy.virtual_address,
+                            .size = std::max(section_copy.file_size, section_copy.virtual_size),
+                            .object_index = object_index,
+                            .preferred_view = PreferredView::Hex,
+                        };
+                        hex_panel_.set_unavailable_reason(avail.unavailable_reason);
+                        hex_panel_.set_visible(true);
+                        activate_panel("Hex View");
+                        last_navigation_selection_ = current_selection_;
+                        return;
+                    }
+                }
                 const std::optional<std::uint64_t> nav_offset =
                     model_.is_live_process()
                         ? model_.virtual_address_to_offset(section_copy.virtual_address)
                         : std::optional<std::uint64_t>(section_copy.file_offset);
                 if (!nav_offset) {
-                    Log().warn("Section '{}' at 0x{:X} is outside the active window",
-                               section_copy.name,
-                               section_copy.virtual_address);
+                    current_selection_ = ViewerSelection{
+                        .kind = SelectionKind::Section,
+                        .label = section_copy.name,
+                        .file_offset = std::nullopt,
+                        .virtual_address = section_copy.virtual_address,
+                        .size = std::max(section_copy.file_size, section_copy.virtual_size),
+                        .object_index = object_index,
+                        .preferred_view = PreferredView::Hex,
+                    };
+                    hex_panel_.set_unavailable_reason(std::format(
+                        "Section '{}' at VA 0x{:X} is outside the active live memory window.",
+                        section_copy.name,
+                        section_copy.virtual_address));
+                    last_navigation_selection_ = current_selection_;
                     return;
                 }
-                const std::uint64_t range_size =
-                    section_copy.file_size != 0 ? section_copy.file_size : section_copy.virtual_size;
                 current_selection_ = ViewerSelection{
                     .kind = SelectionKind::Section,
                     .label = section_copy.name,
@@ -834,10 +865,38 @@ void UiApp::render() {
                 ImGui::PushID(static_cast<int>((section.virtual_address ^ section.file_offset) & 0x7FFFFFFFu));
                 ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(section.executable ? ImGuiCol_HeaderActive : ImGuiCol_FrameBg));
                 if (ImGui::Button(section.name.c_str())) {
-                    const auto nav_off = model_.is_live_process()
-                        ? model_.virtual_address_to_offset(section.virtual_address)
-                        : std::optional<std::uint64_t>(section.file_offset);
-                    if (nav_off) {
+                    if (!model_.is_live_process()) {
+                        const HexAvailabilityStatus avail =
+                            evaluate_section_hex_availability(section, model_.view_size());
+                        if (!avail.available) {
+                            current_selection_ = ViewerSelection{
+                                .kind = SelectionKind::Section,
+                                .label = section.name,
+                                .file_offset = std::nullopt,
+                                .virtual_address = section.virtual_address,
+                                .size = sec_size,
+                                .preferred_view = PreferredView::Hex,
+                            };
+                            hex_panel_.set_unavailable_reason(avail.unavailable_reason);
+                            last_navigation_selection_ = current_selection_;
+                        } else {
+                            hex_panel_.navigate_to_range(clamp_to_size_t(section.file_offset), 1);
+                            if (section.executable) {
+                                const auto disasm_win = static_cast<std::size_t>(
+                                    std::clamp<std::uint64_t>(sec_size, 4096u, 65536u));
+                                disassemble_at_offset(section.file_offset, section.virtual_address, disasm_win);
+                            }
+                            current_selection_ = ViewerSelection{
+                                .kind = SelectionKind::Section,
+                                .label = section.name,
+                                .file_offset = section.file_offset,
+                                .virtual_address = section.virtual_address,
+                                .size = sec_size,
+                                .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex
+                            };
+                            last_navigation_selection_ = current_selection_;
+                        }
+                    } else if (const auto nav_off = model_.virtual_address_to_offset(section.virtual_address)) {
                         hex_panel_.navigate_to_range(clamp_to_size_t(*nav_off), 1);
                         if (section.executable) {
                             const auto disasm_win = static_cast<std::size_t>(
@@ -852,6 +911,7 @@ void UiApp::render() {
                             .size = sec_size,
                             .preferred_view = section.executable ? PreferredView::Disassembly : PreferredView::Hex
                         };
+                        last_navigation_selection_ = current_selection_;
                     }
                 }
                 ImGui::PopStyleColor();
@@ -1077,7 +1137,8 @@ void UiApp::process_deferred_gpu_work() {
     reference_scanner_.poll(reference_index_);
     if (reference_revision_ != model_.edit_revision() || reference_thumb_mode_ != thumb_mode_)
         references_dirty_ = true;
-    if ((references_panel_.visible() || strings_panel_.visible() || show_call_graph_panel_) &&
+    if ((references_panel_.visible() || strings_panel_.visible() ||
+         show_call_graph_panel_ || show_disassembly_panel_) &&
         references_dirty_ && model_.image())
         rebuild_references();
     if (strings_revision_ != model_.edit_revision())
@@ -1236,8 +1297,12 @@ void UiApp::process_deferred_gpu_work() {
         disassembly_location_.reset();
         last_disasm_offset_.reset();
         current_instructions_.clear();
+        linear_disasm_.clear();
+        pending_disasm_scroll_va_.reset();
         disasm_status_.clear();
         thumb_mode_ = false;
+        thumb_mode_user_forced_ = false;
+        hex_panel_.clear_selection();
         active_graph_root_.reset();
         current_call_graph_.reset();
         current_call_graph_layout_.reset();
@@ -1324,11 +1389,23 @@ void UiApp::process_deferred_gpu_work() {
         file_loaded_ = true;
         current_instructions_.clear();
         disasm_status_.clear();
+        thumb_mode_user_forced_ = false;
+        (void)linear_disasm_.sync_with_model(model_, false, false);
+        if (*arch == Architecture::ARM32) {
+            const std::uint64_t ep = img->entry_point();
+            thumb_mode_ = ((ep & 1u) != 0u) || linear_disasm_.resolve_thumb_at_address(ep);
+            (void)disasm_.set_thumb_mode(thumb_mode_);
+            model_.set_analysis_thumb_mode(thumb_mode_);
+            linear_disasm_.set_thumb_mode(thumb_mode_, false);
+        }
 
-        if (const auto entry_offset = img->virtual_address_to_file_offset(img->entry_point())) {
+        const std::uint64_t clean_entry = (*arch == Architecture::ARM32)
+            ? (img->entry_point() & ~std::uint64_t{1u})
+            : img->entry_point();
+        if (const auto entry_offset = img->virtual_address_to_file_offset(clean_entry)) {
             hex_panel_.navigate_to_range(clamp_to_size_t(*entry_offset), 1);
             last_navigation_selection_ = current_selection_;
-            disassemble_at_offset(static_cast<std::size_t>(*entry_offset), img->entry_point());
+            disassemble_at_offset(static_cast<std::size_t>(*entry_offset), clean_entry);
         }
 
         call_graph_sample_ = CallGraphSample::LoadedImage;
