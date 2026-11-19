@@ -29,6 +29,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/dependency_tree.cpp
   src/demangle.cpp
   src/dwarf.cpp
+  src/pdb.cpp
   src/subprocess.cpp
   src/atomic_file_writer.hpp
   src/atomic_file_writer.cpp
@@ -88,6 +89,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/dependency_tree.hpp
   include/peelf/demangle.hpp
   include/peelf/dwarf.hpp
+  include/peelf/pdb.hpp
   include/peelf/subprocess.hpp
   include/peelf/assembler.hpp
   include/peelf/patching.hpp

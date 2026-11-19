@@ -52,6 +52,7 @@ add_executable(peelf_tests
   patch_navigation_test.cpp
   call_graph_test.cpp
   symbol_index_test.cpp
+  pdb_parser_test.cpp
   reference_index_test.cpp
   strings_index_test.cpp
   demangle_dwarf_test.cpp
