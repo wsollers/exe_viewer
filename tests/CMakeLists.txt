@@ -99,6 +99,7 @@ add_executable(peelf_tests
   signatures_and_crypto_test.cpp
   macho_core_and_dsym_test.cpp
   decompiler_contract_test.cpp
+  golden_summary_and_debug_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/disasm/linear_disassembly.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp

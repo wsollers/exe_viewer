@@ -117,12 +117,14 @@ struct SecurityAuditReport {
 enum class HeadlessExportFormat : std::uint8_t {
     Json = 0,
     Sarif = 1,
+    Csv = 2,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(HeadlessExportFormat fmt) noexcept {
     switch (fmt) {
         case HeadlessExportFormat::Json:  return "json";
         case HeadlessExportFormat::Sarif: return "sarif";
+        case HeadlessExportFormat::Csv:   return "csv";
     }
     return "json";
 }
@@ -209,6 +211,11 @@ struct HeadlessAnalysisReport {
 
 /// Serializes `report` to valid OASIS SARIF 2.1.0 JSON for CI / GitHub Code Scanning.
 [[nodiscard]] std::string format_headless_report_sarif(
+    const HeadlessAnalysisReport& report);
+
+/// Serializes `report` to RFC 4180 CSV summary rows (summary, sections, imports, exports,
+/// security findings, YARA-lite rule matches, and crypto/packer constant hits).
+[[nodiscard]] std::string format_headless_report_csv(
     const HeadlessAnalysisReport& report);
 
 /// Evaluates deterministic CI exit code (`0` = clean, `2` = policy violation triggered by `fail_on`).

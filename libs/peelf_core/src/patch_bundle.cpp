@@ -124,6 +124,18 @@ struct JsonValue {
         }
         return std::nullopt;
     }
+
+    [[nodiscard]] std::optional<std::int64_t> as_i64() const noexcept {
+        if (const auto* i = std::get_if<std::int64_t>(&data)) {
+            return *i;
+        }
+        if (const auto* u = std::get_if<std::uint64_t>(&data);
+            u != nullptr &&
+            *u <= static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+            return static_cast<std::int64_t>(*u);
+        }
+        return std::nullopt;
+    }
 };
 
 class JsonParser {
@@ -504,6 +516,8 @@ Result<PatchBundle> export_patch_bundle_from_image(
         entry.label = std::format("Patch #{} @ {:#x}", i + 1u, iv.offset);
         entry.original_bytes = iv.original;
         entry.patched_bytes = iv.patched;
+        entry.timestamp_unix_ms = iv.timestamp_unix_ms;
+        entry.note = iv.note;
         bundle.entries.push_back(std::move(entry));
     }
     return bundle;
@@ -537,6 +551,9 @@ std::string encode_patch_bundle_json(const PatchBundle& bundle) {
         }
         os << "      \"label\": ";
         append_json_escaped(os, e.label);
+        os << ",\n      \"note\": ";
+        append_json_escaped(os, e.note);
+        os << ",\n      \"timestamp_unix_ms\": " << e.timestamp_unix_ms;
         os << ",\n      \"asm_source\": ";
         if (e.asm_source.has_value()) {
             append_json_escaped(os, *e.asm_source);
@@ -642,6 +659,24 @@ Result<PatchBundle> decode_patch_bundle_json(std::string_view json_text) {
 
         if (const JsonValue* lbl = find_field(*eobj, "label")) {
             if (const auto* s = lbl->as_string()) entry.label = *s;
+        }
+
+        if (const JsonValue* note_val = find_field(*eobj, "note");
+            note_val != nullptr && !note_val->is_null()) {
+            const auto* s = note_val->as_string();
+            if (s == nullptr) {
+                return make_error(std::format("Entry [{}] 'note' must be string or null", i));
+            }
+            entry.note = *s;
+        }
+
+        if (const JsonValue* ts_val = find_field(*eobj, "timestamp_unix_ms");
+            ts_val != nullptr && !ts_val->is_null()) {
+            const auto ts = ts_val->as_i64();
+            if (!ts.has_value()) {
+                return make_error(std::format("Entry [{}] has invalid 'timestamp_unix_ms'", i));
+            }
+            entry.timestamp_unix_ms = *ts;
         }
 
         if (const JsonValue* asm_val = find_field(*eobj, "asm_source");
@@ -928,10 +963,13 @@ Result<void> apply_patch_bundle(
                                      : (!bundle.name.empty()
                                             ? std::format("Apply patch bundle '{}'", bundle.name)
                                             : "Apply patch bundle");
+    const std::string tx_note = !options.transaction_note.empty()
+                                    ? options.transaction_note
+                                    : bundle.description;
 
-    PatchTransaction tx = target.begin_transaction(tx_label);
+    PatchTransaction tx = target.begin_transaction(tx_label, tx_note);
     for (const PatchBundleEntry& entry : bundle.entries) {
-        auto w = tx.write(entry.offset, entry.patched_bytes);
+        auto w = tx.write(entry.offset, entry.patched_bytes, entry.note);
         if (!w.has_value()) {
             tx.rollback();
             return std::unexpected(w.error());
@@ -949,6 +987,282 @@ Result<void> apply_patch_bundle(const PatchBundle& /*bundle*/,
                                 IProcessSession& /*live_session*/) {
     return make_error(
         "Live process sessions are strictly read-only; patch bundles cannot be applied to live memory");
+}
+
+Result<std::vector<std::uint8_t>> encode_ips_patch(std::span<const PatchInterval> intervals) {
+    constexpr std::uint64_t kIps24Limit = 0x1000000ULL;
+    constexpr std::uint64_t kIps32Limit = 0x100000000ULL;
+    constexpr std::uint64_t kIpsEofOffset = 0x454F46ULL;     // "EOF"
+    constexpr std::uint64_t kIps32EeofOffset = 0x45454F46ULL; // "EEOF"
+    constexpr std::size_t kMaxChunkLen = 0xFFFFu;
+
+    struct CoalescedRun {
+        std::uint64_t offset{0};
+        std::vector<std::uint8_t> bytes{};
+    };
+
+    std::vector<CoalescedRun> sorted_runs;
+    sorted_runs.reserve(intervals.size());
+    for (std::size_t i = 0; i < intervals.size(); ++i) {
+        const PatchInterval& iv = intervals[i];
+        const auto sz = static_cast<std::uint64_t>(iv.patched.size());
+        if (iv.offset >= kIps32Limit || sz > kIps32Limit - iv.offset) {
+            return make_error(std::format(
+                "IPS/IPS32 patch interval [{}] at {:#x} (+{} B) exceeds 4 GiB limit",
+                i, iv.offset, sz));
+        }
+        if (iv.patched.empty()) {
+            continue;
+        }
+        sorted_runs.push_back(CoalescedRun{
+            .offset = iv.offset,
+            .bytes = iv.patched,
+        });
+    }
+
+    std::sort(sorted_runs.begin(),
+              sorted_runs.end(),
+              [](const CoalescedRun& a, const CoalescedRun& b) noexcept {
+                  return a.offset < b.offset;
+              });
+
+    std::vector<CoalescedRun> merged;
+    merged.reserve(sorted_runs.size());
+    for (CoalescedRun& cur : sorted_runs) {
+        if (!merged.empty()) {
+            CoalescedRun& prev = merged.back();
+            const std::uint64_t prev_end =
+                prev.offset + static_cast<std::uint64_t>(prev.bytes.size());
+            if (cur.offset < prev_end) {
+                return make_error(std::format(
+                    "IPS/IPS32 patch intervals overlap at offset {:#x}", cur.offset));
+            }
+            if (cur.offset == prev_end) {
+                prev.bytes.insert(prev.bytes.end(), cur.bytes.begin(), cur.bytes.end());
+                continue;
+            }
+        }
+        merged.push_back(std::move(cur));
+    }
+
+    bool use_ips32 = false;
+    for (const CoalescedRun& run : merged) {
+        const std::uint64_t run_end =
+            run.offset + static_cast<std::uint64_t>(run.bytes.size());
+        if (run.offset >= kIps24Limit || run_end > kIps24Limit ||
+            run.offset == kIpsEofOffset) {
+            use_ips32 = true;
+            break;
+        }
+    }
+
+    std::vector<std::uint8_t> out;
+    if (use_ips32) {
+        out.insert(out.end(), {'I', 'P', 'S', '3', '2'});
+    } else {
+        out.insert(out.end(), {'P', 'A', 'T', 'C', 'H'});
+    }
+
+    const std::uint64_t marker_collision_offset =
+        use_ips32 ? kIps32EeofOffset : kIpsEofOffset;
+
+    for (const CoalescedRun& run : merged) {
+        std::size_t pos = 0;
+        while (pos < run.bytes.size()) {
+            const std::uint64_t chunk_offset = run.offset + static_cast<std::uint64_t>(pos);
+            const std::size_t remaining = run.bytes.size() - pos;
+            std::size_t chunk_len = std::min<std::size_t>(remaining, kMaxChunkLen);
+            if (remaining > chunk_len &&
+                (chunk_offset + static_cast<std::uint64_t>(chunk_len)) == marker_collision_offset &&
+                chunk_len > 1u) {
+                --chunk_len;
+            }
+
+            if (use_ips32) {
+                out.push_back(static_cast<std::uint8_t>((chunk_offset >> 24u) & 0xFFu));
+                out.push_back(static_cast<std::uint8_t>((chunk_offset >> 16u) & 0xFFu));
+                out.push_back(static_cast<std::uint8_t>((chunk_offset >> 8u) & 0xFFu));
+                out.push_back(static_cast<std::uint8_t>(chunk_offset & 0xFFu));
+            } else {
+                out.push_back(static_cast<std::uint8_t>((chunk_offset >> 16u) & 0xFFu));
+                out.push_back(static_cast<std::uint8_t>((chunk_offset >> 8u) & 0xFFu));
+                out.push_back(static_cast<std::uint8_t>(chunk_offset & 0xFFu));
+            }
+
+            out.push_back(static_cast<std::uint8_t>((chunk_len >> 8u) & 0xFFu));
+            out.push_back(static_cast<std::uint8_t>(chunk_len & 0xFFu));
+            out.insert(out.end(),
+                       run.bytes.begin() + static_cast<std::ptrdiff_t>(pos),
+                       run.bytes.begin() + static_cast<std::ptrdiff_t>(pos + chunk_len));
+            pos += chunk_len;
+        }
+    }
+
+    if (use_ips32) {
+        out.insert(out.end(), {'E', 'E', 'O', 'F'});
+    } else {
+        out.insert(out.end(), {'E', 'O', 'F'});
+    }
+    return out;
+}
+
+Result<std::vector<PatchInterval>> decode_ips_patch(std::span<const std::uint8_t> ips_bytes) {
+    if (ips_bytes.size() < 8u) {
+        return make_error("IPS/IPS32 patch stream is truncated (< 8 bytes)");
+    }
+
+    bool is_ips32 = false;
+    if (ips_bytes[0] == 'P' && ips_bytes[1] == 'A' && ips_bytes[2] == 'T' &&
+        ips_bytes[3] == 'C' && ips_bytes[4] == 'H') {
+        is_ips32 = false;
+    } else if (ips_bytes[0] == 'I' && ips_bytes[1] == 'P' && ips_bytes[2] == 'S' &&
+               ips_bytes[3] == '3' && ips_bytes[4] == '2') {
+        is_ips32 = true;
+    } else {
+        return make_error("Unrecognized IPS header (expected 'PATCH' or 'IPS32')");
+    }
+
+    const std::size_t offset_width = is_ips32 ? 4u : 3u;
+    const std::size_t trailer_len = is_ips32 ? 4u : 3u;
+    constexpr std::uint64_t kIps32Limit = 0x100000000ULL;
+
+    std::size_t pos = 5u;
+    bool saw_trailer = false;
+    std::vector<PatchInterval> raw_chunks;
+
+    while (pos < ips_bytes.size()) {
+        const std::size_t rem = ips_bytes.size() - pos;
+        const bool matches_trailer =
+            is_ips32
+                ? (rem >= 4u && ips_bytes[pos] == 'E' && ips_bytes[pos + 1u] == 'E' &&
+                   ips_bytes[pos + 2u] == 'O' && ips_bytes[pos + 3u] == 'F')
+                : (rem >= 3u && ips_bytes[pos] == 'E' && ips_bytes[pos + 1u] == 'O' &&
+                   ips_bytes[pos + 2u] == 'F');
+
+        // A valid record + trailer requires at least offset_width + 2 + 1 + trailer_len
+        // (9 bytes for IPS, 11 bytes for IPS32), whereas the EOF trailer (with or without
+        // optional target truncation length) leaves trailer_len or 2 * trailer_len bytes.
+        if (matches_trailer && (rem == trailer_len || rem == trailer_len * 2u)) {
+            saw_trailer = true;
+            pos = ips_bytes.size();
+            break;
+        }
+
+        if (rem < offset_width + 2u) {
+            return make_error("Truncated IPS/IPS32 record header before trailer");
+        }
+
+        std::uint64_t rec_offset = 0;
+        if (is_ips32) {
+            rec_offset = (static_cast<std::uint64_t>(ips_bytes[pos]) << 24u) |
+                         (static_cast<std::uint64_t>(ips_bytes[pos + 1u]) << 16u) |
+                         (static_cast<std::uint64_t>(ips_bytes[pos + 2u]) << 8u) |
+                         static_cast<std::uint64_t>(ips_bytes[pos + 3u]);
+        } else {
+            rec_offset = (static_cast<std::uint64_t>(ips_bytes[pos]) << 16u) |
+                         (static_cast<std::uint64_t>(ips_bytes[pos + 1u]) << 8u) |
+                         static_cast<std::uint64_t>(ips_bytes[pos + 2u]);
+        }
+        pos += offset_width;
+
+        const std::size_t rec_len =
+            (static_cast<std::size_t>(ips_bytes[pos]) << 8u) |
+            static_cast<std::size_t>(ips_bytes[pos + 1u]);
+        pos += 2u;
+
+        PatchInterval chunk;
+        chunk.offset = rec_offset;
+        if (rec_len == 0u) {
+            // RLE chunk: 16-bit big-endian repeat count + 1-byte fill value.
+            if (ips_bytes.size() - pos < 3u) {
+                return make_error("Truncated IPS/IPS32 RLE record payload");
+            }
+            const std::size_t rle_count =
+                (static_cast<std::size_t>(ips_bytes[pos]) << 8u) |
+                static_cast<std::size_t>(ips_bytes[pos + 1u]);
+            const std::uint8_t fill_byte = ips_bytes[pos + 2u];
+            pos += 3u;
+            if (rle_count == 0u) {
+                return make_error("Invalid zero-length IPS/IPS32 RLE record");
+            }
+            if (rec_offset >= kIps32Limit || rle_count > kIps32Limit - rec_offset) {
+                return make_error("Decoded IPS/IPS32 RLE record exceeds 4 GiB limit");
+            }
+            chunk.patched.assign(rle_count, fill_byte);
+        } else {
+            if (ips_bytes.size() - pos < rec_len) {
+                return make_error("Truncated IPS/IPS32 literal record payload");
+            }
+            if (rec_offset >= kIps32Limit || rec_len > kIps32Limit - rec_offset) {
+                return make_error("Decoded IPS/IPS32 record exceeds 4 GiB limit");
+            }
+            chunk.patched.assign(ips_bytes.begin() + static_cast<std::ptrdiff_t>(pos),
+                                 ips_bytes.begin() + static_cast<std::ptrdiff_t>(pos + rec_len));
+            pos += rec_len;
+        }
+        raw_chunks.push_back(std::move(chunk));
+    }
+
+    if (!saw_trailer) {
+        return make_error(is_ips32 ? "Missing 'EEOF' trailer in IPS32 patch"
+                                   : "Missing 'EOF' trailer in IPS patch");
+    }
+
+    std::sort(raw_chunks.begin(),
+              raw_chunks.end(),
+              [](const PatchInterval& a, const PatchInterval& b) noexcept {
+                  return a.offset < b.offset;
+              });
+
+    std::vector<PatchInterval> coalesced;
+    coalesced.reserve(raw_chunks.size());
+    for (PatchInterval& cur : raw_chunks) {
+        if (!coalesced.empty()) {
+            PatchInterval& prev = coalesced.back();
+            if (cur.offset < prev.end_offset()) {
+                return make_error(std::format(
+                    "Overlapping IPS/IPS32 records at offset {:#x}", cur.offset));
+            }
+            if (cur.offset == prev.end_offset()) {
+                prev.patched.insert(prev.patched.end(), cur.patched.begin(), cur.patched.end());
+                continue;
+            }
+        }
+        coalesced.push_back(std::move(cur));
+    }
+    return coalesced;
+}
+
+Result<void> save_ips_patch_file(std::span<const PatchInterval> intervals,
+                                 const std::filesystem::path& path) {
+    if (path.empty()) {
+        return make_error("IPS patch output path is empty");
+    }
+    auto encoded = encode_ips_patch(intervals);
+    if (!encoded.has_value()) {
+        return std::unexpected(encoded.error());
+    }
+    return detail::write_bytes_atomically(path, *encoded, true, true);
+}
+
+Result<std::vector<PatchInterval>> load_ips_patch_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        return make_error(std::format("Failed to open IPS patch '{}'", path.string()));
+    }
+    const auto end_pos = in.tellg();
+    if (end_pos < 0) {
+        return make_error(std::format("Failed to query IPS patch size '{}'", path.string()));
+    }
+    std::vector<std::uint8_t> buf(static_cast<std::size_t>(end_pos));
+    in.seekg(0, std::ios::beg);
+    if (!buf.empty()) {
+        in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()));
+        if (in.gcount() != static_cast<std::streamsize>(buf.size())) {
+            return make_error(std::format("Failed reading IPS patch '{}'", path.string()));
+        }
+    }
+    return decode_ips_patch(buf);
 }
 
 } // namespace peelf

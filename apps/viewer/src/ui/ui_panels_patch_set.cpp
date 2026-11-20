@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -19,6 +20,24 @@
 
 namespace viewer {
 namespace {
+
+[[nodiscard]] std::string format_utc_timestamp_ms(std::int64_t timestamp_unix_ms) {
+    if (timestamp_unix_ms <= 0) {
+        return "-";
+    }
+    using namespace std::chrono;
+    const sys_time<milliseconds> tp{milliseconds{timestamp_unix_ms}};
+    const auto day_point = floor<days>(tp);
+    const year_month_day ymd{day_point};
+    const hh_mm_ss hms{floor<seconds>(tp - day_point)};
+    return std::format("{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d} UTC",
+                       static_cast<int>(ymd.year()),
+                       static_cast<unsigned int>(ymd.month()),
+                       static_cast<unsigned int>(ymd.day()),
+                       static_cast<int>(hms.hours().count()),
+                       static_cast<int>(hms.minutes().count()),
+                       static_cast<int>(hms.seconds().count()));
+}
 
 [[nodiscard]] std::string format_bytes(const std::vector<std::uint8_t>& bytes, std::size_t max_visible = 8) {
     std::string output;
@@ -51,9 +70,11 @@ void PatchSetPanel::reset_for_new_target() {
     reset_preview();
     loaded_target_path_.clear();
     bundle_path_[0] = '\0';
+    ips_path_[0] = '\0';
     bundle_name_[0] = '\0';
     bundle_desc_[0] = '\0';
     asm_input_[0] = '\0';
+    patch_note_[0] = '\0';
     status_message_.clear();
 }
 
@@ -158,16 +179,23 @@ void PatchSetPanel::draw_contents() {
         bundle_status_.clear();
         if (!current_target_path.empty()) {
             const std::string def_path = current_target_path + ".pepatch.json";
+            const std::string def_ips = current_target_path + ".ips";
             std::snprintf(bundle_path_, sizeof(bundle_path_), "%s", def_path.c_str());
+            std::snprintf(ips_path_, sizeof(ips_path_), "%s", def_ips.c_str());
             const std::string fname = path_filename_utf8(utf8_to_filesystem_path(current_target_path));
             std::snprintf(bundle_name_, sizeof(bundle_name_), "%s patches", fname.c_str());
         } else {
             bundle_path_[0] = '\0';
+            ips_path_[0] = '\0';
             bundle_name_[0] = '\0';
         }
     } else if (bundle_path_[0] == '\0' && !current_target_path.empty()) {
         const std::string def_path = current_target_path + ".pepatch.json";
         std::snprintf(bundle_path_, sizeof(bundle_path_), "%s", def_path.c_str());
+        if (ips_path_[0] == '\0') {
+            const std::string def_ips = current_target_path + ".ips";
+            std::snprintf(ips_path_, sizeof(ips_path_), "%s", def_ips.c_str());
+        }
         if (bundle_name_[0] == '\0') {
             const std::string fname = path_filename_utf8(utf8_to_filesystem_path(current_target_path));
             std::snprintf(bundle_name_, sizeof(bundle_name_), "%s patches", fname.c_str());
@@ -204,6 +232,12 @@ void PatchSetPanel::draw_contents() {
         preview_.reset();
         refresh_live_assembly_preview();
     }
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##patch_note",
+                             "Analyst note (optional, recorded with transaction & .pepatch.json)",
+                             patch_note_,
+                             sizeof(patch_note_));
 
     if (input_mode_ == 0) {
         ImGui::TextDisabled("Preview a fixed-size hexadecimal replacement at the selected file offset.");
@@ -357,8 +391,12 @@ void PatchSetPanel::draw_contents() {
 
         ImGui::BeginDisabled(preview_->revision != model_.edit_revision());
         if (ImGui::Button("Stage Patch")) {
+            preview_->note = patch_note_;
             auto result = apply_preview(model_, *preview_);
             status_ = result ? "Patch staged into PagedBinaryImage. Undo is available." : result.error().message;
+            if (result) {
+                patch_note_[0] = '\0';
+            }
             preview_.reset();
             if (result && on_patch_mutated_) {
                 on_patch_mutated_();
@@ -397,16 +435,54 @@ void PatchSetPanel::draw_contents() {
         ImGui::TextWrapped("%s", status_.c_str());
     }
 
+    if (editable != nullptr) {
+        const auto commit_history = editable->undo_history();
+        if (!commit_history.empty() && ImGui::CollapsingHeader("Transaction History")) {
+            if (ImGui::BeginTable("PatchTxHistoryTable",
+                                  4,
+                                  ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                      ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
+                                  ImVec2(0.0f, 110.0f))) {
+                ImGui::TableSetupColumn("Committed (UTC)", ImGuiTableColumnFlags_WidthFixed, 155.0f);
+                ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.40f);
+                ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                ImGui::TableSetupColumn("Analyst Note", ImGuiTableColumnFlags_WidthStretch, 0.60f);
+                ImGui::TableHeadersRow();
+
+                for (auto it = commit_history.rbegin(); it != commit_history.rend(); ++it) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    const std::string ts = format_utc_timestamp_ms(it->timestamp_unix_ms);
+                    ImGui::TextUnformatted(ts.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(it->label.c_str());
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%" PRIu64, it->total_bytes);
+                    ImGui::TableNextColumn();
+                    if (!it->note.empty()) {
+                        ImGui::TextUnformatted(it->note.c_str());
+                    } else {
+                        ImGui::TextDisabled("-");
+                    }
+                }
+                ImGui::EndTable();
+            }
+        }
+    }
+
     const std::vector<peelf::PatchInterval> patches = model_.changed_intervals();
 
     // -----------------------------------------------------------------------
-    // Reusable Patch Bundles (.pepatch.json)
+    // Reusable Patch Bundles (.pepatch.json) & IPS/IPS32 Export
     // -----------------------------------------------------------------------
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Reusable Patch Bundles (.pepatch.json)", ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (ImGui::CollapsingHeader("Reusable Patch Bundles (.pepatch.json) & IPS Export", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint("##bundle_path", "Bundle path (.pepatch.json)",
                                  bundle_path_, sizeof(bundle_path_));
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##ips_path", "IPS / IPS32 patch path (.ips)",
+                                 ips_path_, sizeof(ips_path_));
         ImGui::SetNextItemWidth(220.0f);
         ImGui::InputTextWithHint("##bundle_name", "Bundle name", bundle_name_, sizeof(bundle_name_));
         ImGui::SameLine();
@@ -427,6 +503,18 @@ void PatchSetPanel::draw_contents() {
                                                    bundle_path_)
                                      : saved.error().message;
             }
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(patches.empty() || ips_path_[0] == '\0' || !model_.has_file());
+        if (ImGui::Button("Export IPS...")) {
+            const std::filesystem::path ips_fs_path = utf8_to_filesystem_path(ips_path_);
+            auto saved = peelf::save_ips_patch_file(patches, ips_fs_path);
+            bundle_status_ = saved.has_value()
+                                 ? std::format("Exported {} patch range(s) as IPS/IPS32 to '{}'.",
+                                               patches.size(),
+                                               ips_path_)
+                                 : saved.error().message;
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
@@ -537,16 +625,18 @@ void PatchSetPanel::draw_contents() {
     ImGui::Separator();
 
     if (ImGui::BeginTable("PatchSetTable",
-                          5,
+                          7,
                           ImGuiTableFlags_Borders |
                               ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_Resizable |
                               ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Original", ImGuiTableColumnFlags_WidthStretch, 0.5f);
-        ImGui::TableSetupColumn("Patched", ImGuiTableColumnFlags_WidthStretch, 0.5f);
-        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, 105.0f);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 65.0f);
+        ImGui::TableSetupColumn("Original", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+        ImGui::TableSetupColumn("Patched", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+        ImGui::TableSetupColumn("Committed (UTC)", ImGuiTableColumnFlags_WidthFixed, 155.0f);
+        ImGui::TableSetupColumn("Note", ImGuiTableColumnFlags_WidthStretch, 0.30f);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableHeadersRow();
 
         for (std::size_t i = 0; i < patches.size(); ++i) {
@@ -580,6 +670,18 @@ void PatchSetPanel::draw_contents() {
             ImGui::TableNextColumn();
             const std::string patched = format_bytes(patch.patched);
             ImGui::TextUnformatted(patched.c_str());
+
+            ImGui::TableNextColumn();
+            const std::string ts = format_utc_timestamp_ms(patch.timestamp_unix_ms);
+            ImGui::TextUnformatted(ts.c_str());
+
+            ImGui::TableNextColumn();
+            if (!patch.note.empty()) {
+                ImGui::TextUnformatted(patch.note.c_str());
+            } else {
+                ImGui::TextDisabled("-");
+            }
+
             ImGui::TableNextColumn();
             ImGui::PushID(static_cast<int>(i));
             if (ImGui::SmallButton("Revert")) {

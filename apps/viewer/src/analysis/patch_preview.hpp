@@ -29,6 +29,7 @@ struct PatchPreview {
     std::string boundary_warning{};
     std::optional<std::string> asm_source{};
     std::string label{"Reviewed byte replacement"};
+    std::string note{};
 };
 
 [[nodiscard]] std::vector<Instruction> disassemble_patch_bytes(

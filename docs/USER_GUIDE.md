@@ -473,16 +473,17 @@ Open **Patch Set** (**Edit > Patch workspace** or **View > Patch Set**) and sele
    - As you type, `Patch Set` encodes instructions against the exact target **Virtual Address** (so relative `call`/`jmp`/`b`/`jal` displacements compute accurately) and shows a **Live Capstone Round-Trip** disassembly + byte count.
    - **NOP Padding**: Check **`Pad trailing overwritten instruction slack with NOPs`** to automatically emit architecture-appropriate NOPs (`0x90` on x86/x64, `0xD503201F` on ARM64, `0x00000013` on RISC-V, etc.) when your replacement is shorter than the overwritten instruction span, preventing misaligned mid-instruction fallthrough!
    - Click **`Preview Assembly Patch`** to inspect boundary warnings and a side-by-side **Before vs. After Basic-Block CFG** table.
-3. **Commit to Staging, Undo/Redo & Save As**:
-   - Click **`Stage Patch`** to commit a `PatchTransaction` into `PagedBinaryImage`. Modified bytes highlight immediately in **Hex View** and **Disassembly**.
+3. **Commit to Staging, Analyst Notes, Undo/Redo & Save As**:
+   - Enter an optional **Analyst note** alongside your hex or assembly patch, then click **`Stage Patch`** to commit a `PatchTransaction` (stamped with its UTC commit timestamp and note) into `PagedBinaryImage`. Multi-megabyte generated spans automatically spill to a private `0600` unlinked temp workspace off `/mnt/c` so memory usage stays bounded, while modified bytes highlight immediately in **Hex View**, **Disassembly**, and **Patch Set > Transaction History**.
    - Use **Edit > Undo patch** / **Edit > Redo patch** to step backward or forward across transactions.
    - Press **`Ctrl+Shift+S`** (**File > Save Patched As...**) to export the patched executable to a new file path, or **File > Export Patch Report...** for an audit log.
 
-### 8.2 Reusable `.pepatch.json` Patch Bundles
+### 8.2 Reusable `.pepatch.json` Patch Bundles & `IPS` / `IPS32` Binary Patches
 
 Share deterministic patches with teammates without redistributing proprietary binaries:
 
-- **Export**: In **Patch Set**, specify a bundle path (`<binary>.pepatch.json`), description, and click **Export Patch Bundle...**. Each hunk records `offset`, `virtual_address`, `original_bytes_hex`, `patched_bytes_hex`, optional `asm_source`, plus target `expected_sha256` and `expected_size`.
+- **Export `.pepatch.json`**: In **Patch Set**, specify a bundle path (`<binary>.pepatch.json`), description, and click **Export Patch Bundle...**. Each hunk records `offset`, `virtual_address`, `original_bytes_hex`, `patched_bytes_hex`, optional `asm_source`, analyst `note`, `timestamp_unix_ms`, plus target `expected_sha256` and `expected_size`.
+- **Export `IPS` / `IPS32`**: Specify an `.ips` path and click **Export IPS...** to emit standard `"PATCH"..."EOF"` records (`24-bit` offsets, automatic `> 0xFFFF` chunking, and `0x454F46` `"EOF"` offset collision handling) or automatic `"IPS32"..."EEOF"` (`32-bit` offsets when patches touch `>= 16 MiB`, cleanly rejecting `>= 4 GiB`).
 - **Import & Pre-Apply Conflict Verification**: Load a `.pepatch.json` bundle to inspect a per-hunk conflict preview (`Ready`, `AlreadyApplied`, `OriginalBytesMismatch`, `OutOfBounds`, or whole-file `SHA-256` mismatch). Applying stages **all** hunks as a single atomic, undoable `PatchTransaction`—if any hunk conflicts, zero bytes are mutated.
 
 Bundle controls include **Import & Preview Patch Bundle...**, **Apply Patch Bundle Atomically**, and **Dismiss Bundle Preview**. **Allow SHA-256 mismatch when all original byte spans match** relaxes whole-file identity checking, but does not bypass conflicting byte spans. Use **Revert** on a staged interval to restore that interval.
@@ -581,7 +582,7 @@ flowchart TD
 
 Choose **File > Attach to Process...** or **Inspect > Attach to Process (Read-Only Default)...**:
 
-- Filter processes by name, PID, user, or command line; toggle **Accessible only**, enter a manual PID, or click **Attach Self** to inspect `peelf_viewer` itself.
+- Filter processes by name, PID, user, or command line; toggle **Accessible only** or cycle-safe **Tree view (PPID)** hierarchy, sort or hide any of the 11 inventory columns (`PID`, `PPID`, `Name`, `Arch`, `Threads`, `Memory (RSS)`, `Handles/FDs`, `CPU`, `User / Integrity`, `Access`, `Executable / Command Line`), enter a manual PID, or click **Attach Self** to inspect `peelf_viewer` itself.
 - **Strict Read-Only Guarantee**: Read-only sessions do not write target memory. Unmapped or guard-paged ranges render safely as `??` in **Hex View** via `read_memory_tolerant`.
 - Switch between loaded `.exe`/`.dll`/`.so`/`[vdso]` modules in the **Memory Map** active-module selector or the **Structure** tree (`Modules (...)`)—all headers, symbols, imports, exports, disassembly, and decompilation rebase onto the live ASLR address automatically!
 - Read-only attachment prevents byte writes; **Pause Process**, **Resume Process**, and thread pause/resume controls still affect execution when explicitly used.
@@ -613,7 +614,7 @@ Open **Memory Heatmap** (**View > Memory Heatmap**) to inspect page-level physic
 Open **Memory Search** (**Edit > Memory Search** or **Navigate > Memory Search**):
 
 - **Scopes** (on live processes): `Heap (default)`, `Selected Region`, `Active Module`, or `All Readable Memory` (automatically skipping multi-terabyte sparse/unresident sanitizer shadow reservations).
-- **13 Value Types**: `Hex Pattern` with `??` byte wildcards (e.g. `48 8B ?? 10`), signed/unsigned integers (`Int8`/`UInt8` .. `Int64`/`UInt64`), IEEE floats (`Float32`, `Float64`), `Text (UTF-8 / ASCII)`, and `Text (UTF-16)`.
+- **14 Value Types**: `Hex Pattern` with `??` byte wildcards (e.g. `48 8B ?? 10`), signed/unsigned integers (`Int8`/`UInt8` .. `Int64`/`UInt64`), IEEE floats (`Float32`, `Float64`), `Text (UTF-8 / ASCII)`, `Text (UTF-16)`, and safe bounded **`Regex (UTF-8)`** (guarded against invalid syntax, backreferences, excessive nesting/quantifiers, and catastrophic backtracking via NUL-delimited 2 KiB sliding windows).
 - Configure **Endianness** (`Target Auto`, `Little-Endian`, `Big-Endian`), **Alignment** (`1`, `2`, `4`, `8` bytes), `Case-sensitive`, and `Max hits`; click any match to inspect in **Hex View** or **Structure View**.
 
 For static files, the scope is **Static Binary Image**. Enter a query and click **Search** or press Enter. Check the report’s scanned/skipped regions and limits before treating an empty result as exhaustive.
@@ -776,6 +777,7 @@ flowchart LR
     parse --> fmt{"--format"}
     fmt -->|json| json["Deterministic JSON Report<br/>(Summary · Deps · Security · Diff)"]
     fmt -->|sarif| sarif["OASIS SARIF 2.1.0<br/>(GitHub Code Scanning Upload)"]
+    fmt -->|csv| csv["RFC 4180 CSV Summary<br/>(Findings · Sections · Imports · Exports)"]
     parse --> gate{"--fail-on<br/>none | error | warning"}
     gate -->|Pass| e0["Exit Code 0"]
     gate -->|Policy Violation| e2["Exit Code 2"]
@@ -796,7 +798,7 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | `--slice <index\|arch>` | Select a specific Universal Mach-O slice by 0-based index (e.g. `0`, `1`) or architecture name (e.g. `arm64`, `arm64e`, `x86_64`) |
 | `--rules <path>` | Repeatable `.yar`/`.yara` file or directory of YARA-lite rules; matches are emitted in `--format json` (`signatures.yara_matches`) and `--format sarif`, and participate in `--fail-on` policy gates |
 | `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only; matches Universal Mach-O slices automatically or via `--slice`) |
-| `--format <json\|sarif\|text>` | Output format: structured `json` (default for audits), **OASIS SARIF 2.1.0** (`sarif`), or human-readable `text` for scripts. Audits accept only `json` (default) or `sarif`; scripts accept only `text` (default) or `json` |
+| `--format <json\|sarif\|csv\|text>` | Output format: structured `json` (default for audits), **OASIS SARIF 2.1.0** (`sarif`), **RFC 4180 CSV** (`csv`, emitting properly quoted `summary`, `section`, `import`, `export`, `finding`, `yara_match`, `crypto_packer`, and `diff` rows), or human-readable `text` for scripts. Audits accept `json` (default), `sarif`, or `csv`; scripts accept `text` (default) or `json` |
 | `--output <path>` | Write report or script output to `<path>` instead of `stdout` |
 | `--script <file.lua>` | Execute a sandboxed Lua 5.4 script (`peelf.*` API) against `<binary_or_dump>` in **read-only mode by default** |
 | `--script-allow-mutations` | Explicitly permit `--script` to stage and `peelf.commit()` byte patches and workspace annotations on static binaries |

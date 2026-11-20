@@ -246,12 +246,14 @@ namespace viewer {
         bool pad_nops_to_boundary_ = false;
         char replacement_[4096]{};
         char asm_input_[8192]{};
+        char patch_note_[256]{};
         std::optional<ShellcodeTargetConfig> last_asm_target_;
         std::vector<std::uint8_t> live_asm_bytes_;
         std::vector<Instruction> live_asm_disasm_;
         std::string live_asm_diag_;
         std::optional<PatchPreview> preview_;
         char bundle_path_[1024]{};
+        char ips_path_[1024]{};
         char bundle_name_[256]{};
         char bundle_desc_[512]{};
         bool bundle_allow_hash_mismatch_ = false;

@@ -259,9 +259,9 @@ peelf::Result<void> apply_preview(BinaryModel& model, const PatchPreview& previe
     }
     if (model.edit_revision() != preview.revision) return peelf::make_error("Preview is stale; preview the current bytes again");
     const std::string label = preview.label.empty() ? "Reviewed byte replacement" : preview.label;
-    auto applied = model.apply_patch_bytes(preview.offset, preview.replacement, label);
+    auto applied = model.apply_patch_bytes(preview.offset, preview.replacement, label, preview.note);
     if (applied.has_value()) {
-        model.record_patch_metadata(preview.offset, label, preview.asm_source);
+        model.record_patch_metadata(preview.offset, label, preview.asm_source, preview.note);
     }
     return applied;
 }
@@ -272,6 +272,8 @@ std::string patch_report(const BinaryModel& model) {
     for (const auto& patch : model.changed_intervals()) {
         out << std::format("\nOffset: 0x{:X}  Size: {}", patch.offset, patch.patched.size());
         if (model.image()) if (auto va = model.image()->file_offset_to_virtual_address(patch.offset)) out << std::format("  VA: 0x{:X}", *va);
+        if (patch.timestamp_unix_ms > 0) out << std::format("  TimestampMs: {}", patch.timestamp_unix_ms);
+        if (!patch.note.empty()) out << "\nNote: " << patch.note;
         out << "\nOriginal:";
         for (auto b : patch.original) out << std::format(" {:02X}", b);
         out << "\nReplacement:";

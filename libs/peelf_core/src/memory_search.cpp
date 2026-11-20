@@ -12,6 +12,7 @@
 #include <format>
 #include <limits>
 #include <optional>
+#include <regex>
 #include <span>
 #include <string>
 #include <string_view>
@@ -25,6 +26,174 @@ namespace {
 constexpr std::size_t kMaxPreviewBytes = 32u;
 constexpr std::size_t kDefaultChunkBytes = 256u * 1024u;
 constexpr std::size_t kFallbackPageBytes = 4096u;
+constexpr std::size_t kMaxRegexPatternBytes = 512u;
+constexpr std::size_t kMaxRegexWindowBytes = 2048u;
+constexpr std::size_t kRegexWindowOverlapBytes = 256u;
+constexpr std::size_t kMaxRegexGroupDepth = 8u;
+constexpr std::size_t kMaxRegexBraceRepeat = 64u;
+
+[[nodiscard]] Result<std::regex> validate_and_compile_regex(std::string_view pattern,
+                                                            bool case_sensitive) {
+    if (pattern.empty()) {
+        return make_error("regex search query must not be empty");
+    }
+    if (pattern.size() > kMaxRegexPatternBytes) {
+        return make_error("regex search pattern exceeds 512-byte safety limit");
+    }
+
+    bool in_char_class = false;
+    std::size_t char_class_start = 0u;
+    std::vector<bool> group_has_inner_quantifier;
+    group_has_inner_quantifier.reserve(kMaxRegexGroupDepth);
+
+    auto mark_quantifier_in_current_group = [&]() {
+        if (!group_has_inner_quantifier.empty()) {
+            group_has_inner_quantifier.back() = true;
+        }
+    };
+
+    for (std::size_t i = 0u; i < pattern.size(); ++i) {
+        const char ch = pattern[i];
+        if (ch == '\0') {
+            return make_error("regex search pattern must not contain NUL bytes");
+        }
+
+        if (ch == '\\') {
+            if (i + 1u >= pattern.size()) {
+                return make_error("invalid trailing backslash in regex search pattern");
+            }
+            const char next = pattern[++i];
+            if (next == '\0') {
+                return make_error("regex search pattern must not contain NUL bytes");
+            }
+            if (!in_char_class && next >= '1' && next <= '9') {
+                return make_error(
+                    "regex backreferences (\\1..\\9) are disallowed for bounded-time safety");
+            }
+            continue;
+        }
+
+        if (in_char_class) {
+            if (ch == ']' && i > char_class_start + 1u) {
+                in_char_class = false;
+            }
+            continue;
+        }
+
+        if (ch == '[') {
+            in_char_class = true;
+            char_class_start = i;
+            if (i + 1u < pattern.size() && pattern[i + 1u] == '^') {
+                char_class_start = i + 1u;
+            }
+            continue;
+        }
+
+        if (ch == '(') {
+            if (group_has_inner_quantifier.size() >= kMaxRegexGroupDepth) {
+                return make_error("regex group nesting exceeds maximum depth of 8");
+            }
+            group_has_inner_quantifier.push_back(false);
+            if (i + 1u < pattern.size() && pattern[i + 1u] == '?') {
+                ++i;
+                if (i + 1u < pattern.size() &&
+                    (pattern[i + 1u] == ':' || pattern[i + 1u] == '=' || pattern[i + 1u] == '!')) {
+                    ++i;
+                }
+            }
+            continue;
+        }
+
+        if (ch == ')') {
+            if (group_has_inner_quantifier.empty()) {
+                return make_error("unmatched closing parenthesis in regex search pattern");
+            }
+            const bool inner_quant = group_has_inner_quantifier.back();
+            group_has_inner_quantifier.pop_back();
+
+            const bool outer_quant =
+                (i + 1u < pattern.size()) &&
+                (pattern[i + 1u] == '*' || pattern[i + 1u] == '+' ||
+                 pattern[i + 1u] == '?' || pattern[i + 1u] == '{');
+            if (inner_quant && outer_quant) {
+                return make_error(
+                    "nested quantified group rejected to prevent catastrophic backtracking");
+            }
+            if ((inner_quant || outer_quant) && !group_has_inner_quantifier.empty()) {
+                group_has_inner_quantifier.back() = true;
+            }
+            continue;
+        }
+
+        if (ch == '*' || ch == '+' || ch == '?') {
+            mark_quantifier_in_current_group();
+            continue;
+        }
+
+        if (ch == '{') {
+            const std::size_t close = pattern.find('}', i + 1u);
+            if (close == std::string_view::npos) {
+                return make_error("unterminated brace quantifier in regex search pattern");
+            }
+            const std::string_view spec = pattern.substr(i + 1u, close - (i + 1u));
+            if (spec.empty()) {
+                return make_error("empty brace quantifier in regex search pattern");
+            }
+            const std::size_t comma = spec.find(',');
+            const std::string_view first_part =
+                (comma == std::string_view::npos) ? spec : spec.substr(0u, comma);
+            std::size_t min_rep = 0u;
+            const auto [p1, ec1] = std::from_chars(
+                first_part.data(), first_part.data() + first_part.size(), min_rep);
+            if (ec1 != std::errc{} || p1 != first_part.data() + first_part.size() ||
+                first_part.empty()) {
+                return make_error("invalid minimum count in regex brace quantifier");
+            }
+            if (min_rep > kMaxRegexBraceRepeat) {
+                return make_error("regex brace repetition exceeds safety limit of 64");
+            }
+            if (comma != std::string_view::npos) {
+                const std::string_view second_part = spec.substr(comma + 1u);
+                if (!second_part.empty()) {
+                    if (second_part.find(',') != std::string_view::npos) {
+                        return make_error("invalid regex brace quantifier syntax");
+                    }
+                    std::size_t max_rep = 0u;
+                    const auto [p2, ec2] = std::from_chars(
+                        second_part.data(), second_part.data() + second_part.size(), max_rep);
+                    if (ec2 != std::errc{} || p2 != second_part.data() + second_part.size() ||
+                        max_rep < min_rep) {
+                        return make_error("invalid maximum count in regex brace quantifier");
+                    }
+                    if (max_rep > kMaxRegexBraceRepeat) {
+                        return make_error("regex brace repetition exceeds safety limit of 64");
+                    }
+                }
+            }
+            mark_quantifier_in_current_group();
+            i = close;
+            continue;
+        }
+    }
+
+    if (in_char_class) {
+        return make_error("unterminated character class in regex search pattern");
+    }
+    if (!group_has_inner_quantifier.empty()) {
+        return make_error("unclosed parenthesis in regex search pattern");
+    }
+
+    auto flags = std::regex_constants::ECMAScript | std::regex_constants::nosubs;
+    if (!case_sensitive) {
+        flags |= std::regex_constants::icase;
+    }
+
+    try {
+        return std::regex(pattern.begin(), pattern.end(), flags);
+    } catch (const std::regex_error& ex) {
+        return make_error(std::format("invalid regex search pattern: {}", ex.what()));
+    }
+}
 
 [[nodiscard]] std::string_view trim_ascii_ws(std::string_view text) noexcept {
     while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front())) != 0) {
@@ -405,6 +574,7 @@ struct ExplicitSpecialFloat {
             return std::format("{:.15g}", *v);
         }
         case SearchValueKind::Utf8Text:
+        case SearchValueKind::RegexText:
             return sanitize_utf8_preview(capped, has_more);
         case SearchValueKind::Utf16Text: {
             const std::size_t max_units = std::min<std::size_t>(full_match.size() / 2u, 64u);
@@ -426,11 +596,20 @@ struct CompiledScanner {
     std::vector<WildcardByte> pattern;
     std::vector<std::uint8_t> folded_utf8;
     std::vector<std::uint16_t> folded_utf16;
+    std::optional<std::regex> compiled_regex;
     Endianness endianness{Endianness::Little};
     bool utf8_case_insensitive{false};
     bool utf16_case_insensitive{false};
+    bool is_regex{false};
 
     [[nodiscard]] std::size_t match_length() const noexcept { return pattern.size(); }
+
+    [[nodiscard]] std::size_t overlap_bytes() const noexcept {
+        if (is_regex) {
+            return kRegexWindowOverlapBytes;
+        }
+        return !pattern.empty() ? (pattern.size() - 1u) : 0u;
+    }
 
     [[nodiscard]] bool matches_at(std::span<const std::uint8_t> hay,
                                   std::size_t offset) const noexcept {
@@ -469,6 +648,18 @@ struct CompiledScanner {
 };
 
 [[nodiscard]] Result<CompiledScanner> build_compiled_scanner(const MemorySearchQuery& query) {
+    if (query.kind == SearchValueKind::RegexText) {
+        auto rx_res = validate_and_compile_regex(query.query_text, query.case_sensitive);
+        if (!rx_res) {
+            return std::unexpected(rx_res.error());
+        }
+        CompiledScanner scanner;
+        scanner.compiled_regex = std::move(*rx_res);
+        scanner.endianness = query.endianness;
+        scanner.is_regex = true;
+        return scanner;
+    }
+
     auto pat_res = compile_search_pattern(query);
     if (!pat_res) {
         return std::unexpected(pat_res.error());
@@ -499,6 +690,105 @@ struct CompiledScanner {
     return scanner;
 }
 
+void scan_regex_window_into_report(std::span<const std::uint8_t> window,
+                                   std::uint64_t window_base_va,
+                                   std::uint64_t view_base_va,
+                                   std::uint64_t align_origin_va,
+                                   const MemorySearchQuery& query,
+                                   const std::regex& rx,
+                                   std::string_view region_label,
+                                   MemoryRegionKind region_kind,
+                                   std::optional<std::uint64_t>& min_next_va,
+                                   MemorySearchReport& report,
+                                   bool window_has_more_ahead) {
+    if (window.empty()) {
+        return;
+    }
+
+    const std::size_t alignment = std::max<std::size_t>(1u, query.alignment);
+    const auto align_u64 = static_cast<std::uint64_t>(alignment);
+    static_assert(kMaxRegexWindowBytes > kRegexWindowOverlapBytes);
+    constexpr std::size_t kSubStep = kMaxRegexWindowBytes - kRegexWindowOverlapBytes;
+
+    std::size_t cursor = 0u;
+    while (cursor < window.size()) {
+        while (cursor < window.size() && window[cursor] == 0x00u) {
+            ++cursor;
+        }
+        if (cursor >= window.size()) {
+            break;
+        }
+        std::size_t run_end = cursor;
+        while (run_end < window.size() && window[run_end] != 0x00u) {
+            ++run_end;
+        }
+
+        const std::span<const std::uint8_t> run = window.subspan(cursor, run_end - cursor);
+        const std::uint64_t run_base_va = window_base_va + static_cast<std::uint64_t>(cursor);
+        const bool run_touches_chunk_end = window_has_more_ahead && (run_end == window.size());
+
+        std::size_t sub_off = 0u;
+        while (sub_off < run.size()) {
+            const std::size_t sub_len = std::min(kMaxRegexWindowBytes, run.size() - sub_off);
+            const bool has_more_in_run = (sub_off + sub_len < run.size()) || run_touches_chunk_end;
+            const auto* chars_begin = reinterpret_cast<const char*>(run.data() + sub_off);
+            const auto* chars_end = chars_begin + sub_len;
+
+            try {
+                for (std::cregex_iterator it(chars_begin, chars_end, rx), end; it != end; ++it) {
+                    const auto m_pos = static_cast<std::size_t>(it->position());
+                    const auto m_len = static_cast<std::size_t>(it->length());
+                    if (m_len == 0u) {
+                        continue;
+                    }
+                    if (has_more_in_run && sub_len > kRegexWindowOverlapBytes &&
+                        m_pos >= (sub_len - kRegexWindowOverlapBytes)) {
+                        break;
+                    }
+
+                    const std::uint64_t hit_va =
+                        run_base_va + static_cast<std::uint64_t>(sub_off + m_pos);
+                    if (min_next_va.has_value() && hit_va < *min_next_va) {
+                        continue;
+                    }
+                    if (((hit_va - align_origin_va) % align_u64) != 0u) {
+                        continue;
+                    }
+                    if (report.hits.size() >= query.max_results) {
+                        report.truncated = true;
+                        return;
+                    }
+
+                    const auto full_match = run.subspan(sub_off + m_pos, m_len);
+                    const std::size_t preview_bytes = std::min(m_len, kMaxPreviewBytes);
+
+                    MemorySearchHit hit;
+                    hit.address = hit_va;
+                    hit.view_offset = (hit_va >= view_base_va) ? (hit_va - view_base_va) : 0u;
+                    hit.match_length = m_len;
+                    hit.region_kind = region_kind;
+                    hit.region_label = std::string(region_label);
+                    hit.matched_bytes.assign(
+                        full_match.begin(),
+                        full_match.begin() + static_cast<std::ptrdiff_t>(preview_bytes));
+                    hit.decoded_preview = format_decoded_preview(full_match, query);
+                    report.hits.push_back(std::move(hit));
+                    min_next_va = hit_va + static_cast<std::uint64_t>(m_len);
+                }
+            } catch (const std::regex_error&) {
+                // Runtime complexity bailout (e.g. error_complexity / error_stack): stop sub-window cleanly.
+            }
+
+            if (sub_off + sub_len >= run.size()) {
+                break;
+            }
+            sub_off += kSubStep;
+        }
+
+        cursor = run_end;
+    }
+}
+
 void scan_window_into_report(std::span<const std::uint8_t> window,
                              std::uint64_t window_base_va,
                              std::uint64_t view_base_va,
@@ -507,7 +797,27 @@ void scan_window_into_report(std::span<const std::uint8_t> window,
                              const CompiledScanner& scanner,
                              std::string_view region_label,
                              MemoryRegionKind region_kind,
-                             MemorySearchReport& report) {
+                             MemorySearchReport& report,
+                             std::optional<std::uint64_t>* regex_min_next_va = nullptr,
+                             bool window_has_more_ahead = false) {
+    if (scanner.is_regex && scanner.compiled_regex.has_value()) {
+        std::optional<std::uint64_t> local_min_va;
+        std::optional<std::uint64_t>& tracked_min =
+            (regex_min_next_va != nullptr) ? *regex_min_next_va : local_min_va;
+        scan_regex_window_into_report(window,
+                                      window_base_va,
+                                      view_base_va,
+                                      align_origin_va,
+                                      query,
+                                      *scanner.compiled_regex,
+                                      region_label,
+                                      region_kind,
+                                      tracked_min,
+                                      report,
+                                      window_has_more_ahead);
+        return;
+    }
+
     const std::size_t pat_len = scanner.match_length();
     if (pat_len == 0u || window.size() < pat_len) {
         return;
@@ -738,6 +1048,15 @@ Result<std::vector<WildcardByte>> compile_search_pattern(const MemorySearchQuery
             }
             return out;
         }
+
+        case SearchValueKind::RegexText: {
+            const auto rx_res = validate_and_compile_regex(query.query_text, query.case_sensitive);
+            if (!rx_res) {
+                return std::unexpected(rx_res.error());
+            }
+            return make_error(
+                "RegexText uses bounded variable-length scanning via search_buffer / search_process_memory");
+        }
     }
 
     return make_error("unsupported search value kind");
@@ -866,8 +1185,8 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
     }
 
     const std::size_t pat_len = scanner_res->match_length();
-    const std::size_t overlap = (pat_len > 0u) ? (pat_len - 1u) : 0u;
-    const std::size_t chunk_cap = std::max(kDefaultChunkBytes, pat_len * 2u);
+    const std::size_t overlap = scanner_res->overlap_bytes();
+    const std::size_t chunk_cap = std::max(kDefaultChunkBytes, std::max(pat_len, overlap) * 2u);
 
     std::vector<std::uint8_t> read_buf(chunk_cap);
     std::vector<std::uint8_t> carry;
@@ -887,10 +1206,12 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
         const std::uint64_t align_origin = reg.start_address;
 
         carry.clear();
+        std::optional<std::uint64_t> regex_min_next_va;
         bool region_read_any = false;
 
         const auto process_contiguous_span = [&](std::uint64_t chunk_va,
-                                                 std::span<const std::uint8_t> fresh) {
+                                                 std::span<const std::uint8_t> fresh,
+                                                 bool more_ahead_in_region = false) {
             region_read_any = true;
             report.bytes_scanned += static_cast<std::uint64_t>(fresh.size());
 
@@ -908,7 +1229,9 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
                                     *scanner_res,
                                     label,
                                     reg.kind,
-                                    report);
+                                    report,
+                                    &regex_min_next_va,
+                                    more_ahead_in_region);
 
             if (overlap > 0u) {
                 const std::size_t keep = std::min(overlap, work.size());
@@ -936,8 +1259,10 @@ Result<MemorySearchReport> search_process_memory(IProcessSession& session,
             auto fast = session.read_memory(cursor, std::span<std::uint8_t>(read_buf.data(), req_size));
             if (fast && *fast > 0u) {
                 const std::size_t got = std::min(*fast, req_size);
+                const bool more_ahead =
+                    (cursor + static_cast<std::uint64_t>(got)) < reg.end_address;
                 process_contiguous_span(
-                    cursor, std::span<const std::uint8_t>(read_buf.data(), got));
+                    cursor, std::span<const std::uint8_t>(read_buf.data(), got), more_ahead);
                 cursor += static_cast<std::uint64_t>(got);
 
                 if (got < req_size && !report.truncated) {

@@ -3,13 +3,270 @@
 #include "atomic_file_writer.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <utility>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace peelf {
+
+namespace detail {
 namespace {
+
+[[nodiscard]] std::uint64_t next_spill_sequence() noexcept {
+    static std::atomic<std::uint64_t> counter{1};
+    return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+[[nodiscard]] std::filesystem::path resolve_guarded_spill_temp_dir() {
+#ifdef _WIN32
+    wchar_t dir_buf[MAX_PATH] = {};
+    const DWORD dir_len = ::GetTempPathW(MAX_PATH, dir_buf);
+    if (dir_len == 0u || dir_len >= MAX_PATH) {
+        return std::filesystem::current_path();
+    }
+    return std::filesystem::path(dir_buf);
+#else
+    std::error_code dir_ec;
+    std::filesystem::path temp_dir = std::filesystem::temp_directory_path(dir_ec);
+    if (dir_ec || temp_dir.empty()) {
+        return std::filesystem::path("/tmp");
+    }
+    const std::string generic = temp_dir.generic_string();
+    if (generic == "/mnt/c" || generic.starts_with("/mnt/c/")) {
+        return std::filesystem::path("/tmp");
+    }
+    return temp_dir;
+#endif
+}
+
+} // namespace
+
+class PatchSpillWorkspace {
+public:
+    PatchSpillWorkspace(const PatchSpillWorkspace&) = delete;
+    PatchSpillWorkspace& operator=(const PatchSpillWorkspace&) = delete;
+    PatchSpillWorkspace(PatchSpillWorkspace&&) = delete;
+    PatchSpillWorkspace& operator=(PatchSpillWorkspace&&) = delete;
+
+    ~PatchSpillWorkspace() noexcept {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            (void)::CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+#else
+        if (fd_ >= 0) {
+            (void)::close(fd_);
+            fd_ = -1;
+        }
+#endif
+    }
+
+    [[nodiscard]] static Result<std::shared_ptr<PatchSpillWorkspace>> create() {
+        const std::filesystem::path dir = resolve_guarded_spill_temp_dir();
+#ifdef _WIN32
+        const auto pid = static_cast<std::uint64_t>(::GetCurrentProcessId());
+#else
+        const auto pid = static_cast<std::uint64_t>(::getpid());
+#endif
+        for (unsigned int attempt = 0u; attempt < 64u; ++attempt) {
+            const auto ticks = static_cast<std::uint64_t>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            const std::uint64_t seq = next_spill_sequence();
+            const std::filesystem::path candidate =
+                dir / std::format(".peelf_patch_spill_{}_{}_{}.tmp", pid, ticks, seq);
+
+#ifdef _WIN32
+            HANDLE h = ::CreateFileW(
+                candidate.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                0u,
+                nullptr,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                nullptr);
+            if (h == INVALID_HANDLE_VALUE) {
+                const DWORD err = ::GetLastError();
+                if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
+                    continue;
+                }
+                return make_error(std::format(
+                    "failed to create patch spillover workspace (Win32 error {})", err));
+            }
+            return std::shared_ptr<PatchSpillWorkspace>(new PatchSpillWorkspace(dir, h));
+#else
+            int flags = O_RDWR | O_CREAT | O_EXCL;
+#ifdef O_CLOEXEC
+            flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+            flags |= O_NOFOLLOW;
+#endif
+            const int fd = ::open(candidate.c_str(), flags, static_cast<mode_t>(0600));
+            if (fd < 0) {
+                if (errno == EEXIST) {
+                    continue;
+                }
+                return make_error(std::format(
+                    "failed to create patch spillover workspace: {}", std::strerror(errno)));
+            }
+            // Unlink immediately so the private 0600 inode leaves zero filesystem entries
+            // and is reclaimed automatically by the kernel when fd_ closes.
+            (void)::unlink(candidate.c_str());
+            return std::shared_ptr<PatchSpillWorkspace>(new PatchSpillWorkspace(dir, fd));
+#endif
+        }
+        return make_error("exhausted attempts creating exclusive patch spillover workspace");
+    }
+
+    [[nodiscard]] Result<std::uint64_t> append(std::span<const std::uint8_t> bytes) {
+        std::scoped_lock lock(mutex_);
+        const std::uint64_t start_offset = write_cursor_;
+        if (bytes.empty()) {
+            return start_offset;
+        }
+#ifdef _WIN32
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(start_offset);
+        if (!::SetFilePointerEx(handle_, pos, nullptr, FILE_BEGIN)) {
+            return make_error("failed to seek patch spillover workspace for write");
+        }
+        std::size_t written_total = 0;
+        while (written_total < bytes.size()) {
+            const std::size_t rem = bytes.size() - written_total;
+            const auto chunk = static_cast<DWORD>(std::min<std::size_t>(rem, 16u * 1024u * 1024u));
+            DWORD written = 0;
+            if (!::WriteFile(handle_, bytes.data() + written_total, chunk, &written, nullptr) ||
+                written == 0u) {
+                return make_error("failed writing bytes to patch spillover workspace");
+            }
+            written_total += static_cast<std::size_t>(written);
+        }
+#else
+        std::size_t written_total = 0;
+        while (written_total < bytes.size()) {
+            const std::size_t rem = bytes.size() - written_total;
+            const ssize_t n = ::pwrite(
+                fd_,
+                bytes.data() + written_total,
+                rem,
+                static_cast<off_t>(start_offset + written_total));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return make_error(std::format(
+                    "failed writing bytes to patch spillover workspace: {}", std::strerror(errno)));
+            }
+            if (n == 0) {
+                return make_error("zero-byte write to patch spillover workspace");
+            }
+            written_total += static_cast<std::size_t>(n);
+        }
+#endif
+        write_cursor_ += static_cast<std::uint64_t>(bytes.size());
+        bytes_written_atomic_.store(write_cursor_, std::memory_order_relaxed);
+        return start_offset;
+    }
+
+    [[nodiscard]] Result<void> read_at(std::uint64_t offset, std::span<std::uint8_t> out) const {
+        if (out.empty()) {
+            return {};
+        }
+        std::scoped_lock lock(mutex_);
+        if (offset > write_cursor_ || out.size() > write_cursor_ - offset) {
+            return make_error("patch spillover read range exceeds workspace bounds");
+        }
+#ifdef _WIN32
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(offset);
+        if (!::SetFilePointerEx(handle_, pos, nullptr, FILE_BEGIN)) {
+            return make_error("failed to seek patch spillover workspace for read");
+        }
+        std::size_t read_total = 0;
+        while (read_total < out.size()) {
+            const std::size_t rem = out.size() - read_total;
+            const auto chunk = static_cast<DWORD>(std::min<std::size_t>(rem, 16u * 1024u * 1024u));
+            DWORD got = 0;
+            if (!::ReadFile(handle_, out.data() + read_total, chunk, &got, nullptr) || got == 0u) {
+                return make_error("failed reading bytes from patch spillover workspace");
+            }
+            read_total += static_cast<std::size_t>(got);
+        }
+#else
+        std::size_t read_total = 0;
+        while (read_total < out.size()) {
+            const std::size_t rem = out.size() - read_total;
+            const ssize_t n = ::pread(
+                fd_,
+                out.data() + read_total,
+                rem,
+                static_cast<off_t>(offset + read_total));
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return make_error(std::format(
+                    "failed reading bytes from patch spillover workspace: {}", std::strerror(errno)));
+            }
+            if (n == 0) {
+                return make_error("unexpected EOF reading patch spillover workspace");
+            }
+            read_total += static_cast<std::size_t>(n);
+        }
+#endif
+        return {};
+    }
+
+    [[nodiscard]] std::uint64_t bytes_written() const noexcept {
+        return bytes_written_atomic_.load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] const std::filesystem::path& directory() const noexcept {
+        return dir_;
+    }
+
+private:
+#ifdef _WIN32
+    PatchSpillWorkspace(std::filesystem::path dir, HANDLE handle) noexcept
+        : handle_(handle), dir_(std::move(dir)) {}
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    PatchSpillWorkspace(std::filesystem::path dir, int fd) noexcept
+        : fd_(fd), dir_(std::move(dir)) {}
+    int fd_{-1};
+#endif
+    std::filesystem::path dir_{};
+    mutable std::mutex mutex_{};
+    std::uint64_t write_cursor_{0};
+    std::atomic<std::uint64_t> bytes_written_atomic_{0};
+};
+
+} // namespace detail
+
+namespace {
+
+[[nodiscard]] std::int64_t current_unix_timestamp_ms() noexcept {
+    const auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
 
 [[nodiscard]] bool add_overflows(std::uint64_t a, std::uint64_t b) noexcept {
     return a > std::numeric_limits<std::uint64_t>::max() - b;
@@ -94,10 +351,17 @@ void rebuild_committed_interval_into(
 
 } // namespace
 
-PatchTransaction::PatchTransaction(PagedBinaryImage& image, std::string label)
-    : image_(&image), label_(std::move(label)) {}
+PatchTransaction::PatchTransaction(PagedBinaryImage& image, std::string label, std::string note)
+    : image_(&image), label_(std::move(label)), note_(std::move(note)) {}
 
-Result<void> PatchTransaction::write(std::uint64_t offset, std::span<const std::uint8_t> bytes) {
+PatchTransaction& PatchTransaction::set_note(std::string note) {
+    note_ = std::move(note);
+    return *this;
+}
+
+Result<void> PatchTransaction::write(std::uint64_t offset,
+                                     std::span<const std::uint8_t> bytes,
+                                     std::string note) {
     if (committed_) {
         return make_error("cannot write to a committed patch transaction");
     }
@@ -111,7 +375,11 @@ Result<void> PatchTransaction::write(std::uint64_t offset, std::span<const std::
         return std::unexpected(valid.error());
     }
 
-    writes_.push_back(PendingPatchWrite{offset, std::vector<std::uint8_t>(bytes.begin(), bytes.end())});
+    writes_.push_back(PendingPatchWrite{
+        .offset = offset,
+        .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()),
+        .note = std::move(note),
+    });
     return {};
 }
 
@@ -123,7 +391,7 @@ Result<void> PatchTransaction::commit() {
         return make_error("patch transaction has no image");
     }
 
-    auto applied = image_->apply_transaction(label_, writes_);
+    auto applied = image_->apply_transaction(label_, note_, writes_);
     if (!applied) {
         return std::unexpected(applied.error());
     }
@@ -136,6 +404,109 @@ Result<void> PatchTransaction::commit() {
 void PatchTransaction::rollback() noexcept {
     writes_.clear();
     committed_ = true;
+}
+
+Result<void> PagedBinaryImage::StoredPatchPayload::read_into(
+    std::uint64_t sub_offset,
+    std::span<std::uint8_t> out) const {
+    if (out.empty()) {
+        return {};
+    }
+    if (sub_offset > byte_size || out.size() > byte_size - sub_offset) {
+        return make_error("stored patch payload subrange out of bounds");
+    }
+    if (spill_ws != nullptr) {
+        return spill_ws->read_at(spill_offset + sub_offset, out);
+    }
+    std::copy_n(inline_bytes.begin() + static_cast<std::ptrdiff_t>(sub_offset),
+                static_cast<std::ptrdiff_t>(out.size()),
+                out.begin());
+    return {};
+}
+
+Result<std::vector<std::uint8_t>> PagedBinaryImage::StoredPatchPayload::materialize() const {
+    std::vector<std::uint8_t> out(byte_size);
+    if (byte_size == 0u) {
+        return out;
+    }
+    if (auto rd = read_into(0u, out); !rd) {
+        return std::unexpected(rd.error());
+    }
+    return out;
+}
+
+Result<void> PagedBinaryImage::ensure_spill_workspace() const {
+    if (spill_workspace_ != nullptr) {
+        return {};
+    }
+    auto ws = detail::PatchSpillWorkspace::create();
+    if (!ws) {
+        return std::unexpected(ws.error());
+    }
+    spill_workspace_ = std::move(*ws);
+    return {};
+}
+
+Result<PagedBinaryImage::StoredPatchPayload> PagedBinaryImage::store_payload(
+    std::span<const std::uint8_t> bytes) const {
+    StoredPatchPayload payload;
+    payload.byte_size = bytes.size();
+    if (bytes.empty()) {
+        return payload;
+    }
+    if (bytes.size() >= spillover_threshold_bytes_) {
+        if (auto ok = ensure_spill_workspace(); !ok) {
+            return std::unexpected(ok.error());
+        }
+        auto off = spill_workspace_->append(bytes);
+        if (!off) {
+            return std::unexpected(off.error());
+        }
+        payload.spill_ws = spill_workspace_;
+        payload.spill_offset = *off;
+        return payload;
+    }
+    payload.inline_bytes.assign(bytes.begin(), bytes.end());
+    return payload;
+}
+
+Result<PatchInterval> PagedBinaryImage::materialize_interval(
+    const StoredPatchInterval& stored) const {
+    auto orig = stored.original.materialize();
+    if (!orig) {
+        return std::unexpected(orig.error());
+    }
+    auto pat = stored.patched.materialize();
+    if (!pat) {
+        return std::unexpected(pat.error());
+    }
+    PatchInterval out;
+    out.offset = stored.offset;
+    out.original = std::move(*orig);
+    out.patched = std::move(*pat);
+    out.timestamp_unix_ms = stored.timestamp_unix_ms;
+    out.note = stored.note;
+    return out;
+}
+
+std::uint64_t PagedBinaryImage::spilled_bytes_on_disk() const noexcept {
+    return spill_workspace_ != nullptr ? spill_workspace_->bytes_written() : 0u;
+}
+
+std::size_t PagedBinaryImage::inline_patch_bytes_in_ram() const noexcept {
+    std::size_t total = 0u;
+    for (const auto& [off, iv] : patches_) {
+        (void)off;
+        total += iv.original.inline_bytes.size() + iv.patched.inline_bytes.size();
+    }
+    return total;
+}
+
+std::filesystem::path PagedBinaryImage::spillover_directory() const {
+    if (spill_workspace_ != nullptr) {
+        return spill_workspace_->directory();
+    }
+    return detail::resolve_guarded_spill_temp_dir();
 }
 
 Result<PagedBinaryImage> PagedBinaryImage::open(std::filesystem::path path, std::uint64_t page_size) {
@@ -251,7 +622,7 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::read_original(std::uint64_t 
     }
 
     for (; it != patches_.end(); ++it) {
-        const PatchInterval& patch = it->second;
+        const StoredPatchInterval& patch = it->second;
         if (patch.offset >= end) {
             break;
         }
@@ -264,9 +635,12 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::read_original(std::uint64_t 
         const std::uint64_t patch_start = copy_begin - patch.offset;
         const std::uint64_t output_start = copy_begin - offset;
         const std::uint64_t copy_size = copy_end - copy_begin;
-        std::copy_n(patch.original.begin() + static_cast<std::ptrdiff_t>(patch_start),
-                    static_cast<std::ptrdiff_t>(copy_size),
-                    bytes->begin() + static_cast<std::ptrdiff_t>(output_start));
+        auto dst = std::span<std::uint8_t>(
+            bytes->data() + static_cast<std::size_t>(output_start),
+            static_cast<std::size_t>(copy_size));
+        if (auto rd = patch.original.read_into(patch_start, dst); !rd) {
+            return std::unexpected(rd.error());
+        }
     }
 
     return bytes;
@@ -289,7 +663,7 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::read_effective(std::uint64_t
     }
 
     for (; it != patches_.end(); ++it) {
-        const PatchInterval& patch = it->second;
+        const StoredPatchInterval& patch = it->second;
         if (patch.offset >= end) {
             break;
         }
@@ -302,9 +676,12 @@ Result<std::vector<std::uint8_t>> PagedBinaryImage::read_effective(std::uint64_t
         const std::uint64_t patch_start = copy_begin - patch.offset;
         const std::uint64_t output_start = copy_begin - offset;
         const std::uint64_t copy_size = copy_end - copy_begin;
-        std::copy_n(patch.patched.begin() + static_cast<std::ptrdiff_t>(patch_start),
-                    static_cast<std::ptrdiff_t>(copy_size),
-                    bytes->begin() + static_cast<std::ptrdiff_t>(output_start));
+        auto dst = std::span<std::uint8_t>(
+            bytes->data() + static_cast<std::size_t>(output_start),
+            static_cast<std::size_t>(copy_size));
+        if (auto rd = patch.patched.read_into(patch_start, dst); !rd) {
+            return std::unexpected(rd.error());
+        }
     }
 
     return bytes;
@@ -315,7 +692,9 @@ std::vector<PatchInterval> PagedBinaryImage::changed_intervals() const {
     result.reserve(patches_.size());
     for (const auto& [offset, patch] : patches_) {
         (void)offset;
-        result.push_back(patch);
+        if (auto mat = materialize_interval(patch); mat.has_value()) {
+            result.push_back(std::move(*mat));
+        }
     }
     return result;
 }
@@ -329,7 +708,7 @@ bool PagedBinaryImage::is_patched(std::uint64_t offset) const noexcept {
         return false;
     }
     --it;
-    const PatchInterval& patch = it->second;
+    const StoredPatchInterval& patch = it->second;
     return offset >= patch.offset &&
            (offset - patch.offset) < static_cast<std::uint64_t>(patch.patched.size());
 }
@@ -347,23 +726,67 @@ std::vector<PatchInterval> PagedBinaryImage::changed_intervals(std::uint64_t off
         --it;
     }
     for (; it != patches_.end(); ++it) {
-        const PatchInterval& patch = it->second;
+        const StoredPatchInterval& patch = it->second;
         if (patch.offset >= end) {
             break;
         }
         if (patch.end_offset() > offset) {
-            result.push_back(patch);
+            if (auto mat = materialize_interval(patch); mat.has_value()) {
+                result.push_back(std::move(*mat));
+            }
         }
     }
     return result;
 }
 
-PatchTransaction PagedBinaryImage::begin_transaction(std::string label) {
-    return PatchTransaction(*this, std::move(label));
+std::vector<PatchTransactionMetadata> PagedBinaryImage::undo_history() const {
+    std::vector<PatchTransactionMetadata> history;
+    history.reserve(undo_stack_.size());
+    for (const auto& tx_edits : undo_stack_) {
+        if (tx_edits.empty()) {
+            continue;
+        }
+        PatchTransactionMetadata meta;
+        meta.label = tx_edits.front().label;
+        meta.timestamp_unix_ms = tx_edits.front().timestamp_unix_ms;
+        meta.edit_count = tx_edits.size();
+        for (const StoredPatchEdit& e : tx_edits) {
+            meta.total_bytes += static_cast<std::uint64_t>(e.after.size());
+            if (meta.note.empty() && !e.note.empty()) {
+                meta.note = e.note;
+            }
+        }
+        history.push_back(std::move(meta));
+    }
+    return history;
+}
+
+std::optional<PatchTransactionMetadata> PagedBinaryImage::last_commit_metadata() const {
+    if (undo_stack_.empty() || undo_stack_.back().empty()) {
+        return std::nullopt;
+    }
+    const auto& tx_edits = undo_stack_.back();
+    PatchTransactionMetadata meta;
+    meta.label = tx_edits.front().label;
+    meta.timestamp_unix_ms = tx_edits.front().timestamp_unix_ms;
+    meta.edit_count = tx_edits.size();
+    for (const StoredPatchEdit& e : tx_edits) {
+        meta.total_bytes += static_cast<std::uint64_t>(e.after.size());
+        if (meta.note.empty() && !e.note.empty()) {
+            meta.note = e.note;
+        }
+    }
+    return meta;
+}
+
+PatchTransaction PagedBinaryImage::begin_transaction(std::string label, std::string note) {
+    return PatchTransaction(*this, std::move(label), std::move(note));
 }
 
 Result<void> PagedBinaryImage::apply_replacement_no_history(std::uint64_t offset,
-                                                            std::span<const std::uint8_t> bytes) {
+                                                            std::span<const std::uint8_t> bytes,
+                                                            std::int64_t timestamp_unix_ms,
+                                                            std::string_view note) {
     if (bytes.empty()) {
         return {};
     }
@@ -371,8 +794,10 @@ Result<void> PagedBinaryImage::apply_replacement_no_history(std::uint64_t offset
         return std::unexpected(valid.error());
     }
 
-    std::uint64_t union_begin = offset;
-    std::uint64_t union_end = offset + static_cast<std::uint64_t>(bytes.size());
+    const std::uint64_t write_begin = offset;
+    const std::uint64_t write_end = offset + static_cast<std::uint64_t>(bytes.size());
+    std::uint64_t union_begin = write_begin;
+    std::uint64_t union_end = write_end;
 
     auto erase_begin = patches_.lower_bound(offset);
     if (erase_begin != patches_.begin()) {
@@ -383,10 +808,24 @@ Result<void> PagedBinaryImage::apply_replacement_no_history(std::uint64_t offset
         }
     }
 
+    struct PriorMetaSpan {
+        std::uint64_t begin{};
+        std::uint64_t end{};
+        std::int64_t timestamp_unix_ms{0};
+        std::string note{};
+    };
+    std::vector<PriorMetaSpan> prior_meta;
+
     auto erase_end = erase_begin;
     while (erase_end != patches_.end() && erase_end->second.offset <= union_end) {
         union_begin = std::min(union_begin, erase_end->second.offset);
         union_end = std::max(union_end, erase_end->second.end_offset());
+        prior_meta.push_back(PriorMetaSpan{
+            .begin = erase_end->second.offset,
+            .end = erase_end->second.end_offset(),
+            .timestamp_unix_ms = erase_end->second.timestamp_unix_ms,
+            .note = erase_end->second.note,
+        });
         ++erase_end;
     }
 
@@ -417,12 +856,48 @@ Result<void> PagedBinaryImage::apply_replacement_no_history(std::uint64_t offset
         const bool at_end = index + 1 == static_cast<std::uint64_t>(patched->size());
         if (in_run && (!changed || at_end)) {
             const std::uint64_t run_end = changed && at_end ? index + 1 : index;
-            PatchInterval interval;
-            interval.offset = union_begin + run_begin;
-            interval.original.assign(original->begin() + static_cast<std::ptrdiff_t>(run_begin),
-                                     original->begin() + static_cast<std::ptrdiff_t>(run_end));
-            interval.patched.assign(patched->begin() + static_cast<std::ptrdiff_t>(run_begin),
-                                    patched->begin() + static_cast<std::ptrdiff_t>(run_end));
+            const std::uint64_t abs_begin = union_begin + run_begin;
+            const std::uint64_t abs_end = union_begin + run_end;
+            const auto run_len = static_cast<std::size_t>(run_end - run_begin);
+
+            auto orig_payload = store_payload(std::span<const std::uint8_t>(
+                original->data() + static_cast<std::size_t>(run_begin), run_len));
+            if (!orig_payload) {
+                return std::unexpected(orig_payload.error());
+            }
+            auto patched_payload = store_payload(std::span<const std::uint8_t>(
+                patched->data() + static_cast<std::size_t>(run_begin), run_len));
+            if (!patched_payload) {
+                return std::unexpected(patched_payload.error());
+            }
+
+            StoredPatchInterval interval;
+            interval.offset = abs_begin;
+            interval.original = std::move(*orig_payload);
+            interval.patched = std::move(*patched_payload);
+
+            const bool overlaps_write = (abs_begin < write_end) && (abs_end > write_begin);
+            if (overlaps_write && (timestamp_unix_ms != 0 || !note.empty())) {
+                interval.timestamp_unix_ms = timestamp_unix_ms;
+                interval.note = std::string(note);
+                if (interval.note.empty()) {
+                    for (const PriorMetaSpan& pm : prior_meta) {
+                        if (pm.begin < abs_end && pm.end > abs_begin && !pm.note.empty()) {
+                            interval.note = pm.note;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (const PriorMetaSpan& pm : prior_meta) {
+                    if (pm.begin < abs_end && pm.end > abs_begin) {
+                        interval.timestamp_unix_ms = pm.timestamp_unix_ms;
+                        interval.note = pm.note;
+                        break;
+                    }
+                }
+            }
+
             patches_.emplace(interval.offset, std::move(interval));
             in_run = false;
         }
@@ -432,6 +907,7 @@ Result<void> PagedBinaryImage::apply_replacement_no_history(std::uint64_t offset
 }
 
 Result<void> PagedBinaryImage::apply_transaction(std::string label,
+                                                 std::string note,
                                                  std::span<const PendingPatchWrite> writes) {
     if (writes.empty()) {
         return {};
@@ -442,10 +918,12 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
             return std::unexpected(valid.error());
     }
 
+    const std::int64_t commit_ts_ms = current_unix_timestamp_ms();
+
     // Retain sparse intervals for rollback; never snapshot gaps between writes.
     undo_stack_.reserve(undo_stack_.size() + 1);
     auto saved = patches_;
-    std::vector<PatchEdit> edits;
+    std::vector<StoredPatchEdit> edits;
     edits.reserve(writes.size());
     try {
         for (const auto& write : writes) {
@@ -455,17 +933,33 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
                 return std::unexpected(before.error());
             }
             if (*before == write.bytes) continue;
-            edits.push_back(PatchEdit{
-                .offset = write.offset,
-                .before = std::move(*before),
-                .after = write.bytes,
-                .label = label,
-            });
-            auto applied = apply_replacement_no_history(write.offset, write.bytes);
+
+            auto before_payload = store_payload(*before);
+            if (!before_payload) {
+                patches_.swap(saved);
+                return std::unexpected(before_payload.error());
+            }
+            auto after_payload = store_payload(write.bytes);
+            if (!after_payload) {
+                patches_.swap(saved);
+                return std::unexpected(after_payload.error());
+            }
+
+            std::string effective_note = !write.note.empty() ? write.note : note;
+            auto applied = apply_replacement_no_history(
+                write.offset, write.bytes, commit_ts_ms, effective_note);
             if (!applied) {
                 patches_.swap(saved);
                 return std::unexpected(applied.error());
             }
+            edits.push_back(StoredPatchEdit{
+                .offset = write.offset,
+                .before = std::move(*before_payload),
+                .after = std::move(*after_payload),
+                .label = label,
+                .timestamp_unix_ms = commit_ts_ms,
+                .note = std::move(effective_note),
+            });
         }
         if (!edits.empty()) {
             undo_stack_.push_back(std::move(edits));
@@ -481,8 +975,9 @@ Result<void> PagedBinaryImage::apply_transaction(std::string label,
 
 Result<void> PagedBinaryImage::apply_patch(std::uint64_t offset,
                                            std::span<const std::uint8_t> bytes,
-                                           std::string label) {
-    auto tx = begin_transaction(std::move(label));
+                                           std::string label,
+                                           std::string note) {
+    auto tx = begin_transaction(std::move(label), std::move(note));
     if (auto written = tx.write(offset, bytes); !written) {
         return std::unexpected(written.error());
     }
@@ -499,7 +994,34 @@ Result<void> PagedBinaryImage::undo() {
     try {
         // Reverse order is essential for overlapping writes in a transaction.
         for (auto it = undo_stack_.back().rbegin(); it != undo_stack_.back().rend(); ++it) {
-            auto applied = apply_replacement_no_history(it->offset, it->before);
+            auto before_bytes = it->before.materialize();
+            if (!before_bytes) {
+                patches_.swap(saved);
+                return std::unexpected(before_bytes.error());
+            }
+            std::int64_t restored_ts = 0;
+            std::string restored_note;
+            for (std::size_t idx = undo_stack_.size() - 1u; idx > 0u; --idx) {
+                const auto& earlier_tx = undo_stack_[idx - 1u];
+                bool found = false;
+                for (auto eit = earlier_tx.rbegin(); eit != earlier_tx.rend(); ++eit) {
+                    const std::uint64_t eb = eit->offset;
+                    const std::uint64_t ee = eb + static_cast<std::uint64_t>(eit->after.size());
+                    const std::uint64_t cb = it->offset;
+                    const std::uint64_t ce = cb + static_cast<std::uint64_t>(it->before.size());
+                    if (eb < ce && ee > cb) {
+                        restored_ts = eit->timestamp_unix_ms;
+                        restored_note = eit->note;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    break;
+                }
+            }
+            auto applied = apply_replacement_no_history(
+                it->offset, *before_bytes, restored_ts, restored_note);
             if (!applied) {
                 patches_.swap(saved);
                 return std::unexpected(applied.error());
@@ -520,7 +1042,13 @@ Result<void> PagedBinaryImage::redo() {
     auto saved = patches_;
     try {
         for (const auto& edit : redo_stack_.back()) {
-            auto applied = apply_replacement_no_history(edit.offset, edit.after);
+            auto after_bytes = edit.after.materialize();
+            if (!after_bytes) {
+                patches_.swap(saved);
+                return std::unexpected(after_bytes.error());
+            }
+            auto applied = apply_replacement_no_history(
+                edit.offset, *after_bytes, edit.timestamp_unix_ms, edit.note);
             if (!applied) {
                 patches_.swap(saved);
                 return std::unexpected(applied.error());

@@ -3374,6 +3374,252 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
     return out;
 }
 
+std::string format_headless_report_csv(const HeadlessAnalysisReport& report) {
+    auto append_csv_field = [](std::string& out, std::string_view field) {
+        bool needs_quotes = false;
+        for (const char ch : field) {
+            if (ch == ',' || ch == '"' || ch == '\r' || ch == '\n') {
+                needs_quotes = true;
+                break;
+            }
+        }
+        if (!needs_quotes) {
+            out += field;
+            return;
+        }
+        out.push_back('"');
+        for (const char ch : field) {
+            if (ch == '"') {
+                out += "\"\"";
+            } else {
+                out.push_back(ch);
+            }
+        }
+        out.push_back('"');
+    };
+
+    auto append_csv_row = [&](std::string& out,
+                              std::initializer_list<std::string_view> columns) {
+        bool first = true;
+        for (const std::string_view col : columns) {
+            if (!first) {
+                out.push_back(',');
+            }
+            first = false;
+            append_csv_field(out, col);
+        }
+        out += "\r\n";
+    };
+
+    std::string out;
+    out.reserve(4096u);
+    append_csv_row(out, {
+        "record_type",
+        "target_path",
+        "format",
+        "architecture",
+        "id_or_name",
+        "library_or_category",
+        "severity_or_flags",
+        "address_hex",
+        "size_bytes",
+        "detail",
+    });
+
+    const std::string target_path = report.binary_path.generic_string();
+    const IBinaryImage* img = report.image.get();
+    const ICrashDumpSession* dump = report.crash_dump.get();
+
+    std::string fmt_name;
+    std::string arch_name;
+    std::string kind_name;
+    std::string endian_name;
+    std::uint64_t entry_va = 0u;
+
+    if (img != nullptr) {
+        fmt_name = std::string(to_string(img->format()));
+        arch_name = std::string(to_string(img->architecture()));
+        kind_name = std::string(to_string(img->kind()));
+        endian_name = std::string(to_string(img->endianness()));
+        entry_va = img->entry_point();
+    } else if (dump != nullptr) {
+        const CrashDumpSummary& cs = dump->crash_summary();
+        fmt_name = std::string(to_string(cs.kind));
+        arch_name = std::string(to_string(cs.layout.architecture));
+        kind_name = "CrashDump";
+        endian_name = std::string(to_string(cs.layout.endianness));
+        entry_va = cs.exception.has_value() ? cs.exception->instruction_pointer.value_or(0u) : 0u;
+    } else {
+        fmt_name = std::string(to_string(report.target_profile.format));
+        arch_name = std::string(to_string(report.target_profile.architecture));
+        kind_name = "Unknown";
+        endian_name = std::string(to_string(report.target_profile.endianness));
+    }
+
+    static const std::vector<Section> kEmptySecs{};
+    static const std::vector<ImportEntry> kEmptyImps{};
+    static const std::vector<ExportEntry> kEmptyExps{};
+    const auto& secs = img != nullptr ? img->sections() : kEmptySecs;
+    const auto& imps = img != nullptr ? img->imports() : kEmptyImps;
+    const auto& exps = img != nullptr ? img->exports() : kEmptyExps;
+
+    const std::string entry_hex = std::format("0x{:x}", entry_va);
+    const std::string file_size_str = std::to_string(report.file_size);
+    const std::string summary_detail = std::format(
+        "sections={};imports={};exports={};findings={};rules={};crypto={}",
+        secs.size(),
+        imps.size(),
+        exps.size(),
+        report.security.findings.size(),
+        report.rule_matches.size(),
+        report.crypto_hits.size());
+    append_csv_row(out, {
+        "summary",
+        target_path,
+        fmt_name,
+        arch_name,
+        report.sha256,
+        kind_name,
+        endian_name,
+        entry_hex,
+        file_size_str,
+        summary_detail,
+    });
+
+    for (const Section& s : secs) {
+        std::string perms;
+        perms.push_back(s.readable ? 'r' : '-');
+        perms.push_back(s.writable ? 'w' : '-');
+        perms.push_back(s.executable ? 'x' : '-');
+        const std::string va_hex = std::format("0x{:x}", s.virtual_address);
+        const std::string vsize_str = std::to_string(s.virtual_size);
+        const std::string detail = std::format("file_offset=0x{:x};file_size={};raw_flags=0x{:x}",
+                                               s.file_offset,
+                                               s.file_size,
+                                               s.raw_flags);
+        append_csv_row(out, {
+            "section",
+            target_path,
+            fmt_name,
+            arch_name,
+            s.name,
+            "section",
+            perms,
+            va_hex,
+            vsize_str,
+            detail,
+        });
+    }
+
+    for (const ImportEntry& imp : imps) {
+        std::string flags = imp.delay_load ? "delay_load" : "eager";
+        if (imp.import_by_ordinal) {
+            flags += "|ordinal";
+        }
+        const std::string addr_hex = std::format("0x{:x}", imp.address);
+        const std::string detail = std::format("ordinal={}", imp.ordinal);
+        append_csv_row(out, {
+            "import",
+            target_path,
+            fmt_name,
+            arch_name,
+            imp.name,
+            imp.library,
+            flags,
+            addr_hex,
+            "0",
+            detail,
+        });
+    }
+
+    for (const ExportEntry& exp : exps) {
+        const std::string flags = exp.forwarder.empty() ? "direct" : "forwarded";
+        const std::string va_hex = std::format("0x{:x}", exp.virtual_address);
+        std::string detail = std::format("ordinal={}", exp.ordinal);
+        if (!exp.forwarder.empty()) {
+            detail += ";forwarder=" + exp.forwarder;
+        }
+        append_csv_row(out, {
+            "export",
+            target_path,
+            fmt_name,
+            arch_name,
+            exp.name,
+            "export",
+            flags,
+            va_hex,
+            "0",
+            detail,
+        });
+    }
+
+    for (const SecurityFinding& f : report.security.findings) {
+        const std::string domain_str(to_string(f.domain));
+        const std::string sev_str(to_string(f.severity));
+        const std::string va_hex = f.virtual_address.has_value()
+                                       ? std::format("0x{:x}", *f.virtual_address)
+                                       : std::string{};
+        std::string detail = f.subject.empty() ? f.summary : (f.subject + ": " + f.summary);
+        if (!f.evidence.empty()) {
+            detail += " [" + f.evidence + "]";
+        }
+        append_csv_row(out, {
+            "finding",
+            target_path,
+            fmt_name,
+            arch_name,
+            f.rule_id,
+            domain_str,
+            sev_str,
+            va_hex,
+            "0",
+            detail,
+        });
+    }
+
+    for (const SignatureRuleMatch& rm : report.rule_matches) {
+        std::string va_hex;
+        if (!rm.string_matches.empty() && rm.string_matches.front().virtual_address.has_value()) {
+            va_hex = std::format("0x{:x}", *rm.string_matches.front().virtual_address);
+        }
+        const std::string count_str = std::to_string(rm.total_match_count);
+        append_csv_row(out, {
+            "rule_match",
+            target_path,
+            fmt_name,
+            arch_name,
+            rm.rule_name,
+            rm.source_name,
+            rm.severity,
+            va_hex,
+            count_str,
+            rm.description,
+        });
+    }
+
+    for (const CryptoSignatureHit& ch : report.crypto_hits) {
+        const std::string va_hex = ch.virtual_address.has_value()
+                                       ? std::format("0x{:x}", *ch.virtual_address)
+                                       : std::string{};
+        const std::string len_str = std::to_string(ch.byte_length);
+        const std::string detail = ch.algorithm + ": " + ch.summary;
+        append_csv_row(out, {
+            "crypto_signature",
+            target_path,
+            fmt_name,
+            arch_name,
+            ch.id,
+            ch.category,
+            ch.confidence,
+            va_hex,
+            len_str,
+            detail,
+        });
+    }
+
+    return out;
+}
+
 int evaluate_headless_policy_exit_code(
     const HeadlessAnalysisReport& report,
     HeadlessFailPolicy fail_on) noexcept {
@@ -3440,7 +3686,7 @@ std::optional<int> try_run_headless_or_help_cli(
             << "\nHeadless Options:\n"
             << "  --slice <index|arch>         Select Universal Mach-O slice by 0-based index or arch name\n"
             << "  --compare <other_binary>     Include static binary & relocation-tolerant function diff\n"
-            << "  --format <json|sarif>        Output format (default: json; sarif emits SARIF 2.1.0)\n"
+            << "  --format <json|sarif|csv>    Output format (default: json; sarif emits SARIF 2.1.0; csv emits RFC 4180)\n"
             << "  --output <path>              Write report atomically to <path> (default: stdout)\n"
             << "  --search-root <dir>          Extra dependency search directory (repeatable)\n"
             << "  --rules <path>               Evaluate custom YARA-lite rule file (repeatable)\n"
@@ -3504,8 +3750,10 @@ std::optional<int> try_run_headless_or_help_cli(
                 opts.format = HeadlessExportFormat::Json;
             } else if (low == "sarif") {
                 opts.format = HeadlessExportFormat::Sarif;
+            } else if (low == "csv") {
+                opts.format = HeadlessExportFormat::Csv;
             } else {
-                stderr_stream << "Error: unsupported --format '" << *val << "' (expected json or sarif)\n";
+                stderr_stream << "Error: unsupported --format '" << *val << "' (expected json, sarif, or csv)\n";
                 return 1;
             }
         } else if (a == "--output") {
@@ -3575,10 +3823,18 @@ std::optional<int> try_run_headless_or_help_cli(
         return 1;
     }
 
-    const std::string serialized =
-        (opts.format == HeadlessExportFormat::Sarif)
-            ? format_headless_report_sarif(*analysis)
-            : format_headless_report_json(*analysis);
+    std::string serialized;
+    switch (opts.format) {
+        case HeadlessExportFormat::Json:
+            serialized = format_headless_report_json(*analysis);
+            break;
+        case HeadlessExportFormat::Sarif:
+            serialized = format_headless_report_sarif(*analysis);
+            break;
+        case HeadlessExportFormat::Csv:
+            serialized = format_headless_report_csv(*analysis);
+            break;
+    }
 
     if (opts.output_path.has_value()) {
         if (auto wr = write_text_file_atomically(*opts.output_path, serialized); !wr.has_value()) {

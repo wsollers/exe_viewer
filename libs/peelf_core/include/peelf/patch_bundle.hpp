@@ -25,6 +25,8 @@ struct PatchBundleEntry {
     std::optional<std::string> asm_source{};
     std::vector<std::uint8_t> original_bytes{};
     std::vector<std::uint8_t> patched_bytes{};
+    std::int64_t timestamp_unix_ms{0};
+    std::string note{};
 };
 
 struct PatchBundle {
@@ -75,6 +77,7 @@ struct PatchBundleApplyOptions {
     bool allow_hash_mismatch_if_original_bytes_match{false};
     bool allow_already_applied_entries{false};
     std::string transaction_label{};
+    std::string transaction_note{};
 };
 
 struct PatchBundlePreview {
@@ -132,5 +135,24 @@ struct PatchBundlePreview {
 [[nodiscard]] Result<void> apply_patch_bundle(
     const PatchBundle& bundle,
     IProcessSession& live_session);
+
+/// Encodes `intervals` as standard IPS (`"PATCH"..."EOF"` with 24-bit big-endian offsets,
+/// chunking spans > 0xFFFF and avoiding `"EOF"` / `0x454F46` offset collisions) or automatic
+/// IPS32 (`"IPS32"..."EEOF"` with 32-bit big-endian offsets when offsets >= 16 MiB or when a
+/// standalone record starts at `0x454F46`). Cleanly rejects offsets/ranges >= 4 GiB.
+[[nodiscard]] Result<std::vector<std::uint8_t>> encode_ips_patch(
+    std::span<const PatchInterval> intervals);
+
+/// Decodes a standard IPS (`"PATCH"..."EOF"`) or IPS32 (`"IPS32"..."EEOF"`) binary patch
+/// stream (including RLE records and chunk coalescing) into sorted non-overlapping `PatchInterval`s.
+[[nodiscard]] Result<std::vector<PatchInterval>> decode_ips_patch(
+    std::span<const std::uint8_t> ips_bytes);
+
+[[nodiscard]] Result<void> save_ips_patch_file(
+    std::span<const PatchInterval> intervals,
+    const std::filesystem::path& path);
+
+[[nodiscard]] Result<std::vector<PatchInterval>> load_ips_patch_file(
+    const std::filesystem::path& path);
 
 } // namespace peelf

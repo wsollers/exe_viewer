@@ -6,8 +6,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <map>
 #include <fstream>
+#include <map>
+#include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -15,10 +17,16 @@
 
 namespace peelf {
 
+namespace detail {
+class PatchSpillWorkspace;
+} // namespace detail
+
 struct PatchInterval {
     std::uint64_t offset{};
     std::vector<std::uint8_t> original;
     std::vector<std::uint8_t> patched;
+    std::int64_t timestamp_unix_ms{0};
+    std::string note{};
 
     [[nodiscard]] std::uint64_t end_offset() const noexcept {
         return offset + static_cast<std::uint64_t>(patched.size());
@@ -37,20 +45,37 @@ struct PatchEdit {
     std::vector<std::uint8_t> after{};
     std::vector<PatchSpanSnapshot> spans{};
     std::string label{};
+    std::int64_t timestamp_unix_ms{0};
+    std::string note{};
+};
+
+struct PatchTransactionMetadata {
+    std::string label{};
+    std::string note{};
+    std::int64_t timestamp_unix_ms{0};
+    std::size_t edit_count{0};
+    std::uint64_t total_bytes{0};
 };
 
 struct PendingPatchWrite {
     std::uint64_t offset{};
     std::vector<std::uint8_t> bytes;
+    std::string note{};
 };
 
 class PagedBinaryImage;
 
 class PatchTransaction {
 public:
-    PatchTransaction(PagedBinaryImage& image, std::string label);
+    PatchTransaction(PagedBinaryImage& image, std::string label, std::string note = {});
 
-    [[nodiscard]] Result<void> write(std::uint64_t offset, std::span<const std::uint8_t> bytes);
+    PatchTransaction& set_note(std::string note);
+    [[nodiscard]] const std::string& label() const noexcept { return label_; }
+    [[nodiscard]] const std::string& note() const noexcept { return note_; }
+
+    [[nodiscard]] Result<void> write(std::uint64_t offset,
+                                     std::span<const std::uint8_t> bytes,
+                                     std::string note = {});
     [[nodiscard]] Result<void> commit();
     void rollback() noexcept;
 
@@ -60,6 +85,7 @@ public:
 private:
     PagedBinaryImage* image_{};
     std::string label_;
+    std::string note_;
     std::vector<PendingPatchWrite> writes_;
     bool committed_{false};
 };
@@ -67,6 +93,7 @@ private:
 class PagedBinaryImage {
 public:
     static constexpr std::uint64_t default_page_size = 4096;
+    static constexpr std::size_t default_spillover_threshold_bytes = 1024u * 1024u;
 
     PagedBinaryImage() = default;
 
@@ -80,6 +107,16 @@ public:
     [[nodiscard]] bool can_undo() const noexcept { return !undo_stack_.empty(); }
     [[nodiscard]] bool can_redo() const noexcept { return !redo_stack_.empty(); }
 
+    void set_spillover_threshold_bytes(std::size_t threshold_bytes) noexcept {
+        spillover_threshold_bytes_ = threshold_bytes;
+    }
+    [[nodiscard]] std::size_t spillover_threshold_bytes() const noexcept {
+        return spillover_threshold_bytes_;
+    }
+    [[nodiscard]] std::uint64_t spilled_bytes_on_disk() const noexcept;
+    [[nodiscard]] std::size_t inline_patch_bytes_in_ram() const noexcept;
+    [[nodiscard]] std::filesystem::path spillover_directory() const;
+
     [[nodiscard]] Result<std::vector<std::uint8_t>> read_original(std::uint64_t offset,
                                                                   std::uint64_t size) const;
     [[nodiscard]] Result<std::vector<std::uint8_t>> read_effective(std::uint64_t offset,
@@ -90,10 +127,14 @@ public:
                                                                std::uint64_t size) const;
     [[nodiscard]] bool is_patched(std::uint64_t offset) const noexcept;
 
-    [[nodiscard]] PatchTransaction begin_transaction(std::string label);
+    [[nodiscard]] std::vector<PatchTransactionMetadata> undo_history() const;
+    [[nodiscard]] std::optional<PatchTransactionMetadata> last_commit_metadata() const;
+
+    [[nodiscard]] PatchTransaction begin_transaction(std::string label, std::string note = {});
     [[nodiscard]] Result<void> apply_patch(std::uint64_t offset,
                                            std::span<const std::uint8_t> bytes,
-                                           std::string label);
+                                           std::string label,
+                                           std::string note = {});
     [[nodiscard]] Result<void> undo();
     [[nodiscard]] Result<void> redo();
     [[nodiscard]] Result<void> save_as(const std::filesystem::path& output_path,
@@ -104,24 +145,67 @@ public:
 private:
     friend class PatchTransaction;
 
+    struct StoredPatchPayload {
+        std::vector<std::uint8_t> inline_bytes{};
+        std::shared_ptr<detail::PatchSpillWorkspace> spill_ws{};
+        std::uint64_t spill_offset{0};
+        std::size_t byte_size{0};
+
+        [[nodiscard]] std::size_t size() const noexcept { return byte_size; }
+        [[nodiscard]] bool is_spilled() const noexcept { return spill_ws != nullptr; }
+        [[nodiscard]] Result<void> read_into(std::uint64_t sub_offset,
+                                             std::span<std::uint8_t> out) const;
+        [[nodiscard]] Result<std::vector<std::uint8_t>> materialize() const;
+    };
+
+    struct StoredPatchInterval {
+        std::uint64_t offset{};
+        StoredPatchPayload original{};
+        StoredPatchPayload patched{};
+        std::int64_t timestamp_unix_ms{0};
+        std::string note{};
+
+        [[nodiscard]] std::uint64_t end_offset() const noexcept {
+            return offset + static_cast<std::uint64_t>(patched.size());
+        }
+    };
+
+    struct StoredPatchEdit {
+        std::uint64_t offset{};
+        StoredPatchPayload before{};
+        StoredPatchPayload after{};
+        std::string label{};
+        std::int64_t timestamp_unix_ms{0};
+        std::string note{};
+    };
+
+    [[nodiscard]] Result<void> ensure_spill_workspace() const;
+    [[nodiscard]] Result<StoredPatchPayload> store_payload(std::span<const std::uint8_t> bytes) const;
+    [[nodiscard]] Result<PatchInterval> materialize_interval(const StoredPatchInterval& stored) const;
+
     [[nodiscard]] Result<void> validate_range(std::uint64_t offset, std::uint64_t size) const;
     [[nodiscard]] Result<std::vector<std::uint8_t>> read_file_range(std::uint64_t offset,
                                                                     std::uint64_t size) const;
     [[nodiscard]] Result<std::vector<std::uint8_t>> load_page(std::uint64_t page_index) const;
 
     [[nodiscard]] Result<void> apply_replacement_no_history(std::uint64_t offset,
-                                                            std::span<const std::uint8_t> bytes);
+                                                            std::span<const std::uint8_t> bytes,
+                                                            std::int64_t timestamp_unix_ms,
+                                                            std::string_view note);
     [[nodiscard]] Result<void> apply_transaction(std::string label,
+                                                 std::string note,
                                                  std::span<const PendingPatchWrite> writes);
 
     std::filesystem::path path_;
     std::uint64_t size_{};
     std::uint64_t page_size_{default_page_size};
+    std::size_t spillover_threshold_bytes_{default_spillover_threshold_bytes};
+    mutable std::shared_ptr<detail::PatchSpillWorkspace> spill_workspace_;
     mutable std::unordered_map<std::uint64_t, std::vector<std::uint8_t>> page_cache_;
-    mutable std::map<std::uint64_t, PatchInterval> patches_;
+    mutable std::map<std::uint64_t, StoredPatchInterval> patches_;
     mutable std::ifstream input_;
-    std::vector<std::vector<PatchEdit>> undo_stack_;
-    std::vector<std::vector<PatchEdit>> redo_stack_;
+    std::vector<std::vector<StoredPatchEdit>> undo_stack_;
+    std::vector<std::vector<StoredPatchEdit>> redo_stack_;
 };
 
 enum class LiveByteState : std::uint8_t {

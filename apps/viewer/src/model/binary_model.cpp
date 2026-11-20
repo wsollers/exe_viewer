@@ -1788,7 +1788,8 @@ using detail::utf8_path;
 
     peelf::Result<void> BinaryModel::apply_patch_bytes(std::uint64_t offset,
                                                        std::span<const std::uint8_t> bytes,
-                                                       std::string label) {
+                                                       std::string label,
+                                                       std::string note) {
         if (is_live_process()) {
             last_diagnostic_ = "Live process inspection is strictly read-only; target memory is never modified";
             return peelf::make_error(last_diagnostic_);
@@ -1797,7 +1798,7 @@ using detail::utf8_path;
         if (!editable_image_) {
             return peelf::make_error("no editable binary image is loaded");
         }
-        auto result = editable_image_->apply_patch(offset, bytes, std::move(label));
+        auto result = editable_image_->apply_patch(offset, bytes, std::move(label), std::move(note));
         if (result) ++edit_revision_;
         return result;
     }
@@ -1810,7 +1811,7 @@ using detail::utf8_path;
         if (patches.empty()) return {};
         auto transaction = editable_image_->begin_transaction("Restore project patches");
         for (const auto& patch : patches) {
-            auto written = transaction.write(patch.offset, patch.patched);
+            auto written = transaction.write(patch.offset, patch.patched, patch.note);
             if (!written) return written;
         }
         auto result = transaction.commit();
@@ -1841,13 +1842,15 @@ using detail::utf8_path;
 
     void BinaryModel::record_patch_metadata(std::uint64_t offset,
                                             std::string label,
-                                            std::optional<std::string> asm_source) {
+                                            std::optional<std::string> asm_source,
+                                            std::string note) {
         if (is_live_process()) {
             return;
         }
         patch_metadata_by_offset_[offset] = PatchEntryMetadata{
             .label = std::move(label),
             .asm_source = std::move(asm_source),
+            .note = std::move(note),
         };
     }
 
@@ -1874,6 +1877,9 @@ using detail::utf8_path;
                 }
                 if (it->second.asm_source.has_value()) {
                     entry.asm_source = it->second.asm_source;
+                }
+                if (!it->second.note.empty()) {
+                    entry.note = it->second.note;
                 }
             }
         }
@@ -1910,6 +1916,7 @@ using detail::utf8_path;
                 patch_metadata_by_offset_[entry.offset] = PatchEntryMetadata{
                     .label = entry.label,
                     .asm_source = entry.asm_source,
+                    .note = entry.note,
                 };
             }
             ++edit_revision_;

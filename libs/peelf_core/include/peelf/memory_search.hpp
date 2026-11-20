@@ -47,6 +47,7 @@ enum class SearchValueKind : std::uint8_t {
     Float64,
     Utf8Text,
     Utf16Text,
+    RegexText,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(SearchValueKind kind) noexcept {
@@ -64,6 +65,7 @@ enum class SearchValueKind : std::uint8_t {
         case SearchValueKind::Float64:    return "float64";
         case SearchValueKind::Utf8Text:   return "UTF-8 / ASCII";
         case SearchValueKind::Utf16Text:  return "UTF-16";
+        case SearchValueKind::RegexText:  return "Regex (UTF-8)";
     }
     return "Hex Bytes";
 }

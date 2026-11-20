@@ -472,7 +472,12 @@ Result<ExclusiveTempFile> ExclusiveTempFile::create(std::string_view prefix,
     std::error_code dir_ec;
     temp_dir = std::filesystem::temp_directory_path(dir_ec);
     if (dir_ec || temp_dir.empty()) {
-        return make_error("Failed to resolve OS temporary directory");
+        temp_dir = "/tmp";
+    } else {
+        const std::string generic = temp_dir.generic_string();
+        if (generic == "/mnt/c" || generic.starts_with("/mnt/c/")) {
+            temp_dir = "/tmp";
+        }
     }
 #endif
 

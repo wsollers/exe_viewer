@@ -8,6 +8,7 @@
 #include "model/binary_model.hpp"
 #include "navigation/byte_range.hpp"
 #include "disasm/disassembler.hpp"
+#include "peelf/patch_bundle.hpp"
 #include "test_temp_dir.hpp"
 
 #include <gtest/gtest.h>
@@ -331,3 +332,179 @@ TEST(BinaryModelPatching, NonAllocatingNoexceptIsPatchedTracksApplyUndoRedo) {
     EXPECT_TRUE(model.is_byte_patched(4u));
     EXPECT_TRUE(model.editable_image()->is_patched(4u));
 }
+
+TEST(BinaryModelPatching, PreservesPatchNotesAndTimestampsAcrossJsonBundleAndBackwardCompat) {
+    peelf_test::ScopedTempDir temp_dir("peelf_bundle_meta");
+    const std::filesystem::path elf_src = fixture_path("hello.elf");
+
+    viewer::BinaryModel model;
+    ASSERT_TRUE(model.load_file(elf_src.string()));
+    ASSERT_GE(model.bytes().size(), 16u);
+
+    const std::vector<std::uint8_t> repl{
+        static_cast<std::uint8_t>(model.bytes()[8] ^ 0x55u),
+        static_cast<std::uint8_t>(model.bytes()[9] ^ 0xAAu),
+    };
+    ASSERT_TRUE(model.apply_patch_bytes(8u, repl, "patch header", "analyst ticket #43").has_value());
+
+    const auto ivs = model.changed_intervals();
+    ASSERT_EQ(ivs.size(), 1u);
+    EXPECT_EQ(ivs[0].note, "analyst ticket #43");
+    EXPECT_GT(ivs[0].timestamp_unix_ms, 0);
+
+    const std::filesystem::path bundle_path = temp_dir / "meta.pepatch.json";
+    const auto exported = model.export_patch_bundle("meta_bundle", "bundle note");
+    ASSERT_TRUE(exported.has_value()) << exported.error().message;
+    ASSERT_TRUE(peelf::save_patch_bundle_file(*exported, bundle_path).has_value());
+
+    const auto loaded_bundle = peelf::load_patch_bundle_file(bundle_path);
+    ASSERT_TRUE(loaded_bundle.has_value()) << loaded_bundle.error().message;
+    EXPECT_EQ(loaded_bundle->description, "bundle note");
+    ASSERT_EQ(loaded_bundle->entries.size(), 1u);
+    EXPECT_EQ(loaded_bundle->entries[0].note, "analyst ticket #43");
+    EXPECT_EQ(loaded_bundle->entries[0].timestamp_unix_ms, ivs[0].timestamp_unix_ms);
+
+    // Apply onto a clean BinaryModel and verify note survives into PagedBinaryImage history!
+    viewer::BinaryModel clean_model;
+    ASSERT_TRUE(clean_model.load_file(elf_src.string()));
+    const auto applied = clean_model.apply_patch_bundle(*loaded_bundle);
+    ASSERT_TRUE(applied.has_value()) << applied.error().message;
+    ASSERT_EQ(clean_model.changed_intervals().size(), 1u);
+    EXPECT_EQ(clean_model.changed_intervals()[0].note, "analyst ticket #43");
+
+    // Legacy v1 JSON without `note` or `timestamp_unix_ms` must still parse cleanly.
+    const std::string legacy_json = R"({
+  "schema_version": 1,
+  "name": "legacy",
+  "description": "",
+  "target_format": "ELF",
+  "target_arch": "x86_64",
+  "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "expected_size": 64,
+  "entries": [
+    {
+      "offset": 8,
+      "virtual_address": null,
+      "label": "legacy entry",
+      "asm_source": null,
+      "original_bytes_hex": "0000",
+      "patched_bytes_hex": "1122"
+    }
+  ]
+})";
+    const auto parsed_legacy = peelf::decode_patch_bundle_json(legacy_json);
+    ASSERT_TRUE(parsed_legacy.has_value()) << parsed_legacy.error().message;
+    ASSERT_EQ(parsed_legacy->entries.size(), 1u);
+    EXPECT_EQ(parsed_legacy->entries[0].label, "legacy entry");
+    EXPECT_TRUE(parsed_legacy->entries[0].note.empty());
+    EXPECT_EQ(parsed_legacy->entries[0].timestamp_unix_ms, 0);
+}
+
+TEST(IpsPatchExport, EncodesAndDecodesIpsAndIps32WithEdgeOffsetsChunkingAndRle) {
+    peelf_test::ScopedTempDir temp_dir("peelf_ips_export");
+
+    // 1. Standard 24-bit IPS ("PATCH"..."EOF") with span > 0xFFFF (70,000 bytes -> split & coalesced)
+    //    plus chunk-boundary avoidance when a >64 KiB span would split right onto 0x454F46 ("EOF")!
+    std::vector<std::uint8_t> big_payload(70'000u);
+    for (std::size_t i = 0u; i < big_payload.size(); ++i) {
+        big_payload[i] = static_cast<std::uint8_t>((i * 7u + 3u) & 0xFFu);
+    }
+    const std::array<peelf::PatchInterval, 2> ips24_intervals{{
+        peelf::PatchInterval{
+            .offset = 0x100u,
+            .original = std::vector<std::uint8_t>(big_payload.size(), 0u),
+            .patched = big_payload,
+        },
+        peelf::PatchInterval{
+            .offset = 0x444F47u, // + 0xFFFF == 0x454F46 ("EOF"), so chunker trims chunk 1 to 0xFFFE!
+            .original = std::vector<std::uint8_t>(70'000u, 0u),
+            .patched = big_payload,
+        },
+    }};
+
+    const auto encoded_ips = peelf::encode_ips_patch(ips24_intervals);
+    ASSERT_TRUE(encoded_ips.has_value()) << encoded_ips.error().message;
+    ASSERT_GE(encoded_ips->size(), 8u);
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(encoded_ips->data()), 5u), "PATCH");
+
+    const std::filesystem::path ips_file = temp_dir / "out.ips";
+    ASSERT_TRUE(peelf::save_ips_patch_file(ips24_intervals, ips_file).has_value());
+    const auto decoded_ips = peelf::load_ips_patch_file(ips_file);
+    ASSERT_TRUE(decoded_ips.has_value()) << decoded_ips.error().message;
+    ASSERT_EQ(decoded_ips->size(), 2u);
+    EXPECT_EQ((*decoded_ips)[0].offset, 0x100u);
+    EXPECT_EQ((*decoded_ips)[0].patched, big_payload);
+    EXPECT_EQ((*decoded_ips)[1].offset, 0x444F47u);
+    EXPECT_EQ((*decoded_ips)[1].patched, big_payload);
+
+    // Exact 0x454F46 ("EOF") start offset promotes cleanly to IPS32 so offset 0x454F46 is preserved bit-exact!
+    const std::array<peelf::PatchInterval, 1> eof_offset_iv{{
+        peelf::PatchInterval{
+            .offset = 0x454F46u,
+            .original = {0x00u, 0x00u, 0x00u},
+            .patched = {0x90u, 0x90u, 0xC3u},
+        },
+    }};
+    const auto eof_encoded = peelf::encode_ips_patch(eof_offset_iv);
+    ASSERT_TRUE(eof_encoded.has_value()) << eof_encoded.error().message;
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(eof_encoded->data()), 5u), "IPS32");
+    const auto eof_decoded = peelf::decode_ips_patch(*eof_encoded);
+    ASSERT_TRUE(eof_decoded.has_value()) << eof_decoded.error().message;
+    ASSERT_EQ(eof_decoded->size(), 1u);
+    EXPECT_EQ((*eof_decoded)[0].offset, 0x454F46u);
+    EXPECT_EQ((*eof_decoded)[0].patched, (std::vector<std::uint8_t>{0x90u, 0x90u, 0xC3u}));
+
+    // 2. Verify RLE record decoding in standard IPS ("PATCH" + offset 0x000200 + size 0 + rle_len 5 + val 0xCC + "EOF").
+    const std::array<std::uint8_t, 17> rle_ips = {
+        'P', 'A', 'T', 'C', 'H',
+        0x00u, 0x02u, 0x00u,
+        0x00u, 0x00u,
+        0x00u, 0x05u,
+        0xCCu,
+        'E', 'O', 'F', 0x00u // truncated trailing byte must fail cleanly if malformed
+    };
+    EXPECT_FALSE(peelf::decode_ips_patch(rle_ips).has_value());
+    const auto valid_rle = peelf::decode_ips_patch(std::span<const std::uint8_t>(rle_ips.data(), 16u));
+    ASSERT_TRUE(valid_rle.has_value()) << valid_rle.error().message;
+    ASSERT_EQ(valid_rle->size(), 1u);
+    EXPECT_EQ((*valid_rle)[0].offset, 0x200u);
+    EXPECT_EQ((*valid_rle)[0].patched, (std::vector<std::uint8_t>(5u, 0xCCu)));
+
+    // 3. Automatic IPS32 promotion when offset >= 16 MiB (including 0x45454F46 "EEOF" trailer disambiguation!).
+    const std::array<peelf::PatchInterval, 2> ips32_intervals{{
+        peelf::PatchInterval{
+            .offset = 0x0100'0020ULL, // > 16 MiB
+            .original = {0x01u, 0x02u},
+            .patched = {0xFEu, 0xEDu},
+        },
+        peelf::PatchInterval{
+            .offset = 0x4545'4F46ULL, // ASCII "EEOF"!
+            .original = {0x11u, 0x22u},
+            .patched = {0xAAu, 0xBBu},
+        },
+    }};
+    const auto encoded_ips32 = peelf::encode_ips_patch(ips32_intervals);
+    ASSERT_TRUE(encoded_ips32.has_value()) << encoded_ips32.error().message;
+    EXPECT_EQ(std::string_view(reinterpret_cast<const char*>(encoded_ips32->data()), 5u), "IPS32");
+
+    const auto decoded_ips32 = peelf::decode_ips_patch(*encoded_ips32);
+    ASSERT_TRUE(decoded_ips32.has_value()) << decoded_ips32.error().message;
+    ASSERT_EQ(decoded_ips32->size(), 2u);
+    EXPECT_EQ((*decoded_ips32)[0].offset, 0x0100'0020ULL);
+    EXPECT_EQ((*decoded_ips32)[0].patched, (std::vector<std::uint8_t>{0xFEu, 0xEDu}));
+    EXPECT_EQ((*decoded_ips32)[1].offset, 0x4545'4F46ULL);
+    EXPECT_EQ((*decoded_ips32)[1].patched, (std::vector<std::uint8_t>{0xAAu, 0xBBu}));
+
+    // 4. Offsets >= 4 GiB must fail cleanly.
+    const std::array<peelf::PatchInterval, 1> overflow_iv{{
+        peelf::PatchInterval{
+            .offset = 0x1'0000'0000ULL,
+            .original = {0x00u},
+            .patched = {0x90u},
+        },
+    }};
+    const auto overflow_res = peelf::encode_ips_patch(overflow_iv);
+    ASSERT_FALSE(overflow_res.has_value());
+    EXPECT_FALSE(overflow_res.error().message.empty());
+}
+

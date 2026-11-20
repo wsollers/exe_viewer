@@ -391,7 +391,8 @@ namespace viewer {
 
         [[nodiscard]] peelf::Result<void> apply_patch_bytes(std::uint64_t offset,
                                                             std::span<const std::uint8_t> bytes,
-                                                            std::string label);
+                                                            std::string label,
+                                                            std::string note = {});
         [[nodiscard]] peelf::Result<void> stage_patch_at_va(std::uint64_t virtual_address,
                                                             std::span<const std::uint8_t> bytes,
                                                             std::string label);
@@ -426,7 +427,8 @@ namespace viewer {
         // Reusable JSON Patch Bundles (.pepatch.json) — static binaries only; strictly rejected on live processes.
         void record_patch_metadata(std::uint64_t offset,
                                    std::string label,
-                                   std::optional<std::string> asm_source = std::nullopt);
+                                   std::optional<std::string> asm_source = std::nullopt,
+                                   std::string note = {});
         [[nodiscard]] peelf::Result<peelf::PatchBundle> export_patch_bundle(
             std::string name = {},
             std::string description = {}) const;
@@ -612,6 +614,7 @@ namespace viewer {
         struct PatchEntryMetadata {
             std::string label{};
             std::optional<std::string> asm_source{};
+            std::string note{};
         };
 
         std::vector<AppliedStructureBinding> applied_structures_;

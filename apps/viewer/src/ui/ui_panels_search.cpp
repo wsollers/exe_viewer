@@ -46,7 +46,7 @@ void MemorySearchPanel::run_search() {
         default: query.scope = peelf::SearchScope::AllReadable; break;
     }
 
-    static constexpr std::array<peelf::SearchValueKind, 13> kKinds = {
+    static constexpr std::array<peelf::SearchValueKind, 14> kKinds = {
         peelf::SearchValueKind::HexPattern,
         peelf::SearchValueKind::Int8,
         peelf::SearchValueKind::UInt8,
@@ -60,6 +60,7 @@ void MemorySearchPanel::run_search() {
         peelf::SearchValueKind::Float64,
         peelf::SearchValueKind::Utf8Text,
         peelf::SearchValueKind::Utf16Text,
+        peelf::SearchValueKind::RegexText,
     };
     const std::size_t kidx = static_cast<std::size_t>(
         std::clamp(kind_idx_, 0, static_cast<int>(kKinds.size() - 1)));
@@ -111,7 +112,7 @@ void MemorySearchPanel::draw_contents() {
         ImGui::TextDisabled("Scope: Static Binary Image");
     }
 
-    static constexpr std::array<const char*, 13> kKindItems = {
+    static constexpr std::array<const char*, 14> kKindItems = {
         "Hex Pattern (e.g. 48 8B ?? 10)",
         "Int8 (signed)",
         "UInt8 (unsigned)",
@@ -125,6 +126,7 @@ void MemorySearchPanel::draw_contents() {
         "Float64",
         "Text (UTF-8 / ASCII)",
         "Text (UTF-16)",
+        "Regex (UTF-8)",
     };
     ImGui::SetNextItemWidth(175.0f);
     ImGui::Combo("Value Type",
@@ -163,10 +165,17 @@ void MemorySearchPanel::draw_contents() {
     ImGui::InputInt("Max hits", &max_results_, 0, 0);
 
     ImGui::SetNextItemWidth(std::max(140.0f, ImGui::GetContentRegionAvail().x - 84.0f));
+    const char* query_hint = "Numeric value (dec or 0x hex)...";
+    if (kind_idx_ == 0) {
+        query_hint = "Hex bytes / wildcards, e.g. DE AD ?? EF";
+    } else if (kind_idx_ == 13) {
+        query_hint = "Bounded UTF-8 regex, e.g. https?://[A-Za-z0-9._/-]+";
+    } else if (kind_idx_ >= 11) {
+        query_hint = "Text string to find...";
+    }
     const bool enter_pressed = ImGui::InputTextWithHint(
         "##SearchQuery",
-        kind_idx_ == 0 ? "Hex bytes / wildcards, e.g. DE AD ?? EF"
-                       : (kind_idx_ >= 11 ? "Text string to find..." : "Numeric value (dec or 0x hex)..."),
+        query_hint,
         query_buf_,
         sizeof(query_buf_),
         ImGuiInputTextFlags_EnterReturnsTrue);

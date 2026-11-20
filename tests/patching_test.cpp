@@ -518,3 +518,144 @@ TEST(LiveMemoryPatchSpace, RollsBackCurrentPartiallyWrittenSpanAndPriorSpansOnWr
     }
 }
 
+TEST(PagedBinaryImage, RecordsTransactionTimestampAndAnalystNoteAcrossUndoRedo) {
+    peelf_test::ScopedTempDir tmp("peelf_patching_meta");
+    std::vector<std::uint8_t> initial(64u, 0x90u);
+    auto image = peelf::PagedBinaryImage::open(tmp.write_bytes("meta.bin", initial), 16u);
+    ASSERT_TRUE(image.has_value()) << image.error().message;
+
+    EXPECT_FALSE(image->last_commit_metadata().has_value());
+    EXPECT_TRUE(image->undo_history().empty());
+
+    auto tx1 = image->begin_transaction("nop sled", "initial note");
+    tx1.set_note(" bypass license check ");
+    ASSERT_TRUE(tx1.write(4u, std::vector<std::uint8_t>{0x31u, 0xC0u, 0xC3u}).has_value());
+    ASSERT_TRUE(tx1.commit().has_value());
+
+    const auto meta1 = image->last_commit_metadata();
+    ASSERT_TRUE(meta1.has_value());
+    EXPECT_EQ(meta1->label, "nop sled");
+    EXPECT_EQ(meta1->note, " bypass license check ");
+    EXPECT_GT(meta1->timestamp_unix_ms, 1'700'000'000'000LL);
+    EXPECT_EQ(meta1->edit_count, 1u);
+    EXPECT_EQ(meta1->total_bytes, 3u);
+
+    const auto ivs1 = image->changed_intervals();
+    ASSERT_EQ(ivs1.size(), 1u);
+    EXPECT_EQ(ivs1[0].note, " bypass license check ");
+    EXPECT_EQ(ivs1[0].timestamp_unix_ms, meta1->timestamp_unix_ms);
+
+    ASSERT_TRUE(image->apply_patch(24u,
+                                   std::vector<std::uint8_t>{0xCCu, 0xCCu},
+                                   "int3 trap",
+                                   "debug trap")
+                    .has_value());
+    const auto history = image->undo_history();
+    ASSERT_EQ(history.size(), 2u);
+    EXPECT_EQ(history[0].label, "nop sled");
+    EXPECT_EQ(history[0].note, " bypass license check ");
+    EXPECT_EQ(history[1].label, "int3 trap");
+    EXPECT_EQ(history[1].note, "debug trap");
+    EXPECT_GE(history[1].timestamp_unix_ms, history[0].timestamp_unix_ms);
+
+    ASSERT_TRUE(image->undo().has_value());
+    ASSERT_EQ(image->undo_history().size(), 1u);
+    EXPECT_EQ(image->last_commit_metadata()->note, " bypass license check ");
+
+    ASSERT_TRUE(image->redo().has_value());
+    ASSERT_EQ(image->undo_history().size(), 2u);
+    EXPECT_EQ(image->last_commit_metadata()->note, "debug trap");
+    const auto ivs_after_redo = image->changed_intervals();
+    ASSERT_EQ(ivs_after_redo.size(), 2u);
+    EXPECT_EQ(ivs_after_redo[0].note, " bypass license check ");
+    EXPECT_EQ(ivs_after_redo[1].note, "debug trap");
+}
+
+TEST(PagedBinaryImage, SpillsLargeGeneratedSpansToUnlinkedTempWorkspaceOffMntC) {
+    peelf_test::ScopedTempDir tmp("peelf_patching_spill");
+    constexpr std::size_t kImageSize = 2048u;
+    std::vector<std::uint8_t> initial(kImageSize);
+    for (std::size_t i = 0u; i < initial.size(); ++i) {
+        initial[i] = static_cast<std::uint8_t>((i * 13u + 7u) & 0xFFu);
+    }
+
+    const std::filesystem::path src_path = tmp.write_bytes("spill_src.bin", initial);
+    const std::filesystem::path out_path = tmp.path() / "spill_out.bin";
+
+    auto image = peelf::PagedBinaryImage::open(src_path, 128u);
+    ASSERT_TRUE(image.has_value()) << image.error().message;
+
+    // Lower threshold to 64 bytes so multi-hundred-byte generated patches spill to disk.
+    image->set_spillover_threshold_bytes(64u);
+    EXPECT_EQ(image->spillover_threshold_bytes(), 64u);
+    EXPECT_EQ(image->spilled_bytes_on_disk(), 0u);
+
+    // Small patch (< 64 bytes) stays inline in RAM.
+    const std::vector<std::uint8_t> small_patch{0xDEu, 0xADu, 0xBEu, 0xEFu};
+    ASSERT_TRUE(image->apply_patch(16u, small_patch, "small inline", "stays in ram").has_value());
+    EXPECT_EQ(image->spilled_bytes_on_disk(), 0u);
+    EXPECT_GT(image->inline_patch_bytes_in_ram(), 0u);
+
+    // Large generated span (512 bytes >= 64-byte threshold) spills both original & patched payloads.
+    std::vector<std::uint8_t> large_patch(512u);
+    for (std::size_t i = 0u; i < large_patch.size(); ++i) {
+        large_patch[i] = static_cast<std::uint8_t>(initial[200u + i] ^ 0xFFu);
+    }
+    ASSERT_TRUE(image->apply_patch(200u, large_patch, "large cave", "spilled shellcode").has_value());
+    EXPECT_GE(image->spilled_bytes_on_disk(), 1024u);
+    // Only the 4-byte small patch (original + patched = 8 bytes) remains inline in active intervals!
+    EXPECT_EQ(image->inline_patch_bytes_in_ram(), 8u);
+
+    const std::string spill_dir_generic = image->spillover_directory().generic_string();
+    EXPECT_FALSE(spill_dir_generic.empty());
+    EXPECT_NE(spill_dir_generic, "/mnt/c");
+    EXPECT_FALSE(spill_dir_generic.starts_with("/mnt/c/")) << spill_dir_generic;
+
+    // Overlapping second spilled patch coalesces seamlessly across spilled intervals.
+    std::vector<std::uint8_t> overlap_patch(256u);
+    for (std::size_t i = 0u; i < overlap_patch.size(); ++i) {
+        overlap_patch[i] = static_cast<std::uint8_t>(initial[600u + i] ^ 0xAAu);
+    }
+    ASSERT_TRUE(image->apply_patch(600u, overlap_patch, "coalesced spill", "tail overwrite")
+                    .has_value());
+
+    std::vector<std::uint8_t> expected = initial;
+    std::copy(small_patch.begin(), small_patch.end(), expected.begin() + 16);
+    std::copy(large_patch.begin(), large_patch.end(), expected.begin() + 200);
+    std::copy(overlap_patch.begin(), overlap_patch.end(), expected.begin() + 600);
+
+    const auto full_effective = image->read_effective(0u, kImageSize);
+    ASSERT_TRUE(full_effective.has_value()) << full_effective.error().message;
+    EXPECT_EQ(*full_effective, expected);
+
+    const auto sub_effective = image->read_effective(195u, 530u);
+    ASSERT_TRUE(sub_effective.has_value()) << sub_effective.error().message;
+    EXPECT_EQ(*sub_effective,
+              std::vector<std::uint8_t>(expected.begin() + 195, expected.begin() + 725));
+
+    const auto ivs = image->changed_intervals();
+    ASSERT_EQ(ivs.size(), 2u);
+    EXPECT_EQ(ivs[1].offset, 200u);
+    EXPECT_EQ(ivs[1].patched.size(), 656u);
+    EXPECT_EQ(ivs[1].note, "tail overwrite");
+
+    // Undo and redo across spilled transactions must remain bit-exact!
+    ASSERT_TRUE(image->undo().has_value()); // undo overlap_patch
+    ASSERT_TRUE(image->undo().has_value()); // undo large_patch
+    std::vector<std::uint8_t> expected_after_two_undos = initial;
+    std::copy(small_patch.begin(), small_patch.end(), expected_after_two_undos.begin() + 16);
+    EXPECT_EQ(*image->read_effective(0u, kImageSize), expected_after_two_undos);
+
+    ASSERT_TRUE(image->redo().has_value());
+    ASSERT_TRUE(image->redo().has_value());
+    EXPECT_EQ(*image->read_effective(0u, kImageSize), expected);
+
+    // Atomic save_as streams directly from spilled payloads and produces exact output.
+    ASSERT_TRUE(image->save_as(out_path, true).has_value());
+    std::ifstream out_in(out_path, std::ios::binary);
+    const std::vector<std::uint8_t> saved_bytes(
+        (std::istreambuf_iterator<char>(out_in)), std::istreambuf_iterator<char>());
+    EXPECT_EQ(saved_bytes, expected);
+}
+
+
