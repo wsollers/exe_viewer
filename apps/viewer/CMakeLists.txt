@@ -92,6 +92,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_references.cpp
         src/ui/ui_panels_strings.hpp
         src/ui/ui_panels_strings.cpp
+        src/ui/ui_panels_signatures.hpp
+        src/ui/ui_panels_signatures.cpp
         src/ui/ui_panels_struct_view.hpp
         src/ui/ui_panels_struct_view.cpp
         src/ui/ui_panels_process_internals.hpp

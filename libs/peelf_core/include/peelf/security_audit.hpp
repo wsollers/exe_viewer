@@ -11,6 +11,7 @@
 #include <peelf/process.hpp>
 #include <peelf/process_internals.hpp>
 #include <peelf/provenance.hpp>
+#include <peelf/signatures.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -156,8 +157,10 @@ struct HeadlessCliOptions {
     std::optional<std::filesystem::path> output_path{};
     std::optional<std::string> slice_selector{};
     std::vector<std::filesystem::path> search_roots{};
+    std::vector<std::filesystem::path> rule_paths{};
     HeadlessExportFormat format{HeadlessExportFormat::Json};
     HeadlessFailPolicy fail_on{HeadlessFailPolicy::None};
+    bool include_builtin_rules{true};
     bool include_strings{false};
     std::size_t min_string_length{4};
     std::size_t max_strings{4096};
@@ -179,6 +182,9 @@ struct HeadlessAnalysisReport {
     DependencyGraph dependencies{};
     ExecutableSettingsReport executable_settings{};
     SecurityAuditReport security{};
+    std::optional<PeRichHeader> pe_rich_header{};
+    std::vector<CryptoSignatureHit> crypto_hits{};
+    std::vector<SignatureRuleMatch> rule_matches{};
     bool strings_included{false};
     std::vector<HeadlessExtractedString> strings{};
     std::optional<BinaryDiffReport> comparison{};

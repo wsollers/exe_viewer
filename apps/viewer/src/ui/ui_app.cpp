@@ -79,6 +79,14 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , handlers_panel_(model)
     , references_panel_(reference_index_, annotations_, symbol_index_, current_selection_)
     , strings_panel_(model, strings_index_, reference_index_, annotations_, current_selection_)
+    , signatures_panel_(
+          model,
+          reference_index_,
+          current_selection_,
+          [this](std::uint64_t address, PreferredView view) { enqueue_navigation(address, view); },
+          [this](std::uint64_t file_offset, std::size_t byte_length) {
+              pending_navigations_.enqueue_offset(file_offset, std::max<std::size_t>(byte_length, 1u));
+          })
     , struct_view_panel_(model, current_selection_)
     , process_internals_panel_(model)
     , dependencies_panel_(model, symbol_index_, reference_index_, current_selection_)
@@ -653,6 +661,7 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     imports_panel_.set_context_action_callback(bind_ctx);
     exports_panel_.set_context_action_callback(bind_ctx);
     runtime_flags_panel_.set_context_action_callback(bind_ctx);
+    signatures_panel_.set_context_action_callback(bind_ctx);
 
     annotations_.set_on_changed([this]() noexcept {
         model_.bump_annotation_revision();
@@ -794,6 +803,11 @@ void UiApp::render() {
         }
         ImGui::SameLine();
         if (ImGui::Button("Strings")) open_strings();
+        ImGui::SameLine();
+        if (ImGui::Button("Signatures")) {
+            signatures_panel_.set_visible(true);
+            activate_panel(signatures_panel_.name().c_str());
+        }
         ImGui::SameLine();
         if (ImGui::Button("Decompile")) request_decompile();
         ImGui::SameLine();
@@ -953,6 +967,8 @@ void UiApp::render() {
     if (show_data_types_) render_data_types();
     references_panel_.draw();
     strings_panel_.draw();
+    signatures_panel_.set_code_font(code_font_);
+    signatures_panel_.draw();
     struct_view_panel_.set_code_font(code_font_);
     struct_view_panel_.draw();
     process_internals_panel_.draw();

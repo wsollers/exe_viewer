@@ -35,6 +35,7 @@ constexpr std::array<WorkspacePanelId, kWorkspacePanelCount> kAllPanels{{
     WorkspacePanelId::DataStructures,
     WorkspacePanelId::ReferencesAndNotes,
     WorkspacePanelId::Strings,
+    WorkspacePanelId::SignaturesAndCrypto,
     WorkspacePanelId::StructureView,
     WorkspacePanelId::ProcessInternals,
     WorkspacePanelId::Dependencies,
@@ -204,10 +205,11 @@ std::string_view workspace_panel_window_name(WorkspacePanelId panel) noexcept {
         case WorkspacePanelId::MemorySearch:       return "Memory Search";
         case WorkspacePanelId::RuntimeAndFlags:    return "PEB / TEB & Flags";
         case WorkspacePanelId::Handlers:           return "Handlers";
-        case WorkspacePanelId::DataStructures:     return "Data Structures";
-        case WorkspacePanelId::ReferencesAndNotes: return "References & Notes";
-        case WorkspacePanelId::Strings:            return "Strings";
-        case WorkspacePanelId::StructureView:      return "Structure View";
+        case WorkspacePanelId::DataStructures:      return "Data Structures";
+        case WorkspacePanelId::ReferencesAndNotes:  return "References & Notes";
+        case WorkspacePanelId::Strings:             return "Strings";
+        case WorkspacePanelId::SignaturesAndCrypto: return "Signatures & Crypto";
+        case WorkspacePanelId::StructureView:       return "Structure View";
         case WorkspacePanelId::ProcessInternals:   return "Process Internals";
         case WorkspacePanelId::Dependencies:       return "Dependencies";
         case WorkspacePanelId::BinaryDiff:         return "Binary Diff";
@@ -296,7 +298,7 @@ WorkspacePresetSpec build_workspace_preset(WorkspacePreset preset) {
                 {P::Disassembly, P::FlowGraph, P::Decompiler},
                 P::Disassembly);
             auto center_bottom = DockNodeSpec::make_leaf(
-                {P::HexView, P::MemoryHeatmap, P::ByteEntropyViz, P::ReferencesAndNotes, P::Strings, P::PatchSet, P::Shellcode, P::Scripting, P::MemorySearch},
+                {P::HexView, P::MemoryHeatmap, P::ByteEntropyViz, P::ReferencesAndNotes, P::Strings, P::SignaturesAndCrypto, P::PatchSet, P::Shellcode, P::Scripting, P::MemorySearch},
                 P::HexView);
             auto right = DockNodeSpec::make_leaf(
                 {P::Details, P::FileInfo, P::ExecutableSettings, P::TargetCapabilities,

@@ -194,9 +194,10 @@ void UiApp::set_workspace_panel_visible(WorkspacePanelId panel, bool visible) no
         case WorkspacePanelId::RuntimeAndFlags:    runtime_flags_panel_.set_visible(visible); break;
         case WorkspacePanelId::Handlers:           handlers_panel_.set_visible(visible); break;
         case WorkspacePanelId::DataStructures:     show_data_types_ = visible; break;
-        case WorkspacePanelId::ReferencesAndNotes: references_panel_.set_visible(visible); break;
-        case WorkspacePanelId::Strings:            strings_panel_.set_visible(visible); break;
-        case WorkspacePanelId::StructureView:      struct_view_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ReferencesAndNotes:  references_panel_.set_visible(visible); break;
+        case WorkspacePanelId::Strings:             strings_panel_.set_visible(visible); break;
+        case WorkspacePanelId::SignaturesAndCrypto: signatures_panel_.set_visible(visible); break;
+        case WorkspacePanelId::StructureView:       struct_view_panel_.set_visible(visible); break;
         case WorkspacePanelId::ProcessInternals:   process_internals_panel_.set_visible(visible); break;
         case WorkspacePanelId::Dependencies:       dependencies_panel_.set_visible(visible); break;
         case WorkspacePanelId::BinaryDiff:         binary_diff_panel_.set_visible(visible); break;
@@ -237,9 +238,10 @@ bool UiApp::is_workspace_panel_visible(WorkspacePanelId panel) const noexcept {
         case WorkspacePanelId::RuntimeAndFlags:    return runtime_flags_panel_.visible();
         case WorkspacePanelId::Handlers:           return handlers_panel_.visible();
         case WorkspacePanelId::DataStructures:     return show_data_types_;
-        case WorkspacePanelId::ReferencesAndNotes: return references_panel_.visible();
-        case WorkspacePanelId::Strings:            return strings_panel_.visible();
-        case WorkspacePanelId::StructureView:      return struct_view_panel_.visible();
+        case WorkspacePanelId::ReferencesAndNotes:  return references_panel_.visible();
+        case WorkspacePanelId::Strings:             return strings_panel_.visible();
+        case WorkspacePanelId::SignaturesAndCrypto: return signatures_panel_.visible();
+        case WorkspacePanelId::StructureView:       return struct_view_panel_.visible();
         case WorkspacePanelId::ProcessInternals:   return process_internals_panel_.visible();
         case WorkspacePanelId::Dependencies:       return dependencies_panel_.visible();
         case WorkspacePanelId::BinaryDiff:         return binary_diff_panel_.visible();
@@ -684,6 +686,7 @@ void UiApp::render_main_menu() {
                                static_cast<UiPanel*>(&dependencies_panel_),
                                static_cast<UiPanel*>(&functions_panel_),
                                static_cast<UiPanel*>(&strings_panel_),
+                               static_cast<UiPanel*>(&signatures_panel_),
                                static_cast<UiPanel*>(&struct_view_panel_),
                                static_cast<UiPanel*>(&references_panel_),
                                static_cast<UiPanel*>(&threads_panel_),
@@ -783,7 +786,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV11");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV12");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     const bool missing_dockspace = (ImGui::DockBuilderGetNode(dockspace_id) == nullptr);

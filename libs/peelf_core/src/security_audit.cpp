@@ -2359,6 +2359,31 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         return make_error("No input binary path specified");
     }
 
+    SignatureRuleSet active_rules{};
+    if (options.include_builtin_rules) {
+        SignatureRuleSet builtin = builtin_signature_rules();
+        active_rules.rules.insert(active_rules.rules.end(),
+                                  std::make_move_iterator(builtin.rules.begin()),
+                                  std::make_move_iterator(builtin.rules.end()));
+    }
+    for (const std::filesystem::path& rule_path : options.rule_paths) {
+        auto loaded = load_signature_rules_file(rule_path);
+        if (!loaded.has_value()) {
+            return std::unexpected(loaded.error());
+        }
+        if (!loaded->ok()) {
+            const SignatureRuleDiagnostic& diag = loaded->diagnostics.front();
+            return make_error(std::format("Rule syntax error in {}:{}:{}: {}",
+                                          diag.source_name,
+                                          diag.line,
+                                          diag.column,
+                                          diag.message));
+        }
+        active_rules.rules.insert(active_rules.rules.end(),
+                                  std::make_move_iterator(loaded->ruleset.rules.begin()),
+                                  std::make_move_iterator(loaded->ruleset.rules.end()));
+    }
+
     std::ifstream ifs(options.binary_path, std::ios::binary | std::ios::ate);
     if (!ifs) {
         return make_error(std::format("Failed to open binary '{}'", options.binary_path.string()));
@@ -2493,6 +2518,10 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         if (options.compare_path.has_value()) {
             return make_error("--compare is not supported when the primary input is a crash dump");
         }
+        report.crypto_hits = scan_crypto_and_packer_constants(*report.crash_dump);
+        if (!active_rules.rules.empty()) {
+            report.rule_matches = evaluate_signature_rules(active_rules, *report.crash_dump);
+        }
         return report;
     }
 
@@ -2555,6 +2584,14 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         raw_bytes,
         report.analysis_stamp);
     report.executable_settings.target_profile = report.target_profile;
+
+    if (report.image->format() == Format::PE) {
+        report.pe_rich_header = parse_pe_rich_header(raw_bytes);
+    }
+    report.crypto_hits = scan_crypto_and_packer_constants(raw_bytes, report.image.get());
+    if (!active_rules.rules.empty()) {
+        report.rule_matches = evaluate_signature_rules(active_rules, raw_bytes, report.image.get());
+    }
 
     if (options.include_strings) {
         report.strings_included = true;
@@ -2921,7 +2958,96 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
         out += " }";
     }
     if (!report.security.findings.empty()) out += "\n    ";
-    out += "]\n  }";
+    out += "]\n  },\n";
+
+    // PE Rich Header (`WU-38`)
+    out += "  \"pe_rich_header\": ";
+    if (report.pe_rich_header.has_value()) {
+        const PeRichHeader& rh = *report.pe_rich_header;
+        out += "{\n";
+        out += std::format("    \"dans_offset\": {},\n", rh.dans_offset);
+        out += std::format("    \"rich_offset\": {},\n", rh.rich_offset);
+        out += std::format("    \"byte_length\": {},\n", rh.byte_length);
+        out += std::format("    \"xor_key\": {},\n", rh.xor_key);
+        out += std::format("    \"computed_checksum\": {},\n", rh.computed_checksum);
+        out += std::format("    \"checksum_valid\": {},\n", rh.checksum_valid ? "true" : "false");
+        out += std::format("    \"padding_valid\": {},\n", rh.padding_valid ? "true" : "false");
+        out += "    "; key("diagnostic"); append_json_escaped(out, rh.diagnostic); out += ",\n";
+        out += "    \"entries\": [";
+        for (std::size_t i = 0u; i < rh.entries.size(); ++i) {
+            const PeRichCompIdEntry& e = rh.entries[i];
+            out += (i == 0u) ? "\n" : ",\n";
+            out += std::format("      {{ \"prod_id\": {}, \"build_number\": {}, \"use_count\": {}, ",
+                               e.prod_id,
+                               e.build_number,
+                               e.use_count);
+            key("tool_category"); append_json_escaped(out, e.tool_category);
+            out += std::format(", \"file_offset\": {} }}", e.file_offset);
+        }
+        if (!rh.entries.empty()) out += "\n    ";
+        out += "]\n  },\n";
+    } else {
+        out += "null,\n";
+    }
+
+    // Crypto, Hash, Compression & Packer Constant Hits (`WU-38`)
+    out += "  \"crypto_signatures\": [";
+    for (std::size_t i = 0u; i < report.crypto_hits.size(); ++i) {
+        const CryptoSignatureHit& ch = report.crypto_hits[i];
+        out += (i == 0u) ? "\n" : ",\n";
+        out += "    { ";
+        key("id"); append_json_escaped(out, ch.id); out += ", ";
+        key("category"); append_json_escaped(out, ch.category); out += ", ";
+        key("algorithm"); append_json_escaped(out, ch.algorithm); out += ", ";
+        key("summary"); append_json_escaped(out, ch.summary); out += ", ";
+        key("confidence"); append_json_escaped(out, ch.confidence);
+        out += std::format(", \"file_offset\": {}, \"virtual_address\": {}, \"byte_length\": {}, ",
+                           ch.file_offset.has_value() ? std::to_string(*ch.file_offset) : "null",
+                           ch.virtual_address.has_value() ? std::to_string(*ch.virtual_address) : "null",
+                           ch.byte_length);
+        key("section_name"); append_json_escaped(out, ch.section_name);
+        out += " }";
+    }
+    if (!report.crypto_hits.empty()) out += "\n  ";
+    out += "],\n";
+
+    // YARA-Lite Signature Rule Matches (`WU-38`)
+    out += "  \"rule_matches\": [";
+    for (std::size_t i = 0u; i < report.rule_matches.size(); ++i) {
+        const SignatureRuleMatch& rm = report.rule_matches[i];
+        out += (i == 0u) ? "\n" : ",\n";
+        out += "    {\n";
+        out += "      "; key("rule_name"); append_json_escaped(out, rm.rule_name); out += ",\n";
+        out += "      \"tags\": [";
+        for (std::size_t t = 0u; t < rm.tags.size(); ++t) {
+            if (t > 0u) out += ", ";
+            append_json_escaped(out, rm.tags[t]);
+        }
+        out += "],\n";
+        out += "      "; key("description"); append_json_escaped(out, rm.description); out += ",\n";
+        out += "      "; key("severity"); append_json_escaped(out, rm.severity); out += ",\n";
+        out += "      "; key("author"); append_json_escaped(out, rm.author); out += ",\n";
+        out += "      "; key("source_name"); append_json_escaped(out, rm.source_name); out += ",\n";
+        out += std::format("      \"total_match_count\": {},\n", rm.total_match_count);
+        out += "      \"string_matches\": [";
+        for (std::size_t sm_i = 0u; sm_i < rm.string_matches.size(); ++sm_i) {
+            const SignatureStringMatch& sm = rm.string_matches[sm_i];
+            out += (sm_i == 0u) ? "\n" : ",\n";
+            out += "        { ";
+            key("identifier"); append_json_escaped(out, sm.identifier);
+            out += std::format(", \"file_offset\": {}, \"virtual_address\": {}, \"byte_length\": {}, ",
+                               sm.file_offset.has_value() ? std::to_string(*sm.file_offset) : "null",
+                               sm.virtual_address.has_value() ? std::to_string(*sm.virtual_address) : "null",
+                               sm.byte_length);
+            key("section_name"); append_json_escaped(out, sm.section_name); out += ", ";
+            key("matched_preview"); append_json_escaped(out, sm.matched_preview);
+            out += " }";
+        }
+        if (!rm.string_matches.empty()) out += "\n      ";
+        out += "]\n    }";
+    }
+    if (!report.rule_matches.empty()) out += "\n  ";
+    out += "]";
 
     // Optional strings (`--include-strings`)
     if (report.strings_included) {
@@ -2997,19 +3123,6 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
         out += ": ";
     };
 
-    const auto catalog = security_rule_catalog();
-    std::unordered_map<std::string_view, std::size_t> rule_index_by_id;
-    std::vector<SecurityRuleDescriptor> active_rules;
-    for (const SecurityFinding& f : report.security.findings) {
-        for (const SecurityRuleDescriptor& desc : catalog) {
-            if (desc.id == f.rule_id && !rule_index_by_id.contains(desc.id)) {
-                rule_index_by_id.emplace(desc.id, active_rules.size());
-                active_rules.push_back(desc);
-                break;
-            }
-        }
-    }
-
     auto sarif_level = [](SecuritySeverity sev) noexcept -> std::string_view {
         switch (sev) {
             case SecuritySeverity::Pass:    return "none";
@@ -3019,6 +3132,63 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
         }
         return "note";
     };
+
+    auto signature_sarif_level = [](std::string_view sev) -> std::string_view {
+        const std::string low = lower_ascii(sev);
+        if (low == "error" || low == "high" || low == "critical") {
+            return "error";
+        }
+        if (low == "note" || low == "info" || low == "informational") {
+            return "note";
+        }
+        return "warning";
+    };
+
+    struct SarifDriverRuleEntry {
+        std::string id{};
+        std::string name{};
+        std::string short_description{};
+        std::string help_text{};
+        std::string default_level{};
+    };
+
+    const auto catalog = security_rule_catalog();
+    std::unordered_map<std::string, std::size_t> rule_index_by_id;
+    std::vector<SarifDriverRuleEntry> active_rules;
+    for (const SecurityFinding& f : report.security.findings) {
+        for (const SecurityRuleDescriptor& desc : catalog) {
+            if (desc.id == f.rule_id && !rule_index_by_id.contains(std::string(desc.id))) {
+                rule_index_by_id.emplace(std::string(desc.id), active_rules.size());
+                active_rules.push_back(SarifDriverRuleEntry{
+                    .id = std::string(desc.id),
+                    .name = std::string(desc.name),
+                    .short_description = std::string(desc.short_description),
+                    .help_text = std::string(desc.help_text),
+                    .default_level = std::string(sarif_level(desc.default_failure_severity)),
+                });
+                break;
+            }
+        }
+    }
+    for (const SignatureRuleMatch& rm : report.rule_matches) {
+        if (!rule_index_by_id.contains(rm.rule_name)) {
+            rule_index_by_id.emplace(rm.rule_name, active_rules.size());
+            const std::string desc_text = rm.description.empty()
+                                              ? std::format("YARA-lite signature rule {}", rm.rule_name)
+                                              : rm.description;
+            const std::string help_str = std::format(
+                "YARA-lite signature rule '{}' (source: '{}') matched target binary.",
+                rm.rule_name,
+                rm.source_name.empty() ? "builtin" : rm.source_name);
+            active_rules.push_back(SarifDriverRuleEntry{
+                .id = rm.rule_name,
+                .name = rm.rule_name,
+                .short_description = desc_text,
+                .help_text = help_str,
+                .default_level = std::string(signature_sarif_level(rm.severity)),
+            });
+        }
+    }
 
     const std::string artifact_uri = report.binary_path.generic_string();
 
@@ -3034,7 +3204,7 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
     out += "          \"informationUri\": \"https://github.com/wsollers/exe_viewer\",\n";
     out += "          \"rules\": [";
     for (std::size_t i = 0; i < active_rules.size(); ++i) {
-        const SecurityRuleDescriptor& r = active_rules[i];
+        const SarifDriverRuleEntry& r = active_rules[i];
         out += (i == 0u) ? "\n" : ",\n";
         out += "            {\n";
         out += "              "; key("id"); append_json_escaped(out, r.id); out += ",\n";
@@ -3042,7 +3212,7 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
         out += "              \"shortDescription\": { "; key("text"); append_json_escaped(out, r.short_description); out += " },\n";
         out += "              \"help\": { "; key("text"); append_json_escaped(out, r.help_text); out += " },\n";
         out += "              \"defaultConfiguration\": { ";
-        key("level"); append_json_escaped(out, sarif_level(r.default_failure_severity));
+        key("level"); append_json_escaped(out, r.default_level);
         out += " }\n";
         out += "            }";
     }
@@ -3111,7 +3281,69 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
         out += "          ]\n";
         out += "        }";
     }
-    if (!report.security.findings.empty()) out += "\n      ";
+    bool emitted_any_result = !report.security.findings.empty();
+    for (std::size_t i = 0u; i < report.rule_matches.size(); ++i) {
+        const SignatureRuleMatch& rm = report.rule_matches[i];
+        out += (!emitted_any_result && i == 0u) ? "\n" : ",\n";
+        emitted_any_result = true;
+        out += "        {\n";
+        out += "          "; key("ruleId"); append_json_escaped(out, rm.rule_name); out += ",\n";
+        if (auto it = rule_index_by_id.find(rm.rule_name); it != rule_index_by_id.end()) {
+            out += std::format("          \"ruleIndex\": {},\n", it->second);
+        }
+        out += "          \"kind\": \"fail\",\n";
+        out += "          "; key("level"); append_json_escaped(out, signature_sarif_level(rm.severity)); out += ",\n";
+        std::string msg = rm.description.empty()
+                              ? std::format("Signature rule '{}' matched.", rm.rule_name)
+                              : rm.description;
+        if (!rm.string_matches.empty()) {
+            const SignatureStringMatch& sm = rm.string_matches.front();
+            if (sm.file_offset.has_value()) {
+                msg += std::format(" First match: {} @ offset 0x{:X} ({}).",
+                                   sm.identifier,
+                                   *sm.file_offset,
+                                   sm.matched_preview);
+            } else if (sm.virtual_address.has_value()) {
+                msg += std::format(" First match: {} @ VA 0x{:X} ({}).",
+                                   sm.identifier,
+                                   *sm.virtual_address,
+                                   sm.matched_preview);
+            }
+        }
+        out += "          \"message\": { "; key("text"); append_json_escaped(out, msg); out += " },\n";
+        out += "          \"locations\": [\n";
+        out += "            {\n";
+        out += "              \"physicalLocation\": {\n";
+        out += "                \"artifactLocation\": { ";
+        key("uri"); append_json_escaped(out, artifact_uri);
+        out += ", \"index\": 0 }";
+        if (!rm.string_matches.empty()) {
+            const SignatureStringMatch& sm = rm.string_matches.front();
+            if (sm.virtual_address.has_value() || sm.file_offset.has_value() || !sm.section_name.empty()) {
+                out += ",\n                \"address\": { ";
+                bool need_comma = false;
+                if (sm.virtual_address.has_value()) {
+                    out += std::format("\"absoluteAddress\": {}", *sm.virtual_address);
+                    need_comma = true;
+                }
+                if (sm.file_offset.has_value()) {
+                    if (need_comma) out += ", ";
+                    out += std::format("\"offsetFromParent\": {}", *sm.file_offset);
+                    need_comma = true;
+                }
+                if (!sm.section_name.empty()) {
+                    if (need_comma) out += ", ";
+                    key("name"); append_json_escaped(out, sm.section_name);
+                }
+                out += " }";
+            }
+        }
+        out += "\n              }\n";
+        out += "            }\n";
+        out += "          ]\n";
+        out += "        }";
+    }
+    if (emitted_any_result) out += "\n      ";
     out += "]";
 
     // Optional properties block carrying dependency & comparison summary for CI tooling
@@ -3120,6 +3352,8 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
                        report.container_info.is_universal_container ? "true" : "false");
     out += std::format("        \"selectedSliceIndex\": {},\n", report.selected_slice_index);
     out += "        "; key("selectedSliceArch"); append_json_escaped(out, report.selected_slice_arch); out += ",\n";
+    out += std::format("        \"cryptoSignatureCount\": {},\n", report.crypto_hits.size());
+    out += std::format("        \"ruleMatchCount\": {},\n", report.rule_matches.size());
     out += std::format("        \"systemSharedCacheLibraries\": {},\n", report.dependencies.summary.system_shared_cache);
     out += std::format("        \"missingLibraries\": {},\n", report.dependencies.summary.missing_libraries);
     out += std::format("        \"architectureMismatches\": {},\n", report.dependencies.summary.architecture_mismatches);
@@ -3151,8 +3385,19 @@ int evaluate_headless_policy_exit_code(
         ds.architecture_mismatches > 0u ||
         ds.unresolved_symbols > 0u;
 
+    std::size_t rule_error_count = 0u;
+    std::size_t rule_warning_count = 0u;
+    for (const SignatureRuleMatch& rm : report.rule_matches) {
+        const std::string low = lower_ascii(rm.severity);
+        if (low == "error" || low == "high" || low == "critical") {
+            ++rule_error_count;
+        } else if (low != "note" && low != "info" && low != "informational") {
+            ++rule_warning_count;
+        }
+    }
+
     if (fail_on == HeadlessFailPolicy::Error) {
-        if (report.security.error_count > 0u || has_dep_errors) {
+        if (report.security.error_count > 0u || rule_error_count > 0u || has_dep_errors) {
             return 2;
         }
         return 0;
@@ -3161,6 +3406,8 @@ int evaluate_headless_policy_exit_code(
     if (fail_on == HeadlessFailPolicy::Warning) {
         if (report.security.error_count > 0u ||
             report.security.warning_count > 0u ||
+            rule_error_count > 0u ||
+            rule_warning_count > 0u ||
             has_dep_errors) {
             return 2;
         }
@@ -3194,6 +3441,8 @@ std::optional<int> try_run_headless_or_help_cli(
             << "  --format <json|sarif>        Output format (default: json; sarif emits SARIF 2.1.0)\n"
             << "  --output <path>              Write report atomically to <path> (default: stdout)\n"
             << "  --search-root <dir>          Extra dependency search directory (repeatable)\n"
+            << "  --rules <path>               Evaluate custom YARA-lite rule file (repeatable)\n"
+            << "  --no-builtin-rules           Disable built-in YARA-lite starter rule pack\n"
             << "  --include-strings            Include extracted printable ASCII/UTF-16 strings\n"
             << "  --min-string-len <N>         Minimum character length for extracted strings (default: 4)\n"
             << "  --fail-on <none|error|warning>\n"
@@ -3265,6 +3514,16 @@ std::optional<int> try_run_headless_or_help_cli(
             auto val = require_next(a);
             if (!val) return 1;
             opts.search_roots.emplace_back(*val);
+        } else if (a == "--rules") {
+            auto val = require_next(a);
+            if (!val) return 1;
+            if (val->empty()) {
+                stderr_stream << "Error: --rules requires a non-empty rule file path\n";
+                return 1;
+            }
+            opts.rule_paths.emplace_back(*val);
+        } else if (a == "--no-builtin-rules") {
+            opts.include_builtin_rules = false;
         } else if (a == "--include-strings") {
             opts.include_strings = true;
         } else if (a == "--min-string-len") {

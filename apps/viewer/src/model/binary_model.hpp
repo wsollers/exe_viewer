@@ -14,6 +14,7 @@
 
 #include "analysis/c_type_parser.hpp"
 #include "analysis/function_index.hpp"
+#include "analysis/reference_index.hpp"
 #include "symbols/data_types.hpp"
 #include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
@@ -38,6 +39,7 @@
 #include <peelf/runtime_structures.hpp>
 #include <peelf/scripting.hpp>
 #include <peelf/security_audit.hpp>
+#include <peelf/signatures.hpp>
 #include <peelf/stack_tls.hpp>
 
 namespace viewer {
@@ -538,6 +540,30 @@ namespace viewer {
         }
         void clear_last_script_outcome() noexcept { last_script_outcome_.reset(); }
 
+        // PE Rich Header, Crypto/Packer Constants, & YARA-Lite Rule Scanner (WU-38).
+        struct ResolvedHitFunction {
+            std::string display_name{};
+            std::uint64_t function_va{0};
+            std::uint64_t code_va{0};
+            bool via_xref{false};
+        };
+
+        [[nodiscard]] const std::optional<peelf::PeRichHeader>& pe_rich_header() const noexcept {
+            return pe_rich_header_;
+        }
+        [[nodiscard]] std::span<const peelf::CryptoSignatureHit> crypto_signatures() const noexcept {
+            return crypto_hits_;
+        }
+        void refresh_signatures_and_crypto();
+        std::size_t scan_live_process_crypto_signatures();
+        [[nodiscard]] std::vector<peelf::SignatureRuleMatch> evaluate_yara_lite_rules(
+            const peelf::SignatureRuleSet& rules,
+            bool scan_all_live_regions = true) const;
+        [[nodiscard]] std::optional<ResolvedHitFunction> resolve_hit_referencing_function(
+            std::optional<std::uint64_t> virtual_address,
+            std::uint64_t byte_length = 1u,
+            const ReferenceIndex* references = nullptr) const;
+
     private:
         class AsyncScriptRunner;
         struct PreMoveTeardown {
@@ -630,6 +656,8 @@ namespace viewer {
         peelf::ThreadEnvironmentSnapshot thread_env_;
         peelf::HandlersReport handlers_report_;
         peelf::SecurityAuditReport security_audit_;
+        std::optional<peelf::PeRichHeader> pe_rich_header_{};
+        std::vector<peelf::CryptoSignatureHit> crypto_hits_{};
         peelf::ExecutableSettingsReport executable_settings_{};
         peelf::EnvironmentRedactionPolicy environment_redaction_policy_{
             peelf::EnvironmentRedactionPolicy::RedactSensitiveDefault};

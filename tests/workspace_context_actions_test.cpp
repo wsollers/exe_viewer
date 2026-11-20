@@ -63,9 +63,9 @@ TEST(WorkspaceLayoutTest, AllFivePresetsPassStructuralValidationAndCopyMoveClean
     }
 }
 
-TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll38Panels) {
-    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 11u);
-    EXPECT_EQ(kWorkspacePanelCount, 38u);
+TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll39Panels) {
+    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 12u);
+    EXPECT_EQ(kWorkspacePanelCount, 39u);
     const std::span<const WorkspacePanelId> panels = all_workspace_panels();
     EXPECT_EQ(panels.size(), kWorkspacePanelCount);
 
@@ -94,6 +94,7 @@ TEST(WorkspaceLayoutTest, PresetsCoverExpectedDomainPanels) {
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::ByteEntropyViz));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::StructureView));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::TargetCapabilities));
+        EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::SignaturesAndCrypto));
         EXPECT_TRUE(contains_panel(sre.visible_panels, WorkspacePanelId::Scripting));
     }
     {

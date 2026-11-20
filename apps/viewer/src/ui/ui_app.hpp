@@ -23,6 +23,7 @@
 #include "ui/workspace_layout.hpp"
 #include "ui_panels_references.hpp"
 #include "ui_panels_strings.hpp"
+#include "ui_panels_signatures.hpp"
 #include "ui_panels_struct_view.hpp"
 #include "ui_panels_process_internals.hpp"
 #include "ui_panels_dependencies.hpp"
@@ -215,6 +216,7 @@ namespace viewer {
         HandlersPanel   handlers_panel_;
         ReferencesPanel references_panel_;
         StringsPanel    strings_panel_;
+        SignaturesPanel signatures_panel_;
         StructureViewPanel struct_view_panel_;
         ProcessInternalsPanel process_internals_panel_;
         DependenciesPanel dependencies_panel_;

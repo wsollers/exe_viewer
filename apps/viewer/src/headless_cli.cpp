@@ -813,6 +813,8 @@ void print_help_usage(std::ostream& stdout_stream) {
         << "  --format <json|sarif|text>   Output format (default: json for audit, text for --script)\n"
         << "  --output <path>              Write report atomically to <path> (default: stdout)\n"
         << "  --search-root <dir>          Extra dependency search directory (repeatable)\n"
+        << "  --rules <path>               Evaluate custom YARA-lite rule file (repeatable)\n"
+        << "  --no-builtin-rules           Disable built-in YARA-lite starter rule pack\n"
         << "  --include-strings            Include extracted printable ASCII/UTF-16 strings\n"
         << "  --min-string-len <N>         Minimum character length for extracted strings (default: 4)\n"
         << "  --fail-on <none|error|warning>\n"

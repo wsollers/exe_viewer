@@ -17,6 +17,7 @@
 #include <peelf/byte_viz.hpp>
 #include <peelf/timeline_viewport.hpp>
 #include <peelf/pdb.hpp>
+#include <peelf/signatures.hpp>
 
 #include <pe/pe_definitions.h>
 #include <elf/elf_definitions.h>

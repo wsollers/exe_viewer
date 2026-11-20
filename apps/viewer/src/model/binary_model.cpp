@@ -466,6 +466,8 @@ using detail::utf8_path;
         thread_env_ = {};
         handlers_report_ = {};
         security_audit_ = {};
+        pe_rich_header_.reset();
+        crypto_hits_.clear();
         executable_settings_ = {};
         environment_redaction_policy_ = peelf::EnvironmentRedactionPolicy::RedactSensitiveDefault;
         launched_debug_session_ = false;
@@ -1679,6 +1681,7 @@ using detail::utf8_path;
             true,
             peelf::CaptureAvailability::Partial);
         recompute_capabilities();
+        refresh_signatures_and_crypto();
         last_diagnostic_.clear();
         return true;
     }
@@ -2356,6 +2359,147 @@ using detail::utf8_path;
 
         last_script_outcome_ = outcome;
         return outcome;
+    }
+
+    void BinaryModel::refresh_signatures_and_crypto() {
+        pe_rich_header_.reset();
+        crypto_hits_.clear();
+
+        if (is_live_process()) {
+            const std::span<const std::uint8_t> mod_bytes = analysis_image_bytes();
+            if (!mod_bytes.empty()) {
+                if (format_ == BinaryFormat::PE ||
+                    (image_ != nullptr && image_->format() == peelf::Format::PE)) {
+                    pe_rich_header_ = peelf::parse_pe_rich_header(mod_bytes);
+                }
+                crypto_hits_ = peelf::scan_crypto_and_packer_constants(mod_bytes, image_.get());
+            } else if (session_ != nullptr && is_crash_dump()) {
+                crypto_hits_ = peelf::scan_crypto_and_packer_constants(*session_);
+            }
+            return;
+        }
+
+        const std::span<const std::uint8_t> base_span = analysis_image_bytes();
+        if (base_span.empty()) {
+            return;
+        }
+
+        std::vector<std::uint8_t> patched_buf;
+        std::span<const std::uint8_t> scan_span = base_span;
+        if (editable_image_ && editable_image_->dirty()) {
+            const std::uint64_t slice_off =
+                image_ != nullptr ? image_->container_slice_offset() : 0u;
+            if (auto eff = read_effective_bytes(slice_off, base_span.size()); eff.has_value()) {
+                patched_buf = std::move(*eff);
+                scan_span = patched_buf;
+            }
+        }
+
+        if (format_ == BinaryFormat::PE ||
+            (image_ != nullptr && image_->format() == peelf::Format::PE)) {
+            pe_rich_header_ = peelf::parse_pe_rich_header(scan_span);
+        }
+        crypto_hits_ = peelf::scan_crypto_and_packer_constants(scan_span, image_.get());
+    }
+
+    std::size_t BinaryModel::scan_live_process_crypto_signatures() {
+        if (!is_live_process() || session_ == nullptr) {
+            refresh_signatures_and_crypto();
+            return crypto_hits_.size();
+        }
+        crypto_hits_ = peelf::scan_crypto_and_packer_constants(*session_);
+        return crypto_hits_.size();
+    }
+
+    std::vector<peelf::SignatureRuleMatch> BinaryModel::evaluate_yara_lite_rules(
+        const peelf::SignatureRuleSet& rules,
+        bool scan_all_live_regions) const {
+        if (rules.rules.empty()) {
+            return {};
+        }
+        if (is_live_process()) {
+            if (scan_all_live_regions && session_ != nullptr) {
+                return peelf::evaluate_signature_rules(rules, *session_);
+            }
+            const std::span<const std::uint8_t> mod_bytes = analysis_image_bytes();
+            if (!mod_bytes.empty()) {
+                return peelf::evaluate_signature_rules(rules, mod_bytes, image_.get());
+            }
+            if (session_ != nullptr) {
+                return peelf::evaluate_signature_rules(rules, *session_);
+            }
+            return {};
+        }
+
+        const std::span<const std::uint8_t> base_span = analysis_image_bytes();
+        if (base_span.empty()) {
+            return {};
+        }
+        std::vector<std::uint8_t> patched_buf;
+        std::span<const std::uint8_t> scan_span = base_span;
+        if (editable_image_ && editable_image_->dirty()) {
+            const std::uint64_t slice_off =
+                image_ != nullptr ? image_->container_slice_offset() : 0u;
+            if (auto eff = read_effective_bytes(slice_off, base_span.size()); eff.has_value()) {
+                patched_buf = std::move(*eff);
+                scan_span = patched_buf;
+            }
+        }
+        return peelf::evaluate_signature_rules(rules, scan_span, image_.get());
+    }
+
+    std::optional<BinaryModel::ResolvedHitFunction> BinaryModel::resolve_hit_referencing_function(
+        std::optional<std::uint64_t> virtual_address,
+        std::uint64_t byte_length,
+        const ReferenceIndex* references) const {
+        if (!virtual_address.has_value()) {
+            return std::nullopt;
+        }
+        const std::uint64_t hit_va = *virtual_address;
+        if (const FunctionEntry* direct_fn = function_index_.find_containing(hit_va);
+            direct_fn != nullptr) {
+            return ResolvedHitFunction{
+                .display_name = direct_fn->display_name(demangle_symbols_),
+                .function_va = direct_fn->virtual_address,
+                .code_va = hit_va,
+                .via_xref = false,
+            };
+        }
+
+        if (references != nullptr) {
+            const std::uint64_t span_len = std::clamp<std::uint64_t>(byte_length, 1u, 4096u);
+            const auto incoming = references->incoming(hit_va, span_len);
+            for (const Reference* ref : incoming) {
+                if (ref == nullptr) {
+                    continue;
+                }
+                if (const FunctionEntry* caller_fn = function_index_.find_containing(ref->source);
+                    caller_fn != nullptr) {
+                    return ResolvedHitFunction{
+                        .display_name = caller_fn->display_name(demangle_symbols_),
+                        .function_va = caller_fn->virtual_address,
+                        .code_va = ref->source,
+                        .via_xref = true,
+                    };
+                }
+                if (const SymbolRecord* sym = symbol_index_.find_containing_address(ref->source);
+                    sym != nullptr && !sym->name.empty()) {
+                    return ResolvedHitFunction{
+                        .display_name = sym->display_name(demangle_symbols_),
+                        .function_va = sym->virtual_address.value_or(ref->source),
+                        .code_va = ref->source,
+                        .via_xref = true,
+                    };
+                }
+                return ResolvedHitFunction{
+                    .display_name = std::format("sub_{:X}", ref->source),
+                    .function_va = ref->source,
+                    .code_va = ref->source,
+                    .via_xref = true,
+                };
+            }
+        }
+        return std::nullopt;
     }
 
 } // namespace viewer

@@ -1709,6 +1709,7 @@ constexpr std::array<BuiltinCommandSpec, 15> kBuiltinCommands{{
         case WorkspacePanelId::DataStructures:     return "panel:data_structures";
         case WorkspacePanelId::ReferencesAndNotes: return "panel:references_and_notes";
         case WorkspacePanelId::Strings:            return "panel:strings";
+        case WorkspacePanelId::SignaturesAndCrypto: return "panel:signatures_and_crypto";
         case WorkspacePanelId::StructureView:      return "panel:structure_view";
         case WorkspacePanelId::ProcessInternals:   return "panel:process_internals";
         case WorkspacePanelId::Dependencies:       return "panel:dependencies";

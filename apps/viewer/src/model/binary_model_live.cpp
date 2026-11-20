@@ -1383,6 +1383,7 @@ private:
                 "security_audit",
                 "Open a PE/ELF image or attach to a process to evaluate security rules");
         }
+        refresh_signatures_and_crypto();
         if (is_live_process() && session_ != nullptr) {
             const peelf::CaptureAvailability rt_avail =
                 process_env_.core_status.availability == peelf::Availability::Available

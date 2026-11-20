@@ -47,6 +47,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/runtime_structures.cpp
   src/handlers.cpp
   src/security_audit.cpp
+  src/signatures.cpp
   src/crash_dump_minidump.cpp
   src/crash_dump_elf_core.cpp
   src/debugger_common.cpp
@@ -101,6 +102,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   include/peelf/runtime_structures.hpp
   include/peelf/handlers.hpp
   include/peelf/security_audit.hpp
+  include/peelf/signatures.hpp
   include/peelf/crash_dump.hpp
   include/peelf/debugger.hpp
   include/mapping/file_mapping.hpp
