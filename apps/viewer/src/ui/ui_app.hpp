@@ -175,6 +175,17 @@ namespace viewer {
         BinaryModel& model_;
         VulkanManager& vulkan_;
         std::optional<StructureNode> structure_tree_;
+        struct LiveStructureStamp {
+            std::size_t modules = 0;
+            std::size_t regions = 0;
+            std::size_t threads = 0;
+            std::size_t handles = 0;
+            std::size_t findings = 0;
+            std::optional<std::size_t> active_module{};
+            bool valid = false;
+            [[nodiscard]] bool operator==(const LiveStructureStamp&) const noexcept = default;
+        };
+        LiveStructureStamp live_structure_stamp_{};
         SymbolIndex symbol_index_;
         ReferenceIndex reference_index_;
         AsyncReferenceScanner reference_scanner_;

@@ -488,12 +488,32 @@ void UiApp::render_attach_process_modal() {
         strings_dirty_ = true;
         references_dirty_ = true;
         const peelf::IProcessSession* sess = model_.process_session();
+        if (!model_.has_process_internals() && sess->is_alive()) {
+            model_.refresh_process_internals();
+        }
+        const auto& handles_opt = model_.process_internals().handles.value;
+        const std::span<const peelf::ProcessHandleEntry> handles_span =
+            handles_opt.has_value()
+                ? std::span<const peelf::ProcessHandleEntry>(*handles_opt)
+                : std::span<const peelf::ProcessHandleEntry>{};
         structure_tree_ = build_live_process_structure_tree(
             sess->info(),
             model_.process_modules(),
             model_.memory_regions(),
             model_.image(),
-            model_.active_module_index());
+            model_.active_module_index(),
+            model_.threads(),
+            handles_span,
+            model_.security_audit().findings);
+        live_structure_stamp_ = LiveStructureStamp{
+            .modules = model_.process_modules().size(),
+            .regions = model_.memory_regions().size(),
+            .threads = model_.threads().size(),
+            .handles = handles_span.size(),
+            .findings = model_.security_audit().findings.size(),
+            .active_module = model_.active_module_index(),
+            .valid = true,
+        };
 
         pending_call_graph_root_.reset();
         pending_call_graph_delay_frames_ = 0;

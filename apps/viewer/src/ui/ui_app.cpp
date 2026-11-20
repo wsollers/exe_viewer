@@ -62,7 +62,14 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
               }
               return overlay;
           })
-    , structure_panel_(structure_tree_, current_selection_)
+    , structure_panel_(
+          structure_tree_,
+          current_selection_,
+          &model,
+          &pending_navigations_,
+          [this](ContextActionKind kind, const InspectableEntity& entity) {
+              dispatch_entity_context_action(kind, entity);
+          })
     , details_panel_(current_selection_, &model)
     , sections_panel_(model)
     , hex_panel_(model)
@@ -947,6 +954,34 @@ void UiApp::render() {
     memory_map_panel_.draw();
     memory_heatmap_panel_.draw();
     byte_viz_panel_.draw();
+    if (model_.is_live_process() && model_.process_session() != nullptr) {
+        const auto& handles_opt = model_.process_internals().handles.value;
+        const std::span<const peelf::ProcessHandleEntry> handles_span =
+            handles_opt.has_value()
+                ? std::span<const peelf::ProcessHandleEntry>(*handles_opt)
+                : std::span<const peelf::ProcessHandleEntry>{};
+        const LiveStructureStamp cur_stamp{
+            .modules = model_.process_modules().size(),
+            .regions = model_.memory_regions().size(),
+            .threads = model_.threads().size(),
+            .handles = handles_span.size(),
+            .findings = model_.security_audit().findings.size(),
+            .active_module = model_.active_module_index(),
+            .valid = true,
+        };
+        if (cur_stamp != live_structure_stamp_) {
+            structure_tree_ = build_live_process_structure_tree(
+                model_.process_session()->info(),
+                model_.process_modules(),
+                model_.memory_regions(),
+                model_.image(),
+                model_.active_module_index(),
+                model_.threads(),
+                handles_span,
+                model_.security_audit().findings);
+            live_structure_stamp_ = cur_stamp;
+        }
+    }
     structure_panel_.draw();
     details_panel_.draw();
     sections_panel_.draw();
@@ -1284,6 +1319,7 @@ void UiApp::process_deferred_gpu_work() {
 }
 
     void UiApp::reset_target_dependent_state() {
+        live_structure_stamp_ = {};
         pending_slice_selection_.reset();
         pending_navigations_.clear();
         pending_ini_layout_.reset();

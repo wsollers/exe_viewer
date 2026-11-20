@@ -13,7 +13,9 @@
 #include <gtest/gtest.h>
 
 #include "graph/call_graph.hpp"
+#include "navigation/viewer_navigation.hpp"
 #include "symbols/debug_symbols.hpp"
+#include "ui/panel_helpers.hpp"
 #include <peelf/binary_image.hpp>
 
 TEST(CallGraphRelations, SeparatesDirectionsDeduplicatesAndPreservesRecursion) {
@@ -1790,4 +1792,462 @@ TEST(CallGraph, FindSymbolForAddressHandlesHighVirtualAddressWithoutUint64Overfl
     EXPECT_EQ(hit->name, "high_va_kernel_stub");
     EXPECT_FALSE(viewer::find_symbol_for_address(image, 0xFFFF'FFFF'FFFF'FFE0ULL).has_value());
 }
+
+namespace {
+
+void write_pe_u16_le(std::vector<std::uint8_t>& buf, std::size_t off, std::uint16_t val) {
+    buf[off + 0u] = static_cast<std::uint8_t>(val & 0xFFu);
+    buf[off + 1u] = static_cast<std::uint8_t>((val >> 8u) & 0xFFu);
+}
+
+void write_pe_u32_le(std::vector<std::uint8_t>& buf, std::size_t off, std::uint32_t val) {
+    buf[off + 0u] = static_cast<std::uint8_t>(val & 0xFFu);
+    buf[off + 1u] = static_cast<std::uint8_t>((val >> 8u) & 0xFFu);
+    buf[off + 2u] = static_cast<std::uint8_t>((val >> 16u) & 0xFFu);
+    buf[off + 3u] = static_cast<std::uint8_t>((val >> 24u) & 0xFFu);
+}
+
+void write_pe_u64_le(std::vector<std::uint8_t>& buf, std::size_t off, std::uint64_t val) {
+    write_pe_u32_le(buf, off + 0u, static_cast<std::uint32_t>(val & 0xFFFFFFFFu));
+    write_pe_u32_le(buf, off + 4u, static_cast<std::uint32_t>((val >> 32u) & 0xFFFFFFFFu));
+}
+
+void write_pe_cstr(std::vector<std::uint8_t>& buf, std::size_t off, std::string_view s) {
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        buf[off + i] = static_cast<std::uint8_t>(s[i]);
+    }
+    buf[off + s.size()] = 0u;
+}
+
+void emit_rel32_at(std::vector<std::uint8_t>& buf,
+                   std::size_t opcode_file_off,
+                   std::uint8_t opcode,
+                   std::uint64_t inst_va,
+                   std::uint64_t target_va) {
+    const auto rel = static_cast<std::uint32_t>(
+        static_cast<std::int32_t>(static_cast<std::int64_t>(target_va) - static_cast<std::int64_t>(inst_va + 5u)));
+    buf[opcode_file_off] = opcode;
+    write_pe_u32_le(buf, opcode_file_off + 1u, rel);
+}
+
+void emit_x64_call_rip_iat(std::vector<std::uint8_t>& buf,
+                           std::size_t file_off,
+                           std::uint64_t inst_va,
+                           std::uint64_t slot_va) {
+    const auto disp = static_cast<std::uint32_t>(
+        static_cast<std::int32_t>(static_cast<std::int64_t>(slot_va) - static_cast<std::int64_t>(inst_va + 6u)));
+    buf[file_off + 0u] = 0xFFu;
+    buf[file_off + 1u] = 0x15u;
+    write_pe_u32_le(buf, file_off + 2u, disp);
+}
+
+[[nodiscard]] std::vector<std::uint8_t> build_stripped_pe_crt_fixture(bool pe64) {
+    // Layout:
+    //   0x000..0x3FF: DOS + PE headers + 2 section headers (.text @ RVA 0x1000, .idata @ RVA 0x2000)
+    //   0x400..0x7FF: .text (raw 0x400, RVA 0x1000)
+    //   0x800..0xBFF: .idata (raw 0x800, RVA 0x2000) importing KERNEL32.dll:
+    //                   slot 0 (@ RVA 0x2050): GetStartupInfoW
+    //                   slot 1 (@ RVA 0x2058 / 0x2054): GetCommandLineW
+    //                   slot 2 (@ RVA 0x2060 / 0x2058): ExitProcess
+    std::vector<std::uint8_t> b(0xC00u, 0u);
+    b[0u] = 'M';
+    b[1u] = 'Z';
+    write_pe_u32_le(b, 0x3Cu, 0x80u);
+
+    b[0x80u] = 'P';
+    b[0x81u] = 'E';
+    write_pe_u16_le(b, 0x84u, pe64 ? 0x8664u : 0x014Cu);
+    write_pe_u16_le(b, 0x86u, 2u);
+    const std::uint16_t opt_size = pe64 ? 0xF0u : 0xE0u;
+    write_pe_u16_le(b, 0x94u, opt_size);
+    write_pe_u16_le(b, 0x96u, pe64 ? 0x0022u : 0x0102u);
+
+    constexpr std::size_t kOpt = 0x98u;
+    write_pe_u16_le(b, kOpt + 0x00u, pe64 ? 0x020Bu : 0x010Bu);
+    write_pe_u32_le(b, kOpt + 0x10u, 0x1000u); // AddressOfEntryPoint
+    if (pe64) {
+        write_pe_u64_le(b, kOpt + 0x18u, 0x140000000ULL);
+        write_pe_u32_le(b, kOpt + 0x20u, 0x1000u);
+        write_pe_u32_le(b, kOpt + 0x24u, 0x200u);
+        write_pe_u32_le(b, kOpt + 0x38u, 0x3000u);
+        write_pe_u32_le(b, kOpt + 0x3Cu, 0x400u);
+        write_pe_u16_le(b, kOpt + 0x44u, 3u); // CUI
+        write_pe_u32_le(b, kOpt + 0x6Cu, 16u);
+        write_pe_u32_le(b, kOpt + 0x78u, 0x2000u); // Import Directory RVA
+        write_pe_u32_le(b, kOpt + 0x7Cu, 40u);
+    } else {
+        write_pe_u32_le(b, kOpt + 0x1Cu, 0x00400000u);
+        write_pe_u32_le(b, kOpt + 0x20u, 0x1000u);
+        write_pe_u32_le(b, kOpt + 0x24u, 0x200u);
+        write_pe_u32_le(b, kOpt + 0x38u, 0x3000u);
+        write_pe_u32_le(b, kOpt + 0x3Cu, 0x400u);
+        write_pe_u16_le(b, kOpt + 0x44u, 3u); // CUI
+        write_pe_u32_le(b, kOpt + 0x5Cu, 16u);
+        write_pe_u32_le(b, kOpt + 0x68u, 0x2000u); // Import Directory RVA
+        write_pe_u32_le(b, kOpt + 0x6Cu, 40u);
+    }
+
+    const auto write_sec = [&](std::size_t idx, std::string_view name, std::uint32_t rva,
+                               std::uint32_t raw_off, std::uint32_t chars) {
+        const std::size_t sh = kOpt + opt_size + idx * 40u;
+        for (std::size_t i = 0; i < name.size() && i < 8u; ++i) {
+            b[sh + i] = static_cast<std::uint8_t>(name[i]);
+        }
+        write_pe_u32_le(b, sh + 8u, 0x400u);
+        write_pe_u32_le(b, sh + 12u, rva);
+        write_pe_u32_le(b, sh + 16u, 0x400u);
+        write_pe_u32_le(b, sh + 20u, raw_off);
+        write_pe_u32_le(b, sh + 36u, chars);
+    };
+    write_sec(0u, ".text", 0x1000u, 0x400u, 0x60000020u);
+    write_sec(1u, ".idata", 0x2000u, 0x800u, 0x40000040u);
+
+    // Populate .idata (raw 0x800 == RVA 0x2000)
+    write_pe_u32_le(b, 0x800u + 0u, 0x2030u);  // OriginalFirstThunk
+    write_pe_u32_le(b, 0x800u + 12u, 0x2080u); // Name ("KERNEL32.dll")
+    write_pe_u32_le(b, 0x800u + 16u, 0x2050u); // FirstThunk (IAT)
+    write_pe_cstr(b, 0x880u, "KERNEL32.dll");
+
+    write_pe_u16_le(b, 0x8A0u, 1u);
+    write_pe_cstr(b, 0x8A2u, "GetStartupInfoW");
+    write_pe_u16_le(b, 0x8C0u, 2u);
+    write_pe_cstr(b, 0x8C2u, "GetCommandLineW");
+    write_pe_u16_le(b, 0x8E0u, 3u);
+    write_pe_cstr(b, 0x8E2u, "ExitProcess");
+
+    const std::array<std::uint32_t, 3> ibn_rvas{0x20A0u, 0x20C0u, 0x20E0u};
+    for (std::size_t i = 0; i < ibn_rvas.size(); ++i) {
+        if (pe64) {
+            write_pe_u64_le(b, 0x830u + i * 8u, ibn_rvas[i]);
+            write_pe_u64_le(b, 0x850u + i * 8u, ibn_rvas[i]);
+        } else {
+            write_pe_u32_le(b, 0x830u + i * 4u, ibn_rvas[i]);
+            write_pe_u32_le(b, 0x850u + i * 4u, ibn_rvas[i]);
+        }
+    }
+
+    if (pe64) {
+        // PE32+ x64 MSVC UCRT 2-hop chain:
+        //   0x140001000 (entry): sub rsp,0x28; call 0x140001020 (__security_init_cookie); add rsp,0x28; jmp 0x140001040
+        //   0x140001020: ret
+        //   0x140001040 (__scrt_common_main_seh): sub rsp,0x28; call [GetStartupInfoW]; call 0x140001080 (invoke_main);
+        //                                         mov ecx,eax; call [ExitProcess]; int3
+        //   0x140001080 (invoke_main): sub rsp,0x28; call [GetCommandLineW]; call 0x140001100 (user_main); add rsp,0x28; ret
+        //   0x140001100 (user_main): mov eax, 42; ret
+        constexpr std::uint64_t kBase = 0x140000000ULL;
+        // 0x140001000 (raw 0x400):
+        b[0x400u] = 0x48u; b[0x401u] = 0x83u; b[0x402u] = 0xECu; b[0x403u] = 0x28u;
+        emit_rel32_at(b, 0x404u, 0xE8u, kBase + 0x1004u, kBase + 0x1020u);
+        b[0x409u] = 0x48u; b[0x40Au] = 0x83u; b[0x40Bu] = 0xC4u; b[0x40Cu] = 0x28u;
+        emit_rel32_at(b, 0x40Du, 0xE9u, kBase + 0x100Du, kBase + 0x1040u);
+
+        // 0x140001020 (raw 0x420):
+        b[0x420u] = 0xC3u;
+
+        // 0x140001040 (raw 0x440):
+        b[0x440u] = 0x48u; b[0x441u] = 0x83u; b[0x442u] = 0xECu; b[0x443u] = 0x28u;
+        emit_x64_call_rip_iat(b, 0x444u, kBase + 0x1044u, kBase + 0x2050u); // GetStartupInfoW
+        emit_rel32_at(b, 0x44Au, 0xE8u, kBase + 0x104Au, kBase + 0x1080u);  // invoke_main
+        b[0x44Fu] = 0x89u; b[0x450u] = 0xC1u;                               // mov ecx, eax
+        emit_x64_call_rip_iat(b, 0x451u, kBase + 0x1051u, kBase + 0x2060u); // ExitProcess
+        b[0x457u] = 0xCCu;
+
+        // 0x140001080 (raw 0x480):
+        b[0x480u] = 0x48u; b[0x481u] = 0x83u; b[0x482u] = 0xECu; b[0x483u] = 0x28u;
+        emit_x64_call_rip_iat(b, 0x484u, kBase + 0x1084u, kBase + 0x2058u); // GetCommandLineW
+        emit_rel32_at(b, 0x48Au, 0xE8u, kBase + 0x108Au, kBase + 0x1100u);  // user_main
+        b[0x48Fu] = 0x48u; b[0x490u] = 0x83u; b[0x491u] = 0xC4u; b[0x492u] = 0x28u;
+        b[0x493u] = 0xC3u;
+
+        // 0x140001100 (raw 0x500):
+        b[0x500u] = 0xB8u; write_pe_u32_le(b, 0x501u, 42u);
+        b[0x505u] = 0xC3u;
+    } else {
+        // PE32 x86 1-hop CRT chain:
+        //   0x00401000 (entry): call 0x00401010 (__security_init_cookie); jmp 0x00401020 (__tmainCRTStartup)
+        //   0x00401010: ret
+        //   0x00401020 (__tmainCRTStartup): call [0x402050]; call [0x402054]; call 0x00401080 (main);
+        //                                   push eax; call [0x402058]; int3
+        //   0x00401080 (main): mov eax, 7; ret
+        constexpr std::uint64_t kBase = 0x00400000ULL;
+        emit_rel32_at(b, 0x400u, 0xE8u, kBase + 0x1000u, kBase + 0x1010u);
+        emit_rel32_at(b, 0x405u, 0xE9u, kBase + 0x1005u, kBase + 0x1020u);
+
+        b[0x410u] = 0xC3u;
+
+        // 0x00401020 (raw 0x420):
+        b[0x420u] = 0xFFu; b[0x421u] = 0x15u; write_pe_u32_le(b, 0x422u, 0x00402050u); // GetStartupInfoW
+        b[0x426u] = 0xFFu; b[0x427u] = 0x15u; write_pe_u32_le(b, 0x428u, 0x00402054u); // GetCommandLineW
+        emit_rel32_at(b, 0x42Cu, 0xE8u, kBase + 0x102Cu, kBase + 0x1080u);             // user main
+        b[0x431u] = 0x50u;                                                             // push eax
+        b[0x432u] = 0xFFu; b[0x433u] = 0x15u; write_pe_u32_le(b, 0x434u, 0x00402058u); // ExitProcess
+        b[0x438u] = 0xCCu;
+
+        // 0x00401080 (raw 0x480):
+        b[0x480u] = 0xB8u; write_pe_u32_le(b, 0x481u, 7u);
+        b[0x485u] = 0xC3u;
+    }
+
+    return b;
+}
+
+} // namespace
+
+TEST(CallGraph, EmitsDeterministicGoldenDotSnapshot) {
+    const viewer::CallGraph graph{
+        .id = "function_cfg",
+        .label = "golden_cfg",
+        .architecture = peelf::Architecture::X86_64,
+        .endianness = peelf::Endianness::Little,
+        .nodes = {
+            viewer::CallGraphNode{
+                .id = "bb_0",
+                .label = "entry_block",
+                .kind = viewer::CallGraphNodeKind::BasicBlock,
+                .instructions = {
+                    viewer::GraphInstruction{
+                        .address = 0x1000u,
+                        .mnemonic = "test",
+                        .operands = "edi, edi",
+                    },
+                    viewer::GraphInstruction{
+                        .address = 0x1002u,
+                        .mnemonic = "je",
+                        .operands = "0x100c",
+                        .branch_target = 0x100Cu,
+                    },
+                },
+            },
+            viewer::CallGraphNode{
+                .id = "bb_1",
+                .label = "taken_call",
+                .kind = viewer::CallGraphNodeKind::Function,
+                .bytes = viewer::GraphByteRange{
+                    .start = viewer::GraphAddress{
+                        .virtual_address = 0x1004u,
+                        .file_offset = 0x200u,
+                    },
+                    .size = 8u,
+                },
+                .symbol = viewer::GraphSymbolRef{
+                    .name = "helper_fn",
+                    .symbol_index = 1u,
+                },
+            },
+            viewer::CallGraphNode{
+                .id = "imp_exit",
+                .label = "KERNEL32.dll!ExitProcess",
+                .kind = viewer::CallGraphNodeKind::Import,
+            },
+            viewer::CallGraphNode{
+                .id = "return",
+                .label = "return",
+                .kind = viewer::CallGraphNodeKind::External,
+            },
+        },
+        .edges = {
+            viewer::CallGraphEdge{
+                .from_node_id = "bb_0",
+                .to_node_id = "return",
+                .kind = viewer::CallGraphEdgeKind::ConditionalBranch,
+                .label = "true",
+            },
+            viewer::CallGraphEdge{
+                .from_node_id = "bb_0",
+                .to_node_id = "bb_1",
+                .kind = viewer::CallGraphEdgeKind::Fallthrough,
+                .label = "false",
+            },
+            viewer::CallGraphEdge{
+                .from_node_id = "bb_1",
+                .to_node_id = "imp_exit",
+                .kind = viewer::CallGraphEdgeKind::DirectCall,
+                .label = "call",
+            },
+            viewer::CallGraphEdge{
+                .from_node_id = "bb_1",
+                .to_node_id = "return",
+                .kind = viewer::CallGraphEdgeKind::Return,
+            },
+        },
+    };
+
+    constexpr std::string_view kExpectedDot =
+        "digraph \"function_cfg\" {\n"
+        "  graph [rankdir=\"TB\", labelloc=\"t\", label=\"golden_cfg\"];\n"
+        "  node [fontname=\"Consolas\", fontsize=\"10\"];\n"
+        "  edge [fontname=\"Consolas\", fontsize=\"9\"];\n"
+        "  \"bb_0\" [shape=\"record\", label=\"{entry_block|0x1000  test edi, edi\\n0x1002  je 0x100c}\"];\n"
+        "  \"bb_1\" [shape=\"box\", label=\"taken_call\\nVA 0x1004\\nfile 0x200\\nhelper_fn\"];\n"
+        "  \"imp_exit\" [shape=\"component\", label=\"KERNEL32.dll!ExitProcess\"];\n"
+        "  \"return\" [shape=\"oval\", label=\"return\"];\n"
+        "  \"bb_0\" -> \"return\" [color=\"#ff7f0e\",style=\"dashed\", label=\"true\"];\n"
+        "  \"bb_0\" -> \"bb_1\" [color=\"#2ca02c\", label=\"false\"];\n"
+        "  \"bb_1\" -> \"imp_exit\" [color=\"#1f77b4\", label=\"call\"];\n"
+        "  \"bb_1\" -> \"return\" [color=\"#9467bd\"];\n"
+        "}\n";
+
+    EXPECT_EQ(viewer::to_dot(graph), kExpectedDot);
+}
+
+TEST(CallGraph, ClassifiesConditionalTrueFalseUnconditionalFallthroughAndReturnAcrossArchitectures) {
+    // 1. x86_64 diamond:
+    //   bb_0 (0x1000): test edi, edi; je 0x1009 (bb_2)
+    //   bb_1 (0x1004): mov eax, 1; jmp 0x100B (bb_3)
+    //   bb_2 (0x1009): xor eax, eax (falls through to bb_3)
+    //   bb_3 (0x100B): ret -> return
+    const std::array<std::uint8_t, 12> x64_diamond{
+        0x85u, 0xFFu,                         // 0x1000: test edi, edi
+        0x74u, 0x05u,                         // 0x1002: je 0x1009
+        0xB8u, 0x01u, 0x00u, 0x00u, 0x00u,    // 0x1004: mov eax, 1
+        0xEBu, 0x02u,                         // 0x1009? wait -> let's check offsets!
+        0xC3u,
+    };
+    (void)x64_diamond;
+
+    const std::array<std::uint8_t, 14> x64_cfg_bytes{
+        0x85u, 0xFFu,                         // 0x1000: test edi, edi (2)
+        0x74u, 0x07u,                         // 0x1002: je 0x100B     (2 -> next 0x1004, +7 = 0x100B)
+        0xB8u, 0x01u, 0x00u, 0x00u, 0x00u,    // 0x1004: mov eax, 1    (5)
+        0xEBu, 0x02u,                         // 0x1009: jmp 0x100D    (2 -> next 0x100B, +2 = 0x100D)
+        0x31u, 0xC0u,                         // 0x100B: xor eax, eax  (2 -> falls through to 0x100D)
+        0xC3u,                                // 0x100D: ret           (1)
+    };
+    const viewer::CallGraph x64_cfg = viewer::build_function_cfg_call_graph(
+        x64_cfg_bytes, 0x1000u, peelf::Architecture::X86_64, peelf::Endianness::Little, std::nullopt, "x64_diamond");
+    EXPECT_TRUE(has_edge(x64_cfg, "bb_0", "bb_2", viewer::CallGraphEdgeKind::ConditionalBranch));
+    EXPECT_TRUE(has_edge(x64_cfg, "bb_0", "bb_1", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(x64_cfg, "bb_1", "bb_3", viewer::CallGraphEdgeKind::UnconditionalBranch));
+    EXPECT_FALSE(has_edge(x64_cfg, "bb_1", "bb_2", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(x64_cfg, "bb_2", "bb_3", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(x64_cfg, "bb_3", "return", viewer::CallGraphEdgeKind::Return));
+
+    // 2. ARM64 diamond:
+    //   bb_0 (0x2000): cbz w0, 0x200C (bb_2)
+    //   bb_1 (0x2004): mov w0, #1; b 0x2010 (bb_3)
+    //   bb_2 (0x200C): mov w0, #0 (falls through to bb_3)
+    //   bb_3 (0x2010): ret
+    const std::array<std::uint8_t, 20> arm64_cfg_bytes{
+        0x60u, 0x00u, 0x00u, 0x34u, // 0x2000: cbz w0, #0x200c
+        0x20u, 0x00u, 0x80u, 0x52u, // 0x2004: mov w0, #1
+        0x02u, 0x00u, 0x00u, 0x14u, // 0x2008: b #0x2010
+        0x00u, 0x00u, 0x80u, 0x52u, // 0x200C: mov w0, #0
+        0xC0u, 0x03u, 0x5Fu, 0xD6u, // 0x2010: ret
+    };
+    const viewer::CallGraph arm64_cfg = viewer::build_function_cfg_call_graph(
+        arm64_cfg_bytes, 0x2000u, peelf::Architecture::ARM64, peelf::Endianness::Little, std::nullopt, "arm64_diamond");
+    EXPECT_TRUE(has_edge(arm64_cfg, "bb_0", "bb_2", viewer::CallGraphEdgeKind::ConditionalBranch));
+    EXPECT_TRUE(has_edge(arm64_cfg, "bb_0", "bb_1", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(arm64_cfg, "bb_1", "bb_3", viewer::CallGraphEdgeKind::UnconditionalBranch));
+    EXPECT_FALSE(has_edge(arm64_cfg, "bb_1", "bb_2", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(arm64_cfg, "bb_2", "bb_3", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(arm64_cfg, "bb_3", "return", viewer::CallGraphEdgeKind::Return));
+
+    // 3. RISC-V64 diamond:
+    //   bb_0 (0x3000): beq a0, zero, +12 (0x300C -> bb_2)
+    //   bb_1 (0x3004): addi a0, zero, 1; jal zero, +8 (0x3010 -> bb_3)
+    //   bb_2 (0x300C): addi a0, zero, 0 (falls through to bb_3)
+    //   bb_3 (0x3010): jalr zero, ra, 0 (ret)
+    const std::array<std::uint8_t, 20> rv64_cfg_bytes{
+        0x63u, 0x06u, 0x05u, 0x00u, // 0x3000: beq a0, zero, +12 -> 0x300C
+        0x13u, 0x05u, 0x10u, 0x00u, // 0x3004: addi a0, zero, 1
+        0x6Fu, 0x00u, 0x80u, 0x00u, // 0x3008: jal zero, +8 -> 0x3010
+        0x13u, 0x05u, 0x00u, 0x00u, // 0x300C: addi a0, zero, 0
+        0x67u, 0x80u, 0x00u, 0x00u, // 0x3010: ret (jalr zero, ra, 0)
+    };
+    const viewer::CallGraph rv64_cfg = viewer::build_function_cfg_call_graph(
+        rv64_cfg_bytes, 0x3000u, peelf::Architecture::RISCV64, peelf::Endianness::Little, std::nullopt, "rv64_diamond");
+    EXPECT_TRUE(has_edge(rv64_cfg, "bb_0", "bb_2", viewer::CallGraphEdgeKind::ConditionalBranch));
+    EXPECT_TRUE(has_edge(rv64_cfg, "bb_0", "bb_1", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(rv64_cfg, "bb_1", "bb_3", viewer::CallGraphEdgeKind::UnconditionalBranch));
+    EXPECT_FALSE(has_edge(rv64_cfg, "bb_1", "bb_2", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(rv64_cfg, "bb_2", "bb_3", viewer::CallGraphEdgeKind::Fallthrough));
+    EXPECT_TRUE(has_edge(rv64_cfg, "bb_3", "return", viewer::CallGraphEdgeKind::Return));
+}
+
+TEST(CallGraph, RecoversStrippedPeX64AndX86CrtToUserMainCallFlow) {
+    // 1. Stripped PE32+ x64 (2-hop entry -> __scrt_common_main_seh -> invoke_main -> user WinMain/main)
+    {
+        const std::vector<std::uint8_t> pe64_bytes = build_stripped_pe_crt_fixture(true);
+        auto parsed64 = peelf::parse_image(pe64_bytes);
+        ASSERT_TRUE(parsed64.has_value());
+        const std::unique_ptr<peelf::IBinaryImage> pe64 = std::move(*parsed64);
+        ASSERT_TRUE(pe64->symbols().empty());
+
+        const viewer::CallGraph graph = viewer::build_entry_call_graph(*pe64);
+        EXPECT_EQ(find_node(graph, "winmain_unresolved"), nullptr);
+
+        const viewer::CallGraphNode* crt_node = find_node(graph, "crt_startup");
+        const viewer::CallGraphNode* user_node = find_node(graph, "user_entry");
+        ASSERT_NE(crt_node, nullptr);
+        ASSERT_NE(user_node, nullptr);
+        ASSERT_NE(find_node(graph, "entry_symbol"), nullptr);
+        EXPECT_EQ(crt_node->bytes.start.virtual_address, std::optional<std::uint64_t>{0x140001040ULL});
+        EXPECT_EQ(user_node->bytes.start.virtual_address, std::optional<std::uint64_t>{0x140001100ULL});
+        EXPECT_TRUE(has_edge(graph, "entry_symbol", "crt_startup", viewer::CallGraphEdgeKind::DirectCall));
+        EXPECT_TRUE(has_edge(graph, "crt_startup", "user_entry", viewer::CallGraphEdgeKind::DirectCall));
+    }
+
+    // 2. Stripped PE32 x86 (1-hop entry -> __tmainCRTStartup -> user main)
+    {
+        const std::vector<std::uint8_t> pe32_bytes = build_stripped_pe_crt_fixture(false);
+        auto parsed32 = peelf::parse_image(pe32_bytes);
+        ASSERT_TRUE(parsed32.has_value());
+        const std::unique_ptr<peelf::IBinaryImage> pe32 = std::move(*parsed32);
+        ASSERT_TRUE(pe32->symbols().empty());
+
+        const viewer::CallGraph graph = viewer::build_entry_call_graph(*pe32);
+        EXPECT_EQ(find_node(graph, "winmain_unresolved"), nullptr);
+
+        const viewer::CallGraphNode* crt_node = find_node(graph, "crt_startup");
+        const viewer::CallGraphNode* user_node = find_node(graph, "user_entry");
+        ASSERT_NE(crt_node, nullptr);
+        ASSERT_NE(user_node, nullptr);
+        ASSERT_NE(find_node(graph, "entry_symbol"), nullptr);
+        EXPECT_EQ(crt_node->bytes.start.virtual_address, std::optional<std::uint64_t>{0x00401020ULL});
+        EXPECT_EQ(user_node->bytes.start.virtual_address, std::optional<std::uint64_t>{0x00401080ULL});
+        EXPECT_TRUE(has_edge(graph, "entry_symbol", "crt_startup", viewer::CallGraphEdgeKind::DirectCall));
+        EXPECT_TRUE(has_edge(graph, "crt_startup", "user_entry", viewer::CallGraphEdgeKind::DirectCall));
+    }
+}
+
+TEST(CallGraph, GraphNodeClickSelectionRoundTripsThroughNavigationRequestQueue) {
+    const std::vector<std::uint8_t> pe64_bytes = build_stripped_pe_crt_fixture(true);
+    auto parsed64 = peelf::parse_image(pe64_bytes);
+    ASSERT_TRUE(parsed64.has_value());
+    const std::unique_ptr<peelf::IBinaryImage> pe64 = std::move(*parsed64);
+
+    const viewer::CallGraph graph = viewer::build_entry_call_graph(*pe64);
+    const viewer::CallGraphNode* user_node = find_node(graph, "user_entry");
+    ASSERT_NE(user_node, nullptr);
+
+    // Simulate clicking the recovered user_entry node on the Flow Graph canvas.
+    const viewer::ViewerSelection sel = viewer::selection_from_call_graph_node(*user_node, *pe64);
+    EXPECT_EQ(sel.kind, viewer::SelectionKind::CallGraphNode);
+    EXPECT_EQ(sel.preferred_view, viewer::PreferredView::Disassembly);
+    EXPECT_EQ(sel.virtual_address, std::optional<std::uint64_t>{0x140001100ULL});
+    EXPECT_EQ(sel.file_offset, std::optional<std::uint64_t>{0x500ULL});
+
+    viewer::NavigationRequestQueue queue{};
+    viewer::NavigationHistory history{};
+    ASSERT_TRUE(viewer::enqueue_structure_selection_activation(queue, sel));
+
+    std::optional<std::uint64_t> navigated_va{};
+    viewer::PreferredView navigated_view = viewer::PreferredView::Details;
+    const std::size_t drained = queue.drain([&](viewer::DeferredNavigationRequest& req) {
+        if (req.kind == viewer::DeferredNavigationRequest::Kind::Address) {
+            navigated_va = req.target;
+            navigated_view = req.preferred_view;
+            history.visit(sel);
+        }
+    });
+
+    EXPECT_EQ(drained, 1u);
+    EXPECT_EQ(navigated_va, std::optional<std::uint64_t>{0x140001100ULL});
+    EXPECT_EQ(navigated_view, viewer::PreferredView::Disassembly);
+    ASSERT_FALSE(history.entries().empty());
+    EXPECT_EQ(history.entries()[history.cursor()].virtual_address,
+              std::optional<std::uint64_t>{0x140001100ULL});
+}
+
 

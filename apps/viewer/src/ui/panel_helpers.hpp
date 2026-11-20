@@ -2,7 +2,10 @@
 
 #include <peelf/peelf.hpp>
 
+#include "model/binary_model.hpp"
+#include "navigation/viewer_navigation.hpp"
 #include "symbols/symbol_index.hpp"
+#include "ui/context_actions.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +17,30 @@
 #include <vector>
 
 namespace viewer {
+
+struct DetailPropertyRow {
+    std::string key{};
+    std::string value{};
+};
+
+/// Builds a rich, format- and target-aware 2-column property table for `selection`
+/// against `model` (`P6-11`), suitable for both Dear ImGui rendering and headless unit tests.
+[[nodiscard]] std::vector<DetailPropertyRow> build_selection_detail_properties(
+    const ViewerSelection& selection,
+    const BinaryModel& model);
+
+/// Builds a capability-ready `InspectableEntity` for right-click context actions on any
+/// `StructureNavigatorPanel` node (`P6-9`).
+[[nodiscard]] InspectableEntity build_inspectable_entity_from_selection(
+    const ViewerSelection& selection,
+    const BinaryModel* model = nullptr);
+
+/// Enqueues explicit double-click / `Enter` activation for a `StructureNavigatorPanel`
+/// selection onto `queue` according to `selection.preferred_view` (`P6-9` / `P6-20`).
+bool enqueue_structure_selection_activation(
+    NavigationRequestQueue& queue,
+    const ViewerSelection& selection,
+    BinaryModel* model = nullptr);
 
 struct ScriptStarterTemplate {
     std::string_view title{};

@@ -13,6 +13,8 @@
 #include <peelf/binary_image.hpp>
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
+#include <peelf/process_internals.hpp>
+#include <peelf/security_audit.hpp>
 
 #include "symbols/symbol_index.hpp"
 
@@ -54,8 +56,13 @@ enum class SelectionKind : std::uint8_t {
     Process,
     ProcessModule,
     MemoryRegion,
-    Group
+    Group,
+    ProcessThread,
+    ProcessHandle,
+    SecurityFinding
 };
+
+inline constexpr SelectionKind kMaxSelectionKind = SelectionKind::SecurityFinding;
 
 struct ViewerSelection {
     SelectionKind kind = SelectionKind::None;
@@ -168,6 +175,15 @@ struct StructureNode {
     std::vector<StructureNode> children;
 };
 
+[[nodiscard]] std::string_view selection_kind_tag(SelectionKind kind) noexcept;
+[[nodiscard]] std::string_view structure_node_badge(SelectionKind kind) noexcept;
+[[nodiscard]] std::optional<StructureNode> filter_structure_tree(
+    const StructureNode& root,
+    std::string_view query);
+[[nodiscard]] std::size_t count_structure_tree_matches(
+    const StructureNode& root,
+    std::string_view query);
+
 [[nodiscard]] StructureNode build_structure_tree(const peelf::IBinaryImage& image);
 [[nodiscard]] StructureNode build_live_process_structure_tree(
     const peelf::ProcessInfo& process,
@@ -175,6 +191,15 @@ struct StructureNode {
     std::span<const peelf::MemoryRegion> regions,
     const peelf::IBinaryImage* active_image,
     std::optional<std::size_t> active_module_index = std::nullopt);
+[[nodiscard]] StructureNode build_live_process_structure_tree(
+    const peelf::ProcessInfo& process,
+    std::span<const peelf::ModuleInfo> modules,
+    std::span<const peelf::MemoryRegion> regions,
+    const peelf::IBinaryImage* active_image,
+    std::optional<std::size_t> active_module_index,
+    std::span<const peelf::ThreadInfo> threads,
+    std::span<const peelf::HandleInfo> handles = {},
+    std::span<const peelf::SecurityFinding> findings = {});
 struct CallGraphNode;
 [[nodiscard]] ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
                                                             const peelf::IBinaryImage& image);
@@ -189,6 +214,15 @@ struct CallGraphNode;
     const peelf::MemoryRegion& region,
     std::uint64_t region_index,
     std::optional<std::uint64_t> window_offset = std::nullopt);
+[[nodiscard]] ViewerSelection selection_from_process_thread(
+    const peelf::ThreadInfo& thread,
+    std::uint64_t thread_index);
+[[nodiscard]] ViewerSelection selection_from_process_handle(
+    const peelf::HandleInfo& handle,
+    std::uint64_t handle_index);
+[[nodiscard]] ViewerSelection selection_from_security_finding(
+    const peelf::SecurityFinding& finding,
+    std::uint64_t finding_index);
 [[nodiscard]] ViewerSelection selection_from_symbol_record(
     const SymbolRecord& record,
     std::uint64_t record_index);

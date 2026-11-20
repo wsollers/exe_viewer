@@ -1,6 +1,8 @@
 #include "navigation/viewer_navigation.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <format>
 #include <string>
 
@@ -8,6 +10,140 @@
 
 namespace viewer {
 namespace {
+
+[[nodiscard]] std::string_view trim_query_whitespace(std::string_view sv) noexcept {
+    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front())) != 0) {
+        sv.remove_prefix(1u);
+    }
+    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back())) != 0) {
+        sv.remove_suffix(1u);
+    }
+    return sv;
+}
+
+[[nodiscard]] bool icontains_ascii(std::string_view haystack, std::string_view needle) noexcept {
+    if (needle.empty()) {
+        return true;
+    }
+    if (haystack.size() < needle.size()) {
+        return false;
+    }
+    const auto it = std::search(
+        haystack.begin(),
+        haystack.end(),
+        needle.begin(),
+        needle.end(),
+        [](char a, char b) noexcept {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        });
+    return it != haystack.end();
+}
+
+[[nodiscard]] std::optional<std::uint64_t> parse_prefixed_hex_query(std::string_view query) noexcept {
+    if (query.size() <= 2u || query[0] != '0' || (query[1] != 'x' && query[1] != 'X')) {
+        return std::nullopt;
+    }
+    const std::string_view digits = query.substr(2u);
+    if (digits.empty() || digits.front() == '+' || digits.front() == '-') {
+        return std::nullopt;
+    }
+    std::uint64_t value = 0u;
+    const char* begin = digits.data();
+    const char* end = begin + digits.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, value, 16);
+    if (ec == std::errc{} && ptr == end) {
+        return value;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] bool icontains_kind_tag(std::string_view tag, std::string_view needle) noexcept {
+    if (icontains_ascii(tag, needle)) {
+        return true;
+    }
+    if (needle.empty() || tag.size() < needle.size()) {
+        return false;
+    }
+    const auto it = std::search(
+        tag.begin(),
+        tag.end(),
+        needle.begin(),
+        needle.end(),
+        [](char a, char b) noexcept {
+            if (a == ' ' && (b == '_' || b == '-')) {
+                return true;
+            }
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        });
+    return it != tag.end();
+}
+
+[[nodiscard]] bool structure_node_matches_query(
+    const StructureNode& node,
+    std::string_view query,
+    std::optional<std::uint64_t> exact_hex_value) {
+    if (icontains_ascii(node.selection.label, query) ||
+        icontains_kind_tag(selection_kind_tag(node.selection.kind), query) ||
+        icontains_ascii(structure_node_badge(node.selection.kind), query)) {
+        return true;
+    }
+    if (node.selection.virtual_address.has_value()) {
+        const std::uint64_t va = *node.selection.virtual_address;
+        if ((exact_hex_value.has_value() && *exact_hex_value == va) ||
+            icontains_ascii(std::format("0x{:X}", va), query)) {
+            return true;
+        }
+    }
+    if (node.selection.file_offset.has_value()) {
+        const std::uint64_t off = *node.selection.file_offset;
+        if ((exact_hex_value.has_value() && *exact_hex_value == off) ||
+            icontains_ascii(std::format("0x{:X}", off), query)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::optional<StructureNode> filter_node_recursive(
+    const StructureNode& node,
+    std::string_view query,
+    std::optional<std::uint64_t> exact_hex_value) {
+    if (node.selection.kind == SelectionKind::Group &&
+        structure_node_matches_query(node, query, exact_hex_value)) {
+        return node;
+    }
+    std::vector<StructureNode> filtered_children;
+    filtered_children.reserve(node.children.size());
+    for (const StructureNode& child : node.children) {
+        if (auto matched = filter_node_recursive(child, query, exact_hex_value); matched.has_value()) {
+            filtered_children.push_back(std::move(*matched));
+        }
+    }
+    if (!filtered_children.empty()) {
+        StructureNode out{
+            .selection = node.selection,
+            .children = std::move(filtered_children),
+        };
+        return out;
+    }
+    if (structure_node_matches_query(node, query, exact_hex_value)) {
+        return node;
+    }
+    return std::nullopt;
+}
+
+[[nodiscard]] std::size_t count_matches_recursive(
+    const StructureNode& node,
+    std::string_view query,
+    std::optional<std::uint64_t> exact_hex_value) {
+    std::size_t total = structure_node_matches_query(node, query, exact_hex_value) ? 1u : 0u;
+    for (const StructureNode& child : node.children) {
+        total += count_matches_recursive(child, query, exact_hex_value);
+    }
+    return total;
+}
 
 [[nodiscard]] StructureNode group_node(std::string label) {
     return StructureNode{
@@ -66,6 +202,11 @@ void add_headers(const peelf::IBinaryImage& image, StructureNode& root) {
         dos.selection.size = 0x40;
         headers.children.push_back(std::move(dos));
         headers.children.push_back(selectable_node(SelectionKind::Header, "PE/COFF Headers", 2, PreferredView::Details));
+    } else if (image.macho_header() != nullptr) {
+        StructureNode mh = selectable_node(SelectionKind::Header, "Mach-O Header", 1, PreferredView::Details);
+        mh.selection.file_offset = 0;
+        mh.selection.size = image.is_64bit() ? 32u : 28u;
+        headers.children.push_back(std::move(mh));
     }
 
     root.children.push_back(std::move(headers));
@@ -467,12 +608,18 @@ StructureNode build_structure_tree(const peelf::IBinaryImage& image) {
     return root;
 }
 
-StructureNode build_live_process_structure_tree(
+namespace {
+
+[[nodiscard]] StructureNode build_live_process_structure_tree_impl(
     const peelf::ProcessInfo& process,
     std::span<const peelf::ModuleInfo> modules,
     std::span<const peelf::MemoryRegion> regions,
     const peelf::IBinaryImage* active_image,
-    std::optional<std::size_t> active_module_index) {
+    std::optional<std::size_t> active_module_index,
+    bool include_live_subtrees,
+    std::span<const peelf::ThreadInfo> threads,
+    std::span<const peelf::HandleInfo> handles,
+    std::span<const peelf::SecurityFinding> findings) {
     std::string proc_label = "Process " +
         (process.name.empty() ? std::to_string(process.pid) : process.name) +
         " (PID " + std::to_string(process.pid) + ")";
@@ -524,6 +671,35 @@ StructureNode build_live_process_structure_tree(
     }
     root.children.push_back(std::move(memmap_group));
 
+    if (include_live_subtrees) {
+        StructureNode threads_group = group_node("Threads (" + std::to_string(threads.size()) + ")");
+        for (std::size_t i = 0; i < threads.size(); ++i) {
+            threads_group.children.push_back(StructureNode{
+                .selection = selection_from_process_thread(threads[i], static_cast<std::uint64_t>(i)),
+                .children = {},
+            });
+        }
+        root.children.push_back(std::move(threads_group));
+
+        StructureNode handles_group = group_node("Handles / FDs (" + std::to_string(handles.size()) + ")");
+        for (std::size_t i = 0; i < handles.size(); ++i) {
+            handles_group.children.push_back(StructureNode{
+                .selection = selection_from_process_handle(handles[i], static_cast<std::uint64_t>(i)),
+                .children = {},
+            });
+        }
+        root.children.push_back(std::move(handles_group));
+
+        StructureNode findings_group = group_node("Security Findings (" + std::to_string(findings.size()) + ")");
+        for (std::size_t i = 0; i < findings.size(); ++i) {
+            findings_group.children.push_back(StructureNode{
+                .selection = selection_from_security_finding(findings[i], static_cast<std::uint64_t>(i)),
+                .children = {},
+            });
+        }
+        root.children.push_back(std::move(findings_group));
+    }
+
     if (active_image != nullptr) {
         StructureNode image_tree = build_structure_tree(*active_image);
         if (active_module_index && *active_module_index < modules.size() &&
@@ -535,6 +711,145 @@ StructureNode build_live_process_structure_tree(
     }
 
     return root;
+}
+
+} // namespace
+
+std::string_view selection_kind_tag(SelectionKind kind) noexcept {
+    switch (kind) {
+        case SelectionKind::None:              return "None";
+        case SelectionKind::Image:             return "Image";
+        case SelectionKind::Header:            return "Header";
+        case SelectionKind::Section:           return "Section";
+        case SelectionKind::Segment:           return "Segment";
+        case SelectionKind::Import:            return "Import";
+        case SelectionKind::Export:            return "Export";
+        case SelectionKind::Symbol:            return "Symbol";
+        case SelectionKind::Relocation:        return "Relocation";
+        case SelectionKind::DebugDirectory:    return "Debug Directory";
+        case SelectionKind::RuntimeFunction:   return "Runtime Function";
+        case SelectionKind::TlsDirectory:      return "TLS Directory";
+        case SelectionKind::Certificate:       return "Certificate";
+        case SelectionKind::LoadConfig:        return "Load Config";
+        case SelectionKind::BoundImport:       return "Bound Import";
+        case SelectionKind::ResourceDirectory: return "Resource Directory";
+        case SelectionKind::ResourceData:      return "Resource Data";
+        case SelectionKind::ClrHeader:         return "CLR Header";
+        case SelectionKind::DynamicEntry:      return "Dynamic Entry";
+        case SelectionKind::Note:              return "Note";
+        case SelectionKind::HashTable:         return "Hash Table";
+        case SelectionKind::Interpreter:       return "Interpreter";
+        case SelectionKind::CallGraphNode:     return "Call Graph Node";
+        case SelectionKind::Patch:             return "Patch";
+        case SelectionKind::ByteRange:         return "Bytes";
+        case SelectionKind::Process:           return "Process";
+        case SelectionKind::ProcessModule:     return "Process Module";
+        case SelectionKind::MemoryRegion:      return "Memory Region";
+        case SelectionKind::Group:             return "Group";
+        case SelectionKind::ProcessThread:     return "Process Thread";
+        case SelectionKind::ProcessHandle:     return "Process Handle";
+        case SelectionKind::SecurityFinding:   return "Security Finding";
+    }
+    return "Unknown";
+}
+
+std::string_view structure_node_badge(SelectionKind kind) noexcept {
+    switch (kind) {
+        case SelectionKind::None:              return "";
+        case SelectionKind::Image:             return "[IMG]";
+        case SelectionKind::Header:            return "[HDR]";
+        case SelectionKind::Section:           return "[SEC]";
+        case SelectionKind::Segment:           return "[SEG]";
+        case SelectionKind::Import:            return "[IMP]";
+        case SelectionKind::Export:            return "[EXP]";
+        case SelectionKind::Symbol:            return "[SYM]";
+        case SelectionKind::Relocation:        return "[REL]";
+        case SelectionKind::DebugDirectory:    return "[DBG]";
+        case SelectionKind::RuntimeFunction:   return "[RTF]";
+        case SelectionKind::TlsDirectory:      return "[TLS]";
+        case SelectionKind::Certificate:       return "[CRT]";
+        case SelectionKind::LoadConfig:        return "[CFG]";
+        case SelectionKind::BoundImport:       return "[BND]";
+        case SelectionKind::ResourceDirectory: return "[RES]";
+        case SelectionKind::ResourceData:      return "[RES]";
+        case SelectionKind::ClrHeader:         return "[CLR]";
+        case SelectionKind::DynamicEntry:      return "[DYN]";
+        case SelectionKind::Note:              return "[NOTE]";
+        case SelectionKind::HashTable:         return "[HASH]";
+        case SelectionKind::Interpreter:       return "[INTP]";
+        case SelectionKind::CallGraphNode:     return "[NODE]";
+        case SelectionKind::Patch:             return "[PTCH]";
+        case SelectionKind::ByteRange:         return "[BYTE]";
+        case SelectionKind::Process:           return "[PROC]";
+        case SelectionKind::ProcessModule:     return "[MOD]";
+        case SelectionKind::MemoryRegion:      return "[MEM]";
+        case SelectionKind::Group:             return "[GRP]";
+        case SelectionKind::ProcessThread:     return "[THR]";
+        case SelectionKind::ProcessHandle:     return "[HND]";
+        case SelectionKind::SecurityFinding:   return "[SEC!]";
+    }
+    return "";
+}
+
+std::optional<StructureNode> filter_structure_tree(
+    const StructureNode& root,
+    std::string_view query) {
+    const std::string_view trimmed = trim_query_whitespace(query);
+    if (trimmed.empty()) {
+        return root;
+    }
+    const std::optional<std::uint64_t> exact_hex = parse_prefixed_hex_query(trimmed);
+    return filter_node_recursive(root, trimmed, exact_hex);
+}
+
+std::size_t count_structure_tree_matches(
+    const StructureNode& root,
+    std::string_view query) {
+    const std::string_view trimmed = trim_query_whitespace(query);
+    if (trimmed.empty()) {
+        return 0u;
+    }
+    const std::optional<std::uint64_t> exact_hex = parse_prefixed_hex_query(trimmed);
+    return count_matches_recursive(root, trimmed, exact_hex);
+}
+
+StructureNode build_live_process_structure_tree(
+    const peelf::ProcessInfo& process,
+    std::span<const peelf::ModuleInfo> modules,
+    std::span<const peelf::MemoryRegion> regions,
+    const peelf::IBinaryImage* active_image,
+    std::optional<std::size_t> active_module_index) {
+    return build_live_process_structure_tree_impl(
+        process,
+        modules,
+        regions,
+        active_image,
+        active_module_index,
+        false,
+        {},
+        {},
+        {});
+}
+
+StructureNode build_live_process_structure_tree(
+    const peelf::ProcessInfo& process,
+    std::span<const peelf::ModuleInfo> modules,
+    std::span<const peelf::MemoryRegion> regions,
+    const peelf::IBinaryImage* active_image,
+    std::optional<std::size_t> active_module_index,
+    std::span<const peelf::ThreadInfo> threads,
+    std::span<const peelf::HandleInfo> handles,
+    std::span<const peelf::SecurityFinding> findings) {
+    return build_live_process_structure_tree_impl(
+        process,
+        modules,
+        regions,
+        active_image,
+        active_module_index,
+        true,
+        threads,
+        handles,
+        findings);
 }
 
 ViewerSelection selection_from_call_graph_node(const CallGraphNode& node,
@@ -616,6 +931,76 @@ ViewerSelection selection_from_memory_region(const peelf::MemoryRegion& region,
         .size = region.size(),
         .object_index = region_index,
         .preferred_view = region.protection.executable ? PreferredView::Disassembly : PreferredView::Hex
+    };
+}
+
+ViewerSelection selection_from_process_thread(const peelf::ThreadInfo& thread,
+                                              std::uint64_t thread_index) {
+    std::string label = std::format("TID {}", thread.tid);
+    if (!thread.name.empty()) {
+        label += std::format(" ({})", thread.name);
+    }
+    label += std::format(" [{}]", peelf::to_string(thread.state));
+    const std::optional<std::uint64_t> va = thread.instruction_pointer.has_value()
+        ? thread.instruction_pointer
+        : thread.start_address;
+    if (va.has_value()) {
+        label += std::format(" @ 0x{:X}", *va);
+    }
+    return ViewerSelection{
+        .kind = SelectionKind::ProcessThread,
+        .label = std::move(label),
+        .file_offset = std::nullopt,
+        .virtual_address = va,
+        .size = va.has_value() ? 1u : 0u,
+        .object_index = thread_index,
+        .preferred_view = va.has_value() ? PreferredView::Disassembly : PreferredView::Details,
+    };
+}
+
+ViewerSelection selection_from_process_handle(const peelf::HandleInfo& handle,
+                                              std::uint64_t handle_index) {
+    const std::string_view kind_str =
+        !handle.type_name.empty() ? std::string_view{handle.type_name} : peelf::to_string(handle.kind);
+    std::string label = std::format("0x{:X} [{}]", handle.handle_or_fd, kind_str);
+    if (!handle.target.empty()) {
+        label += ' ';
+        label += handle.target;
+    }
+    return ViewerSelection{
+        .kind = SelectionKind::ProcessHandle,
+        .label = std::move(label),
+        .file_offset = std::nullopt,
+        .virtual_address = std::nullopt,
+        .size = 0u,
+        .object_index = handle_index,
+        .preferred_view = PreferredView::Details,
+    };
+}
+
+ViewerSelection selection_from_security_finding(const peelf::SecurityFinding& finding,
+                                                std::uint64_t finding_index) {
+    std::string label = std::format("[{}] {}: {}",
+                                    peelf::to_string(finding.severity),
+                                    finding.rule_id,
+                                    finding.rule_name);
+    if (!finding.subject.empty()) {
+        label += std::format(" ({})", finding.subject);
+    }
+    PreferredView preferred_view = PreferredView::Details;
+    if (finding.virtual_address.has_value()) {
+        preferred_view = PreferredView::Disassembly;
+    } else if (finding.file_offset.has_value()) {
+        preferred_view = PreferredView::Hex;
+    }
+    return ViewerSelection{
+        .kind = SelectionKind::SecurityFinding,
+        .label = std::move(label),
+        .file_offset = finding.file_offset,
+        .virtual_address = finding.virtual_address,
+        .size = (finding.virtual_address.has_value() || finding.file_offset.has_value()) ? 1u : 0u,
+        .object_index = finding_index,
+        .preferred_view = preferred_view,
     };
 }
 

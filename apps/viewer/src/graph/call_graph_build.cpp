@@ -466,6 +466,496 @@ void add_edge_if_missing(CallGraph& graph, CallGraphEdge edge) {
     }
 }
 
+[[nodiscard]] bool ascii_icontains(std::string_view hay, std::string_view needle) noexcept {
+    if (needle.empty() || needle.size() > hay.size()) {
+        return false;
+    }
+    const auto it = std::search(
+        hay.begin(),
+        hay.end(),
+        needle.begin(),
+        needle.end(),
+        [](char a, char b) {
+            return std::tolower(static_cast<unsigned char>(a)) ==
+                   std::tolower(static_cast<unsigned char>(b));
+        });
+    return it != hay.end();
+}
+
+[[nodiscard]] bool ascii_iequals(std::string_view a, std::string_view b) noexcept {
+    return a.size() == b.size() && ascii_icontains(a, b);
+}
+
+[[nodiscard]] std::string_view trim_x86_import_decoration(std::string_view name) noexcept {
+    if (name.starts_with("_imp__")) {
+        name.remove_prefix(6);
+    } else if (name.starts_with("__imp_")) {
+        name.remove_prefix(6);
+    }
+    if (name.starts_with('_') && !name.starts_with("__p_") && !name.starts_with("__get") &&
+        !name.starts_with("__wget") && !name.starts_with("_initterm") &&
+        !name.starts_with("_cexit") && !name.starts_with("_c_exit") &&
+        !name.starts_with("_exit") && !name.starts_with("_get_") &&
+        !name.starts_with("_configure_") && !name.starts_with("_initialize_")) {
+        name.remove_prefix(1);
+    }
+    const std::size_t at = name.find('@');
+    if (at != std::string_view::npos && at > 0u) {
+        name = name.substr(0, at);
+    }
+    return name;
+}
+
+[[nodiscard]] bool is_pe_crt_arg_setup_import(std::string_view raw_name) noexcept {
+    const std::string_view fn = trim_x86_import_decoration(raw_name);
+    constexpr std::array<std::string_view, 15> kArgSetupNames{
+        "GetCommandLineA",
+        "GetCommandLineW",
+        "GetStartupInfoA",
+        "GetStartupInfoW",
+        "GetModuleHandleA",
+        "GetModuleHandleW",
+        "__p___argc",
+        "__p___argv",
+        "__p___wargv",
+        "__getmainargs",
+        "__wgetmainargs",
+        "_get_narrow_winmain_command_line",
+        "_get_wide_winmain_command_line",
+        "_configure_narrow_argv",
+        "_configure_wide_argv",
+    };
+    return std::ranges::any_of(kArgSetupNames, [&](std::string_view pat) {
+        return ascii_iequals(fn, pat);
+    });
+}
+
+[[nodiscard]] bool is_pe_crt_hallmark_import(std::string_view raw_name) noexcept {
+    if (is_pe_crt_arg_setup_import(raw_name)) {
+        return true;
+    }
+    const std::string_view fn = trim_x86_import_decoration(raw_name);
+    constexpr std::array<std::string_view, 7> kCrtInitNames{
+        "_initterm",
+        "_initterm_e",
+        "_initialize_narrow_environment",
+        "_initialize_wide_environment",
+        "_initialize_onexit_table",
+        "__set_app_type",
+        "_set_fmode",
+    };
+    return std::ranges::any_of(kCrtInitNames, [&](std::string_view pat) {
+        return ascii_iequals(fn, pat);
+    });
+}
+
+[[nodiscard]] bool is_pe_crt_exit_import(std::string_view raw_name) noexcept {
+    const std::string_view fn = trim_x86_import_decoration(raw_name);
+    constexpr std::array<std::string_view, 7> kExitNames{
+        "exit",
+        "_exit",
+        "_cexit",
+        "_c_exit",
+        "ExitProcess",
+        "quick_exit",
+        "terminate",
+    };
+    return std::ranges::any_of(kExitNames, [&](std::string_view pat) {
+        return ascii_iequals(fn, pat);
+    });
+}
+
+[[nodiscard]] std::optional<std::uint64_t> parse_x86_abs_memory_target(const Instruction& instruction) {
+    const std::string_view ops = instruction.operands;
+    const std::size_t open_br = ops.find('[');
+    const std::size_t close_br = ops.find(']', open_br == std::string_view::npos ? 0u : open_br + 1u);
+    if (open_br == std::string_view::npos || close_br == std::string_view::npos || close_br <= open_br + 1u) {
+        return std::nullopt;
+    }
+    std::string_view inner = ops.substr(open_br + 1u, close_br - open_br - 1u);
+    while (!inner.empty() && std::isspace(static_cast<unsigned char>(inner.front())) != 0) {
+        inner.remove_prefix(1u);
+    }
+    while (!inner.empty() && std::isspace(static_cast<unsigned char>(inner.back())) != 0) {
+        inner.remove_suffix(1u);
+    }
+    if (!inner.starts_with("0x") && !inner.starts_with("0X")) {
+        return std::nullopt;
+    }
+    return parse_hex_u64(inner);
+}
+
+[[nodiscard]] std::optional<std::uint64_t> parse_pe_iat_slot_operand(const Instruction& instruction,
+                                                                     bool is_64bit) {
+    if (is_64bit) {
+        return parse_x86_rip_relative_memory_target(instruction);
+    }
+    return parse_x86_abs_memory_target(instruction);
+}
+
+[[nodiscard]] const peelf::Section* find_executable_pe_section_at_va(const peelf::IBinaryImage& image,
+                                                                     std::uint64_t va) noexcept {
+    for (const peelf::Section& sec : image.sections()) {
+        if (!sec.executable) {
+            continue;
+        }
+        const std::uint64_t span = std::max(sec.file_size, sec.virtual_size);
+        if (span != 0u && va >= sec.virtual_address && (va - sec.virtual_address) < span) {
+            return &sec;
+        }
+    }
+    return nullptr;
+}
+
+[[nodiscard]] std::string_view find_pe_import_name_at_slot(const peelf::IBinaryImage& image,
+                                                           std::uint64_t slot_va) noexcept {
+    for (const peelf::ImportEntry& imp : image.imports()) {
+        if (imp.address == slot_va && !imp.name.empty()) {
+            return imp.name;
+        }
+    }
+    return {};
+}
+
+[[nodiscard]] std::string_view resolve_pe_thunk_import_name(const peelf::IBinaryImage& image,
+                                                            Disassembler& disasm,
+                                                            std::uint64_t target_va,
+                                                            std::uint8_t depth = 0) {
+    if (depth > 2u) {
+        return {};
+    }
+    const auto off = image.virtual_address_to_file_offset(target_va);
+    if (!off.has_value()) {
+        return {};
+    }
+    const auto raw = image.read_bytes_at_offset(*off, 16u);
+    if (!raw.has_value() || raw->empty()) {
+        return {};
+    }
+    const std::vector<Instruction> insts = disasm.disassemble_count(raw->data(), raw->size(), target_va, 2u);
+    if (insts.empty() || insts.front().mnemonic != "jmp") {
+        return {};
+    }
+    if (const auto slot_va = parse_pe_iat_slot_operand(insts.front(), image.is_64bit()); slot_va.has_value()) {
+        return find_pe_import_name_at_slot(image, *slot_va);
+    }
+    if (const auto next_va = parse_direct_call_target(insts.front());
+        next_va.has_value() && *next_va != target_va) {
+        return resolve_pe_thunk_import_name(image, disasm, *next_va, static_cast<std::uint8_t>(depth + 1u));
+    }
+    return {};
+}
+
+struct ScannedPeStartupFunction {
+    std::uint64_t start_va = 0;
+    std::uint64_t byte_size = 0;
+    struct InternalCallSite {
+        std::size_t inst_index = 0;
+        std::uint64_t target_va = 0;
+        bool is_tail_jump = false;
+    };
+    struct ImportCallSite {
+        std::size_t inst_index = 0;
+        std::string name{};
+    };
+    std::vector<InternalCallSite> internal_calls{};
+    std::vector<ImportCallSite> import_calls{};
+    bool has_arg_setup_import = false;
+    bool has_hallmark_import = false;
+    std::optional<std::size_t> first_exit_inst_index{};
+};
+
+[[nodiscard]] std::optional<ScannedPeStartupFunction> scan_pe_startup_function(
+    const peelf::IBinaryImage& image,
+    Disassembler& disasm,
+    std::uint64_t fn_va,
+    std::size_t max_bytes = 384u) {
+    const peelf::Section* sec = find_executable_pe_section_at_va(image, fn_va);
+    const auto file_off = image.virtual_address_to_file_offset(fn_va);
+    if (sec == nullptr || !file_off.has_value() || sec->file_size == 0u) {
+        return std::nullopt;
+    }
+    const std::uint64_t sec_end_off = sec->file_offset + sec->file_size;
+    if (*file_off >= sec_end_off) {
+        return std::nullopt;
+    }
+    const auto read_len = static_cast<std::size_t>(
+        std::min<std::uint64_t>(max_bytes, sec_end_off - *file_off));
+    const auto raw = image.read_bytes_at_offset(*file_off, read_len);
+    if (!raw.has_value() || raw->empty()) {
+        return std::nullopt;
+    }
+
+    const std::vector<Instruction> insts =
+        disasm.disassemble_count(raw->data(), raw->size(), fn_va, 96u);
+    if (insts.empty()) {
+        return std::nullopt;
+    }
+
+    ScannedPeStartupFunction out{};
+    out.start_va = fn_va;
+    std::uint64_t max_local_branch_va = fn_va;
+    std::map<std::string, std::string> reg_imports{};
+
+    const auto trim_token = [](std::string_view sv) noexcept {
+        while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front())) != 0) {
+            sv.remove_prefix(1u);
+        }
+        while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.back())) != 0) {
+            sv.remove_suffix(1u);
+        }
+        return sv;
+    };
+
+    for (std::size_t i = 0u; i < insts.size(); ++i) {
+        const Instruction& inst = insts[i];
+        if (inst.mnemonic == "int3") {
+            break;
+        }
+        out.byte_size = (inst.address - fn_va) + static_cast<std::uint64_t>(inst.bytes.size());
+
+        auto record_import = [&](std::string_view imp_name, bool is_call) {
+            if (imp_name.empty()) {
+                return;
+            }
+            if (is_pe_crt_arg_setup_import(imp_name)) {
+                out.has_arg_setup_import = true;
+                out.has_hallmark_import = true;
+            } else if (is_pe_crt_hallmark_import(imp_name)) {
+                out.has_hallmark_import = true;
+            }
+            if (is_call) {
+                out.import_calls.push_back(ScannedPeStartupFunction::ImportCallSite{
+                    .inst_index = i,
+                    .name = std::string(imp_name),
+                });
+                if (is_pe_crt_exit_import(imp_name) && !out.first_exit_inst_index.has_value()) {
+                    out.first_exit_inst_index = i;
+                }
+            }
+        };
+
+        if (inst.mnemonic == "mov" || inst.mnemonic == "lea") {
+            const std::size_t comma = inst.operands.find(',');
+            if (comma != std::string_view::npos) {
+                const std::string dst(trim_token(std::string_view(inst.operands).substr(0u, comma)));
+                if (const auto slot = parse_pe_iat_slot_operand(inst, image.is_64bit()); slot.has_value()) {
+                    const std::string_view imp = find_pe_import_name_at_slot(image, *slot);
+                    if (!imp.empty()) {
+                        reg_imports[dst] = std::string(imp);
+                        record_import(imp, false);
+                    } else {
+                        reg_imports.erase(dst);
+                    }
+                } else {
+                    reg_imports.erase(dst);
+                }
+            }
+            continue;
+        }
+
+        if (inst.mnemonic == "call" || inst.mnemonic == "jmp") {
+            const bool is_jmp = (inst.mnemonic == "jmp");
+            if (const auto slot = parse_pe_iat_slot_operand(inst, image.is_64bit()); slot.has_value()) {
+                record_import(find_pe_import_name_at_slot(image, *slot), true);
+            } else if (const auto target = parse_direct_call_target(inst); target.has_value()) {
+                if (is_jmp && inst.address < max_local_branch_va &&
+                    *target > fn_va && *target < fn_va + read_len &&
+                    (*target - fn_va) < 256u && i + 1u < insts.size()) {
+                    max_local_branch_va = std::max(max_local_branch_va, *target);
+                } else {
+                    const std::string_view thunk_imp = resolve_pe_thunk_import_name(image, disasm, *target);
+                    if (!thunk_imp.empty()) {
+                        record_import(thunk_imp, true);
+                    } else if (*target != fn_va &&
+                               find_executable_pe_section_at_va(image, *target) != nullptr) {
+                        out.internal_calls.push_back(ScannedPeStartupFunction::InternalCallSite{
+                            .inst_index = i,
+                            .target_va = *target,
+                            .is_tail_jump = is_jmp,
+                        });
+                    }
+                }
+            } else {
+                const std::string op_reg(trim_token(inst.operands));
+                if (const auto it = reg_imports.find(op_reg); it != reg_imports.end()) {
+                    record_import(it->second, true);
+                }
+            }
+
+            if (is_jmp && inst.address >= max_local_branch_va) {
+                break;
+            }
+            continue;
+        }
+
+        if (inst.mnemonic.starts_with('j')) {
+            if (const auto br_target = parse_direct_call_target(inst);
+                br_target.has_value() && *br_target > fn_va && *br_target < fn_va + read_len) {
+                max_local_branch_va = std::max(max_local_branch_va, *br_target);
+            }
+            continue;
+        }
+
+        if ((inst.mnemonic == "ret" || inst.mnemonic == "retn") &&
+            inst.address >= max_local_branch_va) {
+            break;
+        }
+    }
+
+    return out;
+}
+
+struct RecoveredPeStartupFlow {
+    std::uint64_t crt_va = 0;
+    std::uint64_t crt_size = 1;
+    std::optional<std::uint64_t> invoke_main_va{};
+    std::uint64_t user_entry_va = 0;
+    std::uint64_t user_entry_size = 1;
+    bool entry_tail_jumped_to_crt = false;
+};
+
+[[nodiscard]] std::optional<std::uint64_t> match_pe_invoke_main_wrapper(
+    const peelf::IBinaryImage& image,
+    Disassembler& disasm,
+    std::uint64_t candidate_va) {
+    const auto fn = scan_pe_startup_function(image, disasm, candidate_va, 128u);
+    if (!fn.has_value() || fn->first_exit_inst_index.has_value()) {
+        return std::nullopt;
+    }
+    if (!fn->has_arg_setup_import || fn->internal_calls.size() != 1u) {
+        return std::nullopt;
+    }
+    return fn->internal_calls.front().target_va;
+}
+
+[[nodiscard]] std::optional<RecoveredPeStartupFlow> select_user_entry_from_crt_candidate(
+    const peelf::IBinaryImage& image,
+    Disassembler& disasm,
+    const ScannedPeStartupFunction& crt_fn,
+    bool entry_tail_jumped) {
+    if (crt_fn.internal_calls.empty()) {
+        return std::nullopt;
+    }
+    if (!crt_fn.has_hallmark_import && !crt_fn.first_exit_inst_index.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::size_t cutoff =
+        crt_fn.first_exit_inst_index.value_or(std::numeric_limits<std::size_t>::max());
+
+    // 1. Check for MSVC UCRT 2-hop `invoke_main` wrapper among internal calls before exit.
+    for (auto it = crt_fn.internal_calls.rbegin(); it != crt_fn.internal_calls.rend(); ++it) {
+        if (it->inst_index >= cutoff || it->is_tail_jump) {
+            continue;
+        }
+        if (const auto inner_user_va = match_pe_invoke_main_wrapper(image, disasm, it->target_va);
+            inner_user_va.has_value()) {
+            const auto user_scan = scan_pe_startup_function(image, disasm, *inner_user_va, 128u);
+            return RecoveredPeStartupFlow{
+                .crt_va = crt_fn.start_va,
+                .crt_size = std::max<std::uint64_t>(1u, crt_fn.byte_size),
+                .invoke_main_va = it->target_va,
+                .user_entry_va = *inner_user_va,
+                .user_entry_size = user_scan.has_value()
+                                       ? std::max<std::uint64_t>(1u, user_scan->byte_size)
+                                       : 1u,
+                .entry_tail_jumped_to_crt = entry_tail_jumped,
+            };
+        }
+    }
+
+    // 2. If CRT argument-setup imports (`GetCommandLine*`, `GetStartupInfo*`, `__p___argc`,
+    //    `__getmainargs`) appear in `crt_fn`, prefer the internal call immediately following the
+    //    last argument-setup import before `exit`/`ExitProcess`.
+    std::optional<std::size_t> last_arg_setup_idx{};
+    for (const auto& imp : crt_fn.import_calls) {
+        if (imp.inst_index < cutoff && is_pe_crt_arg_setup_import(imp.name)) {
+            last_arg_setup_idx = imp.inst_index;
+        }
+    }
+    std::optional<std::uint64_t> chosen_user_va{};
+    if (last_arg_setup_idx.has_value()) {
+        for (const auto& call : crt_fn.internal_calls) {
+            if (call.inst_index > *last_arg_setup_idx && call.inst_index < cutoff &&
+                !call.is_tail_jump) {
+                chosen_user_va = call.target_va;
+                break;
+            }
+        }
+    }
+
+    // 3. Otherwise take the final internal `call` prior to `exit`/`_cexit`/`ExitProcess`
+    //    (or final internal call when CRT init hallmarks are present).
+    if (!chosen_user_va.has_value()) {
+        for (auto it = crt_fn.internal_calls.rbegin(); it != crt_fn.internal_calls.rend(); ++it) {
+            if (it->inst_index < cutoff && !it->is_tail_jump) {
+                chosen_user_va = it->target_va;
+                break;
+            }
+        }
+    }
+    if (!chosen_user_va.has_value()) {
+        return std::nullopt;
+    }
+
+    const auto user_scan = scan_pe_startup_function(image, disasm, *chosen_user_va, 128u);
+    return RecoveredPeStartupFlow{
+        .crt_va = crt_fn.start_va,
+        .crt_size = std::max<std::uint64_t>(1u, crt_fn.byte_size),
+        .invoke_main_va = std::nullopt,
+        .user_entry_va = *chosen_user_va,
+        .user_entry_size = user_scan.has_value()
+                               ? std::max<std::uint64_t>(1u, user_scan->byte_size)
+                               : 1u,
+        .entry_tail_jumped_to_crt = entry_tail_jumped,
+    };
+}
+
+[[nodiscard]] std::optional<RecoveredPeStartupFlow> recover_pe_crt_startup_flow(
+    const peelf::IBinaryImage& image) {
+    if (image.format() != peelf::Format::PE) {
+        return std::nullopt;
+    }
+    if (image.architecture() != peelf::Architecture::X86 &&
+        image.architecture() != peelf::Architecture::X86_64) {
+        return std::nullopt;
+    }
+
+    Disassembler disasm{};
+    const Architecture cs_arch =
+        image.architecture() == peelf::Architecture::X86_64 ? Architecture::X86_64 : Architecture::X86_32;
+    if (!disasm.init(cs_arch, Endianness::Little)) {
+        return std::nullopt;
+    }
+
+    const std::uint64_t entry_va = image.entry_point();
+    const auto entry_scan = scan_pe_startup_function(image, disasm, entry_va);
+    if (!entry_scan.has_value()) {
+        return std::nullopt;
+    }
+
+    // Hop 1..2: inspect internal targets called/tail-jumped from `entry_point_va` (preferring
+    // the final call/tail-jump such as `__scrt_common_main_seh` over `__security_init_cookie`).
+    std::size_t inspected = 0u;
+    for (auto it = entry_scan->internal_calls.rbegin();
+         it != entry_scan->internal_calls.rend() && inspected < 4u;
+         ++it, ++inspected) {
+        const auto hop1 = scan_pe_startup_function(image, disasm, it->target_va);
+        if (!hop1.has_value()) {
+            continue;
+        }
+        if (auto recovered = select_user_entry_from_crt_candidate(
+                image, disasm, *hop1, it->is_tail_jump);
+            recovered.has_value()) {
+            return recovered;
+        }
+    }
+
+    // Hop 0: inlined CRT startup directly at `entry_point_va`.
+    return select_user_entry_from_crt_candidate(image, disasm, *entry_scan, false);
+}
+
 } // namespace
 
 CallGraph build_entry_call_graph(const peelf::IBinaryImage& image) {
@@ -632,37 +1122,125 @@ CallGraph build_entry_call_graph(const peelf::IBinaryImage& image, const SymbolI
         const SymbolRecord* crt_record = find_first_symbol_record_containing_name(symbol_index, crt_names);
         const SymbolRecord* user_entry_record =
             find_first_symbol_record_exact_function_name(symbol_index, user_entry_names);
+        const std::optional<RecoveredPeStartupFlow> recovered_flow =
+            (crt_record == nullptr || user_entry_record == nullptr)
+                ? recover_pe_crt_startup_flow(image)
+                : std::nullopt;
 
-        graph.nodes.push_back(CallGraphNode{
-            .id = "crt_startup",
-            .label = crt_record != nullptr ? crt_record->name
-                                           : "CRT startup\nmainCRTStartup / WinMainCRTStartup\nunresolved",
-            .kind = crt_record != nullptr ? CallGraphNodeKind::Function : CallGraphNodeKind::Unknown,
-            .bytes = GraphByteRange{
-                .start = GraphAddress{
-                    .virtual_address = crt_record != nullptr ? crt_record->virtual_address
-                                                             : std::optional<std::uint64_t>{},
-                    .file_offset = crt_record != nullptr ? crt_record->file_offset
-                                                         : std::optional<std::uint64_t>{},
+        if (crt_record != nullptr) {
+            graph.nodes.push_back(CallGraphNode{
+                .id = "crt_startup",
+                .label = crt_record->name,
+                .kind = CallGraphNodeKind::Function,
+                .bytes = GraphByteRange{
+                    .start = GraphAddress{
+                        .virtual_address = crt_record->virtual_address,
+                        .file_offset = crt_record->file_offset,
+                    },
+                    .size = crt_record->size,
                 },
-                .size = crt_record != nullptr ? crt_record->size : 0,
-            },
-            .symbol = graph_ref_from_record(crt_record),
-        });
-        add_edge_if_missing(graph, CallGraphEdge{
-            .from_node_id = entry_id,
-            .to_node_id = "crt_startup",
-            .kind = CallGraphEdgeKind::Unknown,
-            .label = crt_record != nullptr ? "startup symbol" : "startup recovery pending",
-        });
+                .symbol = graph_ref_from_record(crt_record),
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = entry_id,
+                .to_node_id = "crt_startup",
+                .kind = CallGraphEdgeKind::DirectCall,
+                .label = "startup symbol",
+            });
+        } else if (recovered_flow.has_value()) {
+            const std::uint64_t crt_va = recovered_flow->crt_va;
+            const std::optional<std::uint64_t> crt_rva =
+                crt_va >= image.image_base()
+                    ? std::optional<std::uint64_t>{crt_va - image.image_base()}
+                    : std::nullopt;
+            std::string crt_label = crt_va == entry_va
+                ? ("CRT startup (inlined)\n" + format_hex(crt_va))
+                : ("CRT startup\n__scrt_common_main_seh\n" + format_hex(crt_va));
+            if (recovered_flow->invoke_main_va.has_value()) {
+                crt_label += "\nvia invoke_main " + format_hex(*recovered_flow->invoke_main_va);
+            }
+            graph.nodes.push_back(CallGraphNode{
+                .id = "crt_startup",
+                .label = std::move(crt_label),
+                .kind = CallGraphNodeKind::Function,
+                .bytes = GraphByteRange{
+                    .start = GraphAddress{
+                        .virtual_address = crt_va,
+                        .relative_virtual_address = crt_rva,
+                        .file_offset = image.virtual_address_to_file_offset(crt_va),
+                    },
+                    .size = recovered_flow->crt_size,
+                },
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = entry_id,
+                .to_node_id = "crt_startup",
+                .kind = CallGraphEdgeKind::DirectCall,
+                .label = crt_va == entry_va
+                             ? "inlined CRT startup"
+                             : (recovered_flow->entry_tail_jumped_to_crt ? "startup tail-jump" : "startup call"),
+            });
+        } else {
+            graph.nodes.push_back(CallGraphNode{
+                .id = "crt_startup",
+                .label = "CRT startup\nmainCRTStartup / WinMainCRTStartup\nunresolved",
+                .kind = CallGraphNodeKind::Unknown,
+                .bytes = {},
+                .symbol = std::nullopt,
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = entry_id,
+                .to_node_id = "crt_startup",
+                .kind = CallGraphEdgeKind::Unknown,
+                .label = "startup recovery pending",
+            });
+        }
 
         if (user_entry_record != nullptr) {
             graph.nodes.push_back(node_from_record(*user_entry_record, "user_entry"));
             add_edge_if_missing(graph, CallGraphEdge{
                 .from_node_id = "crt_startup",
                 .to_node_id = "user_entry",
-                .kind = CallGraphEdgeKind::Call,
+                .kind = CallGraphEdgeKind::DirectCall,
                 .label = "user entry symbol",
+            });
+        } else if (recovered_flow.has_value()) {
+            const std::uint64_t user_va = recovered_flow->user_entry_va;
+            const std::optional<std::uint64_t> user_rva =
+                user_va >= image.image_base()
+                    ? std::optional<std::uint64_t>{user_va - image.image_base()}
+                    : std::nullopt;
+            const bool is_gui = image.pe_header() != nullptr && image.pe_header()->subsystem == 2u;
+            const char* entry_stem = is_gui ? "WinMain" : "main";
+            const SymbolRecord* sym_at_user = symbol_index.find_containing_address(user_va);
+            const bool exact_sym = sym_at_user != nullptr &&
+                                   sym_at_user->virtual_address.has_value() &&
+                                   *sym_at_user->virtual_address == user_va &&
+                                   sym_at_user->source != SymbolSource::EntryPoint;
+            std::string user_label = exact_sym
+                ? sym_at_user->name
+                : (std::string(entry_stem) + " (recovered)\n" + format_hex(user_va));
+            graph.nodes.push_back(CallGraphNode{
+                .id = "user_entry",
+                .label = std::move(user_label),
+                .kind = CallGraphNodeKind::Function,
+                .bytes = GraphByteRange{
+                    .start = GraphAddress{
+                        .virtual_address = user_va,
+                        .relative_virtual_address = user_rva,
+                        .file_offset = image.virtual_address_to_file_offset(user_va),
+                    },
+                    .size = recovered_flow->user_entry_size,
+                },
+                .symbol = exact_sym ? graph_ref_from_record(sym_at_user) : std::nullopt,
+            });
+            add_edge_if_missing(graph, CallGraphEdge{
+                .from_node_id = "crt_startup",
+                .to_node_id = "user_entry",
+                .kind = CallGraphEdgeKind::DirectCall,
+                .label = recovered_flow->invoke_main_va.has_value()
+                             ? "CRT invoke_main -> user entry"
+                             : "CRT -> user entry",
             });
         } else {
             graph.nodes.push_back(CallGraphNode{

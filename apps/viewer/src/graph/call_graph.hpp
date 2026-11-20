@@ -46,6 +46,7 @@ enum class CallGraphNodeKind : std::uint8_t {
 
 enum class CallGraphEdgeKind : std::uint8_t {
     Call,
+    DirectCall = Call,
     ConditionalBranch,
     UnconditionalBranch,
     Fallthrough,

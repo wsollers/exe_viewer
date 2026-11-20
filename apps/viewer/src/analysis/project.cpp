@@ -178,7 +178,7 @@ bool read_history_and_layout(std::istream& in, AnalysisProject& p, bool require_
         unsigned view = 0;
         int root = 0;
         if (!(in >> kind >> std::quoted(s.label)) ||
-            kind > static_cast<unsigned>(SelectionKind::Group) ||
+            kind > static_cast<unsigned>(kMaxSelectionKind) ||
             !optional_address(in, s.file_offset) ||
             !optional_address(in, s.virtual_address) ||
             !(in >> s.size >> s.object_index >> view >> root) ||

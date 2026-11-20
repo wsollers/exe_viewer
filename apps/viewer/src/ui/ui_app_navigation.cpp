@@ -1444,12 +1444,20 @@ void UiApp::switch_analysis_view(bool graph) {
     void UiApp::apply_structure_selection_navigation() {
         if (current_selection_.kind == SelectionKind::None ||
             current_selection_.kind == SelectionKind::Group ||
-            current_selection_.kind == SelectionKind::Process) {
+            current_selection_.kind == SelectionKind::Process ||
+            current_selection_.kind == SelectionKind::ProcessHandle) {
             return;
         }
         if (last_navigation_selection_ &&
             same_selection(*last_navigation_selection_, current_selection_)) {
             return;
+        }
+
+        if (current_selection_.kind == SelectionKind::ProcessThread && model_.is_live_process()) {
+            const auto thr_idx = static_cast<std::size_t>(current_selection_.object_index);
+            if (thr_idx < model_.threads().size()) {
+                model_.select_thread(model_.threads()[thr_idx].tid);
+            }
         }
 
         if (current_selection_.kind == SelectionKind::ProcessModule && model_.is_live_process()) {

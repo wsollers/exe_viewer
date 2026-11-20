@@ -58,6 +58,8 @@ struct ProcessHandleEntry {
     auto operator<=>(const ProcessHandleEntry&) const = default;
 };
 
+using HandleInfo = ProcessHandleEntry;
+
 enum class SocketProtocol : std::uint8_t {
     Tcp4,
     Tcp6,

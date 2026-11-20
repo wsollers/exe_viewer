@@ -666,7 +666,8 @@ HexAvailabilityStatus evaluate_hex_selection_availability(
     if (selection.kind == SelectionKind::None ||
         selection.kind == SelectionKind::Group ||
         selection.kind == SelectionKind::Process ||
-        selection.kind == SelectionKind::ProcessModule) {
+        selection.kind == SelectionKind::ProcessModule ||
+        selection.kind == SelectionKind::ProcessHandle) {
         return HexAvailabilityStatus{.available = true, .unavailable_reason = {}};
     }
 

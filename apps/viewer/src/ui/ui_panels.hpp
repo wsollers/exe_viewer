@@ -87,14 +87,30 @@ namespace viewer {
 
     class StructureNavigatorPanel : public UiPanel {
     public:
-        StructureNavigatorPanel(const std::optional<StructureNode>& tree, ViewerSelection& selection);
+        StructureNavigatorPanel(const std::optional<StructureNode>& tree,
+                                ViewerSelection& selection,
+                                BinaryModel* model = nullptr,
+                                NavigationRequestQueue* navigation_queue = nullptr,
+                                EntityContextActionCallback on_context_action = {});
+        void set_model(BinaryModel* model) noexcept { model_ = model; }
+        void set_navigation_queue(NavigationRequestQueue* queue) noexcept { navigation_queue_ = queue; }
+        void set_context_action_callback(EntityContextActionCallback cb) {
+            on_context_action_ = std::move(cb);
+        }
     protected:
         void draw_contents() override;
     private:
         const std::optional<StructureNode>& tree_;
         ViewerSelection& selection_;
+        BinaryModel* model_ = nullptr;
+        NavigationRequestQueue* navigation_queue_ = nullptr;
+        EntityContextActionCallback on_context_action_{};
+        char filter_buf_[128] = {};
 
-        void draw_node(const StructureNode& node);
+        void draw_node(const StructureNode& node,
+                       bool force_expand,
+                       std::optional<ViewerSelection>& pending_activation,
+                       std::optional<PendingEntityContextAction>& pending_ctx_action);
     };
 
     class SelectionDetailsPanel : public UiPanel {
