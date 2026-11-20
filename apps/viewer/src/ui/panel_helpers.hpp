@@ -1,11 +1,16 @@
 #pragma once
 
 #include <peelf/peelf.hpp>
+#include <peelf/process.hpp>
 
 #include "model/binary_model.hpp"
 #include "navigation/viewer_navigation.hpp"
 #include "symbols/symbol_index.hpp"
 #include "ui/context_actions.hpp"
+
+#if __has_include(<imgui.h>)
+#include <imgui.h>
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +22,16 @@
 #include <vector>
 
 namespace viewer {
+
+#if __has_include(<imgui.h>)
+inline constexpr ImGuiTableFlags kDenseReTableFlags =
+    ImGuiTableFlags_Borders |
+    ImGuiTableFlags_RowBg |
+    ImGuiTableFlags_Resizable |
+    ImGuiTableFlags_Sortable |
+    ImGuiTableFlags_Hideable |
+    ImGuiTableFlags_ScrollY;
+#endif
 
 struct DetailPropertyRow {
     std::string key{};
@@ -81,5 +96,49 @@ inline constexpr std::size_t kScriptStarterTemplateCount = 4u;
 
 /// Constructs a `std::filesystem::path` from a UTF-8 `std::string_view` via `std::u8string_view`.
 [[nodiscard]] std::filesystem::path utf8_to_filesystem_path(std::string_view utf8_text);
+
+/// Case-insensitive ASCII substring test (`needle.empty()` returns `true`).
+[[nodiscard]] bool icontains(std::string_view haystack, std::string_view needle) noexcept;
+
+/// Canonical zero-padded hexadecimal virtual address (`0x0000000140001000` or `0x00401000`).
+[[nodiscard]] std::string format_va(std::uint64_t va, bool is_64bit);
+
+/// Canonical zero-padded hexadecimal file offset (`0x00001000`, widened past 4 GiB).
+[[nodiscard]] std::string format_file_offset(std::uint64_t offset);
+
+/// Compact binary-unit byte formatter (`512 B`, `64.0 KiB`, `1.25 MiB`, `2.00 GiB`).
+[[nodiscard]] std::string format_compact_bytes(std::uint64_t bytes);
+
+enum class ProcessSortColumn : std::uint8_t {
+    Pid,
+    ParentPid,
+    Name,
+    Architecture,
+    User,
+    Integrity,
+    Threads,
+    WorkingSet,
+    Handles,
+    CpuPercent,
+    Access,
+    Path,
+};
+
+struct ProcessInventoryRow {
+    const peelf::ProcessInfo* info = nullptr;
+    std::size_t tree_depth = 0;
+    bool has_children = false;
+};
+
+/// Builds a filtered, sorted, and optionally PPID-hierarchical view over `processes` (`P6-14`).
+/// Guards against self-parenting (`pid == parent_pid`), zero/missing PPIDs, and arbitrary
+/// PPID cycles (`A -> B -> A`) so cyclic or orphaned hierarchies never loop infinitely.
+[[nodiscard]] std::vector<ProcessInventoryRow> build_process_inventory_view(
+    std::span<const peelf::ProcessInfo> processes,
+    std::string_view filter,
+    bool accessible_only,
+    ProcessSortColumn sort_col = ProcessSortColumn::Pid,
+    bool ascending = true,
+    bool tree_hierarchy = false);
 
 } // namespace viewer

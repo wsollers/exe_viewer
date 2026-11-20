@@ -2,6 +2,7 @@
 #include "ui_app_internal.hpp"
 
 #include "logger.hpp"
+#include "panel_helpers.hpp"
 
 #include <peelf/gdb_remote.hpp>
 #include <peelf/process.hpp>
@@ -13,6 +14,7 @@
 #include <cctype>
 #include <charconv>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstring>
 #include <format>
@@ -66,20 +68,38 @@ constexpr std::array<const char*, 9> kGdbFallbackArchLabels{{
     kGdbFallbackArchOptions[8].label,
 }};
 
-[[nodiscard]] bool icontains_filter(std::string_view haystack, std::string_view needle) {
-    if (needle.empty()) {
-        return true;
+[[nodiscard]] ProcessSortColumn process_sort_column_from_user_id(ImGuiID user_id) noexcept {
+    switch (static_cast<ProcessSortColumn>(user_id)) {
+        case ProcessSortColumn::Pid:
+        case ProcessSortColumn::ParentPid:
+        case ProcessSortColumn::Name:
+        case ProcessSortColumn::Architecture:
+        case ProcessSortColumn::User:
+        case ProcessSortColumn::Integrity:
+        case ProcessSortColumn::Threads:
+        case ProcessSortColumn::WorkingSet:
+        case ProcessSortColumn::Handles:
+        case ProcessSortColumn::CpuPercent:
+        case ProcessSortColumn::Access:
+        case ProcessSortColumn::Path:
+            return static_cast<ProcessSortColumn>(user_id);
     }
-    const auto it = std::search(
-        haystack.begin(),
-        haystack.end(),
-        needle.begin(),
-        needle.end(),
-        [](char a, char b) {
-            return std::tolower(static_cast<unsigned char>(a)) ==
-                   std::tolower(static_cast<unsigned char>(b));
-        });
-    return it != haystack.end();
+    return ProcessSortColumn::Pid;
+}
+
+[[nodiscard]] std::string format_user_and_integrity(const peelf::ProcessInfo& proc) {
+    std::string safe_user = sanitize_single_line_control_chars(proc.user);
+    const std::string safe_il = sanitize_single_line_control_chars(proc.integrity_level);
+    if (!safe_user.empty() && !safe_il.empty()) {
+        return std::format("{} [{}]", safe_user, safe_il);
+    }
+    if (!safe_user.empty()) {
+        return safe_user;
+    }
+    if (!safe_il.empty()) {
+        return std::format("[{}]", safe_il);
+    }
+    return "-";
 }
 } // namespace
 
@@ -90,14 +110,48 @@ void UiApp::open_attach_process_modal() {
 }
 
 void UiApp::refresh_process_list() {
+    const auto sample_now = std::chrono::steady_clock::now();
     auto listed = model_.list_processes();
     if (!listed) {
         attach_error_message_ = "Failed to enumerate processes: " + listed.error().message;
         cached_process_list_.clear();
         selected_attach_pid_.reset();
+        prev_process_cpu_time_ns_.clear();
+        last_process_refresh_time_.reset();
         return;
     }
     cached_process_list_ = std::move(*listed);
+
+    std::uint64_t wall_delta_ns = 0u;
+    if (last_process_refresh_time_.has_value() && sample_now > *last_process_refresh_time_) {
+        const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            sample_now - *last_process_refresh_time_).count();
+        if (elapsed_ns > 0) {
+            wall_delta_ns = static_cast<std::uint64_t>(elapsed_ns);
+        }
+    }
+
+    std::unordered_map<peelf::ProcessId, std::uint64_t> next_cpu_times;
+    next_cpu_times.reserve(cached_process_list_.size());
+    for (peelf::ProcessInfo& proc : cached_process_list_) {
+        if (!proc.cpu_time_ns.has_value()) {
+            continue;
+        }
+        next_cpu_times[proc.pid] = *proc.cpu_time_ns;
+        if (wall_delta_ns > 0u) {
+            const auto prev_it = prev_process_cpu_time_ns_.find(proc.pid);
+            if (prev_it != prev_process_cpu_time_ns_.end() &&
+                *proc.cpu_time_ns >= prev_it->second) {
+                const std::uint64_t cpu_delta_ns = *proc.cpu_time_ns - prev_it->second;
+                proc.cpu_percent =
+                    (static_cast<double>(cpu_delta_ns) * 100.0) /
+                    static_cast<double>(wall_delta_ns);
+            }
+        }
+    }
+    prev_process_cpu_time_ns_ = std::move(next_cpu_times);
+    last_process_refresh_time_ = sample_now;
+
     if (selected_attach_pid_.has_value()) {
         const peelf::ProcessId wanted = *selected_attach_pid_;
         const bool still_present = std::ranges::any_of(
@@ -140,24 +194,22 @@ void UiApp::render_gdb_remote_modal() {
     bool connected_debug = false;
     std::optional<bool> switch_to_debug_mode{};
 
-    ImGui::SetNextWindowSize(ImVec2(680.0f, 440.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(660.0f, 390.0f), ImGuiCond_FirstUseEver);
     bool modal_open = true;
     if (ImGui::BeginPopupModal(popup_title, &modal_open)) {
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.14f, 0.17f, 0.22f, 1.0f));
-        if (ImGui::BeginChild("##GdbRemoteBanner", ImVec2(0.0f, 92.0f), ImGuiChildFlags_Borders)) {
+        if (ImGui::BeginChild("##GdbRemoteBanner", ImVec2(0.0f, 60.0f), ImGuiChildFlags_Borders)) {
             if (!gdb_remote_modal_debug_mode_) {
                 ImGui::TextColored(ImVec4(0.40f, 0.90f, 0.55f, 1.0f),
-                                   "Read-Only GDB Remote / QEMU Inspection (Non-Invasive Default)");
+                                   "Read-Only GDB RSP Inspection");
                 ImGui::TextWrapped(
-                    "Connects an IProcessSession over GDB Remote Serial Protocol (gdbserver, QEMU -s/-g, kgdb, OpenOCD) "
-                    "using strictly read-only inspection packets (qSupported, qXfer, qfThreadInfo, g, m). "
-                    "Never sends breakpoint (Z), memory-write (M/X), register-write (P/G), or resume/kill packets.");
+                    "Queries target state via read-only RSP packets (qSupported, qXfer, qfThreadInfo, g, m); "
+                    "no Z/M/X/P/G/vCont mutations.");
             } else {
                 ImGui::TextColored(ImVec4(1.00f, 0.78f, 0.25f, 1.0f),
-                                   "Opt-In GDB Remote Active Debugger (Explicit Mutation Consent Required)");
+                                   "Opt-In GDB RSP Debugger (Mutation Consent Required)");
                 ImGui::TextWrapped(
-                    "Opens an opt-in IDebugSession over GDB RSP supporting vCont/Hc execution control, Ctrl-C (0x03) pause, "
-                    "software & hardware breakpoints/watchpoints (Z0..Z4), register/memory writes (P/G/M), and clean detach (z0..z4 + D).");
+                    "Enables vCont/Hc/Ctrl-C control, Z0..Z4 breakpoints/watchpoints, P/G/M writes, and clean detach (z0..z4 + D).");
             }
         }
         ImGui::EndChild();
@@ -317,7 +369,7 @@ void UiApp::render_attach_process_modal() {
         open_attach_modal_next_frame_ = false;
     }
 
-    ImGui::SetNextWindowSize(ImVec2(860.0f, 540.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(1080.0f, 580.0f), ImGuiCond_FirstUseEver);
     bool modal_open = true;
     if (!ImGui::BeginPopupModal("Attach to Process", &modal_open)) {
         return;
@@ -337,7 +389,7 @@ void UiApp::render_attach_process_modal() {
 
     ImGui::SetNextItemWidth(320.0f);
     ImGui::InputTextWithHint("##ProcSearch",
-                             "Filter by PID, name, path, or command line...",
+                             "Filter PID, PPID, name, user, integrity, arch, or path...",
                              process_filter_buf_,
                              sizeof(process_filter_buf_));
     ImGui::SameLine();
@@ -363,8 +415,10 @@ void UiApp::render_attach_process_modal() {
             selected_attach_pid_.reset();
         }
     }
+    ImGui::SameLine();
+    ImGui::Checkbox("Tree view (PPID)", &process_tree_hierarchy_);
 
-    ImGui::SetNextItemWidth(140.0f);
+    ImGui::SetNextItemWidth(130.0f);
     ImGui::InputTextWithHint("##ManualPid", "PID...", manual_pid_buf_, sizeof(manual_pid_buf_), ImGuiInputTextFlags_CharsDecimal);
     ImGui::SameLine();
     if (ImGui::Button("Attach PID")) {
@@ -378,86 +432,186 @@ void UiApp::render_attach_process_modal() {
         }
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("(%zu processes enumerated)", cached_process_list_.size());
+    ImGui::TextDisabled("%zu enumerated", cached_process_list_.size());
 
     if (!attach_error_message_.empty()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", attach_error_message_.c_str());
+        ImGui::TextColored(ImVec4(0.86f, 0.25f, 0.25f, 1.0f), "%s", attach_error_message_.c_str());
     }
 
     ImGui::Separator();
 
     const std::string_view filter(process_filter_buf_);
-    const float footer_height = ImGui::GetFrameHeightWithSpacing() + 8.0f;
+    const float footer_height = ImGui::GetFrameHeightWithSpacing() + 6.0f;
     if (ImGui::BeginTable("AttachProcessTable",
-                          6,
-                          ImGuiTableFlags_Borders |
-                              ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_Resizable |
-                              ImGuiTableFlags_ScrollY,
+                          11,
+                          kDenseReTableFlags,
                           ImVec2(0.0f, -footer_height))) {
-        ImGui::TableSetupColumn("PID", ImGuiTableColumnFlags_WidthFixed, 76.0f);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 165.0f);
-        ImGui::TableSetupColumn("Arch", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-        ImGui::TableSetupColumn("User", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn("Access", ImGuiTableColumnFlags_WidthFixed, 68.0f);
-        ImGui::TableSetupColumn("Executable / Command Line", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("PID",
+                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthFixed,
+                                68.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Pid));
+        ImGui::TableSetupColumn("PPID",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                64.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::ParentPid));
+        ImGui::TableSetupColumn("Name",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                185.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Name));
+        ImGui::TableSetupColumn("Arch",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                64.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Architecture));
+        ImGui::TableSetupColumn("Threads",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                56.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Threads));
+        ImGui::TableSetupColumn("Memory (RSS)",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                88.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::WorkingSet));
+        ImGui::TableSetupColumn("Handles/FDs",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                78.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Handles));
+        ImGui::TableSetupColumn("CPU",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                58.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::CpuPercent));
+        ImGui::TableSetupColumn("User / Integrity",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                135.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::User));
+        ImGui::TableSetupColumn("Access",
+                                ImGuiTableColumnFlags_WidthFixed,
+                                78.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Access));
+        ImGui::TableSetupColumn("Executable / Command Line",
+                                ImGuiTableColumnFlags_WidthStretch,
+                                0.0f,
+                                static_cast<ImGuiID>(ProcessSortColumn::Path));
+        ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableHeadersRow();
 
-        for (const peelf::ProcessInfo& proc : cached_process_list_) {
-            const bool is_accessible = proc.access == peelf::ProcessAccessStatus::Accessible ||
-                                       proc.access == peelf::ProcessAccessStatus::ReadOnly;
-            if (process_accessible_only_ && !is_accessible) {
-                continue;
-            }
-            const std::string exe_path_str = proc.executable_path.string();
-            const std::string pid_str = std::format("{}", proc.pid);
-            if (!filter.empty() &&
-                !icontains_filter(pid_str, filter) &&
-                !icontains_filter(proc.name, filter) &&
-                !icontains_filter(exe_path_str, filter) &&
-                !icontains_filter(proc.command_line, filter)) {
-                continue;
-            }
+        ProcessSortColumn sort_col = ProcessSortColumn::Pid;
+        bool sort_ascending = true;
+        if (ImGuiTableSortSpecs* sort_specs = ImGui::TableGetSortSpecs();
+            sort_specs != nullptr && sort_specs->SpecsCount > 0 && sort_specs->Specs != nullptr) {
+            sort_col = process_sort_column_from_user_id(sort_specs->Specs[0].ColumnUserID);
+            sort_ascending = sort_specs->Specs[0].SortDirection != ImGuiSortDirection_Descending;
+            sort_specs->SpecsDirty = false;
+        }
 
-            const bool is_sel = selected_attach_pid_ && *selected_attach_pid_ == proc.pid;
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::PushID(static_cast<int>(proc.pid & 0x7FFFFFFFu));
-            if (ImGui::Selectable(pid_str.c_str(),
-                                  is_sel,
-                                  ImGuiSelectableFlags_SpanAllColumns |
-                                      ImGuiSelectableFlags_AllowDoubleClick)) {
-                selected_attach_pid_ = proc.pid;
-                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                    try_attach_pid(proc.pid);
+        const std::vector<ProcessInventoryRow> rows = build_process_inventory_view(
+            cached_process_list_,
+            filter,
+            process_accessible_only_,
+            sort_col,
+            sort_ascending,
+            process_tree_hierarchy_);
+
+        ImGuiListClipper clipper;
+        clipper.Begin(clamp_imgui_clipper_count(rows.size()));
+        while (clipper.Step()) {
+            for (int row_idx = clipper.DisplayStart; row_idx < clipper.DisplayEnd; ++row_idx) {
+                const ProcessInventoryRow& row = rows[static_cast<std::size_t>(row_idx)];
+                if (row.info == nullptr) {
+                    continue;
                 }
-            }
-            ImGui::PopID();
+                const peelf::ProcessInfo& proc = *row.info;
+                const bool is_accessible =
+                    proc.access == peelf::ProcessAccessStatus::Accessible ||
+                    proc.access == peelf::ProcessAccessStatus::ReadOnly;
+                const bool is_sel = selected_attach_pid_ && *selected_attach_pid_ == proc.pid;
+                const std::string pid_str = std::format("{}", proc.pid);
 
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(proc.name.empty() ? "<unknown>" : proc.name.c_str());
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::PushID(row_idx);
+                if (ImGui::Selectable(pid_str.c_str(),
+                                      is_sel,
+                                      ImGuiSelectableFlags_SpanAllColumns |
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
+                    selected_attach_pid_ = proc.pid;
+                    if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        try_attach_pid(proc.pid);
+                    }
+                }
+                ImGui::PopID();
 
-            ImGui::TableNextColumn();
-            const std::string_view arch = peelf::to_string(proc.architecture);
-            ImGui::TextUnformatted(arch.data(), arch.data() + arch.size());
+                ImGui::TableNextColumn();
+                ImGui::Text("%" PRIu32, proc.parent_pid);
 
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(proc.user.empty() ? "-" : proc.user.c_str());
+                ImGui::TableNextColumn();
+                const std::string base_name = proc.name.empty()
+                    ? std::string{"<unknown>"}
+                    : sanitize_single_line_control_chars(proc.name);
+                if (process_tree_hierarchy_ && row.tree_depth > 0u) {
+                    const std::size_t indent = std::min<std::size_t>(row.tree_depth, 12u) * 2u;
+                    const std::string indented = std::string(indent, ' ') + "|- " + base_name;
+                    ImGui::TextUnformatted(indented.c_str());
+                } else {
+                    ImGui::TextUnformatted(base_name.c_str());
+                }
 
-            ImGui::TableNextColumn();
-            const std::string_view access_label = peelf::to_string(proc.access);
-            ImGui::TextColored(is_accessible ? ImVec4(0.40f, 0.90f, 0.55f, 1.0f)
-                                             : ImVec4(0.70f, 0.55f, 0.55f, 1.0f),
-                               "%.*s",
-                               static_cast<int>(access_label.size()),
-                               access_label.data());
+                ImGui::TableNextColumn();
+                const std::string_view arch = peelf::to_string(proc.architecture);
+                ImGui::TextUnformatted(arch.data(), arch.data() + arch.size());
 
-            ImGui::TableNextColumn();
-            const std::string& detail = !exe_path_str.empty() ? exe_path_str : proc.command_line;
-            if (!detail.empty()) {
-                ImGui::TextUnformatted(detail.c_str());
-            } else {
-                ImGui::TextDisabled("-");
+                ImGui::TableNextColumn();
+                if (proc.thread_count.has_value()) {
+                    ImGui::Text("%" PRIu32, *proc.thread_count);
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableNextColumn();
+                if (proc.working_set_bytes.has_value()) {
+                    const std::string rss_str = format_compact_bytes(*proc.working_set_bytes);
+                    ImGui::TextUnformatted(rss_str.c_str());
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableNextColumn();
+                if (proc.handle_count.has_value()) {
+                    ImGui::Text("%" PRIu64, *proc.handle_count);
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableNextColumn();
+                if (proc.cpu_percent.has_value()) {
+                    ImGui::Text("%.1f%%", *proc.cpu_percent);
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+
+                ImGui::TableNextColumn();
+                const std::string user_il = format_user_and_integrity(proc);
+                if (user_il == "-") {
+                    ImGui::TextDisabled("-");
+                } else {
+                    ImGui::TextUnformatted(user_il.c_str());
+                }
+
+                ImGui::TableNextColumn();
+                const std::string_view access_label = peelf::to_string(proc.access);
+                ImGui::TextColored(is_accessible ? ImVec4(0.18f, 0.58f, 0.30f, 1.0f)
+                                                 : ImVec4(0.62f, 0.35f, 0.35f, 1.0f),
+                                   "%.*s",
+                                   static_cast<int>(access_label.size()),
+                                   access_label.data());
+
+                ImGui::TableNextColumn();
+                const std::string exe_path_str = proc.executable_path.string();
+                const std::string raw_detail = !exe_path_str.empty() ? exe_path_str : proc.command_line;
+                if (!raw_detail.empty()) {
+                    const std::string safe_detail = sanitize_single_line_control_chars(raw_detail);
+                    ImGui::TextUnformatted(safe_detail.c_str());
+                } else {
+                    ImGui::TextDisabled("-");
+                }
             }
         }
 

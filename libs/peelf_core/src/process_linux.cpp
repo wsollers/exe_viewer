@@ -30,6 +30,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <pwd.h>
@@ -374,6 +375,8 @@ struct ProcReadResult {
     const std::string status = read_text_file(proc_dir / "status");
     std::istringstream status_stream(status);
     std::string line;
+    std::optional<std::uint32_t> effective_uid{};
+    bool no_new_privs = false;
     while (std::getline(status_stream, line)) {
         if (line.starts_with("Name:") && info.name.empty()) {
             std::size_t pos = 5;
@@ -397,10 +400,195 @@ struct ProcReadResult {
             std::uint32_t ruid = 0;
             const auto [ptr, ec] =
                 std::from_chars(line.data() + pos, line.data() + line.size(), ruid);
-            (void)ptr;
             if (ec == std::errc{}) {
                 info.uid = ruid;
                 info.user = lookup_username(ruid, user_cache);
+                const char* euid_ptr = ptr;
+                const char* end_ptr = line.data() + line.size();
+                while (euid_ptr < end_ptr && (*euid_ptr == ' ' || *euid_ptr == '\t')) {
+                    ++euid_ptr;
+                }
+                std::uint32_t euid = ruid;
+                const auto [eptr, eec] = std::from_chars(euid_ptr, end_ptr, euid);
+                (void)eptr;
+                effective_uid = (eec == std::errc{}) ? euid : ruid;
+            }
+        } else if (line.starts_with("Threads:")) {
+            std::size_t pos = 8;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+            std::uint32_t threads = 0;
+            const auto [ptr, ec] =
+                std::from_chars(line.data() + pos, line.data() + line.size(), threads);
+            (void)ptr;
+            if (ec == std::errc{} && threads > 0u) {
+                info.thread_count = threads;
+            }
+        } else if (line.starts_with("VmRSS:")) {
+            std::size_t pos = 6;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+            std::uint64_t rss_kb = 0;
+            const auto [ptr, ec] =
+                std::from_chars(line.data() + pos, line.data() + line.size(), rss_kb);
+            (void)ptr;
+            if (ec == std::errc{} &&
+                rss_kb <= (std::numeric_limits<std::uint64_t>::max() / 1024ULL)) {
+                info.working_set_bytes = rss_kb * 1024ULL;
+            }
+        } else if (line.starts_with("NoNewPrivs:")) {
+            std::size_t pos = 11;
+            while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) {
+                ++pos;
+            }
+            std::uint32_t nnp = 0;
+            const auto [ptr, ec] =
+                std::from_chars(line.data() + pos, line.data() + line.size(), nnp);
+            (void)ptr;
+            if (ec == std::errc{} && nnp != 0u) {
+                no_new_privs = true;
+            }
+        }
+    }
+
+    if (effective_uid.has_value() || info.uid.has_value()) {
+        const std::uint32_t uid_for_priv = effective_uid.value_or(info.uid.value_or(1u));
+        if (uid_for_priv == 0u) {
+            info.integrity_level = no_new_privs ? "root (NoNewPrivs)" : "root";
+        } else {
+            info.integrity_level = no_new_privs ? "user (NoNewPrivs)" : "user";
+        }
+    }
+
+    if (!info.working_set_bytes.has_value()) {
+        const std::string statm = read_text_file(proc_dir / "statm", 256u);
+        if (!statm.empty()) {
+            const char* p = statm.data();
+            const char* end = p + statm.size();
+            std::uint64_t total_pages = 0;
+            auto [p1, ec1] = std::from_chars(p, end, total_pages);
+            if (ec1 == std::errc{}) {
+                while (p1 < end && (*p1 == ' ' || *p1 == '\t')) {
+                    ++p1;
+                }
+                std::uint64_t rss_pages = 0;
+                const auto [p2, ec2] = std::from_chars(p1, end, rss_pages);
+                (void)p2;
+                const long page_sz = ::sysconf(_SC_PAGESIZE);
+                if (ec2 == std::errc{} && page_sz > 0 && rss_pages > 0u) {
+                    const auto page_bytes = static_cast<std::uint64_t>(page_sz);
+                    if (rss_pages <= (std::numeric_limits<std::uint64_t>::max() / page_bytes)) {
+                        info.working_set_bytes = rss_pages * page_bytes;
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        const std::string proc_stat = read_text_file(proc_dir / "stat", 8192u);
+        const std::size_t rparen = proc_stat.rfind(')');
+        if (rparen != std::string::npos && (rparen + 2u) < proc_stat.size()) {
+            std::string_view rest(proc_stat.data() + rparen + 2u, proc_stat.size() - rparen - 2u);
+            std::array<std::string_view, 20> fields{};
+            std::size_t field_count = 0u;
+            while (!rest.empty() && field_count < fields.size()) {
+                while (!rest.empty() &&
+                       (rest.front() == ' ' || rest.front() == '\t' ||
+                        rest.front() == '\n' || rest.front() == '\r')) {
+                    rest.remove_prefix(1u);
+                }
+                if (rest.empty()) {
+                    break;
+                }
+                std::size_t tok_len = 0u;
+                while (tok_len < rest.size() && rest[tok_len] != ' ' && rest[tok_len] != '\t' &&
+                       rest[tok_len] != '\n' && rest[tok_len] != '\r') {
+                    ++tok_len;
+                }
+                fields[field_count++] = rest.substr(0u, tok_len);
+                rest.remove_prefix(tok_len);
+            }
+            if (info.parent_pid == 0u && field_count > 1u) {
+                std::uint32_t ppid = 0u;
+                const auto [p, ec] = std::from_chars(
+                    fields[1].data(), fields[1].data() + fields[1].size(), ppid);
+                (void)p;
+                if (ec == std::errc{}) {
+                    info.parent_pid = ppid;
+                }
+            }
+            if (field_count > 12u) {
+                std::uint64_t utime = 0u;
+                std::uint64_t stime = 0u;
+                const auto [pu, ecu] = std::from_chars(
+                    fields[11].data(), fields[11].data() + fields[11].size(), utime);
+                const auto [ps, ecs] = std::from_chars(
+                    fields[12].data(), fields[12].data() + fields[12].size(), stime);
+                (void)pu;
+                (void)ps;
+                const long clk_tck = ::sysconf(_SC_CLK_TCK);
+                if (ecu == std::errc{} && ecs == std::errc{} && clk_tck > 0) {
+                    const auto rate = static_cast<std::uint64_t>(clk_tck);
+                    const std::uint64_t total_ticks =
+                        utime <= (std::numeric_limits<std::uint64_t>::max() - stime)
+                            ? (utime + stime)
+                            : std::numeric_limits<std::uint64_t>::max();
+                    const std::uint64_t secs = total_ticks / rate;
+                    const std::uint64_t rem = total_ticks % rate;
+                    if (secs <= (std::numeric_limits<std::uint64_t>::max() / 1'000'000'000ULL)) {
+                        const std::uint64_t sub_ns = (rem * 1'000'000'000ULL) / rate;
+                        const std::uint64_t sec_ns = secs * 1'000'000'000ULL;
+                        info.cpu_time_ns =
+                            sec_ns <= (std::numeric_limits<std::uint64_t>::max() - sub_ns)
+                                ? (sec_ns + sub_ns)
+                                : std::numeric_limits<std::uint64_t>::max();
+                    }
+                }
+            }
+            if (!info.thread_count.has_value() && field_count > 17u) {
+                std::uint32_t nt = 0u;
+                const auto [p, ec] = std::from_chars(
+                    fields[17].data(), fields[17].data() + fields[17].size(), nt);
+                (void)p;
+                if (ec == std::errc{} && nt > 0u) {
+                    info.thread_count = nt;
+                }
+            }
+        }
+    }
+
+    {
+        const std::string fd_dir_path = (proc_dir / "fd").string();
+        const int dir_fd =
+            ::open(fd_dir_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK);
+        if (dir_fd >= 0) {
+            DIR* dir = ::fdopendir(dir_fd);
+            if (dir != nullptr) {
+                const bool is_self = (pid == static_cast<ProcessId>(::getpid()));
+                std::uint64_t fd_count = 0u;
+                while (const struct dirent* ent = ::readdir(dir)) {
+                    const std::string_view dname(ent->d_name);
+                    if (dname.empty() || dname == "." || dname == "..") {
+                        continue;
+                    }
+                    if (is_self) {
+                        int parsed_fd = -1;
+                        const auto [p, ec] = std::from_chars(
+                            dname.data(), dname.data() + dname.size(), parsed_fd);
+                        if (ec == std::errc{} && p == dname.data() + dname.size() &&
+                            parsed_fd == dir_fd) {
+                            continue;
+                        }
+                    }
+                    ++fd_count;
+                }
+                ::closedir(dir);
+                info.handle_count = fd_count;
+            } else {
+                ::close(dir_fd);
             }
         }
     }

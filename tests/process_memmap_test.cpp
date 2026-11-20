@@ -7,11 +7,13 @@
 #include "navigation/viewer_navigation.hpp"
 #include "symbols/debug_symbols.hpp"
 #include "symbols/symbol_index.hpp"
+#include "ui/panel_helpers.hpp"
 #include "test_temp_dir.hpp"
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -163,10 +165,12 @@ class FakeProcessBackend final : public peelf::IProcessBackend {
 public:
     using SessionFactory = std::function<std::unique_ptr<FakeProcessSession>()>;
 
-    void register_process(peelf::ProcessInfo info, SessionFactory factory) {
+    void register_process(peelf::ProcessInfo info, SessionFactory factory = {}) {
         const peelf::ProcessId pid = info.pid;
         processes_.push_back(std::move(info));
-        factories_[pid] = std::move(factory);
+        if (factory) {
+            factories_[pid] = std::move(factory);
+        }
     }
 
     [[nodiscard]] peelf::Result<std::vector<peelf::ProcessInfo>> list_processes() override {
@@ -739,4 +743,335 @@ TEST(LiveProcessMemMap, OverflowSafeVaContainmentAndTolerantReadNearUint64Max) {
         EXPECT_EQ(sample.valid[i], 0u);
         EXPECT_EQ(sample.bytes[i], 0u);
     }
+}
+
+TEST(ProcessInventoryViewModel, WindowsFakeProviderEdgeCasesFilterAndTreeHierarchy) {
+    auto backend = std::make_shared<FakeProcessBackend>();
+
+    // PID 0 System Idle Process (root, ppid 0, AccessDenied, no executable path)
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 0u,
+        .parent_pid = 0u,
+        .name = "[System Idle Process]",
+        .executable_path = {},
+        .command_line = {},
+        .user = "NT AUTHORITY\\SYSTEM",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::AccessDenied,
+        .thread_count = 8u,
+        .working_set_bytes = 8192u,
+        .integrity_level = "System",
+    });
+
+    // PID 4 System (ppid 0 must NOT attach under PID 0!)
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 4u,
+        .parent_pid = 0u,
+        .name = "System",
+        .executable_path = {},
+        .user = "NT AUTHORITY\\SYSTEM",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::AccessDenied,
+        .thread_count = 164u,
+        .working_set_bytes = 262144u,
+        .handle_count = 4200u,
+        .integrity_level = "System",
+    });
+
+    // Elevated kernel/session chain: 4 -> 512 (smss.exe) -> 880 (svchost.exe)
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 512u,
+        .parent_pid = 4u,
+        .name = "smss.exe",
+        .user = "NT AUTHORITY\\SYSTEM",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::AccessDenied,
+        .integrity_level = "System",
+    });
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 880u,
+        .parent_pid = 512u,
+        .name = "svchost.exe",
+        .command_line = "C:\\Windows\\System32\\svchost.exe -k DcomLaunch",
+        .user = "NT AUTHORITY\\SYSTEM",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::AccessDenied,
+        .integrity_level = "System",
+    });
+
+    // Orphan user desktop root (ppid 1900 exited earlier) -> WoW64 32-bit child -> Low-IL renderer + Exited child
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 2048u,
+        .parent_pid = 1900u,
+        .name = "explorer.exe",
+        .executable_path = "C:/Windows/explorer.exe",
+        .user = "DESKTOP\\alice",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::Accessible,
+        .thread_count = 48u,
+        .working_set_bytes = 94371840u,
+        .handle_count = 1850u,
+        .cpu_time_ns = 3500000000ULL,
+        .cpu_percent = 3.5,
+        .integrity_level = "Medium",
+    });
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 3100u,
+        .parent_pid = 2048u,
+        .name = "legacy_wow64.exe",
+        .executable_path = "C:/Program Files (x86)/Vendor/legacy_wow64.exe",
+        .user = "DESKTOP\\alice",
+        .architecture = peelf::Architecture::X86,
+        .is_64bit = false,
+        .access = peelf::ProcessAccessStatus::Accessible,
+        .thread_count = 6u,
+        .working_set_bytes = 18874368u,
+        .handle_count = 210u,
+        .cpu_time_ns = 12250000000ULL,
+        .cpu_percent = 12.25,
+        .integrity_level = "Medium",
+    });
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 3200u,
+        .parent_pid = 3100u,
+        .name = "sandbox_worker.exe",
+        .command_line = "sandbox_worker.exe --type=renderer",
+        .user = "DESKTOP\\alice",
+        .architecture = peelf::Architecture::X86,
+        .is_64bit = false,
+        .access = peelf::ProcessAccessStatus::ReadOnly,
+        .thread_count = 4u,
+        .working_set_bytes = 8388608u,
+        .handle_count = 95u,
+        .cpu_time_ns = 400000000ULL,
+        .cpu_percent = 0.4,
+        .integrity_level = "Low",
+    });
+    backend->register_process(peelf::ProcessInfo{
+        .pid = 9999u,
+        .parent_pid = 2048u,
+        .name = "transient_helper.exe",
+        .architecture = peelf::Architecture::X86_64,
+        .is_64bit = true,
+        .access = peelf::ProcessAccessStatus::Exited,
+    });
+
+    viewer::BinaryModel model;
+    model.set_process_backend(backend);
+    const auto listed = model.list_processes();
+    ASSERT_TRUE(listed.has_value()) << listed.error().message;
+    ASSERT_EQ(listed->size(), 8u);
+
+    // Full tree hierarchy sorted by PID ascending:
+    const auto tree_all = viewer::build_process_inventory_view(
+        *listed, "", false, viewer::ProcessSortColumn::Pid, true, true);
+    ASSERT_EQ(tree_all.size(), 8u);
+
+    // Expected pre-order:
+    //   0 (depth 0, leaf) — PID 4 has parent_pid=0, which must NOT attach under PID 0!
+    //   4 (depth 0, children) -> 512 (depth 1, children) -> 880 (depth 2, leaf)
+    //   2048 (depth 0, children) -> 3100 (depth 1, children) -> 3200 (depth 2, leaf), 9999 (depth 1, leaf)
+    EXPECT_EQ(tree_all[0].info->pid, 0u);
+    EXPECT_EQ(tree_all[0].tree_depth, 0u);
+    EXPECT_FALSE(tree_all[0].has_children);
+
+    EXPECT_EQ(tree_all[1].info->pid, 4u);
+    EXPECT_EQ(tree_all[1].tree_depth, 0u);
+    EXPECT_TRUE(tree_all[1].has_children);
+
+    EXPECT_EQ(tree_all[2].info->pid, 512u);
+    EXPECT_EQ(tree_all[2].tree_depth, 1u);
+    EXPECT_TRUE(tree_all[2].has_children);
+
+    EXPECT_EQ(tree_all[3].info->pid, 880u);
+    EXPECT_EQ(tree_all[3].tree_depth, 2u);
+    EXPECT_FALSE(tree_all[3].has_children);
+
+    EXPECT_EQ(tree_all[4].info->pid, 2048u);
+    EXPECT_EQ(tree_all[4].tree_depth, 0u);
+    EXPECT_TRUE(tree_all[4].has_children);
+
+    EXPECT_EQ(tree_all[5].info->pid, 3100u);
+    EXPECT_EQ(tree_all[5].tree_depth, 1u);
+    EXPECT_TRUE(tree_all[5].has_children);
+
+    EXPECT_EQ(tree_all[6].info->pid, 3200u);
+    EXPECT_EQ(tree_all[6].tree_depth, 2u);
+    EXPECT_FALSE(tree_all[6].has_children);
+
+    EXPECT_EQ(tree_all[7].info->pid, 9999u);
+    EXPECT_EQ(tree_all[7].tree_depth, 1u);
+    EXPECT_FALSE(tree_all[7].has_children);
+
+    // Accessible-only filters out AccessDenied (0, 4, 512, 880) and Exited (9999),
+    // retaining Accessible + ReadOnly (2048 -> 3100 -> 3200).
+    const auto accessible_tree = viewer::build_process_inventory_view(
+        *listed, "", true, viewer::ProcessSortColumn::Pid, true, true);
+    ASSERT_EQ(accessible_tree.size(), 3u);
+    EXPECT_EQ(accessible_tree[0].info->pid, 2048u);
+    EXPECT_EQ(accessible_tree[0].tree_depth, 0u);
+    EXPECT_EQ(accessible_tree[1].info->pid, 3100u);
+    EXPECT_EQ(accessible_tree[1].tree_depth, 1u);
+    EXPECT_FALSE(accessible_tree[1].info->is_64bit);
+    EXPECT_EQ(accessible_tree[2].info->pid, 3200u);
+    EXPECT_EQ(accessible_tree[2].tree_depth, 2u);
+
+    // Case-insensitive filtering across integrity, architecture, command line, and user:
+    const auto low_il = viewer::build_process_inventory_view(*listed, "low", false);
+    ASSERT_EQ(low_il.size(), 1u);
+    EXPECT_EQ(low_il[0].info->pid, 3200u);
+
+    const auto cmd_match = viewer::build_process_inventory_view(*listed, "DCOMLAUNCH", false);
+    ASSERT_EQ(cmd_match.size(), 1u);
+    EXPECT_EQ(cmd_match[0].info->pid, 880u);
+
+    const auto wow64_match = viewer::build_process_inventory_view(*listed, "program files (x86)", false);
+    ASSERT_EQ(wow64_match.size(), 1u);
+    EXPECT_EQ(wow64_match[0].info->pid, 3100u);
+}
+
+TEST(ProcessInventoryViewModel, CyclicAndSelfParentPpidResilienceNeverLoopsOrDropsProcesses) {
+    // 2-cycle: 100 <-> 200 with tail child 300 -> 200
+    // Self-parent: 400 -> 400
+    // 3-cycle: 500 -> 700 -> 600 -> 500
+    const std::vector<peelf::ProcessInfo> cyclic{
+        peelf::ProcessInfo{.pid = 200u, .parent_pid = 100u, .name = "cycle_b"},
+        peelf::ProcessInfo{.pid = 100u, .parent_pid = 200u, .name = "cycle_a"},
+        peelf::ProcessInfo{.pid = 300u, .parent_pid = 200u, .name = "cycle_tail"},
+        peelf::ProcessInfo{.pid = 400u, .parent_pid = 400u, .name = "self_parent"},
+        peelf::ProcessInfo{.pid = 700u, .parent_pid = 600u, .name = "tri_c"},
+        peelf::ProcessInfo{.pid = 500u, .parent_pid = 700u, .name = "tri_a"},
+        peelf::ProcessInfo{.pid = 600u, .parent_pid = 500u, .name = "tri_b"},
+    };
+
+    const auto rows = viewer::build_process_inventory_view(
+        cyclic, "", false, viewer::ProcessSortColumn::Pid, true, true);
+    ASSERT_EQ(rows.size(), cyclic.size());
+
+    // 100 breaks the {100, 200} cycle as root: 100 (0) -> 200 (1) -> 300 (2)
+    EXPECT_EQ(rows[0].info->pid, 100u);
+    EXPECT_EQ(rows[0].tree_depth, 0u);
+    EXPECT_EQ(rows[1].info->pid, 200u);
+    EXPECT_EQ(rows[1].tree_depth, 1u);
+    EXPECT_EQ(rows[2].info->pid, 300u);
+    EXPECT_EQ(rows[2].tree_depth, 2u);
+
+    // 400 self-parent becomes root (depth 0, no children)
+    EXPECT_EQ(rows[3].info->pid, 400u);
+    EXPECT_EQ(rows[3].tree_depth, 0u);
+    EXPECT_FALSE(rows[3].has_children);
+
+    // 500 breaks the {500, 600, 700} cycle as root: 500 (0) -> 600 (1) -> 700 (2)
+    EXPECT_EQ(rows[4].info->pid, 500u);
+    EXPECT_EQ(rows[4].tree_depth, 0u);
+    EXPECT_EQ(rows[5].info->pid, 600u);
+    EXPECT_EQ(rows[5].tree_depth, 1u);
+    EXPECT_EQ(rows[6].info->pid, 700u);
+    EXPECT_EQ(rows[6].tree_depth, 2u);
+}
+
+TEST(ProcessInventoryViewModel, SortsAcrossAllColumnsAscendingAndDescendingWithNulloptHandling) {
+    const std::vector<peelf::ProcessInfo> procs{
+        peelf::ProcessInfo{
+            .pid = 30u,
+            .parent_pid = 10u,
+            .name = "zeta",
+            .executable_path = "/usr/bin/zeta",
+            .user = "charlie",
+            .architecture = peelf::Architecture::X86_64,
+            .access = peelf::ProcessAccessStatus::Accessible,
+            .thread_count = 12u,
+            .working_set_bytes = 64ULL * 1024ULL * 1024ULL,
+            .handle_count = 120u,
+            .cpu_percent = 45.5,
+            .integrity_level = "Medium",
+        },
+        peelf::ProcessInfo{
+            .pid = 10u,
+            .parent_pid = 1u,
+            .name = "Alpha",
+            .executable_path = "/bin/alpha",
+            .user = "alice",
+            .architecture = peelf::Architecture::ARM64,
+            .access = peelf::ProcessAccessStatus::ReadOnly,
+            .thread_count = 2u,
+            .working_set_bytes = 4ULL * 1024ULL * 1024ULL,
+            .handle_count = 18u,
+            .cpu_percent = 1.25,
+            .integrity_level = "High",
+        },
+        peelf::ProcessInfo{
+            .pid = 20u,
+            .parent_pid = 5u,
+            .name = "beta",
+            .executable_path = {},
+            .command_line = {},
+            .user = {},
+            .architecture = peelf::Architecture::Unknown,
+            .access = peelf::ProcessAccessStatus::AccessDenied,
+            .thread_count = std::nullopt,
+            .working_set_bytes = std::nullopt,
+            .handle_count = std::nullopt,
+            .cpu_percent = std::numeric_limits<double>::quiet_NaN(),
+            .integrity_level = {},
+        },
+    };
+
+    using Col = viewer::ProcessSortColumn;
+
+    // PID asc & desc
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Pid, true)[0].info->pid, 10u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Pid, false)[0].info->pid, 30u);
+
+    // ParentPid asc & desc
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::ParentPid, true)[0].info->pid, 10u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::ParentPid, false)[0].info->pid, 30u);
+
+    // Name case-insensitive asc ("Alpha", "beta", "zeta") & desc ("zeta", "beta", "Alpha")
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Name, true)[0].info->pid, 10u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Name, false)[0].info->pid, 30u);
+
+    // Architecture: known architectures precede Unknown in both asc & desc
+    const auto arch_asc = viewer::build_process_inventory_view(procs, "", false, Col::Architecture, true);
+    const auto arch_desc = viewer::build_process_inventory_view(procs, "", false, Col::Architecture, false);
+    EXPECT_EQ(arch_asc[0].info->pid, 10u);   // ARM64 < x86_64
+    EXPECT_EQ(arch_asc[2].info->pid, 20u);   // Unknown last
+    EXPECT_EQ(arch_desc[0].info->pid, 30u);  // x86_64 > ARM64
+    EXPECT_EQ(arch_desc[2].info->pid, 20u);  // Unknown last
+
+    // User & Integrity: populated strings precede empty strings in both asc & desc
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::User, true)[0].info->pid, 10u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::User, false)[0].info->pid, 30u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::User, false)[2].info->pid, 20u);
+
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Integrity, true)[0].info->pid, 10u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Integrity, false)[0].info->pid, 30u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Integrity, false)[2].info->pid, 20u);
+
+    // Optional numeric columns: populated values precede nullopt/NaN in BOTH asc & desc!
+    for (const Col numeric_col : {Col::Threads, Col::WorkingSet, Col::Handles, Col::CpuPercent}) {
+        const auto asc_rows = viewer::build_process_inventory_view(procs, "", false, numeric_col, true);
+        const auto desc_rows = viewer::build_process_inventory_view(procs, "", false, numeric_col, false);
+        ASSERT_EQ(asc_rows.size(), 3u);
+        ASSERT_EQ(desc_rows.size(), 3u);
+        EXPECT_EQ(asc_rows[0].info->pid, 10u);
+        EXPECT_EQ(asc_rows[1].info->pid, 30u);
+        EXPECT_EQ(asc_rows[2].info->pid, 20u);
+        EXPECT_EQ(desc_rows[0].info->pid, 30u);
+        EXPECT_EQ(desc_rows[1].info->pid, 10u);
+        EXPECT_EQ(desc_rows[2].info->pid, 20u);
+    }
+
+    // Access & Path
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Access, true)[0].info->pid, 30u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Access, false)[0].info->pid, 20u);
+
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Path, true)[0].info->pid, 10u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Path, false)[0].info->pid, 30u);
+    EXPECT_EQ(viewer::build_process_inventory_view(procs, "", false, Col::Path, false)[2].info->pid, 20u);
 }

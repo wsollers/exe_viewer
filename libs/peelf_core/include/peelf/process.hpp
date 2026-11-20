@@ -53,6 +53,12 @@ struct ProcessInfo {
     Endianness endianness{Endianness::Little};
     bool is_64bit{true};
     ProcessAccessStatus access{ProcessAccessStatus::Unknown};
+    std::optional<std::uint32_t> thread_count{};
+    std::optional<std::uint64_t> working_set_bytes{};
+    std::optional<std::uint64_t> handle_count{};
+    std::optional<std::uint64_t> cpu_time_ns{};
+    std::optional<double> cpu_percent{};
+    std::string integrity_level{};
 
     auto operator<=>(const ProcessInfo&) const = default;
 };

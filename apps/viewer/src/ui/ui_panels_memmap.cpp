@@ -43,22 +43,6 @@ enum class ProtectionBucket : int {
     NoAccessOrGuard = 4,
 };
 
-[[nodiscard]] bool icontains(std::string_view haystack, std::string_view needle) {
-    if (needle.empty()) {
-        return true;
-    }
-    const auto it = std::search(
-        haystack.begin(),
-        haystack.end(),
-        needle.begin(),
-        needle.end(),
-        [](char a, char b) {
-            return std::tolower(static_cast<unsigned char>(a)) ==
-                   std::tolower(static_cast<unsigned char>(b));
-        });
-    return it != haystack.end();
-}
-
 [[nodiscard]] ImVec4 protection_color(const peelf::MemoryProtection& p) noexcept {
     if (p.executable && p.writable) {
         return ImVec4(1.0f, 0.38f, 0.30f, 1.0f);  // RWX: high-attention coral

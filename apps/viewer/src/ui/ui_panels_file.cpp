@@ -1,3 +1,4 @@
+#include "panel_helpers.hpp"
 #include "ui_panels.hpp"
 #include "ui_panels_capabilities.hpp"
 #include <imgui.h>
@@ -13,11 +14,12 @@ namespace viewer {
 
     void FilePanel::draw_contents() {
         if (!model_.has_file()) {
-            ImGui::TextUnformatted("No file or live process loaded.");
-            ImGui::Separator();
-            ImGui::TextWrapped("Open a PE/ELF/Mach-O file from disk or attach to a running process to inspect memory and symbols.");
-            if (on_attach_requested_ && ImGui::Button("Attach to Process...")) {
-                on_attach_requested_();
+            ImGui::TextDisabled("No target loaded.");
+            if (on_attach_requested_) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Attach to Process...")) {
+                    on_attach_requested_();
+                }
             }
             return;
         }
@@ -188,14 +190,15 @@ namespace viewer {
                             };
                         });
                 }
-                row("Size", std::format("{} bytes", info.size_bytes));
-                row("Window base", std::format("0x{:X}", model_.view_base_address()));
+                const bool is_64 = model_.image() == nullptr || model_.image()->is_64bit();
+                row("Size", std::format("{} ({} bytes)", format_compact_bytes(info.size_bytes), info.size_bytes));
+                row("Window base", format_va(model_.view_base_address(), is_64));
 
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
                 ImGui::TextDisabled("%s", "Entry point");
                 ImGui::TableNextColumn();
-                const std::string ep_str = std::format("0x{:X}", info.entry_point);
+                const std::string ep_str = format_va(info.entry_point, is_64);
                 if (ImGui::Selectable(ep_str.c_str(), false, ImGuiSelectableFlags_SpanAllColumns)) {
                     if (info.entry_point != 0 && on_context_action_) {
                         pending_ctx_action = PendingEntityContextAction{

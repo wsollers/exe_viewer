@@ -10,6 +10,7 @@
 #include <cmath>
 #include <format>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 
 namespace viewer {
@@ -1411,6 +1412,354 @@ bool enqueue_structure_selection_activation(
         return true;
     }
     return false;
+}
+
+bool icontains(std::string_view haystack, std::string_view needle) noexcept {
+    return contains_ascii_icase(haystack, needle);
+}
+
+std::string format_va(std::uint64_t va, bool is_64bit) {
+    return is_64bit ? std::format("0x{:016X}", va) : std::format("0x{:08X}", va);
+}
+
+std::string format_file_offset(std::uint64_t offset) {
+    return offset > 0xFFFFFFFFULL
+        ? std::format("0x{:016X}", offset)
+        : std::format("0x{:08X}", offset);
+}
+
+std::string format_compact_bytes(std::uint64_t bytes) {
+    if (bytes < 1024ULL) {
+        return std::format("{} B", bytes);
+    }
+    static constexpr std::array<std::string_view, 6> kUnits{
+        "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"};
+    double scaled = static_cast<double>(bytes) / 1024.0;
+    std::size_t unit_idx = 0u;
+    while (scaled >= 1023.95 && (unit_idx + 1u) < kUnits.size()) {
+        scaled /= 1024.0;
+        ++unit_idx;
+    }
+    if (scaled < 10.0) {
+        return std::format("{:.2f} {}", scaled, kUnits[unit_idx]);
+    }
+    return std::format("{:.1f} {}", scaled, kUnits[unit_idx]);
+}
+
+namespace {
+
+[[nodiscard]] int compare_ascii_icase(std::string_view a, std::string_view b) noexcept {
+    const std::size_t common = std::min(a.size(), b.size());
+    for (std::size_t i = 0u; i < common; ++i) {
+        const int ca = std::tolower(static_cast<unsigned char>(a[i]));
+        const int cb = std::tolower(static_cast<unsigned char>(b[i]));
+        if (ca != cb) {
+            return ca < cb ? -1 : 1;
+        }
+    }
+    if (a.size() != b.size()) {
+        return a.size() < b.size() ? -1 : 1;
+    }
+    const int exact = a.compare(b);
+    if (exact < 0) {
+        return -1;
+    }
+    return exact > 0 ? 1 : 0;
+}
+
+[[nodiscard]] int compare_nonempty_string_icase(
+    std::string_view a, std::string_view b, bool ascending) noexcept {
+    if (a.empty() != b.empty()) {
+        return a.empty() ? 1 : -1;
+    }
+    if (a.empty()) {
+        return 0;
+    }
+    const int cmp = compare_ascii_icase(a, b);
+    return ascending ? cmp : -cmp;
+}
+
+template <typename T>
+[[nodiscard]] int compare_optional_value(
+    const std::optional<T>& a, const std::optional<T>& b, bool ascending) noexcept {
+    if (a.has_value() != b.has_value()) {
+        return a.has_value() ? -1 : 1;
+    }
+    if (!a.has_value()) {
+        return 0;
+    }
+    if (*a < *b) {
+        return ascending ? -1 : 1;
+    }
+    if (*b < *a) {
+        return ascending ? 1 : -1;
+    }
+    return 0;
+}
+
+[[nodiscard]] int compare_optional_double(
+    const std::optional<double>& a, const std::optional<double>& b, bool ascending) noexcept {
+    const bool a_valid = a.has_value() && !std::isnan(*a);
+    const bool b_valid = b.has_value() && !std::isnan(*b);
+    if (a_valid != b_valid) {
+        return a_valid ? -1 : 1;
+    }
+    if (!a_valid) {
+        return 0;
+    }
+    if (*a < *b) {
+        return ascending ? -1 : 1;
+    }
+    if (*b < *a) {
+        return ascending ? 1 : -1;
+    }
+    return 0;
+}
+
+[[nodiscard]] bool process_matches_filter(
+    const peelf::ProcessInfo& proc, std::string_view filter) {
+    if (filter.empty()) {
+        return true;
+    }
+    if (icontains(proc.name, filter) ||
+        icontains(proc.user, filter) ||
+        icontains(proc.integrity_level, filter) ||
+        icontains(peelf::to_string(proc.architecture), filter) ||
+        icontains(proc.command_line, filter)) {
+        return true;
+    }
+    const std::string pid_str = std::to_string(proc.pid);
+    if (icontains(pid_str, filter)) {
+        return true;
+    }
+    const std::string ppid_str = std::to_string(proc.parent_pid);
+    if (icontains(ppid_str, filter)) {
+        return true;
+    }
+    if (!proc.executable_path.empty()) {
+        const std::string exe_str = proc.executable_path.string();
+        if (icontains(exe_str, filter)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] int compare_process_column(
+    const peelf::ProcessInfo& a,
+    const peelf::ProcessInfo& b,
+    ProcessSortColumn sort_col,
+    bool ascending) {
+    switch (sort_col) {
+        case ProcessSortColumn::Pid:
+            if (a.pid == b.pid) {
+                return 0;
+            }
+            return (a.pid < b.pid) == ascending ? -1 : 1;
+        case ProcessSortColumn::ParentPid:
+            if (a.parent_pid == b.parent_pid) {
+                return 0;
+            }
+            return (a.parent_pid < b.parent_pid) == ascending ? -1 : 1;
+        case ProcessSortColumn::Name:
+            return compare_nonempty_string_icase(a.name, b.name, ascending);
+        case ProcessSortColumn::Architecture: {
+            const bool a_known = a.architecture != peelf::Architecture::Unknown;
+            const bool b_known = b.architecture != peelf::Architecture::Unknown;
+            if (a_known != b_known) {
+                return a_known ? -1 : 1;
+            }
+            if (!a_known) {
+                return 0;
+            }
+            const int cmp = compare_ascii_icase(
+                peelf::to_string(a.architecture), peelf::to_string(b.architecture));
+            return ascending ? cmp : -cmp;
+        }
+        case ProcessSortColumn::User:
+            return compare_nonempty_string_icase(a.user, b.user, ascending);
+        case ProcessSortColumn::Integrity:
+            return compare_nonempty_string_icase(
+                a.integrity_level, b.integrity_level, ascending);
+        case ProcessSortColumn::Threads:
+            return compare_optional_value(a.thread_count, b.thread_count, ascending);
+        case ProcessSortColumn::WorkingSet:
+            return compare_optional_value(a.working_set_bytes, b.working_set_bytes, ascending);
+        case ProcessSortColumn::Handles:
+            return compare_optional_value(a.handle_count, b.handle_count, ascending);
+        case ProcessSortColumn::CpuPercent:
+            return compare_optional_double(a.cpu_percent, b.cpu_percent, ascending);
+        case ProcessSortColumn::Access: {
+            const auto av = static_cast<std::uint8_t>(a.access);
+            const auto bv = static_cast<std::uint8_t>(b.access);
+            if (av == bv) {
+                return 0;
+            }
+            return (av < bv) == ascending ? -1 : 1;
+        }
+        case ProcessSortColumn::Path: {
+            const std::string path_a =
+                !a.executable_path.empty() ? a.executable_path.string() : a.command_line;
+            const std::string path_b =
+                !b.executable_path.empty() ? b.executable_path.string() : b.command_line;
+            return compare_nonempty_string_icase(path_a, path_b, ascending);
+        }
+    }
+    return 0;
+}
+
+} // namespace
+
+std::vector<ProcessInventoryRow> build_process_inventory_view(
+    std::span<const peelf::ProcessInfo> processes,
+    std::string_view filter,
+    bool accessible_only,
+    ProcessSortColumn sort_col,
+    bool ascending,
+    bool tree_hierarchy) {
+    std::vector<std::size_t> matched_indices;
+    matched_indices.reserve(processes.size());
+    for (std::size_t idx = 0u; idx < processes.size(); ++idx) {
+        const peelf::ProcessInfo& proc = processes[idx];
+        const bool is_accessible =
+            proc.access == peelf::ProcessAccessStatus::Accessible ||
+            proc.access == peelf::ProcessAccessStatus::ReadOnly;
+        if (accessible_only && !is_accessible) {
+            continue;
+        }
+        if (!process_matches_filter(proc, filter)) {
+            continue;
+        }
+        matched_indices.push_back(idx);
+    }
+
+    if (matched_indices.empty()) {
+        return {};
+    }
+
+    std::ranges::sort(matched_indices, [&](std::size_t ia, std::size_t ib) {
+        const peelf::ProcessInfo& a = processes[ia];
+        const peelf::ProcessInfo& b = processes[ib];
+        const int cmp = compare_process_column(a, b, sort_col, ascending);
+        if (cmp != 0) {
+            return cmp < 0;
+        }
+        if (a.pid != b.pid) {
+            return a.pid < b.pid;
+        }
+        return ia < ib;
+    });
+
+    const std::size_t count = matched_indices.size();
+    std::unordered_map<peelf::ProcessId, std::size_t> pid_to_node;
+    pid_to_node.reserve(count);
+    for (std::size_t node = 0u; node < count; ++node) {
+        pid_to_node.try_emplace(processes[matched_indices[node]].pid, node);
+    }
+
+    constexpr std::size_t kNoParent = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> parent(count, kNoParent);
+    for (std::size_t node = 0u; node < count; ++node) {
+        const peelf::ProcessInfo& proc = processes[matched_indices[node]];
+        if (proc.parent_pid == 0u || proc.parent_pid == proc.pid) {
+            continue;
+        }
+        const auto it = pid_to_node.find(proc.parent_pid);
+        if (it != pid_to_node.end() && it->second != node) {
+            parent[node] = it->second;
+        }
+    }
+
+    if (!tree_hierarchy) {
+        std::vector<std::uint8_t> has_child(count, 0u);
+        for (std::size_t node = 0u; node < count; ++node) {
+            if (parent[node] != kNoParent) {
+                has_child[parent[node]] = 1u;
+            }
+        }
+        std::vector<ProcessInventoryRow> rows;
+        rows.reserve(count);
+        for (std::size_t node = 0u; node < count; ++node) {
+            rows.push_back(ProcessInventoryRow{
+                .info = &processes[matched_indices[node]],
+                .tree_depth = 0u,
+                .has_children = has_child[node] != 0u,
+            });
+        }
+        return rows;
+    }
+
+    // Break any PPID cycles deterministically at the highest-priority node in the cycle.
+    std::vector<std::uint8_t> color(count, 0u);
+    std::vector<std::size_t> chain;
+    for (std::size_t start = 0u; start < count; ++start) {
+        if (color[start] != 0u) {
+            continue;
+        }
+        chain.clear();
+        std::size_t cur = start;
+        while (cur != kNoParent && color[cur] == 0u) {
+            color[cur] = 1u;
+            chain.push_back(cur);
+            cur = parent[cur];
+        }
+        if (cur != kNoParent && color[cur] == 1u) {
+            const auto cyc_begin = std::ranges::find(chain, cur);
+            if (cyc_begin != chain.end()) {
+                const std::size_t cycle_root = *std::min_element(cyc_begin, chain.end());
+                parent[cycle_root] = kNoParent;
+            }
+        }
+        for (const std::size_t visited : chain) {
+            color[visited] = 2u;
+        }
+    }
+
+    std::vector<std::size_t> roots;
+    std::vector<std::vector<std::size_t>> children(count);
+    for (std::size_t node = 0u; node < count; ++node) {
+        if (parent[node] == kNoParent) {
+            roots.push_back(node);
+        } else {
+            children[parent[node]].push_back(node);
+        }
+    }
+
+    struct StackFrame {
+        std::size_t node = 0u;
+        std::size_t depth = 0u;
+    };
+    std::vector<StackFrame> stack;
+    stack.reserve(count);
+    for (std::size_t idx = roots.size(); idx > 0u; --idx) {
+        stack.push_back(StackFrame{.node = roots[idx - 1u], .depth = 0u});
+    }
+
+    std::vector<std::uint8_t> emitted(count, 0u);
+    std::vector<ProcessInventoryRow> rows;
+    rows.reserve(count);
+    while (!stack.empty()) {
+        const StackFrame frame = stack.back();
+        stack.pop_back();
+        if (emitted[frame.node] != 0u) {
+            continue;
+        }
+        emitted[frame.node] = 1u;
+        const auto& node_children = children[frame.node];
+        rows.push_back(ProcessInventoryRow{
+            .info = &processes[matched_indices[frame.node]],
+            .tree_depth = frame.depth,
+            .has_children = !node_children.empty(),
+        });
+        for (std::size_t idx = node_children.size(); idx > 0u; --idx) {
+            stack.push_back(StackFrame{
+                .node = node_children[idx - 1u],
+                .depth = frame.depth + 1u,
+            });
+        }
+    }
+
+    return rows;
 }
 
 } // namespace viewer

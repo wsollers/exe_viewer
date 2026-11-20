@@ -11,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "analysis/project.hpp"
@@ -302,8 +303,11 @@ namespace viewer {
         char process_filter_buf_[128] = {};
         char manual_pid_buf_[32] = {};
         bool process_accessible_only_ = false;
+        bool process_tree_hierarchy_ = false;
         std::optional<peelf::ProcessId> selected_attach_pid_;
         std::string attach_error_message_;
+        std::unordered_map<peelf::ProcessId, std::uint64_t> prev_process_cpu_time_ns_{};
+        std::optional<std::chrono::steady_clock::time_point> last_process_refresh_time_{};
 
         bool open_gdb_remote_modal_next_frame_ = false;
         bool gdb_remote_modal_debug_mode_ = false;

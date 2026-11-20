@@ -26,13 +26,13 @@ inline void load_theme(float content_scale = 0.0f) {
     ImGui::GetStyle().FontScaleDpi = font_dpi;
     ImGui::StyleColorsDark();
     auto& style = ImGui::GetStyle();
-    style.WindowPadding = {12,12};
-    style.FramePadding = {8,5};
-    style.ItemSpacing = {8,7};
-    style.CellPadding = {8,4};
-    style.FrameRounding = 4;
-    style.TabRounding = 4;
-    style.ScrollbarSize = 12;
+    style.WindowPadding = {8, 6};
+    style.FramePadding = {5, 2};
+    style.ItemSpacing = {6, 3};
+    style.CellPadding = {4, 2};
+    style.FrameRounding = 2;
+    style.TabRounding = 2;
+    style.ScrollbarSize = 11;
 #ifdef _WIN32
     wchar_t executable[32768]{};
     GetModuleFileNameW(nullptr, executable, 32768);

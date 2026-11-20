@@ -52,6 +52,26 @@ TEST(LiveSelfProcess, EnumeratesProcessesAndAttachesToSelfReadOnlyWithStaticMeta
     });
     ASSERT_NE(self_it, processes->end()) << "current_process_id() must appear in list_processes()";
 
+    EXPECT_TRUE(self_it->thread_count.has_value());
+    if (self_it->thread_count.has_value()) {
+        EXPECT_GE(*self_it->thread_count, 1u);
+    }
+    EXPECT_TRUE(self_it->working_set_bytes.has_value());
+    if (self_it->working_set_bytes.has_value()) {
+        EXPECT_GT(*self_it->working_set_bytes, 0u);
+    }
+    EXPECT_TRUE(self_it->cpu_time_ns.has_value());
+    EXPECT_TRUE(self_it->handle_count.has_value());
+    if (self_it->handle_count.has_value()) {
+        EXPECT_GE(*self_it->handle_count, 3u);
+    }
+    EXPECT_FALSE(self_it->integrity_level.empty());
+#if defined(__linux__)
+    EXPECT_TRUE(self_it->integrity_level.starts_with("user") ||
+                self_it->integrity_level.starts_with("root"))
+        << self_it->integrity_level;
+#endif
+
     viewer::BinaryModel model;
     model.set_process_backend(backend);
     auto attached = model.attach_process(self_pid);

@@ -20,6 +20,7 @@
 #include <array>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -204,6 +205,116 @@ void detect_win32_process_arch(HANDLE process, Architecture& out_arch, bool& out
     }
     out_arch = sizeof(void*) == 8 ? Architecture::X86_64 : Architecture::X86;
     out_is64 = sizeof(void*) == 8;
+}
+
+[[nodiscard]] std::string win32_integrity_rid_label(DWORD rid) {
+    if (rid < SECURITY_MANDATORY_LOW_RID) {
+        return "Untrusted";
+    }
+    if (rid < SECURITY_MANDATORY_MEDIUM_RID) {
+        return "Low";
+    }
+    if (rid < SECURITY_MANDATORY_HIGH_RID) {
+        return "Medium";
+    }
+    if (rid < SECURITY_MANDATORY_SYSTEM_RID) {
+        return "High";
+    }
+    return "System";
+}
+
+void populate_win32_process_metrics(HANDLE process, ProcessInfo& info) {
+    if (process == nullptr || process == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    if (::GetProcessMemoryInfo(process, &pmc, sizeof(pmc)) != 0) {
+        info.working_set_bytes = static_cast<std::uint64_t>(pmc.WorkingSetSize);
+    }
+
+    DWORD handle_cnt = 0;
+    if (::GetProcessHandleCount(process, &handle_cnt) != 0) {
+        info.handle_count = static_cast<std::uint64_t>(handle_cnt);
+    }
+
+    FILETIME create_ft{};
+    FILETIME exit_ft{};
+    FILETIME kernel_ft{};
+    FILETIME user_ft{};
+    if (::GetProcessTimes(process, &create_ft, &exit_ft, &kernel_ft, &user_ft) != 0) {
+        const std::uint64_t k100 =
+            (static_cast<std::uint64_t>(kernel_ft.dwHighDateTime) << 32u) |
+            static_cast<std::uint64_t>(kernel_ft.dwLowDateTime);
+        const std::uint64_t u100 =
+            (static_cast<std::uint64_t>(user_ft.dwHighDateTime) << 32u) |
+            static_cast<std::uint64_t>(user_ft.dwLowDateTime);
+        const std::uint64_t total_100ns =
+            k100 <= (std::numeric_limits<std::uint64_t>::max() - u100)
+                ? (k100 + u100)
+                : std::numeric_limits<std::uint64_t>::max();
+        info.cpu_time_ns =
+            total_100ns <= (std::numeric_limits<std::uint64_t>::max() / 100ULL)
+                ? (total_100ns * 100ULL)
+                : std::numeric_limits<std::uint64_t>::max();
+    }
+
+    HANDLE raw_token = nullptr;
+    if (::OpenProcessToken(process, TOKEN_QUERY, &raw_token) != 0) {
+        const ScopedWinHandle token(raw_token);
+        DWORD il_needed = 0;
+        (void)::GetTokenInformation(token.get(), TokenIntegrityLevel, nullptr, 0, &il_needed);
+        if (il_needed >= sizeof(TOKEN_MANDATORY_LABEL)) {
+            std::vector<std::uint8_t> il_buf(il_needed, 0u);
+            if (::GetTokenInformation(
+                    token.get(), TokenIntegrityLevel, il_buf.data(), il_needed, &il_needed) != 0) {
+                const auto* tml = reinterpret_cast<const TOKEN_MANDATORY_LABEL*>(il_buf.data());
+                if (tml->Label.Sid != nullptr && ::IsValidSid(tml->Label.Sid) != 0) {
+                    const PUCHAR sub_count = ::GetSidSubAuthorityCount(tml->Label.Sid);
+                    if (sub_count != nullptr && *sub_count > 0) {
+                        const PDWORD rid_ptr = ::GetSidSubAuthority(
+                            tml->Label.Sid, static_cast<DWORD>(*sub_count - 1u));
+                        if (rid_ptr != nullptr) {
+                            info.integrity_level = win32_integrity_rid_label(*rid_ptr);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (info.user.empty()) {
+            DWORD user_needed = 0;
+            (void)::GetTokenInformation(token.get(), TokenUser, nullptr, 0, &user_needed);
+            if (user_needed >= sizeof(TOKEN_USER)) {
+                std::vector<std::uint8_t> user_buf(user_needed, 0u);
+                if (::GetTokenInformation(
+                        token.get(), TokenUser, user_buf.data(), user_needed, &user_needed) != 0) {
+                    const auto* tu = reinterpret_cast<const TOKEN_USER*>(user_buf.data());
+                    if (tu->User.Sid != nullptr && ::IsValidSid(tu->User.Sid) != 0) {
+                        std::array<wchar_t, 256> name_buf{};
+                        std::array<wchar_t, 256> dom_buf{};
+                        DWORD name_len = static_cast<DWORD>(name_buf.size());
+                        DWORD dom_len = static_cast<DWORD>(dom_buf.size());
+                        SID_NAME_USE use = SidTypeUnknown;
+                        if (::LookupAccountSidW(nullptr,
+                                                tu->User.Sid,
+                                                name_buf.data(),
+                                                &name_len,
+                                                dom_buf.data(),
+                                                &dom_len,
+                                                &use) != 0) {
+                            const std::string uname = wide_to_utf8(name_buf.data());
+                            const std::string udom = wide_to_utf8(dom_buf.data());
+                            if (!uname.empty()) {
+                                info.user = udom.empty() ? uname : (udom + "\\" + uname);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 [[nodiscard]] bool raw_read_process_mem(HANDLE process,
@@ -1354,6 +1465,9 @@ public:
                 info.parent_pid = static_cast<ProcessId>(pe.th32ParentProcessID);
                 info.name = wide_to_utf8(pe.szExeFile);
                 info.endianness = Endianness::Little;
+                if (pe.cntThreads > 0) {
+                    info.thread_count = static_cast<std::uint32_t>(pe.cntThreads);
+                }
 
                 // Strictly read-only OpenProcess: never request PROCESS_VM_WRITE / PROCESS_VM_OPERATION.
                 bool has_vm_read = true;
@@ -1374,6 +1488,7 @@ public:
                             std::filesystem::path(wide_to_utf8(path_buf.data()));
                     }
                     detect_win32_process_arch(h.get(), info.architecture, info.is_64bit);
+                    populate_win32_process_metrics(h.get(), info);
                     if (has_vm_read) {
                         const PebInspectionData peb = inspect_win32_peb(h.get(), info.is_64bit);
                         info.command_line = peb.command_line;
@@ -1439,6 +1554,26 @@ public:
             info.name = info.executable_path.filename().string();
         }
         detect_win32_process_arch(h.get(), info.architecture, info.is_64bit);
+        populate_win32_process_metrics(h.get(), info);
+
+        {
+            ScopedWinHandle snap(::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+            if (snap.valid()) {
+                PROCESSENTRY32W pe{};
+                pe.dwSize = sizeof(pe);
+                if (::Process32FirstW(snap.get(), &pe) != 0) {
+                    do {
+                        if (pe.th32ProcessID == static_cast<DWORD>(pid)) {
+                            info.parent_pid = static_cast<ProcessId>(pe.th32ParentProcessID);
+                            if (pe.cntThreads > 0) {
+                                info.thread_count = static_cast<std::uint32_t>(pe.cntThreads);
+                            }
+                            break;
+                        }
+                    } while (::Process32NextW(snap.get(), &pe) != 0);
+                }
+            }
+        }
 
         PebInspectionData peb =
             has_vm_read ? inspect_win32_peb(h.get(), info.is_64bit) : PebInspectionData{};

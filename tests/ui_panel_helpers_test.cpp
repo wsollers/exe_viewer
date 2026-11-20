@@ -283,3 +283,25 @@ TEST(UiPanelHelpersTest, ClipperCountControlCharSanitizerAndUtf8PathHelpers) {
     const std::string roundtrip(roundtrip_u8.begin(), roundtrip_u8.end());
     EXPECT_EQ(roundtrip, utf8_rel);
 }
+
+TEST(UiPanelHelpersTest, ReverseEngineeringHexByteAndCaseInsensitiveHelpers) {
+    EXPECT_EQ(viewer::format_va(0x140001000ULL, true), "0x0000000140001000");
+    EXPECT_EQ(viewer::format_va(0x00401000ULL, false), "0x00401000");
+
+    EXPECT_EQ(viewer::format_file_offset(0x1000ULL), "0x00001000");
+    EXPECT_EQ(viewer::format_file_offset(0x140001000ULL), "0x0000000140001000");
+
+    EXPECT_EQ(viewer::format_compact_bytes(0ULL), "0 B");
+    EXPECT_EQ(viewer::format_compact_bytes(512ULL), "512 B");
+    EXPECT_EQ(viewer::format_compact_bytes(1024ULL), "1.00 KiB");
+    EXPECT_EQ(viewer::format_compact_bytes(65536ULL), "64.0 KiB");
+    EXPECT_EQ(viewer::format_compact_bytes(1310720ULL), "1.25 MiB");
+    EXPECT_EQ(viewer::format_compact_bytes(1048575ULL), "1.00 MiB");
+    EXPECT_EQ(viewer::format_compact_bytes(2ULL * 1024ULL * 1024ULL * 1024ULL), "2.00 GiB");
+
+    EXPECT_TRUE(viewer::icontains("KERNEL32.DLL", ""));
+    EXPECT_TRUE(viewer::icontains("KERNEL32.DLL", "kernel32"));
+    EXPECT_TRUE(viewer::icontains("CreateProcessW", "PROCESSW"));
+    EXPECT_FALSE(viewer::icontains("short", "longer_needle"));
+    EXPECT_FALSE(viewer::icontains("ntdll.dll", "advapi32"));
+}

@@ -188,16 +188,6 @@ constexpr std::array<KindChipSpec, peelf::kTimelineEventKindCount> kKindChipSpec
     return std::format("TID {} #{}", ev.thread->tid, ev.thread->epoch);
 }
 
-[[nodiscard]] std::string format_compact_bytes(std::uint64_t bytes) {
-    if (bytes >= 1024ULL * 1024ULL) {
-        return std::format("{:.1f} MiB", static_cast<double>(bytes) / (1024.0 * 1024.0));
-    }
-    if (bytes >= 1024ULL) {
-        return std::format("{:.1f} KiB", static_cast<double>(bytes) / 1024.0);
-    }
-    return std::format("{} B", bytes);
-}
-
 [[nodiscard]] std::size_t preset_index_for_capacity(std::size_t cap) noexcept {
     for (std::size_t i = 0u; i < kCapacityValues.size(); ++i) {
         if (kCapacityValues[i] == cap) {
