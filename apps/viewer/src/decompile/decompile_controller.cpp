@@ -32,12 +32,20 @@ DecompiledUnit execute_decompile_job(const DecompileJobSpec& spec, std::stop_tok
             }
             return unit;
         }
-        case DecompilerProvider::BinaryNinja:
+        case DecompilerProvider::BinaryNinja: {
+            DecompilerSettings bn_settings = spec.settings;
+            if (bn_settings.binary_ninja_home.empty()) {
+                const BinaryNinjaCapabilityStatus discovered = discover_binary_ninja(bn_settings);
+                if (discovered.install_found) {
+                    bn_settings.binary_ninja_home = discovered.install_directory;
+                }
+            }
             return BinaryNinjaDecompiler(
-                       spec.settings.python,
+                       bn_settings,
                        spec.resources_directory / "bn_decompile.py",
                        runner)
                 .decompile(spec.request, stop_token);
+        }
         case DecompilerProvider::StructuredPseudoC:
             return StructuredPseudoCDecompiler{}.decompile(spec.request, stop_token);
         case DecompilerProvider::RetDec:

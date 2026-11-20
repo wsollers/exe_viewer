@@ -57,16 +57,7 @@ bool is_wsl_windows_c_mount(const std::filesystem::path& path) {
 }
 
 std::filesystem::path safe_scratch_base_directory() {
-#ifndef _WIN32
-    std::error_code ec;
-    auto tmp = std::filesystem::temp_directory_path(ec);
-    if (!ec && !tmp.empty() && !is_wsl_windows_c_mount(tmp)) {
-        return tmp;
-    }
-    return "/tmp";
-#else
-    return std::filesystem::temp_directory_path();
-#endif
+    return safe_decompiler_scratch_directory();
 }
 
 [[nodiscard]] unsigned long current_process_id() noexcept {
@@ -413,6 +404,10 @@ DecompilerSettings discover_decompilers(const std::filesystem::path& directory) 
         settings.java = home / "bin/java";
 #endif
     }
+    const BinaryNinjaCapabilityStatus bn_caps = discover_binary_ninja(settings);
+    if (bn_caps.install_found) {
+        settings.binary_ninja_home = bn_caps.install_directory;
+    }
     return settings;
 }
 peelf::Result<DecompilerSettings> read_decompiler_settings(const std::filesystem::path& path) {
@@ -454,7 +449,25 @@ peelf::Result<DecompilerSettings> read_decompiler_settings(const std::filesystem
         return peelf::make_error("Invalid decompiler settings");
     }
     in >> std::ws;
-    if (!in.eof()) return peelf::make_error("Unexpected trailing decompiler settings");
+    while (in.peek() != std::char_traits<char>::eof()) {
+        std::string key;
+        if (!std::getline(in, key, '=') || key != "binary_ninja_home") {
+            return peelf::make_error("Unexpected trailing decompiler settings");
+        }
+        std::string bn_home;
+        if (in.peek() == '"') {
+            if (!(in >> std::quoted(bn_home))) {
+                return peelf::make_error("Invalid decompiler settings");
+            }
+        } else {
+            std::getline(in, bn_home);
+            if (!bn_home.empty() && bn_home.back() == '\r') {
+                bn_home.pop_back();
+            }
+        }
+        settings.binary_ninja_home = bn_home;
+        in >> std::ws;
+    }
 
     settings.provider = static_cast<DecompilerProvider>(provider);
     settings.ghidra_home = home;
@@ -477,7 +490,8 @@ peelf::Result<void> save_decompiler_settings(const std::filesystem::path& path, 
         << settings.timeout_seconds << '\n'
         << std::quoted(settings.cache_directory.string()) << '\n'
         << settings.max_cached_workspaces << '\n'
-        << (settings.reuse_analysis ? 1 : 0) << '\n';
+        << (settings.reuse_analysis ? 1 : 0) << '\n'
+        << "binary_ninja_home=" << std::quoted(settings.binary_ninja_home.string()) << '\n';
     return write_analysis_file(path, out.str());
 }
 std::filesystem::path GhidraDecompiler::effective_cache_directory() const {

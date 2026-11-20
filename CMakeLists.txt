@@ -46,6 +46,45 @@ option(PEELF_BUILD_SHARED "Build peelf_core as a shared library" ${_peelf_defaul
 option(PEELF_BUILD_TESTS "Build unit tests (GoogleTest)" ON)
 option(PEELF_ENABLE_CLANG_TIDY "Run clang-tidy on peelf targets during build (Ninja/Makefile generators only)" OFF)
 option(PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST "Register the Docker-backed bin-matrix refresh test with CTest" OFF)
+option(PEELF_ENABLE_BINARY_NINJA_SDK "Experimental opt-in check for local Binary Ninja C++ SDK headers/core library (never required)" OFF)
+option(PEELF_ENABLE_BINARY_NINJA_TESTS "Register opt-in Binary Ninja integration CTests when Binary Ninja is installed (never required in CI)" OFF)
+
+if(PEELF_ENABLE_BINARY_NINJA_SDK)
+  set(BN_SDK_DIR "" CACHE PATH "Optional path to Vector 35 binaryninja-api C++ SDK checkout")
+  set(BN_INSTALL_DIR "" CACHE PATH "Optional path to local Binary Ninja installation containing binaryninjacore")
+  find_path(PEELF_BN_SDK_INCLUDE_DIR
+    NAMES binaryninjacore.h
+    HINTS
+      "${BN_SDK_DIR}"
+      "$ENV{BN_SDK_DIR}"
+    PATH_SUFFIXES include ""
+  )
+  find_library(PEELF_BN_CORE_LIBRARY
+    NAMES binaryninjacore binaryninjacore.1
+    HINTS
+      "${BN_INSTALL_DIR}"
+      "$ENV{BN_INSTALL_DIR}"
+      "$ENV{BINARYNINJA_HOME}"
+      "/opt/binaryninja"
+      "$ENV{HOME}/binaryninja"
+      "$ENV{LOCALAPPDATA}/Vector35/BinaryNinja"
+      "$ENV{ProgramFiles}/Vector35/BinaryNinja"
+      "/Applications/Binary Ninja.app/Contents/MacOS"
+  )
+  if(PEELF_BN_SDK_INCLUDE_DIR AND PEELF_BN_CORE_LIBRARY)
+    set(PEELF_BINARY_NINJA_SDK_FOUND TRUE)
+    add_library(peelf_binary_ninja_sdk INTERFACE)
+    target_include_directories(peelf_binary_ninja_sdk SYSTEM INTERFACE "${PEELF_BN_SDK_INCLUDE_DIR}")
+    target_link_libraries(peelf_binary_ninja_sdk INTERFACE "${PEELF_BN_CORE_LIBRARY}")
+    message(STATUS "Binary Ninja C++ SDK detected (opt-in evaluation): headers=${PEELF_BN_SDK_INCLUDE_DIR}, core=${PEELF_BN_CORE_LIBRARY}")
+  else()
+    set(PEELF_BINARY_NINJA_SDK_FOUND FALSE)
+    message(WARNING
+      "PEELF_ENABLE_BINARY_NINJA_SDK=ON, but binaryninjacore.h or binaryninjacore library was not found "
+      "(set -DBN_SDK_DIR=<binaryninja-api> and -DBN_INSTALL_DIR=<BinaryNinja>). "
+      "Continuing with the process-isolated bn_decompile.py Python bridge.")
+  endif()
+endif()
 
 set(PEELF_BIN_MATRIX_DOCKER_IMAGE "exe-viewer-clang" CACHE STRING "Docker image tag used for bin-matrix fixture generation")
 

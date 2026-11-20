@@ -82,9 +82,34 @@ void UiApp::initialize_decompiler() {
     decompiler_provider_ = static_cast<int>(settings.provider);
     decompiler_timeout_ = settings.timeout_seconds;
     copy_cstr_buffer(ghidra_home_, settings.ghidra_home.string());
+    copy_cstr_buffer(binary_ninja_home_, settings.binary_ninja_home.string());
     copy_cstr_buffer(decompiler_java_, settings.java.string());
     copy_cstr_buffer(decompiler_python_, settings.python.string());
     copy_cstr_buffer(decompiler_retdec_, settings.retdec.string());
+    refresh_binary_ninja_capabilities(false);
+}
+
+void UiApp::refresh_binary_ninja_capabilities(bool run_python_probe) {
+    DecompilerSettings settings{};
+    settings.provider = static_cast<DecompilerProvider>(decompiler_provider_);
+    settings.ghidra_home = ghidra_home_;
+    settings.binary_ninja_home = binary_ninja_home_;
+    settings.java = decompiler_java_;
+    settings.python = decompiler_python_;
+    settings.retdec = decompiler_retdec_;
+    settings.timeout_seconds = std::clamp(decompiler_timeout_, 5, 15);
+    if (run_python_probe) {
+        BackendRunner runner;
+        binary_ninja_status_ = probe_binary_ninja_capabilities(
+            settings,
+            decompiler_directory_ / "resources" / "bn_decompile.py",
+            runner);
+    } else {
+        binary_ninja_status_ = discover_binary_ninja(settings);
+    }
+    if (binary_ninja_home_[0] == '\0' && binary_ninja_status_.install_found) {
+        copy_cstr_buffer(binary_ninja_home_, binary_ninja_status_.install_directory.string());
+    }
 }
 void UiApp::clear_decompiler_caches() {
     decompile_cache_.clear();
@@ -118,6 +143,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
     DecompilerSettings settings{};
     settings.provider = static_cast<DecompilerProvider>(decompiler_provider_);
     settings.ghidra_home = ghidra_home_;
+    settings.binary_ninja_home = binary_ninja_home_;
     settings.java = decompiler_java_;
     settings.python = decompiler_python_;
     settings.retdec = decompiler_retdec_;
@@ -338,8 +364,47 @@ void UiApp::render_decompiler() {
             ImGui::InputText("##java", decompiler_java_, sizeof(decompiler_java_));
             ImGui::InputInt("Timeout (seconds)", &decompiler_timeout_);
         } else if (decompiler_provider_ == 1) {
-            ImGui::TextWrapped("Headless API requires Binary Ninja Commercial or above. Personal is not supported by this adapter.");
-            ImGui::SetNextItemWidth(-1); ImGui::InputTextWithHint("##python", "Python with Binary Ninja API",decompiler_python_,sizeof(decompiler_python_));
+            ImGui::TextUnformatted("Binary Ninja installation folder (optional; auto-detected)");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint(
+                "##bn_home",
+                "Auto-detected from BN_INSTALL_DIR / lastrun / standard paths",
+                binary_ninja_home_,
+                sizeof(binary_ninja_home_));
+            ImGui::TextUnformatted("Python executable with Binary Ninja API");
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint(
+                "##python",
+                "Python with Binary Ninja API",
+                decompiler_python_,
+                sizeof(decompiler_python_));
+            ImGui::InputInt("Timeout (seconds)", &decompiler_timeout_);
+            if (ImGui::Button("Auto-detect")) {
+                binary_ninja_home_[0] = '\0';
+                refresh_binary_ninja_capabilities(false);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Probe capabilities")) {
+                refresh_binary_ninja_capabilities(true);
+            }
+            ImGui::TextWrapped("%s", binary_ninja_status_.status_summary.c_str());
+            const std::string_view ed_name = to_string(binary_ninja_status_.edition);
+            ImGui::TextDisabled(
+                "Edition: %.*s | Version: %s | Python API: %s | Headless: %s | Archs: %zu",
+                static_cast<int>(ed_name.size()),
+                ed_name.data(),
+                binary_ninja_status_.version.empty() ? "—" : binary_ninja_status_.version.c_str(),
+                binary_ninja_status_.python_api_available ? "Yes" : "No",
+                binary_ninja_status_.headless_supported ? "Supported" : "Unsupported",
+                binary_ninja_status_.supported_architectures.size());
+            if (const auto* active_img = model_.image(); active_img != nullptr &&
+                (binary_ninja_status_.install_found || binary_ninja_status_.python_api_available)) {
+                if (const auto compat = check_binary_ninja_headless_support(
+                        binary_ninja_status_, active_img->architecture());
+                    !compat) {
+                    ImGui::TextWrapped("Active target notice: %s", compat.error().message.c_str());
+                }
+            }
         } else if (decompiler_provider_ == 4) {
             ImGui::TextUnformatted("RetDec CLI executable");
             ImGui::SetNextItemWidth(-1);
@@ -350,6 +415,7 @@ void UiApp::render_decompiler() {
             DecompilerSettings settings{};
             settings.provider = static_cast<DecompilerProvider>(decompiler_provider_);
             settings.ghidra_home = ghidra_home_;
+            settings.binary_ninja_home = binary_ninja_home_;
             settings.java = decompiler_java_;
             settings.python = decompiler_python_;
             settings.retdec = decompiler_retdec_;

@@ -135,14 +135,17 @@ namespace viewer {
         bool focus_decompiler_ = false;
         int decompiler_provider_ = 0;
         char ghidra_home_[2048] = "";
+        char binary_ninja_home_[2048] = "";
         char decompiler_java_[2048] = "java";
         int decompiler_timeout_ = 180;
         bool decompiler_thumb_ = false;
         std::filesystem::path decompiler_directory_;
+        BinaryNinjaCapabilityStatus binary_ninja_status_{};
         RecentBinaries recent_binaries_;
         std::filesystem::path recent_binaries_path_;
         std::string decompiler_settings_status_;
         void initialize_decompiler();
+        void refresh_binary_ninja_capabilities(bool run_python_probe);
         void render_data_types();
         void select_decompiled_line(std::size_t index);
         bool show_data_types_ = true;

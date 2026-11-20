@@ -98,6 +98,7 @@ add_executable(peelf_tests
   c_type_parser_test.cpp
   signatures_and_crypto_test.cpp
   macho_core_and_dsym_test.cpp
+  decompiler_contract_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/disasm/linear_disassembly.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
@@ -188,6 +189,7 @@ endif()
 target_compile_definitions(peelf_tests PRIVATE
   PEELF_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
   PEELF_BIN_MATRIX_DIR="${CMAKE_SOURCE_DIR}/bin-matrix"
+  PEELF_VIEWER_RESOURCES_DIR="${CMAKE_SOURCE_DIR}/apps/viewer/resources"
   PEELF_CALLGRAPH_FIXTURE_EXE="$<TARGET_FILE:peelf_callgraph_fixture>"
   PEELF_CALLGRAPH_FIXTURE_PDB="${PEELF_CALLGRAPH_FIXTURE_PDB_PATH}"
 )
@@ -211,8 +213,46 @@ target_compile_definitions(peelf_tests PRIVATE PEELF_BACKEND_FIXTURE="$<TARGET_F
 gtest_discover_tests(peelf_tests)
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  file(TO_CMAKE_PATH "${Python3_EXECUTABLE}" PEELF_PYTHON3_NORMALIZED)
+  target_compile_definitions(peelf_tests PRIVATE PEELF_PYTHON3_EXECUTABLE="${PEELF_PYTHON3_NORMALIZED}")
   add_test(NAME Decompiler.PythonBridge
     COMMAND ${Python3_EXECUTABLE} -B ${CMAKE_CURRENT_SOURCE_DIR}/bn_bridge_test.py)
+endif()
+
+if(PEELF_ENABLE_BINARY_NINJA_TESTS)
+  add_executable(peelf_binary_ninja_tests
+    binary_ninja_integration_test.cpp
+    ${CMAKE_SOURCE_DIR}/apps/viewer/src/symbols/symbol_index.cpp
+    ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler.cpp
+    ${CMAKE_SOURCE_DIR}/apps/viewer/src/decompile/decompiler_symbols.cpp
+  )
+  target_compile_features(peelf_binary_ninja_tests PRIVATE cxx_std_23)
+  peelf_apply_project_warnings(peelf_binary_ninja_tests)
+  target_link_libraries(peelf_binary_ninja_tests PRIVATE
+    peelf::core
+    GTest::gtest_main
+  )
+  target_include_directories(peelf_binary_ninja_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/apps/viewer/src
+  )
+  target_compile_definitions(peelf_binary_ninja_tests PRIVATE
+    PEELF_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+    PEELF_BIN_MATRIX_DIR="${CMAKE_SOURCE_DIR}/bin-matrix"
+    PEELF_VIEWER_RESOURCES_DIR="${CMAKE_SOURCE_DIR}/apps/viewer/resources"
+  )
+  if(Python3_Interpreter_FOUND)
+    target_compile_definitions(peelf_binary_ninja_tests PRIVATE
+      PEELF_PYTHON3_EXECUTABLE="${PEELF_PYTHON3_NORMALIZED}"
+    )
+  endif()
+  if(WIN32 AND PEELF_BUILD_SHARED)
+    add_custom_command(TARGET peelf_binary_ninja_tests POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:peelf_core>
+        $<TARGET_FILE_DIR:peelf_binary_ninja_tests>
+    )
+  endif()
+  gtest_discover_tests(peelf_binary_ninja_tests PROPERTIES LABELS "binary_ninja_opt_in")
 endif()
 if(TARGET peelf_viewer)
   target_compile_definitions(peelf_tests PRIVATE

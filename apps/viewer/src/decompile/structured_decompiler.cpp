@@ -2871,7 +2871,7 @@ DecompiledUnit RetDecDecompiler::decompile(
 
     static std::atomic<std::uint64_t> serial{0u};
     const std::filesystem::path workspace_dir =
-        std::filesystem::temp_directory_path() /
+        safe_decompiler_scratch_directory() /
         std::format(
             "peelf-retdec-{}-{}",
             std::chrono::steady_clock::now().time_since_epoch().count(),
@@ -2881,6 +2881,11 @@ DecompiledUnit RetDecDecompiler::decompile(
     if (!std::filesystem::create_directory(workspace_dir, ec)) {
         return failure(DecompileStatus::Failed, "Cannot create RetDec workspace");
     }
+    std::filesystem::permissions(
+        workspace_dir,
+        std::filesystem::perms::owner_all,
+        std::filesystem::perm_options::replace,
+        ec);
     struct ScopedWorkspace {
         std::filesystem::path path;
         explicit ScopedWorkspace(std::filesystem::path p) : path(std::move(p)) {}
