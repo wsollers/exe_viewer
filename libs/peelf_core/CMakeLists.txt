@@ -50,6 +50,7 @@ add_library(peelf_core ${_peelf_core_lib_type}
   src/signatures.cpp
   src/crash_dump_minidump.cpp
   src/crash_dump_elf_core.cpp
+  src/crash_dump_macho.cpp
   src/debugger_common.cpp
   src/debugger_linux.cpp
   src/debugger_win32.cpp

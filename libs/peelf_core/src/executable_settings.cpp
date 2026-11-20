@@ -2451,8 +2451,7 @@ ExecutableSettingsReport extract_executable_settings(
     }
 
     const ProvenanceTag prov =
-        (eff_stamp.target_id.backend == BackendKind::CrashDumpMinidump ||
-         eff_stamp.target_id.backend == BackendKind::CrashDumpElfCore)
+        is_crash_dump_backend(eff_stamp.target_id.backend)
             ? ProvenanceTag::CrashDump
             : ((eff_stamp.target_id.backend == BackendKind::LiveNativeReadOnly ||
                 eff_stamp.target_id.backend == BackendKind::ActiveDebugger ||

@@ -87,6 +87,7 @@ inline constexpr std::uint32_t kMhAppExtensionSafe       = 0x02000000u;
 inline constexpr std::uint32_t kLcReqDyld           = 0x80000000u;
 inline constexpr std::uint32_t kLcSegment           = 0x00000001u;
 inline constexpr std::uint32_t kLcSymtab            = 0x00000002u;
+inline constexpr std::uint32_t kLcThread            = 0x00000004u;
 inline constexpr std::uint32_t kLcUnixThread        = 0x00000005u;
 inline constexpr std::uint32_t kLcDysymtab          = 0x0000000Bu;
 inline constexpr std::uint32_t kLcLoadDylib         = 0x0000000Cu;
@@ -133,6 +134,7 @@ inline constexpr std::uint8_t  kSSymbolStubs             = 0x08u;
 inline constexpr std::uint8_t  kSGbZeroFill              = 0x0Cu;
 inline constexpr std::uint8_t  kSThreadLocalZeroFill     = 0x12u;
 inline constexpr std::uint32_t kSAttrPureInstructions    = 0x80000000u;
+inline constexpr std::uint32_t kSAttrDebug               = 0x02000000u;
 inline constexpr std::uint32_t kSAttrSomeInstructions    = 0x00000400u;
 
 // nlist symbol masks and flags.

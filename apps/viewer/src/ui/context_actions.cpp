@@ -136,8 +136,7 @@ void append_json_escaped(std::string& out, std::string_view text) {
     const peelf::BackendKind backend = capabilities.profile().backend;
     if (backend == peelf::BackendKind::LiveNativeReadOnly ||
         backend == peelf::BackendKind::ActiveDebugger ||
-        backend == peelf::BackendKind::CrashDumpMinidump ||
-        backend == peelf::BackendKind::CrashDumpElfCore ||
+        peelf::is_crash_dump_backend(backend) ||
         backend == peelf::BackendKind::RemoteGdbRsp) {
         return true;
     }

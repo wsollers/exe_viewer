@@ -21,6 +21,7 @@ enum class BackendKind : std::uint8_t {
     LiveNativeReadOnly,
     CrashDumpMinidump,
     CrashDumpElfCore,
+    CrashDumpMachOCore,
     ActiveDebugger,
     RemoteGdbRsp,
     Unknown,
@@ -35,11 +36,18 @@ using TargetSessionKind = BackendKind;
         case BackendKind::LiveNativeReadOnly: return "LiveNativeReadOnly";
         case BackendKind::CrashDumpMinidump:  return "CrashDumpMinidump";
         case BackendKind::CrashDumpElfCore:   return "CrashDumpElfCore";
+        case BackendKind::CrashDumpMachOCore: return "CrashDumpMachOCore";
         case BackendKind::ActiveDebugger:     return "ActiveDebugger";
         case BackendKind::RemoteGdbRsp:       return "RemoteGdbRsp";
         case BackendKind::Unknown:            return "Unknown";
     }
     return "Unknown";
+}
+
+[[nodiscard]] constexpr bool is_crash_dump_backend(BackendKind kind) noexcept {
+    return kind == BackendKind::CrashDumpMinidump ||
+           kind == BackendKind::CrashDumpElfCore ||
+           kind == BackendKind::CrashDumpMachOCore;
 }
 
 /// First-class provenance tag recording where a displayed or serialized fact came from.
@@ -133,9 +141,7 @@ struct TargetInstanceId {
         const std::uint64_t rhs_nonce =
             other.dump_nonce != 0u ? other.dump_nonce : other.session_nonce;
 
-        if (backend == BackendKind::StaticFile ||
-            backend == BackendKind::CrashDumpMinidump ||
-            backend == BackendKind::CrashDumpElfCore) {
+        if (backend == BackendKind::StaticFile || is_crash_dump_backend(backend)) {
             if (!image_sha256.empty() || !other.image_sha256.empty()) {
                 return !image_sha256.empty() && image_sha256 == other.image_sha256;
             }

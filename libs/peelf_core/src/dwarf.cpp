@@ -3,8 +3,10 @@
 #include <peelf/endian_reader.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <limits>
 #include <optional>
 #include <span>
@@ -265,12 +267,46 @@ constexpr std::uint8_t kDW_LNE_set_discriminator  = 4;
     }
 }
 
-[[nodiscard]] std::vector<std::uint8_t> read_section_bytes(const IBinaryImage& image,
-                                                           std::span<const std::uint8_t> file_bytes,
-                                                           std::string_view target_name) {
+constexpr std::array<std::string_view, 3> kDebugInfoSectionNames{{
+    ".debug_info", "__DWARF,__debug_info", "__debug_info"
+}};
+constexpr std::array<std::string_view, 3> kDebugAbbrevSectionNames{{
+    ".debug_abbrev", "__DWARF,__debug_abbrev", "__debug_abbrev"
+}};
+constexpr std::array<std::string_view, 3> kDebugStrSectionNames{{
+    ".debug_str", "__DWARF,__debug_str", "__debug_str"
+}};
+constexpr std::array<std::string_view, 3> kDebugLineSectionNames{{
+    ".debug_line", "__DWARF,__debug_line", "__debug_line"
+}};
+constexpr std::array<std::string_view, 3> kDebugLineStrSectionNames{{
+    ".debug_line_str", "__DWARF,__debug_line_str", "__debug_line_str"
+}};
+constexpr std::array<std::string_view, 4> kDebugStrOffsetsSectionNames{{
+    ".debug_str_offsets", "__DWARF,__debug_str_offs", "__debug_str_offs", "__DWARF,__debug_str_offsets"
+}};
+constexpr std::array<std::string_view, 3> kDebugAddrSectionNames{{
+    ".debug_addr", "__DWARF,__debug_addr", "__debug_addr"
+}};
+
+[[nodiscard]] bool matches_any_section_name(
+    std::string_view actual_name,
+    std::span<const std::string_view> candidates) noexcept {
+    for (const std::string_view cand : candidates) {
+        if (actual_name == cand) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::vector<std::uint8_t> read_section_bytes(
+    const IBinaryImage& image,
+    std::span<const std::uint8_t> file_bytes,
+    std::span<const std::string_view> target_names) {
     constexpr std::uint64_t kMaxDwarfSectionBytes = 128ULL * 1024ULL * 1024ULL;
     for (const auto& sec : image.sections()) {
-        if (sec.name != target_name || sec.file_size == 0) {
+        if (!matches_any_section_name(sec.name, target_names) || sec.file_size == 0) {
             continue;
         }
         if (sec.file_offset > file_bytes.size()) {
@@ -290,6 +326,14 @@ constexpr std::uint8_t kDW_LNE_set_discriminator  = 4;
 }
 
 [[nodiscard]] std::uint64_t infer_static_image_base(const IBinaryImage& image) noexcept {
+    if (image.format() == Format::MachO) {
+        for (const auto& seg : image.macho_segments()) {
+            if (seg.name == "__TEXT") {
+                return seg.virtual_address;
+            }
+        }
+        return 0;
+    }
     if (image.image_base() != 0) {
         return image.image_base();
     }
@@ -1688,6 +1732,85 @@ void parse_debug_line_units(const DwarfSectionViews& views, DwarfDebugData& out)
     return !p.empty() && std::filesystem::is_regular_file(p, ec) && !ec;
 }
 
+void append_dsym_bundle_candidates(const std::filesystem::path& dsym_bundle_dir,
+                                   const std::filesystem::path& preferred_filename,
+                                   std::vector<std::filesystem::path>& out) {
+    if (dsym_bundle_dir.empty()) {
+        return;
+    }
+    const std::filesystem::path dwarf_dir = dsym_bundle_dir / "Contents" / "Resources" / "DWARF";
+    if (!preferred_filename.empty()) {
+        out.push_back(dwarf_dir / preferred_filename);
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dwarf_dir, ec) || ec) {
+        return;
+    }
+    std::vector<std::filesystem::path> entries;
+    for (const auto& entry : std::filesystem::directory_iterator(dwarf_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code fec;
+        if (!entry.is_regular_file(fec) || fec) {
+            continue;
+        }
+        const std::string fname = entry.path().filename().string();
+        if (fname.empty() || fname.front() == '.') {
+            continue;
+        }
+        if (!preferred_filename.empty() && entry.path().filename() == preferred_filename) {
+            continue;
+        }
+        entries.push_back(entry.path());
+    }
+    std::ranges::sort(entries);
+    for (auto& p : entries) {
+        out.push_back(std::move(p));
+    }
+}
+
+[[nodiscard]] bool macho_dsym_candidate_matches_image(const std::filesystem::path& cand_path,
+                                                      const IBinaryImage& target_image) {
+    constexpr std::uintmax_t kMaxDsymFileSize = 512ull * 1024ull * 1024ull;
+    std::error_code ec;
+    const auto fsize = std::filesystem::file_size(cand_path, ec);
+    if (ec || fsize < 28u || fsize > kMaxDsymFileSize) {
+        return false;
+    }
+
+    std::ifstream file(cand_path, std::ios::binary);
+    if (!file) {
+        return false;
+    }
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(fsize));
+    if (!file.read(reinterpret_cast<char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()))) {
+        return false;
+    }
+
+    BinaryOpenOptions opts{};
+    if (target_image.architecture() != Architecture::Unknown) {
+        opts.preferred_architecture = target_image.architecture();
+    }
+    auto parsed = open_binary_image(bytes, opts);
+    if (!parsed) {
+        return false;
+    }
+    if ((*parsed)->format() != Format::MachO || !has_embedded_dwarf(**parsed)) {
+        return false;
+    }
+
+    const auto expected_uuid = target_image.macho_uuid();
+    if (expected_uuid.has_value()) {
+        const auto cand_uuid = (*parsed)->macho_uuid();
+        if (!cand_uuid.has_value() || *cand_uuid != *expected_uuid) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 ElfDebugLinkInfo extract_elf_debug_link_info(const IBinaryImage& image) {
@@ -1715,8 +1838,66 @@ std::optional<std::filesystem::path> find_separate_debug_file(
     const std::filesystem::path& binary_path,
     const IBinaryImage& image,
     std::span<const std::filesystem::path> extra_search_dirs) {
-    const ElfDebugLinkInfo link = extract_elf_debug_link_info(image);
+    std::error_code ec;
+    const auto bin_canon = binary_path.empty()
+        ? std::filesystem::path{}
+        : std::filesystem::weakly_canonical(binary_path, ec);
     const std::filesystem::path bin_dir = binary_path.parent_path();
+
+    if (image.format() == Format::MachO) {
+        std::filesystem::path fname = binary_path.filename();
+        if (fname.empty() && image.macho_id_dylib() != nullptr &&
+            !image.macho_id_dylib()->name.empty()) {
+            fname = std::filesystem::path(image.macho_id_dylib()->name).filename();
+        }
+
+        std::vector<std::filesystem::path> dsym_candidates;
+        if (!binary_path.empty()) {
+            std::filesystem::path direct_bundle = binary_path;
+            direct_bundle += ".dSYM";
+            append_dsym_bundle_candidates(direct_bundle, fname, dsym_candidates);
+        }
+        if (!bin_dir.empty() && !fname.empty()) {
+            std::filesystem::path sibling_bundle = bin_dir / fname;
+            sibling_bundle += ".dSYM";
+            append_dsym_bundle_candidates(sibling_bundle, fname, dsym_candidates);
+        }
+        for (const auto& extra : extra_search_dirs) {
+            if (extra.empty()) {
+                continue;
+            }
+            if (!fname.empty()) {
+                std::filesystem::path extra_bundle = extra / fname;
+                extra_bundle += ".dSYM";
+                append_dsym_bundle_candidates(extra_bundle, fname, dsym_candidates);
+            }
+            append_dsym_bundle_candidates(extra, fname, dsym_candidates);
+        }
+
+        std::vector<std::filesystem::path> seen_canon;
+        for (const auto& cand : dsym_candidates) {
+            if (!file_exists_regular(cand)) {
+                continue;
+            }
+            std::error_code cec;
+            const auto cand_canon = std::filesystem::weakly_canonical(cand, cec);
+            if (!cec && !bin_canon.empty() && cand_canon == bin_canon) {
+                continue;
+            }
+            if (!cec) {
+                if (std::ranges::find(seen_canon, cand_canon) != seen_canon.end()) {
+                    continue;
+                }
+                seen_canon.push_back(cand_canon);
+            }
+            if (macho_dsym_candidate_matches_image(cand, image)) {
+                return cand;
+            }
+        }
+        return std::nullopt;
+    }
+
+    const ElfDebugLinkInfo link = extract_elf_debug_link_info(image);
 
     std::vector<std::filesystem::path> candidates;
 
@@ -1767,9 +1948,6 @@ std::optional<std::filesystem::path> find_separate_debug_file(
         }
     }
 
-    std::error_code ec;
-    const auto bin_canon = binary_path.empty() ? std::filesystem::path{} : std::filesystem::weakly_canonical(binary_path, ec);
-
     for (const auto& cand : candidates) {
         if (!file_exists_regular(cand)) {
             continue;
@@ -1788,7 +1966,9 @@ std::optional<std::filesystem::path> find_separate_debug_file(
 
 bool has_embedded_dwarf(const IBinaryImage& image) noexcept {
     for (const auto& sec : image.sections()) {
-        if (sec.file_size != 0 && (sec.name == ".debug_info" || sec.name == ".debug_line")) {
+        if (sec.file_size != 0 &&
+            (matches_any_section_name(sec.name, kDebugInfoSectionNames) ||
+             matches_any_section_name(sec.name, kDebugLineSectionNames))) {
             return true;
         }
     }
@@ -1814,13 +1994,13 @@ Result<DwarfDebugData> parse_dwarf_image(const IBinaryImage& image,
     views.endian = image.endianness();
     views.default_address_size = image.is_64bit() ? 8 : 4;
     views.static_image_base = infer_static_image_base(image);
-    views.debug_info = read_section_bytes(image, file_bytes, ".debug_info");
-    views.debug_abbrev = read_section_bytes(image, file_bytes, ".debug_abbrev");
-    views.debug_str = read_section_bytes(image, file_bytes, ".debug_str");
-    views.debug_line = read_section_bytes(image, file_bytes, ".debug_line");
-    views.debug_line_str = read_section_bytes(image, file_bytes, ".debug_line_str");
-    views.debug_str_offsets = read_section_bytes(image, file_bytes, ".debug_str_offsets");
-    views.debug_addr = read_section_bytes(image, file_bytes, ".debug_addr");
+    views.debug_info = read_section_bytes(image, file_bytes, kDebugInfoSectionNames);
+    views.debug_abbrev = read_section_bytes(image, file_bytes, kDebugAbbrevSectionNames);
+    views.debug_str = read_section_bytes(image, file_bytes, kDebugStrSectionNames);
+    views.debug_line = read_section_bytes(image, file_bytes, kDebugLineSectionNames);
+    views.debug_line_str = read_section_bytes(image, file_bytes, kDebugLineStrSectionNames);
+    views.debug_str_offsets = read_section_bytes(image, file_bytes, kDebugStrOffsetsSectionNames);
+    views.debug_addr = read_section_bytes(image, file_bytes, kDebugAddrSectionNames);
 
     return parse_dwarf_sections(views);
 }

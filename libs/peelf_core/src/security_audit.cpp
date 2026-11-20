@@ -2640,7 +2640,9 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
     if (dump != nullptr) {
         const CrashDumpSummary& cs = dump->crash_summary();
         const std::string_view fmt_str =
-            cs.kind == CrashDumpKind::WindowsMinidump ? "Minidump" : "ELF";
+            cs.kind == CrashDumpKind::WindowsMinidump
+                ? "Minidump"
+                : (cs.kind == CrashDumpKind::MachOCore ? "Mach-O" : "ELF");
         out += "    "; key("format"); append_json_escaped(out, fmt_str); out += ",\n";
         out += "    "; key("kind"); append_json_escaped(out, "CrashDump"); out += ",\n";
         out += "    "; key("arch"); append_json_escaped(out, to_string(cs.layout.architecture)); out += ",\n";

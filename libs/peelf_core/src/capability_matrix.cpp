@@ -180,6 +180,7 @@ enum class IsaTier : std::uint8_t {
         case OsKind::Unknown:
         case OsKind::Windows:
         case OsKind::Linux:
+        case OsKind::Darwin:
         case OsKind::FreeBsd:
         case OsKind::OpenBsd:
         case OsKind::NetBsd:
@@ -197,6 +198,7 @@ enum class IsaTier : std::uint8_t {
         case BackendKind::LiveNativeReadOnly:
         case BackendKind::CrashDumpMinidump:
         case BackendKind::CrashDumpElfCore:
+        case BackendKind::CrashDumpMachOCore:
         case BackendKind::ActiveDebugger:
         case BackendKind::RemoteGdbRsp:
             return true;
@@ -620,9 +622,13 @@ TargetProfile derive_target_profile(
             const auto* dump = dynamic_cast<const ICrashDumpSession*>(session);
             if (dump != nullptr) {
                 const CrashDumpSummary& cs = dump->crash_summary();
-                p.backend = cs.kind == CrashDumpKind::WindowsMinidump
-                                ? BackendKind::CrashDumpMinidump
-                                : BackendKind::CrashDumpElfCore;
+                if (cs.kind == CrashDumpKind::WindowsMinidump) {
+                    p.backend = BackendKind::CrashDumpMinidump;
+                } else if (cs.kind == CrashDumpKind::MachOCore) {
+                    p.backend = BackendKind::CrashDumpMachOCore;
+                } else {
+                    p.backend = BackendKind::CrashDumpElfCore;
+                }
                 if (p.architecture == Architecture::Unknown) {
                     p.architecture = cs.layout.architecture;
                     p.address_width = cs.layout.address_width;
@@ -634,6 +640,17 @@ TargetProfile derive_target_profile(
                         p.abi = p.address_width == AddressWidth::Bits64
                                     ? AbiKind::PeWindows64
                                     : AbiKind::PeWindows32;
+                    }
+                } else if (cs.kind == CrashDumpKind::MachOCore) {
+                    p.os = OsKind::Darwin;
+                    if (p.abi == AbiKind::Unknown) {
+                        if (p.architecture == Architecture::ARM64) {
+                            p.abi = AbiKind::AArch64SysV;
+                        } else if (p.architecture == Architecture::ARM) {
+                            p.abi = AbiKind::ArmEabi;
+                        } else {
+                            p.abi = AbiKind::SysV;
+                        }
                     }
                 } else {
                     p.os = OsKind::Linux;
@@ -772,11 +789,13 @@ TargetCapabilityMatrix capabilities_for(
         return TargetCapabilityMatrix(profile, facts, std::move(entries));
     }
 
-    // Guard 2: Backend vs OS coherence (e.g. Windows Minidump with Linux OS, or ELF core with Windows OS).
+    // Guard 2: Backend vs OS coherence (e.g. Windows Minidump with Linux OS, ELF core with Windows/Darwin OS, or Mach-O core with Windows/Linux OS).
     if ((profile.backend == BackendKind::CrashDumpMinidump &&
          profile.os != OsKind::Windows && profile.os != OsKind::Unknown) ||
         (profile.backend == BackendKind::CrashDumpElfCore &&
-         profile.os == OsKind::Windows)) {
+         (profile.os == OsKind::Windows || profile.os == OsKind::Darwin)) ||
+        (profile.backend == BackendKind::CrashDumpMachOCore &&
+         (profile.os == OsKind::Windows || profile.os == OsKind::Linux))) {
         for (Capability& c : entries) {
             c.reason = std::format(
                 "Contradictory backend/OS combination ({} with {})",
@@ -841,13 +860,12 @@ TargetCapabilityMatrix capabilities_for(
         set_cap(Operation::ExecutableSettings,
                 (profile.backend == BackendKind::LiveNativeReadOnly ||
                  profile.backend == BackendKind::ActiveDebugger ||
-                 profile.backend == BackendKind::CrashDumpMinidump ||
-                 profile.backend == BackendKind::CrashDumpElfCore)
+                 is_crash_dump_backend(profile.backend))
                     ? SupportState::Partial
                     : SupportState::Unsupported,
                 true,
                 "peelf_core",
-                "Declared file metadata unavailable without PE/ELF image; runtime sections only");
+                "Declared file metadata unavailable without PE/ELF/Mach-O image; runtime sections only");
     }
 
     // 2. Disassembly, CFG, ReferenceScan, StructuredDecompile
@@ -1021,8 +1039,7 @@ TargetCapabilityMatrix capabilities_for(
     const bool is_live_or_dump =
         profile.backend == BackendKind::LiveNativeReadOnly ||
         profile.backend == BackendKind::ActiveDebugger ||
-        profile.backend == BackendKind::CrashDumpMinidump ||
-        profile.backend == BackendKind::CrashDumpElfCore;
+        is_crash_dump_backend(profile.backend);
 
     if (profile.format == Format::PE ||
         profile.format == Format::ELF ||
@@ -1036,18 +1053,21 @@ TargetCapabilityMatrix capabilities_for(
                     : (profile.format == Format::MachO
                            ? "Static Mach-O mitigation, entitlements, and code-signature posture audit"
                            : "Static PE/ELF mitigation and hardening audit"));
-    } else if (is_live_or_dump && (profile.os == OsKind::Linux || profile.os == OsKind::Windows)) {
+    } else if (is_live_or_dump &&
+               (profile.os == OsKind::Linux ||
+                profile.os == OsKind::Windows ||
+                profile.os == OsKind::Darwin)) {
         set_cap(Operation::SecurityAudit,
                 SupportState::Partial,
                 true,
                 "peelf_security_audit",
-                "Live-process memory/privilege audit only (no parsed static container)");
+                "Live-process / crash-dump memory posture audit only (no parsed static container)");
     } else {
         set_cap(Operation::SecurityAudit,
                 SupportState::Unsupported,
                 true,
                 "peelf_security_audit",
-                "Security audit requires a PE/ELF binary or supported Windows/Linux session");
+                "Security audit requires a PE/ELF/Mach-O binary or supported Windows/Linux/Darwin session");
     }
 
     // 7. Live / Crash-Dump / Debugger Operations
@@ -1094,8 +1114,7 @@ TargetCapabilityMatrix capabilities_for(
             "Syscall stop / ETW kernel trace timeline source is not enabled");
 
     const bool session_provider_ok =
-        (profile.backend == BackendKind::CrashDumpMinidump ||
-         profile.backend == BackendKind::CrashDumpElfCore)
+        is_crash_dump_backend(profile.backend)
             ? true
             : (profile.backend == BackendKind::RemoteGdbRsp
                    ? facts.remote_gdb_stub_available
@@ -1177,6 +1196,17 @@ TargetCapabilityMatrix capabilities_for(
                     facts.remote_gdb_stub_available,
                     "peelf_snapshot",
                     "Snapshot diff covers RSP-exposed modules, regions, and threads");
+        } else if (profile.backend == BackendKind::CrashDumpMachOCore) {
+            set_cap(Operation::ProcessInternals,
+                    SupportState::Partial,
+                    true,
+                    "macho_core",
+                    "Mach-O MH_CORE exposes threads, registers, exception state, and segments; Darwin file-descriptor/socket tables are unavailable");
+            set_cap(Operation::ProcessSnapshotDiff,
+                    SupportState::Partial,
+                    true,
+                    "peelf_snapshot",
+                    "Snapshot diff covers Mach-O MH_CORE segments, mapped modules, and threads");
         } else {
             set_cap(Operation::ProcessInternals,
                     is_validated_live_os ? SupportState::SupportedValidated : SupportState::Unsupported,

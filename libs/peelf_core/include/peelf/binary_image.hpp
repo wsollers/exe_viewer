@@ -810,6 +810,9 @@ public:
 
 // Parse bytes into a concrete PE/ELF/Mach-O image behind the IBinaryImage interface.
 [[nodiscard]] Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> bytes);
+[[nodiscard]] Result<std::unique_ptr<IBinaryImage>> parse_image(
+    std::span<const std::uint8_t> bytes,
+    const BinaryOpenOptions& options);
 
 // Parse an on-disk PE/ELF file and rebase all virtual addresses and mapped section offsets
 // to a live runtime load base (`live_base`), so window offset `off` maps to `live_base + off`.

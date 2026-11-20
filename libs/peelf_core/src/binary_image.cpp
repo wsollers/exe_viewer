@@ -53,6 +53,241 @@ namespace {
     return parsed;
 }
 
+[[nodiscard]] std::vector<std::uint8_t> normalize_mapped_macho_for_file_parsers(
+    std::span<const std::uint8_t> mapped_bytes) {
+    using detail::fits_range;
+    using detail::rd32;
+    using detail::rd64;
+    using detail::wr32_endian;
+    using detail::wr64_endian;
+
+    std::vector<std::uint8_t> out(mapped_bytes.begin(), mapped_bytes.end());
+    if (out.size() < 32u) {
+        return out;
+    }
+
+    const std::uint32_t magic_be = rd32(out, 0u, true);
+    bool is_64 = false;
+    bool big_endian = false;
+    if (magic_be == macho::kMhMagic64) {
+        is_64 = true;
+        big_endian = true;
+    } else if (magic_be == macho::kMhCigam64) {
+        is_64 = true;
+        big_endian = false;
+    } else if (magic_be == macho::kMhMagic) {
+        is_64 = false;
+        big_endian = true;
+    } else if (magic_be == macho::kMhCigam) {
+        is_64 = false;
+        big_endian = false;
+    } else {
+        return out;
+    }
+
+    const std::size_t hdr_sz = is_64 ? 32u : 28u;
+    const std::uint32_t ncmds = rd32(out, 16u, big_endian);
+    const std::uint32_t sizeofcmds = rd32(out, 20u, big_endian);
+    if (!fits_range(hdr_sz, sizeofcmds, static_cast<std::uint64_t>(out.size()))) {
+        return out;
+    }
+
+    const std::size_t lc_end = hdr_sz + static_cast<std::size_t>(sizeofcmds);
+    std::optional<std::uint64_t> base_vmaddr{};
+    {
+        std::optional<std::uint64_t> lowest_vmaddr{};
+        std::size_t cur = hdr_sz;
+        for (std::uint32_t i = 0u; i < ncmds && cur + 8u <= lc_end; ++i) {
+            const std::uint32_t cmd = rd32(out, cur, big_endian);
+            const std::uint32_t cmdsize = rd32(out, cur + 4u, big_endian);
+            if (cmdsize < 8u || cur + cmdsize > lc_end) {
+                break;
+            }
+            if ((cmd == macho::kLcSegment64 && cmdsize >= 72u) ||
+                (cmd == macho::kLcSegment && cmdsize >= 56u)) {
+                std::string_view segname(
+                    reinterpret_cast<const char*>(out.data() + cur + 8u), 16u);
+                const std::size_t nul = segname.find('\0');
+                if (nul != std::string_view::npos) {
+                    segname = segname.substr(0u, nul);
+                }
+                const std::uint64_t vmaddr = (cmd == macho::kLcSegment64)
+                    ? rd64(out, cur + 24u, big_endian)
+                    : static_cast<std::uint64_t>(rd32(out, cur + 24u, big_endian));
+                const std::uint32_t maxprot = (cmd == macho::kLcSegment64)
+                    ? rd32(out, cur + 56u, big_endian)
+                    : rd32(out, cur + 40u, big_endian);
+                const std::uint32_t initprot = (cmd == macho::kLcSegment64)
+                    ? rd32(out, cur + 60u, big_endian)
+                    : rd32(out, cur + 44u, big_endian);
+                if (segname != "__PAGEZERO" && (initprot != 0u || maxprot != 0u)) {
+                    if (segname == "__TEXT" && !base_vmaddr.has_value()) {
+                        base_vmaddr = vmaddr;
+                    }
+                    if (!lowest_vmaddr.has_value() || vmaddr < *lowest_vmaddr) {
+                        lowest_vmaddr = vmaddr;
+                    }
+                }
+            }
+            cur += cmdsize;
+        }
+        if (!base_vmaddr.has_value()) {
+            base_vmaddr = lowest_vmaddr;
+        }
+    }
+    if (!base_vmaddr.has_value()) {
+        return out;
+    }
+
+    struct SegRemap {
+        std::uint64_t orig_off{0};
+        std::uint64_t orig_sz{0};
+        std::uint64_t new_off{0};
+        bool mapped{false};
+    };
+    std::vector<SegRemap> remaps;
+
+    std::size_t cur = hdr_sz;
+    for (std::uint32_t i = 0u; i < ncmds && cur + 8u <= lc_end; ++i) {
+        const std::uint32_t cmd = rd32(out, cur, big_endian);
+        const std::uint32_t cmdsize = rd32(out, cur + 4u, big_endian);
+        if (cmdsize < 8u || cur + cmdsize > lc_end) {
+            break;
+        }
+        if ((cmd == macho::kLcSegment64 && cmdsize >= 72u) ||
+            (cmd == macho::kLcSegment && cmdsize >= 56u)) {
+            const bool seg64 = (cmd == macho::kLcSegment64);
+            std::string_view segname(
+                reinterpret_cast<const char*>(out.data() + cur + 8u), 16u);
+            const std::size_t nul = segname.find('\0');
+            if (nul != std::string_view::npos) {
+                segname = segname.substr(0u, nul);
+            }
+            if (segname != "__PAGEZERO") {
+                const std::uint64_t vmaddr = seg64
+                    ? rd64(out, cur + 24u, big_endian)
+                    : static_cast<std::uint64_t>(rd32(out, cur + 24u, big_endian));
+                const std::uint64_t vmsize = seg64
+                    ? rd64(out, cur + 32u, big_endian)
+                    : static_cast<std::uint64_t>(rd32(out, cur + 28u, big_endian));
+                const std::uint64_t fileoff = seg64
+                    ? rd64(out, cur + 40u, big_endian)
+                    : static_cast<std::uint64_t>(rd32(out, cur + 32u, big_endian));
+                const std::uint64_t filesize = seg64
+                    ? rd64(out, cur + 48u, big_endian)
+                    : static_cast<std::uint64_t>(rd32(out, cur + 36u, big_endian));
+                const std::uint32_t nsects = seg64
+                    ? rd32(out, cur + 64u, big_endian)
+                    : rd32(out, cur + 48u, big_endian);
+
+                if (vmaddr >= *base_vmaddr) {
+                    const std::uint64_t rva = vmaddr - *base_vmaddr;
+                    if (rva < out.size()) {
+                        const std::uint64_t clamped = std::min<std::uint64_t>(
+                            vmsize, static_cast<std::uint64_t>(out.size()) - rva);
+                        remaps.push_back(SegRemap{
+                            .orig_off = fileoff,
+                            .orig_sz = filesize,
+                            .new_off = rva,
+                            .mapped = true,
+                        });
+                        if (seg64) {
+                            wr64_endian(out, cur + 40u, rva, big_endian);
+                            wr64_endian(out, cur + 48u, clamped, big_endian);
+                        } else if (rva <= 0xFFFF'FFFFull && clamped <= 0xFFFF'FFFFull) {
+                            wr32_endian(out, cur + 32u, static_cast<std::uint32_t>(rva), big_endian);
+                            wr32_endian(out, cur + 36u, static_cast<std::uint32_t>(clamped), big_endian);
+                        }
+
+                        const std::size_t seg_hdr_sz = seg64 ? 72u : 56u;
+                        const std::size_t sec_hdr_sz = seg64 ? 80u : 68u;
+                        for (std::uint32_t s = 0u; s < nsects; ++s) {
+                            const std::uint64_t sec_off64 =
+                                static_cast<std::uint64_t>(cur) + seg_hdr_sz +
+                                static_cast<std::uint64_t>(s) * sec_hdr_sz;
+                            if (!fits_range(sec_off64, sec_hdr_sz, lc_end)) {
+                                break;
+                            }
+                            const auto sec_off = static_cast<std::size_t>(sec_off64);
+                            const std::uint64_t sec_va = seg64
+                                ? rd64(out, sec_off + 32u, big_endian)
+                                : static_cast<std::uint64_t>(rd32(out, sec_off + 32u, big_endian));
+                            const std::uint32_t sec_file_off = seg64
+                                ? rd32(out, sec_off + 48u, big_endian)
+                                : rd32(out, sec_off + 40u, big_endian);
+                            if (sec_file_off != 0u && sec_va >= *base_vmaddr) {
+                                const std::uint64_t sec_rva = sec_va - *base_vmaddr;
+                                if (sec_rva < out.size() && sec_rva <= 0xFFFF'FFFFull) {
+                                    wr32_endian(out,
+                                                sec_off + (seg64 ? 48u : 40u),
+                                                static_cast<std::uint32_t>(sec_rva),
+                                                big_endian);
+                                }
+                            }
+                        }
+                    } else if (!fits_range(fileoff, filesize, static_cast<std::uint64_t>(out.size()))) {
+                        remaps.push_back(SegRemap{
+                            .orig_off = fileoff,
+                            .orig_sz = filesize,
+                            .new_off = 0u,
+                            .mapped = false,
+                        });
+                        if (seg64) {
+                            wr64_endian(out, cur + 40u, 0u, big_endian);
+                            wr64_endian(out, cur + 48u, 0u, big_endian);
+                        } else {
+                            wr32_endian(out, cur + 32u, 0u, big_endian);
+                            wr32_endian(out, cur + 36u, 0u, big_endian);
+                        }
+                    }
+                }
+            }
+        }
+        cur += cmdsize;
+    }
+
+    auto remap_u32_off = [&](std::size_t field_off) {
+        const std::uint32_t orig = rd32(out, field_off, big_endian);
+        if (orig == 0u) {
+            return;
+        }
+        for (const SegRemap& rm : remaps) {
+            if (rm.orig_sz > 0u && orig >= rm.orig_off && orig < rm.orig_off + rm.orig_sz) {
+                if (rm.mapped) {
+                    const std::uint64_t mapped_off = rm.new_off + (orig - rm.orig_off);
+                    if (mapped_off < out.size() && mapped_off <= 0xFFFF'FFFFull) {
+                        wr32_endian(out, field_off, static_cast<std::uint32_t>(mapped_off), big_endian);
+                    }
+                } else {
+                    wr32_endian(out, field_off, 0u, big_endian);
+                }
+                return;
+            }
+        }
+    };
+
+    cur = hdr_sz;
+    for (std::uint32_t i = 0u; i < ncmds && cur + 8u <= lc_end; ++i) {
+        const std::uint32_t cmd = rd32(out, cur, big_endian);
+        const std::uint32_t cmdsize = rd32(out, cur + 4u, big_endian);
+        if (cmdsize < 8u || cur + cmdsize > lc_end) {
+            break;
+        }
+        if (cmd == macho::kLcSymtab && cmdsize >= 24u) {
+            remap_u32_off(cur + 8u);
+            remap_u32_off(cur + 16u);
+        } else if ((cmd == macho::kLcCodeSignature || cmd == macho::kLcFunctionStarts ||
+                    cmd == macho::kLcDataInCode || cmd == macho::kLcDyldExportsTrie ||
+                    cmd == macho::kLcDyldChainedFixups) &&
+                   cmdsize >= 16u) {
+            remap_u32_off(cur + 8u);
+        }
+        cur += cmdsize;
+    }
+
+    return out;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -333,6 +568,12 @@ Result<std::unique_ptr<IBinaryImage>> parse_image(std::span<const std::uint8_t> 
     return open_binary_image(bytes, BinaryOpenOptions{});
 }
 
+Result<std::unique_ptr<IBinaryImage>> parse_image(
+    std::span<const std::uint8_t> bytes,
+    const BinaryOpenOptions& options) {
+    return open_binary_image(bytes, options);
+}
+
 Result<std::unique_ptr<IBinaryImage>> parse_rebased_image(
     std::span<const std::uint8_t> file_bytes,
     std::uint64_t live_base) {
@@ -371,7 +612,9 @@ Result<std::unique_ptr<IBinaryImage>> parse_mapped_image(
             return std::unique_ptr<IBinaryImage>(std::move(*parsed));
         }
         case Format::MachO: {
-            auto parsed = MachOImage::parse(mapped_bytes);
+            const std::vector<std::uint8_t> norm =
+                normalize_mapped_macho_for_file_parsers(mapped_bytes);
+            auto parsed = MachOImage::parse(norm);
             if (!parsed) {
                 return std::unexpected(parsed.error());
             }

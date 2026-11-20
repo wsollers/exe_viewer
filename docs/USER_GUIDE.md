@@ -49,7 +49,7 @@ Related documentation:
 | **Host OS** | Windows 10/11 x64 (MSVC 2022) and Linux / WSL2 Ubuntu 22.04+ (Clang 18) |
 | **Static Binary Formats** | **PE32 / PE32+** (`.exe`, `.dll`, `.sys`, `.ocx`, delay-load/bound/forwarded/ordinal tables, `.pdata`, manifest/version/CLR, Authenticode), **ELF32 / ELF64** little- & big-endian (`ET_EXEC`, `ET_DYN`, `ET_REL`, `SHN_XINDEX`/`PN_XNUM`, sectionless `PT_DYNAMIC`-only ELFs), and **Mach-O / Universal FAT** (`MH_MAGIC`/`MH_MAGIC_64`/`MH_CIGAM`/`MH_CIGAM_64`, `FAT_MAGIC`/`FAT_CIGAM_64`, `LC_DYLD_EXPORTS_TRIE`, `LC_DYLD_CHAINED_FIXUPS`, structural `LC_CODE_SIGNATURE`) |
 | **Live & Remote Targets** | Local read-only live processes (Win32 / Linux `/proc`), **GDB Remote / QEMU RSP** stubs (`GdbRemoteBackend` read-only & opt-in debug), and opt-in local `ptrace` / Win32 debugging |
-| **Offline Crash Dumps** | Windows Minidumps (`.dmp` `MDMP`) and Linux ELF Core Dumps (`ET_CORE`, 32/64-bit LE/BE) |
+| **Offline Crash Dumps** | Windows Minidumps (`.dmp` `MDMP`), Linux ELF Core Dumps (`ET_CORE`, 32/64-bit LE/BE), and macOS / iOS Mach-O Core Dumps (`MH_CORE`, thin & Universal `x86`/`x86_64`/`ARM`/`ARM64`) |
 | **Target Architectures** | `x86` (32-bit), `x86_64`, `ARM` (ARM32 + Thumb-2), `ARM64` (`AArch64` / `arm64e`), `RISC-V` (`RV32`/`RV64`), `MIPS` (`MIPS32`/`MIPS64` LE/BE), `PowerPC` (`PPC32`/`PPC64` LE/BE) |
 
 > On WSL2, keep builds and analysis caches in the Linux filesystem (for example `/home/<user>/projects/exe_viewer`) for better I/O performance. Default recovery and Ghidra cache paths avoid `/mnt/c`.
@@ -119,9 +119,10 @@ The GUI needs its graphics dependencies and bundled resources. Static inspection
    - Installing `llvm` (`sudo apt install llvm-18` or LLVM for Windows on `PATH` so `llvm-mc` / `llvm-mc-18` is discoverable) enables interactive assembly patching across `ARM`, `Thumb-2`, `ARM64`, `RISC-V 32/64`, `MIPS 32/64`, and `PowerPC 32/64`.
 3. **Graphviz (`dot`) — Graph Layout**:
    - Interactive `Flow Graph` cards render natively in ImGui. Installing `graphviz` (`dot` on `PATH`) additionally enables Graphviz coordinate layout. The current graph toolbar does not expose image export.
-4. **Symbol Discovery Paths, Symbol Servers & `debuginfod`**:
-   - **Windows PDB/DIA**: Visual Studio 2022 provides `msdia140.dll` (auto-discovered even without `regsvr32`). Pre-populated local symbol caches referenced in `_NT_SYMBOL_PATH` (for example `srv*C:\Symbols*https://msdl.microsoft.com/download/symbols`) or sibling `.pdb` paths can be selected directly via **File > Open Debug Symbols...**.
-   - **Linux Split Debug / `debuginfod`**: The DWARF loader automatically searches `.gnu_debuglink` (sibling directory, `.debug/`, and `/usr/lib/debug/...`) and `.note.gnu.build-id` (`/usr/lib/debug/.build-id/xx/yyyy....debug`, plus `$HOME/.cache/debuginfod_client/<buildid>/debuginfo` populated when `DEBUGINFOD_URLS` tools have cached symbols).
+4. **Symbol Discovery Paths, Cross-Platform PDB, `.dSYM` & `debuginfod`**:
+   - **Cross-Platform PDB (`peelf/pdb.hpp` + Optional Windows DIA)**: Built-in MSF 7.00 & CodeView parsing loads `.pdb` public/module symbols, C13 source file:line mappings, and TPI structs/unions/enums/bitfields natively on **both Linux and Windows** without external SDKs; on Windows, `msdia140.dll` supplements recovery when installed. Pre-populated local symbol caches in `_NT_SYMBOL_PATH` or sibling `.pdb` files can also be selected via **File > Open Debug Symbols...**.
+   - **Linux Split Debug / `debuginfod`**: The DWARF loader automatically searches `.gnu_debuglink` (sibling directory, `.debug/`, and `/usr/lib/debug/...`) and `.note.gnu.build-id` (`/usr/lib/debug/.build-id/xx/yyyy....debug`, plus `$HOME/.cache/debuginfod_client/<buildid>/debuginfo`).
+   - **macOS / Apple `.dSYM` Bundles**: Embedded `__DWARF,__debug_*` sections and companion `<binary>.dSYM/Contents/Resources/DWARF/<name>` bundles (matching thin or Universal slices via 16-byte `LC_UUID`) are discovered automatically, or you can pass either a `.dSYM` bundle directory or inner DWARF file to **File > Open Debug Symbols...**.
 
 ---
 
@@ -152,9 +153,10 @@ flowchart LR
   - **ELF**: `PT_INTERP`, `.note.ABI-tag`, `.note.gnu.build-id`, `DT_SONAME`/`DT_RPATH`/`DT_RUNPATH`, and `DT_FLAGS`/`DF_1_*`.
   - **Mach-O**: File type, `LC_BUILD_VERSION` / `LC_VERSION_MIN_*` platform & SDK versions, `LC_MAIN` / `LC_UNIXTHREAD` entry point, `LC_ID_DYLIB` / `LC_RPATH`, `LC_UUID`, and `LC_CODE_SIGNATURE` flags/entitlements summary.
   - **Observed Runtime Settings**: Live command line, working directory, security posture, and environment variables (**sensitive secret values are redacted by default** unless explicitly revealed).
-- **Structure Tree, Jump Bar & Synchronized Views**:
+- **Structure Tree, Omni-Search Command Palette (`Ctrl+K`) & Symbolic Go-To (`Ctrl+G`)**:
   - The left **Structure** panel presents a unified hierarchy (`File/Image -> Headers -> Sections -> Segments -> Imports -> Exports -> Symbols -> Relocations / Notes / Dynamic / Debug`).
-  - Enter a hexadecimal virtual address (VA) in the top address field and click **Jump**; **Disassembly** and **Hex View** synchronize byte spans and mapped offsets automatically.
+  - Press **`Ctrl+K`** or **`Ctrl+Shift+P`** to open the **Omni-Search Command Palette** and fuzzy-search across functions/symbols (`@`), commands/panels/workspace presets (`>`), strings (`#`), Go-To expressions (`:`), or types & security rules (`?`).
+  - Press **`Ctrl+G`** (**Navigate > Go to Address / Expression...**) or use the top Jump bar to evaluate symbolic expressions such as `0x140001000`, `rva:0x1000`, `off:0x400`, `main + 0x24`, `.text + 0x100`, `$entry`, `$here`, or live/dump register names (`rip`, `rsp + 0x18`).
 
 ### 2.2 Keyboard Shortcuts & Menu Reference
 
@@ -163,6 +165,8 @@ flowchart LR
 | **`Ctrl+O`** | `File > Open...` | Open a static PE, ELF, or Mach-O binary |
 | Menu command | `File > Attach to Process...` | Open the read-only attach dialog. The menu advertises `Ctrl+P`, but this revision does not register that keyboard shortcut. |
 | **`Ctrl+Shift+S`** | `File > Save Patched As...` | Write staged patches to a new binary file (never overwrites original) |
+| **`Ctrl+K`** / **`Ctrl+Shift+P`** | `Navigate > Command Palette...` | Open fuzzy Omni-Search across functions, symbols, strings, types, bookmarks, panels, presets, and commands |
+| **`Ctrl+G`** | `Navigate > Go to Address / Expression...` | Evaluate a VA, `rva:...`, `off:...`, `sym + offset`, `.section + offset`, `$entry`, or register expression |
 | **`Ctrl+F5`** | `File > Refresh Process Memory Map` | Re-enumerate live process regions and modules |
 | **`Alt+Left`** / **`Backspace`** | `Navigate > Back` | Navigate backward in address selection history |
 | **`Alt+Right`** / **`Shift+Backspace`** | `Navigate > Forward` | Navigate forward in address selection history |
@@ -187,7 +191,7 @@ flowchart LR
    - Choose **File > Save Analysis Project...** to write a `.peproj` v2 text session (headed `PEELF_PROJECT 2`, not JSON) containing:
      - Cryptographic target identity: **`source_sha256`** (64-hex SHA-256) + **`source_size`**,
      - Both `source` and **`relative_source`** (relative to the `.peproj` directory so projects can be moved across machines or git checkouts),
-     - User symbol renames, comments, bookmarks, pinned **Structure View** bindings, and staged patch intervals.
+     - User symbol renames, comments, bookmarks, custom C `struct`/`union`/`enum`/`#pragma pack` definitions, pinned **Structure View** bindings, and staged patch intervals.
    - Atomic persistence writes `<name>.peproj.tmp` and renames it atomically to avoid replacing the saved project with a partially written file.
 3. **Moved or Changed Binaries**:
    - Projects record both absolute and relative source paths plus the original size and SHA-256. If the source cannot be found or its identity differs, **Relocate or Verify Project Binary** displays the problem.
@@ -200,7 +204,7 @@ Projects also preserve navigation history, ARM/Thumb mode, debug-symbol paths, a
 
 ### 2.4 Panel directory
 
-All 38 workspace panels are listed below. Open them through **View**; **Navigate > Symbols** opens **Functions & Names**, and **Navigate > Structure** opens the tree rather than the typed **Structure View**.
+All 39 workspace panels are listed below (`kWorkspaceLayoutSchemaVersion = 12`). Open them through **View** or `Ctrl+K`; **Navigate > Symbols** opens **Functions & Names**, and **Navigate > Structure** opens the tree rather than the typed **Structure View**.
 
 | Panel | What to use it for |
 |---|---|
@@ -222,7 +226,8 @@ All 38 workspace panels are listed below. Open them through **View**; **Navigate
 | References & Notes | Follow incoming/outgoing references; edit names, comments, and categorized bookmarks. |
 | Strings | Filter extracted text by encoding, region, length, and reference count. |
 | Data Structures | Search recovered structures, members, and types; **Apply** a layout or browse **Data symbols**. |
-| Structure View | Decode a type at an address, follow pointers, and pin bindings. |
+| Structure View | Decode built-in, PDB/DWARF, or custom C `struct`/`union`/`enum` layouts at an address, follow pointers, and pin bindings. |
+| Signatures & Crypto | Inspect PE `Rich` header toolchains, static/live cryptographic & packer constant detections, and custom YARA-lite rule scans. |
 | Dependencies | Resolve libraries and symbol bindings, adjust search paths, and review missing dependencies. |
 | Executable Settings | Compare declared metadata with observed environment/runtime state and snapshot differences. |
 | Target Capabilities | Inspect support states, provider explanations, target identity, and capture provenance. |
@@ -261,22 +266,23 @@ Toggle **View > Demangle symbols** (enabled by default) to decode mangled compil
 - **Rust v0 (`_R...`) & Legacy Rust (`_ZN...17h<hex>E`)** — Clean crate/module/trait paths without trailing hash noise
 - **MSVC C++ (`?...`)** — Visual C++ decorated functions, constructors/destructors, templates, and vtables
 
-### 3.2 Windows CodeView / PDB & RSDS GUID+Age Verification
+### 3.2 Cross-Platform CodeView / PDB (`peelf/pdb.hpp`) & RSDS GUID+Age Verification
 
 1. When opening a PE executable or DLL containing an `IMAGE_DEBUG_DIRECTORY` (`IMAGE_DEBUG_TYPE_CODEVIEW` `RSDS` record), PE / ELF Explorer extracts the embedded **PDB GUID**, **Age**, and `.pdb` path.
 2. Sibling and configured paths are checked automatically, or you can load an explicit `.pdb` via **File > Open Debug Symbols...**.
-3. **PDB Identity Verification**: Before merging symbols, `debug_symbols.cpp` parses the PDB's MSF 7.00 superblock, PDB Info Stream (Stream 1), and DBI Stream (Stream 3) to verify that the **GUID and Age match** the binary's `RSDS` record, rejecting mismatched or corrupt `.pdb` files with an explicit diagnostic in **Log**.
-4. On Windows hosts with the DIA SDK (`msdia140.dll`), public symbols, functions, parameters, and user-defined structs/unions (`UDT`s) populate `SymbolIndex` and `StructureCatalog`—and automatically rebase onto live ASLR module base addresses when attached to a running process.
+3. **PDB Identity Verification & Clean-Room Cross-Platform Parsing (`WU-34`)**: Before merging symbols, the built-in MSF 7.00 & CodeView parser (`peelf/pdb.hpp`) decodes the superblock, PDB Info Stream (Stream 1), and DBI Stream (Stream 3) to verify that the **GUID and Age match** the binary's `RSDS` record (rejecting mismatched or corrupt `.pdb` files with an explicit diagnostic), and natively extracts GSI/PSI public symbols (`S_PUB32`), module procedure symbols (`S_GPROC32`/`S_LPROC32`), C13 `DEBUG_S_LINES` source file:line tables, and TPI Stream 2 `LF_STRUCTURE`/`LF_CLASS`/`LF_UNION`/`LF_ENUM`/`LF_BITFIELD` layouts on **both Linux and Windows** without external SDKs.
+4. On Windows hosts where `msdia140.dll` is installed, the DIA bridge can additionally supplement symbol recovery—and all recovered symbols/types rebase automatically onto live ASLR module base addresses when attached to a running process.
 
-### 3.3 Cross-Platform ELF & MinGW DWARF v2–v5 + Separate Debug Sidecars
+### 3.3 Cross-Platform ELF, MinGW & Mach-O DWARF v2–v5 + `.debug` / `.dSYM` Sidecars
 
-On both Windows and Linux hosts without external libraries, the built-in DWARF v2–v5 reader (`peelf/dwarf.hpp`) parses:
+On Windows and Linux hosts without external libraries, the built-in DWARF v2–v5 reader (`peelf/dwarf.hpp`) parses both ELF/MinGW `.debug_*` sections and Mach-O `__DWARF,__debug_*` sections (including 16-character truncated `__DWARF,__debug_str_offs`):
 
-- `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line_str`, `.debug_str_offsets` (`DW_FORM_strx*`), `.debug_addr` (`DW_FORM_addrx*`), `.debug_line` (source file + line numbers), `.debug_ranges`, and DWARF v5 `.debug_rnglists` (`DW_RLE_*`).
+- `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line_str`, `.debug_str_offsets` / `__debug_str_offs` (`DW_FORM_strx*`), `.debug_addr` (`DW_FORM_addrx*`), `.debug_line` (source file + line numbers), `.debug_ranges`, and DWARF v5 `.debug_rnglists` (`DW_RLE_*`).
 - Recovering function boundaries (`DW_TAG_subprogram`), variables, formal parameters, source file:line mappings, and composite `DW_TAG_structure_type` / `DW_TAG_union_type` layouts.
-- **Automatic Split-Debug Sidecar Discovery**:
+- **Automatic Split-Debug & `.dSYM` Bundle Discovery (`WU-05`, `WU-39`)**:
   - `.gnu_debuglink` — locates sibling `<file>.debug`, `<dir>/.debug/<file>.debug`, or `/usr/lib/debug/<dir>/<file>.debug` and verifies its IEEE **CRC32** checksum.
-  - `.note.gnu.build-id` — resolves `/usr/lib/debug/.build-id/<ab>/<cdef...>.debug` and cached `debuginfod` paths, or load any detached `.debug` file manually via **File > Open Debug Symbols...**.
+  - `.note.gnu.build-id` — resolves `/usr/lib/debug/.build-id/<ab>/<cdef...>.debug` and cached `debuginfod` paths.
+  - **macOS `.dSYM` Bundles (`LC_UUID`)** — searches `<binary>.dSYM/Contents/Resources/DWARF/<name>` and sibling `.dSYM` bundles, selects the matching architecture slice on Universal `.dSYM` companions, and enforces 16-byte **`LC_UUID`** identity verification (you can also pass either a `.dSYM` bundle directory or inner DWARF file to **File > Open Debug Symbols...**).
 
 ---
 
@@ -324,13 +330,13 @@ flowchart LR
     pseudo --> ui
 ```
 
-### 5.1 Selecting bytes and instructions
+### 5.1 Virtualized Linear Disassembly, Branch-Arc Gutter & Patched-Hex UX
 
-In **Hex View**, click a byte to select it, then Shift-click another byte to select a contiguous range. Enter an **Offset (hex)** and click **Go** to move within the current byte view. **Copy hex** copies the selected bytes; for a decompiler selection covering disjoint ranges, **Copy primary range** copies only the primary range. Use **Apply Structure...** to interpret the selection as a type.
+In **Hex View**, `ImGuiListClipper` streams megabyte/gigabyte files directly from `FileMapping` / `PagedBinaryImage` without loading whole-file UI tables. Toggle the left address gutter between **File Offset**, **RVA**, and **VA**, click a byte and Shift-click another to select a contiguous range, or press **`Ctrl+G`** to jump to a symbolic expression. When a selection targets unmapped or zero-filled `.bss` space without readable bytes, **Hex View** displays an explicit **`(Hex Not Available)`** state rather than stale bytes.
 
-On a static file, enter replacement hex and choose **Apply bytes**, or double-click a byte to open the quick-patch popup and choose **Stage Patch**. Multi-range selections must be replaced with a contiguous selection before editing. Staged bytes are highlighted; unreadable process bytes show `??`.
+On a static file, enter replacement hex and choose **Apply bytes**, or double-click a byte to open the quick-patch popup and choose **Stage Patch**. Staged patch bytes are highlighted with distinct tinting and hover tooltips showing **original vs. patched** hex values; unreadable live-process bytes show `??`.
 
-In **Disassembly**, use Up/Down to move between instructions and Enter or double-click to follow a direct target. `Space` switches between the graph and listing. For ARM32 code, **Thumb mode** changes instruction decoding and is saved with the project.
+In **Disassembly** (`WU-35`), switch **Scope** between **Whole Binary**, **Active Section**, and **Active Function** to scroll seamlessly across lazy-decoded 4 KiB code chunks. A multi-lane **branch-arc gutter** draws intra-function forward/backward jumps with directional arrowheads, function header banners surface demangled signatures, `[file:line]` debug rows, incoming xrefs, and user comments, and patched instructions display inline `[PATCHED]` indicators. Use Up/Down to step instructions, `Enter` or double-click to follow a branch/call target, and `Space` to switch between **Flow Graph** and **Disassembly**. For ARM32 code, **Thumb mode** changes instruction decoding and persists in `.peproj` v2.
 
 ![Disassembly and linked hex view](screenshots/disassembly-hex.png)
 
@@ -401,9 +407,10 @@ Open **Structure View** (**View > Structure View**) to overlay strongly typed la
    - **Win32 Runtime**: `PEB32`, `PEB64`, `RTL_USER_PROCESS_PARAMETERS64`, `TEB64`
    - **ELF Header**: `Elf32_Ehdr`, `Elf64_Ehdr`, `Elf64_Phdr`, `Elf64_Shdr`
    - **Linux Runtime**: `r_debug64`, `link_map64`
-2. **Custom C-Struct Definitions & Debug Types (`Debug / User` Category)**:
-   - C/C++ `struct` and `union` layouts compiled with `-g` (ELF/MinGW DWARF v2–v5) or `/Zi` (Windows PDB/DIA), or recovered by Ghidra, may be imported into the **`Debug / User`** schema group with the field offsets, sizes, and pointee types available from that provider. Stripped or incomplete debug information limits recovered layouts.
-   - Browse all discovered composite layouts at any time via **View > Data Structures**.
+2. **Interactive Custom C Type Definitions (`WU-37`) & Debug Types (`Debug / User` Category)**:
+   - Click **`Define Custom C Types...`** in **Structure View** (or **Data Structures**) to write or paste standard C header declarations (`struct`, `union`, `enum`, `typedef`, nested structs, pointers, multi-dimensional arrays, C ABI bitfields `: width`, `#pragma pack(push, 1)` / `#pragma pack(pop)`, and `__attribute__((packed))`) with live `line:col` syntax diagnostics. Parsed custom C source persists directly inside `.peproj` v2 session files, and enum/bitfield members decode symbolically in **Structure View**.
+   - C/C++ `struct`, `union`, and `enum` layouts from cross-platform `.pdb` (`peelf/pdb.hpp`), Windows DIA, ELF/MinGW/Mach-O DWARF v2–v5 (`.debug` / `.dSYM`), or Ghidra also populate the **`Debug / User`** schema group automatically.
+   - Browse all discovered and user-defined layouts at any time via **View > Data Structures**.
 3. **Address Mode, Endianness, Array Stride & Pointer Dereferencing**:
    - Choose **`Virtual Addr`** or **`File Offset`** on static files (live processes read **`Live VA`** directly through `read_memory_tolerant`, rendering unreadable guard pages cleanly without failing the rest of the struct).
    - Click **`Use Selection`** (or enable **`Sync`** to follow `ViewerSelection` live as you click in Hex/Disassembly).
@@ -645,13 +652,14 @@ In **Execution Timeline**, start with **Capture Baseline Snapshot**, then use **
 
 ## 11. Crash dump analysis
 
-Analyze post-mortem production crashes on **any** host OS (for example, open a Windows `.dmp` on Linux/WSL2 or a Linux ARM64/RISC-V `core` file on Windows) without executing the crashed binary:
+Analyze post-mortem production crashes on **any** host OS (for example, open a Windows `.dmp` or macOS `MH_CORE` dump on Linux/WSL2, or a Linux ARM64/RISC-V `ET_CORE` dump on Windows) without executing the crashed binary:
 
 1. **Opening a Crash Dump**:
    - Choose **File > Open Crash Dump...** (or pass a `.dmp` / `core` file to `peelf_viewer` on the command line).
-   - Both crash dump readers implement the read-only `IProcessSession` + `ICrashDumpSession` interface:
+   - All three crash dump readers implement the read-only `IProcessSession` + `ICrashDumpSession` interface:
      - **Windows Minidump (`MDMP`)**: Parses `ThreadListStream`, `ModuleListStream`, `MemoryListStream` & `Memory64ListStream` (full-memory dumps), `ExceptionStream` (faulting `TID`, exception code such as `0xC0000005` `EXCEPTION_ACCESS_VIOLATION`, read/write fault target VA), `SystemInfoStream`, `MiscInfoStream`, `HandleDataStream`, and `UnloadedModuleListStream`.
      - **Linux ELF Core (`ET_CORE`)**: Parses 32/64-bit little- and big-endian `PT_LOAD` memory segments plus `PT_NOTE` records (`NT_PRSTATUS` per-thread signal & registers across x86, x86_64, ARM, ARM64, RISC-V 64, MIPS, PowerPC; `NT_PRPSINFO` command line/PID; `NT_SIGINFO` `si_signo`/`si_code`/`si_addr`; `NT_AUXV`; and **`NT_FILE` mapped module filenames & offsets**).
+     - **macOS / iOS Mach-O Core (`MH_CORE`, `WU-39`)**: Parses thin and Universal 32/64-bit little- and big-endian `MH_CORE` dumps, mapping `LC_SEGMENT` / `LC_SEGMENT_64` regions (cleanly zero-filling `[filesize, vmsize)` tails), decoding `LC_THREAD` / `LC_UNIXTHREAD` register and exception flavors (`x86_THREAD_STATE64`/`x86_EXCEPTION_STATE64`, `x86_THREAD_STATE32`/`x86_EXCEPTION_STATE32`, `ARM_THREAD_STATE64` with PAC stripping + `ARM_EXCEPTION_STATE64` `far`/`esr`, and `ARM_THREAD_STATE32`), and recovering mapped `MH_EXECUTE` / `MH_DYLIB` / `MH_DYLINKER` images (`LC_ID_DYLIB`) directly from core memory.
 2. **Triage Workflow**:
    - Upon load, PE / ELF Explorer automatically selects the **faulting thread**, displays a crash summary banner (signal / exception code + fault address), and jumps **Disassembly**, **Hex View**, and **Threads & Stack** to the faulting instruction pointer!
    - Load matching debug symbols where supported. Symbolization, unwinding, and decompilation depend on captured memory, module backing files, and available symbols; a small dump may omit the needed bytes. Use **Jump to Faulting IP** in **Threads & Stack** to revisit the crash location.
@@ -747,6 +755,17 @@ The security audit selects applicable checks from 25 security hardening rules (`
 | **`MACHO4005`** | `SafeDylibRpathAndDyldHardening` | `Error` / `Warning` | Rejects world-writable (`/tmp`, `/var/tmp`), unanchored relative, or escaping `..` `LC_RPATH` / `LC_LOAD_*_DYLIB` paths; checks `MH_TWOLEVEL` and `__RESTRICT,__restrict` |
 | **`MACHO4006`** | `PointerAuthAndSegmentEncryption` | `Warning` / `Note` | Reports `arm64e` Pointer Authentication (`PAC`) posture on `arm64` slices and warns when `LC_ENCRYPTION_INFO(_64)` has `cryptid != 0` |
 
+### 13.5 PE Rich Header, Crypto/Packer Constant Detector & YARA-Lite Rule Scanner (`Signatures & Crypto`, `WU-38`)
+
+Open **View > Signatures & Crypto** (or pass `--rules <file_or_dir>` to `--headless`) to inspect toolchain provenance, cryptographic/packer tables, and custom pattern rules across static images, live processes, and offline crash dumps:
+
+1. **PE `Rich` Header Toolchain Decoder**:
+   - Locates the `Rich` marker between the DOS stub and `PE\0\0` signature, XOR-decodes the `DanS` payload, validates the rolling DOS-header/entry checksum, and lists every `(ProductId, BuildNumber, UseCount)` entry mapped to human-readable Microsoft MSVC / MASM / Linker tool names.
+2. **Static & Live Crypto / Hash / Compression / Packer Constant Scanner**:
+   - Scans image sections and readable live/core memory regions (with endian-aware integer constant matching) for **AES** S-Box/InvS-Box/Rcon, **DES** SP-boxes, **Blowfish** P-array, **ChaCha20 / Salsa20** `"expand 32-byte k"`, **TEA / XTEA** delta `0x9E3779B9`, **SHA-256 / SHA-512 / SHA-1 / MD5** IVs & round constants, **CRC32** `0xEDB88320` / `0x82F63B78`, **zlib / Deflate**, **LZ4 / Zstd / Brotli** frame magics, **UPX / VMProtect / Themida / ASPack / MPRESS / Enigma** section & stub markers, and high-entropy ($\ge 7.20$ bits/byte) executable sections. Click any match to jump **Hex View** / **Disassembly** directly to its offset/VA.
+3. **Clean-Room YARA-Lite Rule Editor & Scanner**:
+   - Load `.yar` / `.yara` files or author rules live in the **YARA-Lite Rules** tab using `meta:` (`description`, `author`, `severity`), `strings:` (text literals with `ascii`, `wide`, `nocase`, `fullword`, plus hex strings `{ 4D 5A ?? [2-8] 50 45 00 00 }` with byte/nibble wildcards and bounded jumps), and `condition:` (`all/any/N of them`, `$id`, `#id`, `@id`, `filesize`, `uint8/16/32/16be/32be(...)`, `pe.is_pe`, `pe.imports("dll", "sym")`, `pe.section_exists(".upx0")`, `elf.is_elf`, `macho.is_macho`, `entropy(off, len) >= 7.2`).
+
 ---
 
 ## 14. Headless CLI and automation
@@ -773,8 +792,9 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | Option | Description |
 |---|---|
 | `--headless` | Run in Vulkan-free CLI mode (passing `--headless` alone with no path performs a fast readiness check and exits `0`) |
-| `<binary_or_dump>` | Path to a PE, ELF, Mach-O / Universal fat binary, Windows `.dmp` Minidump, or Linux ELF `ET_CORE` file |
+| `<binary_or_dump>` | Path to a PE, ELF, Mach-O / Universal fat binary, Windows `.dmp` Minidump, Linux ELF `ET_CORE`, or macOS/iOS Mach-O `MH_CORE` file |
 | `--slice <index\|arch>` | Select a specific Universal Mach-O slice by 0-based index (e.g. `0`, `1`) or architecture name (e.g. `arm64`, `arm64e`, `x86_64`) |
+| `--rules <path>` | Repeatable `.yar`/`.yara` file or directory of YARA-lite rules; matches are emitted in `--format json` (`signatures.yara_matches`) and `--format sarif`, and participate in `--fail-on` policy gates |
 | `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only; matches Universal Mach-O slices automatically or via `--slice`) |
 | `--format <json\|sarif\|text>` | Output format: structured `json` (default for audits), **OASIS SARIF 2.1.0** (`sarif`), or human-readable `text` for scripts. Audits accept only `json` (default) or `sarif`; scripts accept only `text` (default) or `json` |
 | `--output <path>` | Write report or script output to `<path>` instead of `stdout` |
@@ -827,6 +847,11 @@ peelf_viewer --headless ./firmware.elf \
   --script-allow-mutations \
   --output-binary ./firmware.patched.elf \
   --project ./firmware.peproj --format json
+
+# 6. Scan a binary or offline crash dump with custom YARA-lite rules & gate CI on matches
+peelf_viewer --headless ./suspect_sample.exe \
+  --rules ./rules/packers_and_crypto.yar \
+  --format sarif --output signatures.sarif --fail-on warning
 ```
 
 ### 14.3 GitHub Actions workflow example

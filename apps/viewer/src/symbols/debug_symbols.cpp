@@ -139,6 +139,137 @@ namespace {
     return diag;
 }
 
+[[nodiscard]] std::string format_macho_uuid_canonical(std::span<const std::uint8_t, 16> uuid) {
+    std::string out;
+    out.reserve(36u);
+    constexpr std::string_view kHex = "0123456789ABCDEF";
+    for (std::size_t i = 0u; i < 16u; ++i) {
+        if (i == 4u || i == 6u || i == 8u || i == 10u) {
+            out.push_back('-');
+        }
+        out.push_back(kHex[(uuid[i] >> 4u) & 0x0Fu]);
+        out.push_back(kHex[uuid[i] & 0x0Fu]);
+    }
+    return out;
+}
+
+[[nodiscard]] std::optional<std::string> validate_macho_uuid_matches_target(
+    const peelf::IBinaryImage& dwarf_source_image,
+    const peelf::IBinaryImage& target_image,
+    std::string_view label) {
+    const auto expected_uuid = target_image.macho_uuid();
+    const auto actual_uuid = dwarf_source_image.macho_uuid();
+    if (!expected_uuid.has_value() || !actual_uuid.has_value()) {
+        return std::nullopt;
+    }
+    if (*expected_uuid == *actual_uuid) {
+        return std::nullopt;
+    }
+
+    const std::string expected_str = !target_image.macho_uuid_string().empty()
+        ? std::string(target_image.macho_uuid_string())
+        : format_macho_uuid_canonical(*expected_uuid);
+    const std::string actual_str = !dwarf_source_image.macho_uuid_string().empty()
+        ? std::string(dwarf_source_image.macho_uuid_string())
+        : format_macho_uuid_canonical(*actual_uuid);
+
+    return "Mach-O dSYM LC_UUID does not match target image: " + std::string(label) +
+           " (expected UUID=" + expected_str + "; actual UUID=" + actual_str + ")";
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> resolve_dsym_bundle_dwarf_file(
+    const std::filesystem::path& bundle_dir,
+    const peelf::IBinaryImage& target_image) {
+    std::error_code ec;
+    std::filesystem::path dwarf_dir = bundle_dir / "Contents" / "Resources" / "DWARF";
+    if (!std::filesystem::is_directory(dwarf_dir, ec) || ec) {
+        ec.clear();
+        dwarf_dir = bundle_dir / "Resources" / "DWARF";
+        if (!std::filesystem::is_directory(dwarf_dir, ec) || ec) {
+            ec.clear();
+            if (bundle_dir.filename() == "DWARF" &&
+                std::filesystem::is_directory(bundle_dir, ec) && !ec) {
+                dwarf_dir = bundle_dir;
+            } else {
+                return std::nullopt;
+            }
+        }
+    }
+
+    std::string ext = bundle_dir.extension().string();
+    std::ranges::transform(ext, ext.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    const std::filesystem::path preferred_name =
+        (ext == ".dsym") ? bundle_dir.stem() : std::filesystem::path{};
+
+    std::vector<std::filesystem::path> entries;
+    if (!preferred_name.empty()) {
+        const std::filesystem::path exact = dwarf_dir / preferred_name;
+        std::error_code fec;
+        if (std::filesystem::is_regular_file(exact, fec) && !fec) {
+            entries.push_back(exact);
+        }
+    }
+
+    std::vector<std::filesystem::path> others;
+    for (const auto& entry : std::filesystem::directory_iterator(dwarf_dir, ec)) {
+        if (ec) {
+            break;
+        }
+        std::error_code fec;
+        if (!entry.is_regular_file(fec) || fec) {
+            continue;
+        }
+        const std::string fname = entry.path().filename().string();
+        if (fname.empty() || fname.front() == '.') {
+            continue;
+        }
+        if (!preferred_name.empty() && entry.path().filename() == preferred_name) {
+            continue;
+        }
+        others.push_back(entry.path());
+    }
+    std::ranges::sort(others);
+    for (auto& p : others) {
+        entries.push_back(std::move(p));
+    }
+
+    if (entries.empty()) {
+        return std::nullopt;
+    }
+    if (entries.size() == 1u || !target_image.macho_uuid().has_value()) {
+        return entries.front();
+    }
+
+    for (const auto& cand : entries) {
+        std::error_code sz_ec;
+        const auto fsz = std::filesystem::file_size(cand, sz_ec);
+        if (sz_ec || fsz < 28u || fsz > (512ull * 1024ull * 1024ull)) {
+            continue;
+        }
+        std::ifstream f(cand, std::ios::binary);
+        if (!f) {
+            continue;
+        }
+        std::vector<std::uint8_t> buf(static_cast<std::size_t>(fsz));
+        if (!f.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size()))) {
+            continue;
+        }
+        peelf::BinaryOpenOptions opts{};
+        if (target_image.architecture() != peelf::Architecture::Unknown) {
+            opts.preferred_architecture = target_image.architecture();
+        }
+        if (auto img = peelf::parse_image(buf, opts);
+            img.has_value() && (*img)->macho_uuid().has_value() &&
+            *(*img)->macho_uuid() == *target_image.macho_uuid()) {
+            return cand;
+        }
+    }
+
+    return entries.front();
+}
+
 void sort_and_deduplicate_debug_symbols(std::vector<DebugSymbol>& symbols) {
     std::ranges::sort(symbols, [](const DebugSymbol& lhs, const DebugSymbol& rhs) {
         if (lhs.virtual_address != rhs.virtual_address) {
@@ -797,6 +928,17 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
         };
     }
 
+    if (const auto uuid_mismatch = validate_macho_uuid_matches_target(
+            dwarf_source_image,
+            target_image,
+            diagnostic_label.empty() ? std::string_view("DWARF") : diagnostic_label);
+        uuid_mismatch.has_value()) {
+        return DebugSymbolLoadResult{
+            .status = DebugSymbolLoadStatus::BackendError,
+            .diagnostic = *uuid_mismatch,
+        };
+    }
+
     auto parsed = peelf::parse_dwarf_image(dwarf_source_image, dwarf_source_bytes);
     if (!parsed) {
         return DebugSymbolLoadResult{
@@ -805,9 +947,21 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
         };
     }
 
-    const std::uint64_t source_base = dwarf_source_image.image_base();
+    std::uint64_t source_base = dwarf_source_image.image_base();
+    bool macho_dsym_without_text = false;
+    if (dwarf_source_image.format() == peelf::Format::MachO) {
+        const bool has_text_seg = std::ranges::any_of(
+            dwarf_source_image.macho_segments(),
+            [](const peelf::MachOSegmentCommand& s) { return s.name == "__TEXT"; });
+        if (!has_text_seg) {
+            source_base = 0u;
+            macho_dsym_without_text = true;
+        }
+    }
     const std::uint64_t target_base = target_image.image_base();
-    const bool phdr_less_source = (source_base == 0 && dwarf_source_image.segments().empty());
+    const bool phdr_less_source =
+        (source_base == 0u &&
+         (dwarf_source_image.segments().empty() || macho_dsym_without_text));
 
     const auto compute_rva_and_va =
         [&](std::uint64_t raw_addr) noexcept -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
@@ -817,6 +971,14 @@ DebugSymbolLoadResult load_dwarf_debug_symbols_from_image(
         } else if (phdr_less_source && target_base != 0 && raw_addr >= target_base &&
                    target_image.virtual_address_to_file_offset(raw_addr).has_value()) {
             rva = raw_addr - target_base;
+        } else if (macho_dsym_without_text && target_image.is_64bit() &&
+                   raw_addr >= 0x1'0000'0000ull) {
+            const std::uint64_t cand_rva = raw_addr - 0x1'0000'0000ull;
+            if (const auto cand_va = checked_add_rva(target_base, cand_rva);
+                cand_va.has_value() &&
+                target_image.virtual_address_to_file_offset(*cand_va).has_value()) {
+                rva = cand_rva;
+            }
         }
         if (target_base != 0) {
             const auto va = checked_add_rva(target_base, rva);
@@ -916,20 +1078,33 @@ DebugSymbolLoadResult load_dwarf_debug_symbols(const std::filesystem::path& debu
         };
     }
 
+    std::filesystem::path effective_path = debug_path;
+    if (std::filesystem::is_directory(debug_path, ec) && !ec) {
+        const auto resolved = resolve_dsym_bundle_dwarf_file(debug_path, target_image);
+        if (!resolved.has_value()) {
+            return DebugSymbolLoadResult{
+                .status = DebugSymbolLoadStatus::FileNotFound,
+                .diagnostic = "No DWARF companion file found inside .dSYM bundle: " +
+                              debug_path.string(),
+            };
+        }
+        effective_path = *resolved;
+    }
+
     constexpr std::uintmax_t kMaxDwarfFileSize = 512ull * 1024ull * 1024ull;
-    const auto fsize = std::filesystem::file_size(debug_path, ec);
+    const auto fsize = std::filesystem::file_size(effective_path, ec);
     if (ec || fsize < 16u || fsize > kMaxDwarfFileSize) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
-            .diagnostic = "Unable to read DWARF file size: " + debug_path.string(),
+            .diagnostic = "Unable to read DWARF file size: " + effective_path.string(),
         };
     }
 
-    std::ifstream file(debug_path, std::ios::binary);
+    std::ifstream file(effective_path, std::ios::binary);
     if (!file) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::FileNotFound,
-            .diagnostic = debug_path.string(),
+            .diagnostic = effective_path.string(),
         };
     }
 
@@ -937,11 +1112,18 @@ DebugSymbolLoadResult load_dwarf_debug_symbols(const std::filesystem::path& debu
     if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::BackendError,
-            .diagnostic = "Failed reading DWARF file: " + debug_path.string(),
+            .diagnostic = "Failed reading DWARF file: " + effective_path.string(),
         };
     }
 
-    auto parsed_image = peelf::parse_image(bytes);
+    peelf::BinaryOpenOptions open_opts{};
+    if (target_image.architecture() != peelf::Architecture::Unknown) {
+        open_opts.preferred_architecture = target_image.architecture();
+    }
+    auto parsed_image = peelf::parse_image(bytes, open_opts);
+    if (!parsed_image && open_opts.preferred_architecture.has_value()) {
+        parsed_image = peelf::parse_image(bytes);
+    }
     if (!parsed_image) {
         return DebugSymbolLoadResult{
             .status = DebugSymbolLoadStatus::UnsupportedFormat,
@@ -949,7 +1131,8 @@ DebugSymbolLoadResult load_dwarf_debug_symbols(const std::filesystem::path& debu
         };
     }
 
-    return load_dwarf_debug_symbols_from_image(**parsed_image, bytes, target_image, debug_path.string());
+    return load_dwarf_debug_symbols_from_image(
+        **parsed_image, bytes, target_image, effective_path.string());
 }
 
 DebugSymbolLoadResult load_debug_symbols_file(const std::filesystem::path& debug_path,
@@ -960,6 +1143,9 @@ DebugSymbolLoadResult load_debug_symbols_file(const std::filesystem::path& debug
             .status = DebugSymbolLoadStatus::FileNotFound,
             .diagnostic = debug_path.string(),
         };
+    }
+    if (std::filesystem::is_directory(debug_path, ec) && !ec) {
+        return load_dwarf_debug_symbols(debug_path, target_image);
     }
     if (has_pdb_extension(debug_path) || has_native_pdb_signature(debug_path)) {
         return load_pdb_debug_symbols(debug_path, target_image);

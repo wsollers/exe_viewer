@@ -225,9 +225,12 @@ private:
 
         target_instance_id_ = peelf::TargetInstanceId{
             .backend = session_->is_crash_dump()
-                           ? (crash_dump_summary() != nullptr &&
-                                      crash_dump_summary()->kind == peelf::CrashDumpKind::WindowsMinidump
-                                  ? peelf::BackendKind::CrashDumpMinidump
+                           ? (crash_dump_summary() != nullptr
+                                  ? (crash_dump_summary()->kind == peelf::CrashDumpKind::WindowsMinidump
+                                         ? peelf::BackendKind::CrashDumpMinidump
+                                         : (crash_dump_summary()->kind == peelf::CrashDumpKind::MachOCore
+                                                ? peelf::BackendKind::CrashDumpMachOCore
+                                                : peelf::BackendKind::CrashDumpElfCore))
                                   : peelf::BackendKind::CrashDumpElfCore)
                            : (is_remote_gdb
                                   ? peelf::BackendKind::RemoteGdbRsp

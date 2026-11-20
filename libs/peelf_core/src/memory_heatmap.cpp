@@ -1352,9 +1352,13 @@ Observed<MemoryHeatmapSnapshot> MemoryHeatmapTracker::sample_crash_dump(
 
     const CrashDumpSummary& summary = dump.crash_summary();
     TargetInstanceId target_id{};
-    target_id.backend = summary.kind == CrashDumpKind::WindowsMinidump
-                            ? BackendKind::CrashDumpMinidump
-                            : BackendKind::CrashDumpElfCore;
+    if (summary.kind == CrashDumpKind::WindowsMinidump) {
+        target_id.backend = BackendKind::CrashDumpMinidump;
+    } else if (summary.kind == CrashDumpKind::MachOCore) {
+        target_id.backend = BackendKind::CrashDumpMachOCore;
+    } else {
+        target_id.backend = BackendKind::CrashDumpElfCore;
+    }
     target_id.pid = summary.pid;
     target_id.image_sha256 = summary.sha256;
     target_id.dump_nonce = static_cast<std::uint64_t>(dump_token);

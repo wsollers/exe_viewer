@@ -1456,7 +1456,10 @@ Result<std::unique_ptr<ICrashDumpSession>> open_crash_dump_bytes(
     if (is_elf_core_dump(bytes)) {
         return open_elf_core_bytes(std::move(bytes), std::move(source_path));
     }
-    return make_error("file is neither a Windows MDMP minidump nor a Linux ELF ET_CORE dump");
+    if (is_macho_core_dump(bytes)) {
+        return open_macho_core_bytes(std::move(bytes), std::move(source_path));
+    }
+    return make_error("file is neither a Windows MDMP minidump, Linux ELF ET_CORE, nor Mach-O MH_CORE dump");
 }
 
 Result<std::unique_ptr<ICrashDumpSession>> open_crash_dump_file(
@@ -1466,7 +1469,7 @@ Result<std::unique_ptr<ICrashDumpSession>> open_crash_dump_file(
         return make_error("crash dump file does not exist: " + path.string());
     }
     const auto fsize = std::filesystem::file_size(path, ec);
-    if (ec || fsize < 32u) {
+    if (ec || fsize < 28u) {
         return make_error("crash dump file is empty or too small: " + path.string());
     }
     std::ifstream in(path, std::ios::binary);

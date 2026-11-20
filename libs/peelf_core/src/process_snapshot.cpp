@@ -151,9 +151,13 @@ std::atomic<std::uint64_t> g_next_snapshot_revision{1u};
     if (const auto* dump_session = dynamic_cast<const ICrashDumpSession*>(&session);
         dump_session != nullptr) {
         const CrashDumpSummary& cs = dump_session->crash_summary();
-        tid.backend = (cs.kind == CrashDumpKind::WindowsMinidump)
-                          ? BackendKind::CrashDumpMinidump
-                          : BackendKind::CrashDumpElfCore;
+        if (cs.kind == CrashDumpKind::WindowsMinidump) {
+            tid.backend = BackendKind::CrashDumpMinidump;
+        } else if (cs.kind == CrashDumpKind::MachOCore) {
+            tid.backend = BackendKind::CrashDumpMachOCore;
+        } else {
+            tid.backend = BackendKind::CrashDumpElfCore;
+        }
         if (!cs.sha256.empty() && tid.image_sha256.empty()) {
             tid.image_sha256 = cs.sha256;
         }
@@ -1728,8 +1732,7 @@ void populate_runtime_settings_from_snapshot(
     report.launch_environment = snapshot.launch_environment;
 
     const ProvenanceTag prov =
-        (snapshot.target_id.backend == BackendKind::CrashDumpMinidump ||
-         snapshot.target_id.backend == BackendKind::CrashDumpElfCore)
+        is_crash_dump_backend(snapshot.target_id.backend)
             ? ProvenanceTag::CrashDump
             : ProvenanceTag::ProcOrOsApi;
 

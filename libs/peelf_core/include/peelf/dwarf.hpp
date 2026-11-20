@@ -86,22 +86,24 @@ struct DwarfSectionViews {
 /// Extracts `.note.gnu.build-id` and `.gnu_debuglink` metadata from an ELF image.
 [[nodiscard]] ElfDebugLinkInfo extract_elf_debug_link_info(const IBinaryImage& image);
 
-/// Searches standard separate-debug locations (`.gnu_debuglink` sibling / `.debug/` /
-/// `/usr/lib/debug`, `.note.gnu.build-id` `.build-id/xx/yyyy.debug`, and `<bin>.debug`).
+/// Searches standard separate-debug locations (ELF `.gnu_debuglink` sibling / `.debug/` /
+/// `/usr/lib/debug`, `.note.gnu.build-id` `.build-id/xx/yyyy.debug`, `<bin>.debug`, and
+/// Mach-O `LC_UUID`-verified `<bin>.dSYM/Contents/Resources/DWARF/*` bundles).
 [[nodiscard]] std::optional<std::filesystem::path> find_separate_debug_file(
     const std::filesystem::path& binary_path,
     const IBinaryImage& image,
     std::span<const std::filesystem::path> extra_search_dirs = {});
 
-/// Returns true if `image` contains non-empty `.debug_info` or `.debug_line` sections.
+/// Returns true if `image` contains non-empty ELF/MinGW `.debug_info`/`.debug_line`
+/// or Mach-O `__DWARF,__debug_info`/`__DWARF,__debug_line` sections.
 [[nodiscard]] bool has_embedded_dwarf(const IBinaryImage& image) noexcept;
 
 /// Parses DWARF v2..v5 `.debug_info`, `.debug_abbrev`, `.debug_str`, `.debug_line_str`,
 /// `.debug_str_offsets`, `.debug_addr`, and `.debug_line` from raw section buffers.
 [[nodiscard]] Result<DwarfDebugData> parse_dwarf_sections(const DwarfSectionViews& views);
 
-/// Parses DWARF v2..v5 debug info directly from a parsed ELF or MinGW PE image
-/// and its backing raw file bytes (either an unstripped binary or a separate `.debug` sidecar).
+/// Parses DWARF v2..v5 debug info directly from a parsed ELF, MinGW PE, or Mach-O / `.dSYM` image
+/// and its backing raw file bytes (either an unstripped binary or a separate debug companion).
 [[nodiscard]] Result<DwarfDebugData> parse_dwarf_image(const IBinaryImage& image,
                                                        std::span<const std::uint8_t> file_bytes);
 

@@ -54,6 +54,7 @@ enum class OsKind : std::uint8_t {
     Unknown = 0,
     Windows,
     Linux,
+    Darwin,
     FreeBsd,
     OpenBsd,
     NetBsd,
@@ -67,6 +68,7 @@ enum class OsKind : std::uint8_t {
         case OsKind::Unknown:   return "Unknown";
         case OsKind::Windows:   return "Windows";
         case OsKind::Linux:     return "Linux";
+        case OsKind::Darwin:    return "Darwin";
         case OsKind::FreeBsd:   return "FreeBsd";
         case OsKind::OpenBsd:   return "OpenBsd";
         case OsKind::NetBsd:    return "NetBsd";

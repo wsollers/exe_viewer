@@ -674,7 +674,15 @@ using detail::utf8_path;
             // so inspect the backing on-disk ELF/PE image when available and rebase onto `image_->image_base()`.
             std::unique_ptr<peelf::IBinaryImage> disk_image;
             if (!live_backing_file_bytes_.empty()) {
-                if (auto parsed_disk = peelf::parse_image(live_backing_file_bytes_)) {
+                peelf::BinaryOpenOptions open_opts{};
+                if (image_->architecture() != peelf::Architecture::Unknown) {
+                    open_opts.preferred_architecture = image_->architecture();
+                }
+                auto parsed_disk = peelf::parse_image(live_backing_file_bytes_, open_opts);
+                if (!parsed_disk && open_opts.preferred_architecture.has_value()) {
+                    parsed_disk = peelf::parse_image(live_backing_file_bytes_);
+                }
+                if (parsed_disk) {
                     disk_image = std::move(*parsed_disk);
                 }
             }

@@ -156,6 +156,8 @@ struct ThreadContext {
     SubsystemStatus status{};
 };
 
+using RegisterContext = ThreadContext;
+
 struct MemoryProtection {
     bool readable{false};
     bool writable{false};
@@ -421,6 +423,9 @@ public:
         ctx.layout = target_layout();
         ctx.status = SubsystemStatus::unavailable("session", "thread context is not supported");
         return ctx;
+    }
+    [[nodiscard]] ThreadContext read_registers(ThreadId tid) {
+        return thread_context(tid);
     }
 
     [[nodiscard]] virtual ForgivingValue<std::vector<std::uint8_t>> proc_auxv() {

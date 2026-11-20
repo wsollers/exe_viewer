@@ -21,12 +21,14 @@ namespace peelf {
 enum class CrashDumpKind : std::uint8_t {
     WindowsMinidump = 0,
     ElfCore = 1,
+    MachOCore = 2,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(CrashDumpKind kind) noexcept {
     switch (kind) {
         case CrashDumpKind::WindowsMinidump: return "WindowsMinidump";
         case CrashDumpKind::ElfCore:         return "ElfCore";
+        case CrashDumpKind::MachOCore:       return "MachOCore";
     }
     return "WindowsMinidump";
 }
@@ -87,9 +89,12 @@ public:
 /// Returns true if `bytes` begins with a 32/64-bit LE/BE ELF header whose `e_type == ET_CORE` (`4`).
 [[nodiscard]] bool is_elf_core_dump(std::span<const std::uint8_t> bytes) noexcept;
 
-/// Returns true if `bytes` is either a Windows Minidump or an ELF `ET_CORE` crash dump.
+/// Returns true if `bytes` begins with a thin or Universal/FAT Mach-O container whose slice(s) have `filetype == MH_CORE` (`0x4`).
+[[nodiscard]] bool is_macho_core_dump(std::span<const std::uint8_t> bytes) noexcept;
+
+/// Returns true if `bytes` is a Windows Minidump, ELF `ET_CORE`, or Mach-O `MH_CORE` crash dump.
 [[nodiscard]] inline bool is_crash_dump_bytes(std::span<const std::uint8_t> bytes) noexcept {
-    return is_windows_minidump(bytes) || is_elf_core_dump(bytes);
+    return is_windows_minidump(bytes) || is_elf_core_dump(bytes) || is_macho_core_dump(bytes);
 }
 
 /// Maps a Win32 / NTSTATUS exception code (e.g. `0xC0000005`) to its symbolic name.
@@ -108,7 +113,12 @@ public:
     std::vector<std::uint8_t> bytes,
     std::filesystem::path source_path = {});
 
-/// Auto-detects `"MDMP"` vs. ELF `ET_CORE` and opens `bytes` as an offline `ICrashDumpSession`.
+/// Opens an in-memory macOS/Darwin Mach-O `MH_CORE` buffer as an offline `ICrashDumpSession`.
+[[nodiscard]] Result<std::unique_ptr<ICrashDumpSession>> open_macho_core_bytes(
+    std::vector<std::uint8_t> bytes,
+    std::filesystem::path source_path = {});
+
+/// Auto-detects `"MDMP"`, ELF `ET_CORE`, or Mach-O `MH_CORE` and opens `bytes` as an offline `ICrashDumpSession`.
 [[nodiscard]] Result<std::unique_ptr<ICrashDumpSession>> open_crash_dump_bytes(
     std::vector<std::uint8_t> bytes,
     std::filesystem::path source_path = {});
