@@ -33,6 +33,11 @@ endif()
 
 option(PEELF_WARNINGS_AS_ERRORS "Treat warnings as errors on peelf project targets" ON)
 option(PEELF_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+option(PEELF_ENABLE_FUZZERS "Build Clang libFuzzer + ASan + UBSan parser harnesses" OFF)
+if(PEELF_ENABLE_FUZZERS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  message(FATAL_ERROR
+    "PEELF_ENABLE_FUZZERS=ON requires a Clang compiler for libFuzzer + SanitizerCoverage instrumentation (detected '${CMAKE_CXX_COMPILER_ID}').")
+endif()
 
 include(cmake/ProjectOptions.cmake)  # <-- Add here, once
 
@@ -108,6 +113,10 @@ endif()
 if(PEELF_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+if(PEELF_ENABLE_FUZZERS)
+  add_subdirectory(tests/fuzz)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -200,7 +209,8 @@ if(PEELF_CLANG_FORMAT_EXE)
         ${CMAKE_SOURCE_DIR}/apps/viewer/*.cpp
         ${CMAKE_SOURCE_DIR}/apps/viewer/*.hpp
         ${CMAKE_SOURCE_DIR}/apps/viewer/*.h
-        ${CMAKE_SOURCE_DIR}/tests/*.cpp)
+        ${CMAKE_SOURCE_DIR}/tests/*.cpp
+        ${CMAKE_SOURCE_DIR}/tests/fuzz/*.hpp)
     add_custom_target(format
         COMMAND ${PEELF_CLANG_FORMAT_EXE} -i ${PEELF_FORMAT_SOURCES}
         COMMENT "clang-format: rewriting sources in place"

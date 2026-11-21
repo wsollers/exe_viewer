@@ -160,6 +160,57 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --repeat until-pass:2 --parallel 2
 
+  linux-fuzz-smoke:
+    name: Linux Clang 18 (libFuzzer + ASan + UBSan Smoke)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Clang 18 libFuzzer & sanitizer toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-18 \
+            libc++-18-dev \
+            libc++abi-18-dev \
+            libclang-rt-18-dev \
+            cmake \
+            ninja-build \
+            pkg-config
+
+      - name: Configure (clang18-fuzz)
+        run: cmake --preset clang18-fuzz -DPEELF_WARNINGS_AS_ERRORS=ON
+
+      - name: Build (clang18-fuzz)
+        run: cmake --build --preset clang18-fuzz --parallel
+
+      - name: Run 4 libFuzzer + ASan + UBSan smoke harnesses
+        env:
+          ASAN_OPTIONS: detect_leaks=1:alloc_dealloc_mismatch=0:halt_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          set -euo pipefail
+          CORPUS_ROOT="${RUNNER_TEMP}/peelf-fuzz-corpus"
+          ART_DIR="${RUNNER_TEMP}/peelf-fuzz-artifacts"
+          rm -rf "${CORPUS_ROOT}" "${ART_DIR}"
+          mkdir -p "${ART_DIR}"
+          for target in fuzz_binary_image fuzz_debug_formats fuzz_crash_dumps fuzz_parsers_dsl; do
+            SEED_DIR="${CORPUS_ROOT}/${target}"
+            mkdir -p "${SEED_DIR}"
+            find tests/fixtures -maxdepth 1 -type f -exec cp {} "${SEED_DIR}/" \;
+            echo "=== Smoke fuzzing ${target} ==="
+            "./out/build/clang18-fuzz/tests/fuzz/${target}" \
+              -max_total_time=10 \
+              -max_len=262144 \
+              -rss_limit_mb=2048 \
+              -timeout=5 \
+              -print_final_stats=1 \
+              -artifact_prefix="${ART_DIR}/${target}-" \
+              "${SEED_DIR}"
+          done
+          rm -rf "${CORPUS_ROOT}" "${ART_DIR}"
+
   windows-msvc:
     name: Windows MSVC 2022 (${{ matrix.build_type }})
     runs-on: windows-2022

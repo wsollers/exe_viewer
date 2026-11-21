@@ -31,6 +31,77 @@ constexpr std::size_t kMaxRegexWindowBytes = 2048u;
 constexpr std::size_t kRegexWindowOverlapBytes = 256u;
 constexpr std::size_t kMaxRegexGroupDepth = 8u;
 constexpr std::size_t kMaxRegexBraceRepeat = 64u;
+constexpr std::size_t kMaxRegexAlternations = 16u;
+constexpr std::size_t kMaxRegexBranchProduct = 32768u;
+
+struct RegexGroupFrame {
+    std::size_t entry_branch_product{1u};
+    std::size_t max_alt_branch_product{1u};
+    bool has_inner_quantifier{false};
+    bool has_alternation{false};
+    bool has_atoms{false};
+};
+
+struct ParsedBraceQuantifier {
+    std::size_t min_rep{0u};
+    std::optional<std::size_t> max_rep;
+    std::size_t close_index{0u};
+};
+
+[[nodiscard]] Result<ParsedBraceQuantifier> parse_brace_quantifier(std::string_view pattern,
+                                                                   std::size_t open_index) {
+    const std::size_t close = pattern.find('}', open_index + 1u);
+    if (close == std::string_view::npos) {
+        return make_error("unterminated brace quantifier in regex search pattern");
+    }
+    const std::string_view spec = pattern.substr(open_index + 1u, close - (open_index + 1u));
+    if (spec.empty()) {
+        return make_error("empty brace quantifier in regex search pattern");
+    }
+    const std::size_t comma = spec.find(',');
+    const std::string_view first_part =
+        (comma == std::string_view::npos) ? spec : spec.substr(0u, comma);
+    std::size_t min_rep = 0u;
+    const auto [p1, ec1] =
+        std::from_chars(first_part.data(), first_part.data() + first_part.size(), min_rep);
+    if (ec1 != std::errc{} || p1 != first_part.data() + first_part.size() || first_part.empty()) {
+        return make_error("invalid minimum count in regex brace quantifier");
+    }
+    if (min_rep > kMaxRegexBraceRepeat) {
+        return make_error("regex brace repetition exceeds safety limit of 64");
+    }
+
+    ParsedBraceQuantifier out{};
+    out.min_rep = min_rep;
+    out.close_index = close;
+    if (comma == std::string_view::npos) {
+        out.max_rep = min_rep;
+        return out;
+    }
+
+    const std::string_view second_part = spec.substr(comma + 1u);
+    if (!second_part.empty()) {
+        if (second_part.find(',') != std::string_view::npos) {
+            return make_error("invalid regex brace quantifier syntax");
+        }
+        std::size_t max_rep = 0u;
+        const auto [p2, ec2] =
+            std::from_chars(second_part.data(), second_part.data() + second_part.size(), max_rep);
+        if (ec2 != std::errc{} || p2 != second_part.data() + second_part.size() ||
+            max_rep < min_rep) {
+            return make_error("invalid maximum count in regex brace quantifier");
+        }
+        if (max_rep > kMaxRegexBraceRepeat) {
+            return make_error("regex brace repetition exceeds safety limit of 64");
+        }
+        out.max_rep = max_rep;
+    }
+    return out;
+}
+
+[[nodiscard]] constexpr bool is_regex_quantifier_start(char ch) noexcept {
+    return ch == '*' || ch == '+' || ch == '?' || ch == '{';
+}
 
 [[nodiscard]] Result<std::regex> validate_and_compile_regex(std::string_view pattern,
                                                             bool case_sensitive) {
@@ -43,13 +114,40 @@ constexpr std::size_t kMaxRegexBraceRepeat = 64u;
 
     bool in_char_class = false;
     std::size_t char_class_start = 0u;
-    std::vector<bool> group_has_inner_quantifier;
-    group_has_inner_quantifier.reserve(kMaxRegexGroupDepth);
+    bool prev_can_quantify = false;
+    std::size_t total_alternations = 0u;
+    std::size_t branch_product = 1u;
+    std::vector<RegexGroupFrame> groups;
+    groups.reserve(kMaxRegexGroupDepth);
 
-    auto mark_quantifier_in_current_group = [&]() {
-        if (!group_has_inner_quantifier.empty()) {
-            group_has_inner_quantifier.back() = true;
+    auto mark_atom = [&]() noexcept {
+        prev_can_quantify = true;
+        if (!groups.empty()) {
+            groups.back().has_atoms = true;
         }
+    };
+
+    auto apply_quantifier = [&](std::size_t branch_span, std::size_t& idx) -> Result<void> {
+        if (!prev_can_quantify) {
+            return make_error("quantifier has no repeatable atom in regex search pattern");
+        }
+        prev_can_quantify = false;
+        if (!groups.empty()) {
+            groups.back().has_inner_quantifier = true;
+        }
+        if (branch_span > 1u) {
+            if (branch_product > (kMaxRegexBranchProduct / branch_span)) {
+                return make_error("regex quantifier complexity exceeds bounded-time safety budget");
+            }
+            branch_product *= branch_span;
+        }
+        if (idx + 1u < pattern.size() && pattern[idx + 1u] == '?') {
+            ++idx;
+        }
+        if (idx + 1u < pattern.size() && is_regex_quantifier_start(pattern[idx + 1u])) {
+            return make_error("stacked quantifiers rejected in regex search pattern");
+        }
+        return {};
     };
 
     for (std::size_t i = 0u; i < pattern.size(); ++i) {
@@ -66,16 +164,39 @@ constexpr std::size_t kMaxRegexBraceRepeat = 64u;
             if (next == '\0') {
                 return make_error("regex search pattern must not contain NUL bytes");
             }
-            if (!in_char_class && next >= '1' && next <= '9') {
-                return make_error(
-                    "regex backreferences (\\1..\\9) are disallowed for bounded-time safety");
+            if (!in_char_class) {
+                if (next >= '1' && next <= '9') {
+                    return make_error(
+                        "regex backreferences (\\1..\\9) are disallowed for bounded-time safety");
+                }
+                if (next == 'b' || next == 'B') {
+                    prev_can_quantify = false;
+                } else {
+                    mark_atom();
+                }
             }
             continue;
         }
 
         if (in_char_class) {
-            if (ch == ']' && i > char_class_start + 1u) {
+            if (ch == '[' && i + 1u < pattern.size() &&
+                (pattern[i + 1u] == ':' || pattern[i + 1u] == '.' || pattern[i + 1u] == '=')) {
+                const char delim = pattern[i + 1u];
+                const std::array<char, 2> end_seq = {delim, ']'};
+                const std::size_t nested_end =
+                    pattern.find(std::string_view(end_seq.data(), end_seq.size()), i + 2u);
+                if (nested_end == std::string_view::npos) {
+                    return make_error("unterminated POSIX class in regex character class");
+                }
+                i = nested_end + 1u;
+                continue;
+            }
+            if (ch == ']') {
+                if (i <= char_class_start + 1u) {
+                    return make_error("empty character class rejected in regex search pattern");
+                }
                 in_char_class = false;
+                mark_atom();
             }
             continue;
         }
@@ -84,102 +205,135 @@ constexpr std::size_t kMaxRegexBraceRepeat = 64u;
             in_char_class = true;
             char_class_start = i;
             if (i + 1u < pattern.size() && pattern[i + 1u] == '^') {
-                char_class_start = i + 1u;
+                ++i;
+                char_class_start = i;
+            }
+            continue;
+        }
+
+        if (ch == '|') {
+            ++total_alternations;
+            if (total_alternations > kMaxRegexAlternations) {
+                return make_error("regex alternation count exceeds bounded-time safety limit");
+            }
+            prev_can_quantify = false;
+            if (!groups.empty()) {
+                auto& frame = groups.back();
+                frame.has_alternation = true;
+                frame.max_alt_branch_product =
+                    std::max(frame.max_alt_branch_product, branch_product);
+                branch_product = frame.entry_branch_product;
+            } else {
+                branch_product = 1u;
             }
             continue;
         }
 
         if (ch == '(') {
-            if (group_has_inner_quantifier.size() >= kMaxRegexGroupDepth) {
+            if (groups.size() >= kMaxRegexGroupDepth) {
                 return make_error("regex group nesting exceeds maximum depth of 8");
             }
-            group_has_inner_quantifier.push_back(false);
             if (i + 1u < pattern.size() && pattern[i + 1u] == '?') {
-                ++i;
-                if (i + 1u < pattern.size() &&
-                    (pattern[i + 1u] == ':' || pattern[i + 1u] == '=' || pattern[i + 1u] == '!')) {
-                    ++i;
+                if (i + 2u >= pattern.size() || pattern[i + 2u] != ':') {
+                    return make_error("regex lookaround and special group extensions are "
+                                      "disallowed for bounded-time safety");
                 }
+                i += 2u;
             }
+            groups.push_back(RegexGroupFrame{
+                .entry_branch_product = branch_product,
+                .max_alt_branch_product = branch_product,
+            });
+            prev_can_quantify = false;
             continue;
         }
 
         if (ch == ')') {
-            if (group_has_inner_quantifier.empty()) {
+            if (groups.empty()) {
                 return make_error("unmatched closing parenthesis in regex search pattern");
             }
-            const bool inner_quant = group_has_inner_quantifier.back();
-            group_has_inner_quantifier.pop_back();
+            const RegexGroupFrame closed = groups.back();
+            groups.pop_back();
+            branch_product = std::max(closed.max_alt_branch_product, branch_product);
 
             const bool outer_quant =
-                (i + 1u < pattern.size()) &&
-                (pattern[i + 1u] == '*' || pattern[i + 1u] == '+' ||
-                 pattern[i + 1u] == '?' || pattern[i + 1u] == '{');
-            if (inner_quant && outer_quant) {
-                return make_error(
-                    "nested quantified group rejected to prevent catastrophic backtracking");
+                (i + 1u < pattern.size()) && is_regex_quantifier_start(pattern[i + 1u]);
+            if (outer_quant) {
+                if (!closed.has_atoms) {
+                    return make_error("quantified empty group rejected in regex search pattern");
+                }
+                if (closed.has_inner_quantifier) {
+                    return make_error(
+                        "nested quantified group rejected to prevent catastrophic backtracking");
+                }
+                bool outer_repeats_multiple = true;
+                if (pattern[i + 1u] == '?') {
+                    outer_repeats_multiple = false;
+                } else if (pattern[i + 1u] == '{') {
+                    const auto brace = parse_brace_quantifier(pattern, i + 1u);
+                    if (!brace) {
+                        return std::unexpected(brace.error());
+                    }
+                    outer_repeats_multiple = !brace->max_rep.has_value() || (*brace->max_rep > 1u);
+                }
+                if (closed.has_alternation && outer_repeats_multiple) {
+                    return make_error("quantified alternation group rejected to prevent "
+                                      "catastrophic backtracking");
+                }
             }
-            if ((inner_quant || outer_quant) && !group_has_inner_quantifier.empty()) {
-                group_has_inner_quantifier.back() = true;
+
+            if (!groups.empty()) {
+                auto& parent = groups.back();
+                parent.has_atoms = parent.has_atoms || closed.has_atoms;
+                parent.has_alternation = parent.has_alternation || closed.has_alternation;
+                parent.has_inner_quantifier =
+                    parent.has_inner_quantifier || closed.has_inner_quantifier || outer_quant;
+            }
+            prev_can_quantify = true;
+            continue;
+        }
+
+        if (ch == '*' || ch == '+') {
+            if (const auto q = apply_quantifier(kMaxRegexWindowBytes, i); !q) {
+                return std::unexpected(q.error());
             }
             continue;
         }
 
-        if (ch == '*' || ch == '+' || ch == '?') {
-            mark_quantifier_in_current_group();
+        if (ch == '?') {
+            if (const auto q = apply_quantifier(2u, i); !q) {
+                return std::unexpected(q.error());
+            }
             continue;
         }
 
         if (ch == '{') {
-            const std::size_t close = pattern.find('}', i + 1u);
-            if (close == std::string_view::npos) {
-                return make_error("unterminated brace quantifier in regex search pattern");
+            const auto brace = parse_brace_quantifier(pattern, i);
+            if (!brace) {
+                return std::unexpected(brace.error());
             }
-            const std::string_view spec = pattern.substr(i + 1u, close - (i + 1u));
-            if (spec.empty()) {
-                return make_error("empty brace quantifier in regex search pattern");
+            const std::size_t span = brace->max_rep.has_value()
+                                         ? ((*brace->max_rep - brace->min_rep) + 1u)
+                                         : kMaxRegexWindowBytes;
+            i = brace->close_index;
+            if (const auto q = apply_quantifier(span, i); !q) {
+                return std::unexpected(q.error());
             }
-            const std::size_t comma = spec.find(',');
-            const std::string_view first_part =
-                (comma == std::string_view::npos) ? spec : spec.substr(0u, comma);
-            std::size_t min_rep = 0u;
-            const auto [p1, ec1] = std::from_chars(
-                first_part.data(), first_part.data() + first_part.size(), min_rep);
-            if (ec1 != std::errc{} || p1 != first_part.data() + first_part.size() ||
-                first_part.empty()) {
-                return make_error("invalid minimum count in regex brace quantifier");
-            }
-            if (min_rep > kMaxRegexBraceRepeat) {
-                return make_error("regex brace repetition exceeds safety limit of 64");
-            }
-            if (comma != std::string_view::npos) {
-                const std::string_view second_part = spec.substr(comma + 1u);
-                if (!second_part.empty()) {
-                    if (second_part.find(',') != std::string_view::npos) {
-                        return make_error("invalid regex brace quantifier syntax");
-                    }
-                    std::size_t max_rep = 0u;
-                    const auto [p2, ec2] = std::from_chars(
-                        second_part.data(), second_part.data() + second_part.size(), max_rep);
-                    if (ec2 != std::errc{} || p2 != second_part.data() + second_part.size() ||
-                        max_rep < min_rep) {
-                        return make_error("invalid maximum count in regex brace quantifier");
-                    }
-                    if (max_rep > kMaxRegexBraceRepeat) {
-                        return make_error("regex brace repetition exceeds safety limit of 64");
-                    }
-                }
-            }
-            mark_quantifier_in_current_group();
-            i = close;
             continue;
         }
+
+        if (ch == '^' || ch == '$') {
+            prev_can_quantify = false;
+            continue;
+        }
+
+        mark_atom();
     }
 
     if (in_char_class) {
         return make_error("unterminated character class in regex search pattern");
     }
-    if (!group_has_inner_quantifier.empty()) {
+    if (!groups.empty()) {
         return make_error("unclosed parenthesis in regex search pattern");
     }
 

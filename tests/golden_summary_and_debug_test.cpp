@@ -1364,10 +1364,15 @@ TEST(MemorySearchRegex, BoundedRegexMatchesCrossWindowAndRejectsUnsafeOrInvalidP
     EXPECT_EQ(live_res->hits.size(), 3u);
 
     // Adversarial & malformed regexes must return an error without throwing!
-    const std::array<std::string, 6> rejected_patterns = {
+    const std::array<std::string, 11> rejected_patterns = {
         "[unterminated",
         "(a+)+$",                       // catastrophic nested quantifier
         "([a-zA-Z0-9_]+)*!",            // nested quantified group
+        "(a|a)+b",                      // quantified alternation group
+        "((a|b))+z",                    // nested quantified alternation group
+        ".*.*z",                        // cubic multi-wildcard backtracking
+        "[^](a+)+[x]",                  // empty negated char-class smuggle
+        "(?=a+)a+z",                    // lookaround backtracking disallowed
         "(ab)\\1",                      // backreference disallowed
         "a{128}",                       // brace repeat > 64
         std::string(520u, 'x'),         // > 512-byte pattern limit

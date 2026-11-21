@@ -173,11 +173,17 @@ cmake --preset clang18-asan-ubsan
 cmake --build --preset clang18-asan-ubsan
 ASAN_OPTIONS=detect_leaks=1:alloc_dealloc_mismatch=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
   ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure
+
+# Opt-in Clang libFuzzer + ASan + UBSan parser harnesses (-DPEELF_ENABLE_FUZZERS=ON)
+cmake --preset clang18-fuzz
+cmake --build --preset clang18-fuzz
+ASAN_OPTIONS=detect_leaks=1:alloc_dealloc_mismatch=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+  ./out/build/clang18-fuzz/tests/fuzz/fuzz_binary_image -max_total_time=20 -rss_limit_mb=2048 -timeout=5
 ```
 
-Output binary: `out/build/<preset>/apps/viewer/peelf_viewer`
+Output binary: `out/build/<preset>/apps/viewer/peelf_viewer` (fuzzer harnesses: `out/build/clang18-fuzz/tests/fuzz/fuzz_{binary_image,debug_formats,crash_dumps,parsers_dsl}`)
 
-Continuous integration in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `clang18-debug`, `clang18-release`, `clang18-asan-ubsan`, and Windows MSVC 2022 `Debug` + `Release` (with `-Werror` / `/WX /FS` and `--headless` JSON/SARIF smoke checks) on every push and pull request.
+Continuous integration in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `clang18-debug`, `clang18-release`, `clang18-asan-ubsan`, `linux-fuzz-smoke` (`clang18-fuzz` `libFuzzer` + ASan + UBSan across all 4 parser harnesses), and Windows MSVC 2022 `Debug` + `Release` (with `-Werror` / `/WX /FS` and `--headless` JSON/SARIF/CSV smoke checks) on every push and pull request.
 
 ### Configure with options
 

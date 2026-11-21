@@ -103,6 +103,11 @@ add_executable(peelf_tests
   decompiler_contract_test.cpp
   golden_summary_and_debug_test.cpp
   runtime_paths_and_version_test.cpp
+  fuzz_corpus_regression_test.cpp
+  fuzz/fuzz_binary_image.cpp
+  fuzz/fuzz_debug_formats.cpp
+  fuzz/fuzz_crash_dumps.cpp
+  fuzz/fuzz_parsers_dsl.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/runtime_paths.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/disasm/linear_disassembly.cpp
@@ -150,6 +155,7 @@ target_link_libraries(peelf_tests PRIVATE
 
 target_include_directories(peelf_tests PRIVATE
   ${CMAKE_SOURCE_DIR}/apps/viewer/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/fuzz
 )
 
 if(MSVC)
