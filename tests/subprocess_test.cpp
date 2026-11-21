@@ -99,24 +99,29 @@ TEST(SubprocessQuoteTest, OrdinaryPathsAndUncPathsNeverDoubleBackslashes) {
 TEST(SubprocessQuoteTest, SpacesEmbeddedQuotesUncAndTrailingBackslashesFollowCommandLineToArgvW) {
     EXPECT_EQ(peelf::quote_windows_arg(""), "\"\"");
 
-    // Ordinary path separators inside a quoted path with spaces must NOT be doubled.
-    EXPECT_EQ(peelf::quote_windows_arg(R"(C:\Program Files\Graphviz\bin\dot.exe)"),
-              R"("C:\Program Files\Graphviz\bin\dot.exe")");
-
-    // UNC prefix inside a quoted path with spaces must remain \\ (not \\\\).
-    EXPECT_EQ(peelf::quote_windows_arg(R"(\\server\share name\Graphviz\dot.exe)"),
-              R"("\\server\share name\Graphviz\dot.exe")");
-
-    // Trailing backslashes immediately before the closing quote MUST be doubled.
-    EXPECT_EQ(peelf::quote_windows_arg(R"(C:\Program Files\Graphviz\)"),
-              R"("C:\Program Files\Graphviz\\")");
-    EXPECT_EQ(peelf::quote_windows_arg(R"(C:\Program Files\Graphviz\\)"),
-              R"("C:\Program Files\Graphviz\\\\")");
-
-    // Embedded quotes and backslashes immediately preceding embedded quotes.
-    EXPECT_EQ(peelf::quote_windows_arg(R"(label="main")"), R"("label=\"main\"")");
-    EXPECT_EQ(peelf::quote_windows_arg(R"(C:\dir\"quoted"\file)"),
-              R"("C:\dir\\\"quoted\"\file")");
+    struct QuoteCase {
+        std::string_view input;
+        std::string_view expected;
+    };
+    constexpr std::array<QuoteCase, 6> kCases{{
+        // Ordinary path separators inside a quoted path with spaces must NOT be doubled.
+        {R"(C:\Program Files\Graphviz\bin\dot.exe)",
+         R"("C:\Program Files\Graphviz\bin\dot.exe")"},
+        // UNC prefix inside a quoted path with spaces must remain \\ (not \\\\).
+        {R"(\\server\share name\Graphviz\dot.exe)",
+         R"("\\server\share name\Graphviz\dot.exe")"},
+        // Trailing backslashes immediately before the closing quote MUST be doubled.
+        {R"(C:\Program Files\Graphviz\)",
+         R"("C:\Program Files\Graphviz\\")"},
+        {R"(C:\Program Files\Graphviz\\)",
+         R"("C:\Program Files\Graphviz\\\\")"},
+        // Embedded quotes and backslashes immediately preceding embedded quotes.
+        {R"(label="main")", R"("label=\"main\"")"},
+        {R"(C:\dir\"quoted"\file)", R"("C:\dir\\\"quoted\"\file")"},
+    }};
+    for (const auto& tc : kCases) {
+        EXPECT_EQ(peelf::quote_windows_arg(tc.input), tc.expected);
+    }
 
     const std::vector<std::string> vectors = {
         "",
