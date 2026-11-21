@@ -958,15 +958,29 @@ private:
 
             std::vector<std::pair<std::filesystem::path, std::string>> direct_candidates;
             const std::filesystem::path exp_path(expanded);
-            if (exp_path.is_relative() && !parent_origin.empty()) {
+            const bool posix_relative = !requested_name.starts_with('/') && exp_path.is_relative();
+            if (posix_relative && !parent_origin.empty()) {
                 direct_candidates.emplace_back((parent_origin / exp_path).lexically_normal(),
                                                "relative module path");
             }
             if (!opts_.sysroot.empty() && expanded.starts_with('/')) {
-                direct_candidates.emplace_back((opts_.sysroot / expanded.substr(1)).lexically_normal(),
+                direct_candidates.emplace_back((opts_.sysroot / expanded.substr(1u)).lexically_normal(),
                                                "sysroot direct path");
             }
-            if (opts_.include_default_system_dirs || exp_path.is_relative()) {
+            const std::string leaf_name = exp_path.filename().string();
+            for (const auto& sr : opts_.search_roots) {
+                if (expanded.starts_with('/')) {
+                    direct_candidates.emplace_back(
+                        (sr / expanded.substr(1u)).lexically_normal(),
+                        std::format("configured search root '{}'", sr.generic_string()));
+                }
+                if (!leaf_name.empty()) {
+                    direct_candidates.emplace_back(
+                        (sr / leaf_name).lexically_normal(),
+                        std::format("configured search root '{}'", sr.generic_string()));
+                }
+            }
+            if (opts_.include_default_system_dirs || !requested_name.starts_with('/')) {
                 direct_candidates.emplace_back(exp_path.lexically_normal(), "direct ELF path");
             }
 

@@ -223,6 +223,7 @@ struct ElfSecuritySpec {
     std::string runpath{"/usr/lib/myapp"};
     bool emit_empty_rpath{false};
     bool emit_empty_runpath{false};
+    bool emit_interp{true};
     bool has_cet_note{true};
     std::uint8_t code_imm{0x2Au};
 };
@@ -324,7 +325,7 @@ std::vector<std::uint8_t> build_elf64_security_fixture(const ElfSecuritySpec& sp
         return off;
     };
 
-    const std::uint64_t interp_off = append_aligned(interp_bytes);
+    const std::uint64_t interp_off = spec.emit_interp ? append_aligned(interp_bytes) : 0u;
     const std::uint64_t note_off = spec.has_cet_note ? append_aligned(note_bytes) : 0u;
     const std::uint64_t text_off = append_aligned(text_bytes);
     const std::uint64_t rodata_off = append_aligned(rodata_bytes);
@@ -380,8 +381,10 @@ std::vector<std::uint8_t> build_elf64_security_fixture(const ElfSecuritySpec& sp
         put64(out, ph + 48u, 0x1000u);
     };
 
-    // PT_INTERP
-    push_phdr(3u, 4u, interp_off, 0x0300u, interp_bytes.size(), interp_bytes.size());
+    // Optional PT_INTERP
+    if (spec.emit_interp) {
+        push_phdr(3u, 4u, interp_off, 0x0300u, interp_bytes.size(), interp_bytes.size());
+    }
     // PT_LOAD (.text)
     push_phdr(1u, spec.rwx_segment ? 7u : 5u, text_off, 0x1000u, text_bytes.size(), text_bytes.size());
     // PT_LOAD (.rodata + .dynstr + .dynamic)
@@ -416,7 +419,11 @@ std::vector<std::uint8_t> build_elf64_security_fixture(const ElfSecuritySpec& sp
         put64(out, sh + 56u, entsz);
     };
 
-    write_sh(1u, sh_interp_nm, 1u, 0x2u, 0x0300u, interp_off, interp_bytes.size());
+    if (spec.emit_interp) {
+        write_sh(1u, sh_interp_nm, 1u, 0x2u, 0x0300u, interp_off, interp_bytes.size());
+    } else {
+        write_sh(1u, sh_interp_nm, 8u, 0u, 0u, 0u, 0u); // SHT_NOBITS placeholder
+    }
     if (spec.has_cet_note) {
         write_sh(2u, sh_note_nm, 7u, 0x2u, 0x0340u, note_off, note_bytes.size()); // SHT_NOTE = 7
     } else {
@@ -770,6 +777,14 @@ TEST(SecurityHeadlessCliTest, JsonSarifComparePolicyGatesAndBinaryModelIntegrati
 
     write_bytes(hardened_elf, build_elf64_security_fixture(ElfSecuritySpec{}));
     write_bytes(modified_elf, build_elf64_security_fixture(v2_spec));
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(tmp.dir / "lib64", ec);
+        ElfSecuritySpec ld_spec{};
+        ld_spec.emit_interp = false;
+        write_bytes(tmp.dir / "lib64" / "ld-linux-x86-64.so.2",
+                    build_elf64_security_fixture(ld_spec));
+    }
     write_bytes(hardened_pe, build_hardened_pe64());
     write_bytes(low_entropy_pe, build_hardened_pe64(0x4140u));
     write_bytes(dummy_cert_pe, build_hardened_pe64(0x41E0u, PeCertFixtureMode::MalformedDummyCert));

@@ -860,3 +860,34 @@ TEST(DependencyTreeTest, ShortestDepthBfsDiamondExpansionAndNonThrowingDirectory
     EXPECT_EQ(shared_item.children[0].depth, 2u);
 }
 
+TEST(DependencyTreeTest, ElfPtInterpResolvesViaSearchRootWithoutHostSystemDirs) {
+    peelf_test::ScopedTempDir temp_dir("peelf_wu44_elf_interp_search_root");
+    const fs::path& scratch = temp_dir.path();
+
+    write_bytes(scratch / "lib64" / "ld-linux-x86-64.so.2", build_synthetic_elf(SynthElfSpec{
+        .e_type = 3,
+        .soname = "ld-linux-x86-64.so.2",
+    }));
+    const fs::path app_path = scratch / "app.elf";
+    write_bytes(app_path, build_synthetic_elf(SynthElfSpec{
+        .e_type = 3,
+        .interpreter = "/lib64/ld-linux-x86-64.so.2",
+    }));
+
+    peelf::DependencyResolveOptions opts;
+    opts.include_default_system_dirs = false;
+    opts.search_roots = {scratch};
+
+    auto graph_res = peelf::build_dependency_graph_from_file(app_path, opts);
+    ASSERT_TRUE(graph_res.has_value()) << graph_res.error().message;
+    const peelf::DependencyGraph& g = *graph_res;
+
+    EXPECT_EQ(g.summary.direct_dependencies, 1u);
+    EXPECT_EQ(g.summary.resolved_count, 1u);
+    EXPECT_EQ(g.summary.missing_libraries, 0u);
+    ASSERT_EQ(g.edges.size(), 1u);
+    EXPECT_EQ(g.edges[0].kind, peelf::DependencyEdgeKind::DynamicLinkerInterp);
+    EXPECT_EQ(g.edges[0].resolution_status, peelf::DependencyResolutionStatus::ResolvedOnDisk);
+}
+
+
