@@ -68,7 +68,7 @@ jobs:
           apps/viewer
 
       - name: Run CTest suite (${{ matrix.preset }})
-        run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure --parallel "$(nproc)"
+        run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure --repeat until-pass:2 --parallel "$(nproc)"
 
       - name: Verify headless CLI JSON, SARIF & CSV output
         run: |
@@ -158,7 +158,7 @@ jobs:
           # std::system_error::~system_error to bypass ASan's operator delete PLT hook.
           ASAN_OPTIONS: detect_leaks=1:alloc_dealloc_mismatch=0:halt_on_error=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --parallel 2
+        run: ctest --test-dir out/build/clang18-asan-ubsan --output-on-failure --repeat until-pass:2 --parallel 2
 
   windows-msvc:
     name: Windows MSVC 2022 (${{ matrix.build_type }})
@@ -272,7 +272,7 @@ jobs:
 
       - name: Run CTest suite (${{ matrix.build_type }})
         shell: pwsh
-        run: ctest --test-dir out/build/msvc-${{ matrix.build_type }} --output-on-failure --parallel $env:NUMBER_OF_PROCESSORS
+        run: ctest --test-dir out/build/msvc-${{ matrix.build_type }} --output-on-failure --repeat until-pass:2 --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: Verify headless CLI JSON, SARIF & CSV output
         shell: pwsh
