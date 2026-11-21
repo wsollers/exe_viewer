@@ -242,6 +242,7 @@ All 39 workspace panels are listed below (`kWorkspaceLayoutSchemaVersion = 12`).
 | PE Headers | Inspect PE-specific DOS, file, and optional-header fields. |
 | PE Imports | Inspect PE import descriptors and their entries. |
 | PE Exports | Inspect the PE export directory and filter its entries. |
+| .NET / CLR | Inspect ECMA-335 `BSJB` metadata, `Assembly`/`AssemblyRef` identities, `TypeDef`/`MethodDef`/`Field` signatures, Tiny/Fat CIL bytecode & EH clauses, `ImplMap` P/Invoke imports, and `#US` user strings. |
 | References & Notes | Follow incoming/outgoing references; edit names, comments, and categorized bookmarks. |
 | Strings | Filter extracted text by encoding, region, length, and reference count. |
 | Data Structures | Search recovered structures, members, and types; **Apply** a layout or browse **Data symbols**. |
@@ -828,6 +829,7 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | `--search-root <dir>` | Repeatable sysroot / staging directory prefix for resolving `DT_NEEDED` / DLL dependencies |
 | `--include-strings` | Extract and embed printable ASCII/UTF-8/UTF-16 strings in the JSON report |
 | `--min-string-len <N>` | Minimum character length for `--include-strings` (default `4`) |
+| `--clr` | Parse `.NET` / CLR ECMA-335 metadata and export runtime version, assembly identity, `AssemblyRef` list, `TypeDef`/`MethodDef` counts, and `ImplMap` P/Invoke imports across `text`, `json`, and RFC 4180 `csv` |
 | `--fail-on <none\|error\|warning>` | CI policy gate (`none` default):<br/>• `error`: exits `2` on any security `Error` finding, missing library, arch mismatch, or unresolved symbol<br/>• `warning`: exits `2` on those dependency errors or any security `Error` **or** `Warning` finding |
 | `-V`, `--version` | Print deterministic version string (`peelf_viewer 1.0.0`) and exit `0` |
 | `-h`, `--help` | Print CLI usage and exit `0` |

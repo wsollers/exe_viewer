@@ -824,6 +824,7 @@ void print_help_usage(std::ostream& stdout_stream) {
         << "  --no-builtin-rules           Disable built-in YARA-lite starter rule pack\n"
         << "  --include-strings            Include extracted printable ASCII/UTF-16 strings\n"
         << "  --min-string-len <N>         Minimum character length for extracted strings (default: 4)\n"
+        << "  --clr                        Include .NET / CLR ECMA-335 metadata, AssemblyRefs & P/Invoke imports\n"
         << "  --fail-on <none|error|warning>\n"
         << "                               CI policy gate (exit 2 on security findings or missing deps)\n"
         << "\nHeadless Lua Scripting Options (--script):\n"

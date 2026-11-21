@@ -467,6 +467,8 @@ using detail::utf8_path;
         handlers_report_ = {};
         security_audit_ = {};
         pe_rich_header_.reset();
+        clr_metadata_.reset();
+        clr_metadata_error_.clear();
         crypto_hits_.clear();
         executable_settings_ = {};
         environment_redaction_policy_ = peelf::EnvironmentRedactionPolicy::RedactSensitiveDefault;
@@ -2378,6 +2380,8 @@ using detail::utf8_path;
 
     void BinaryModel::refresh_signatures_and_crypto() {
         pe_rich_header_.reset();
+        clr_metadata_.reset();
+        clr_metadata_error_.clear();
         crypto_hits_.clear();
 
         if (is_live_process()) {
@@ -2386,6 +2390,13 @@ using detail::utf8_path;
                 if (format_ == BinaryFormat::PE ||
                     (image_ != nullptr && image_->format() == peelf::Format::PE)) {
                     pe_rich_header_ = peelf::parse_pe_rich_header(mod_bytes);
+                }
+                if (image_ != nullptr && image_->pe_clr_header() != nullptr) {
+                    if (auto clr = peelf::parse_clr_metadata(*image_, mod_bytes); clr.has_value()) {
+                        clr_metadata_ = std::move(*clr);
+                    } else {
+                        clr_metadata_error_ = clr.error().message;
+                    }
                 }
                 crypto_hits_ = peelf::scan_crypto_and_packer_constants(mod_bytes, image_.get());
             } else if (session_ != nullptr && is_crash_dump()) {
@@ -2413,6 +2424,13 @@ using detail::utf8_path;
         if (format_ == BinaryFormat::PE ||
             (image_ != nullptr && image_->format() == peelf::Format::PE)) {
             pe_rich_header_ = peelf::parse_pe_rich_header(scan_span);
+        }
+        if (image_ != nullptr && image_->pe_clr_header() != nullptr) {
+            if (auto clr = peelf::parse_clr_metadata(*image_, scan_span); clr.has_value()) {
+                clr_metadata_ = std::move(*clr);
+            } else {
+                clr_metadata_error_ = clr.error().message;
+            }
         }
         crypto_hits_ = peelf::scan_crypto_and_packer_constants(scan_span, image_.get());
     }

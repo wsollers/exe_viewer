@@ -2523,6 +2523,10 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         if (!active_rules.rules.empty()) {
             report.rule_matches = evaluate_signature_rules(active_rules, *report.crash_dump);
         }
+        if (options.include_clr) {
+            report.clr_included = true;
+            report.clr_diagnostic = "CLR metadata extraction requires a static PE binary image";
+        }
         return report;
     }
 
@@ -2598,6 +2602,19 @@ Result<HeadlessAnalysisReport> analyze_binary_headless(const HeadlessCliOptions&
         report.strings_included = true;
         report.strings = extract_headless_strings(
             *report.image, raw_bytes, options.min_string_length, options.max_strings);
+    }
+
+    if (options.include_clr) {
+        report.clr_included = true;
+        if (report.image->pe_clr_header() != nullptr) {
+            if (auto clr_res = parse_clr_metadata(*report.image, raw_bytes); clr_res.has_value()) {
+                report.clr_metadata = std::move(*clr_res);
+            } else {
+                report.clr_diagnostic = clr_res.error().message;
+            }
+        } else {
+            report.clr_diagnostic = "Binary does not contain a PE CLR (IMAGE_COR20_HEADER) directory";
+        }
     }
 
     if (options.compare_path.has_value()) {
@@ -3069,6 +3086,90 @@ std::string format_headless_report_json(const HeadlessAnalysisReport& report) {
         }
         if (!report.strings.empty()) out += "\n  ";
         out += "]";
+    }
+
+    // Optional .NET / CLR ECMA-335 Metadata (`--clr` from `WU-47`)
+    if (report.clr_included) {
+        out += ",\n  \"clr\": {\n";
+        out += std::format("    \"present\": {},\n", report.clr_metadata.has_value() ? "true" : "false");
+        out += "    "; key("diagnostic"); append_json_escaped(out, report.clr_diagnostic);
+        if (report.clr_metadata.has_value()) {
+            const ClrMetadata& clr = *report.clr_metadata;
+            out += ",\n";
+            out += "    "; key("cor20_runtime_version");
+            append_json_escaped(out, std::format("{}.{}", clr.cor20_major_runtime_version, clr.cor20_minor_runtime_version));
+            out += ",\n";
+            out += std::format("    \"cor20_flags\": {},\n", clr.cor20_flags);
+            out += "    "; key("cor20_flags_summary"); append_json_escaped(out, clr.cor20_flags_summary); out += ",\n";
+            out += std::format("    \"entry_point_token\": {},\n", clr.entry_point_token_or_rva);
+            out += std::format("    \"metadata_rva\": {},\n", clr.metadata_rva);
+            out += std::format("    \"metadata_size\": {},\n", clr.metadata_size);
+            out += "    "; key("runtime_version"); append_json_escaped(out, clr.runtime_version); out += ",\n";
+            out += std::format("    \"compressed_tables\": {},\n", clr.compressed_tables ? "true" : "false");
+            out += "    \"module\": { ";
+            const std::string mod_name = clr.module.has_value() ? clr.module->name : std::string{};
+            const std::string mod_mvid = clr.module.has_value() ? clr.module->mvid_guid : std::string{};
+            key("name"); append_json_escaped(out, mod_name); out += ", ";
+            key("mvid"); append_json_escaped(out, mod_mvid);
+            out += " },\n";
+            out += "    \"assembly\": ";
+            if (clr.assembly.has_value()) {
+                const ClrAssemblyInfo& asm_info = *clr.assembly;
+                out += "{ ";
+                key("name"); append_json_escaped(out, asm_info.name); out += ", ";
+                key("version"); append_json_escaped(out, asm_info.version_string()); out += ", ";
+                key("culture"); append_json_escaped(out, asm_info.culture.empty() ? "neutral" : asm_info.culture); out += ", ";
+                out += std::format("\"flags\": {}, ", asm_info.flags);
+                key("public_key_hex"); append_json_escaped(out, asm_info.public_key_hex);
+                out += " },\n";
+            } else {
+                out += "null,\n";
+            }
+            out += std::format("    \"type_ref_count\": {},\n", clr.type_refs.size());
+            out += std::format("    \"type_def_count\": {},\n", clr.type_defs.size());
+            out += std::format("    \"field_count\": {},\n", clr.fields.size());
+            out += std::format("    \"method_def_count\": {},\n", clr.methods.size());
+            out += std::format("    \"member_ref_count\": {},\n", clr.member_refs.size());
+            out += std::format("    \"user_string_count\": {},\n", clr.user_strings.size());
+            out += std::format("    \"assembly_ref_count\": {},\n", clr.assembly_refs.size());
+            out += "    \"assembly_refs\": [";
+            for (std::size_t i = 0u; i < clr.assembly_refs.size(); ++i) {
+                const ClrAssemblyRef& ar = clr.assembly_refs[i];
+                out += (i == 0u) ? "\n" : ",\n";
+                out += "      { ";
+                out += std::format("\"token\": {}, ", ar.token);
+                key("name"); append_json_escaped(out, ar.name); out += ", ";
+                key("version"); append_json_escaped(out, ar.version_string()); out += ", ";
+                key("culture"); append_json_escaped(out, ar.culture.empty() ? "neutral" : ar.culture); out += ", ";
+                key("public_key_or_token_hex"); append_json_escaped(out, ar.public_key_or_token_hex);
+                out += " }";
+            }
+            if (!clr.assembly_refs.empty()) out += "\n    ";
+            out += "],\n";
+            out += std::format("    \"pinvoke_count\": {},\n", clr.pinvoke_entries.size());
+            out += "    \"pinvoke_imports\": [";
+            for (std::size_t i = 0u; i < clr.pinvoke_entries.size(); ++i) {
+                const ClrPInvokeEntry& pi = clr.pinvoke_entries[i];
+                out += (i == 0u) ? "\n" : ",\n";
+                out += "      { ";
+                out += std::format("\"method_token\": {}, ", pi.method_token);
+                key("method_name"); append_json_escaped(out, pi.method_full_name); out += ", ";
+                key("module_name"); append_json_escaped(out, pi.module_name); out += ", ";
+                key("entry_point_name"); append_json_escaped(out, pi.entry_point_name); out += ", ";
+                out += std::format("\"mapping_flags\": {}, ", pi.mapping_flags);
+                key("flags_summary"); append_json_escaped(out, pi.flags_summary());
+                out += " }";
+            }
+            if (!clr.pinvoke_entries.empty()) out += "\n    ";
+            out += "],\n";
+            out += "    \"warnings\": [";
+            for (std::size_t i = 0u; i < clr.diagnostics.size(); ++i) {
+                if (i > 0u) out += ", ";
+                append_json_escaped(out, clr.diagnostics[i]);
+            }
+            out += "]";
+        }
+        out += "\n  }";
     }
 
     // Optional binary comparison (`--compare` from `WU-12`)
@@ -3618,6 +3719,187 @@ std::string format_headless_report_csv(const HeadlessAnalysisReport& report) {
         });
     }
 
+    if (report.clr_included) {
+        if (report.clr_metadata.has_value()) {
+            const ClrMetadata& clr = *report.clr_metadata;
+            const std::string mod_name = clr.module.has_value() ? clr.module->name : std::string{};
+            const std::string mod_mvid = clr.module.has_value() ? clr.module->mvid_guid : std::string{};
+            const std::string asm_name = clr.assembly.has_value() && !clr.assembly->name.empty()
+                                             ? clr.assembly->name
+                                             : mod_name;
+            const std::string asm_ver = clr.assembly.has_value()
+                                            ? clr.assembly->version_string()
+                                            : std::string("0.0.0.0");
+            const std::string md_rva_hex = std::format("0x{:x}", clr.metadata_rva);
+            const std::string md_size_str = std::to_string(clr.metadata_size);
+            const std::string clr_detail = std::format(
+                "version={};mvid={};assembly_refs={};typedefs={};methods={};pinvoke={}",
+                asm_ver,
+                mod_mvid,
+                clr.assembly_refs.size(),
+                clr.type_defs.size(),
+                clr.methods.size(),
+                clr.pinvoke_entries.size());
+            append_csv_row(out, {
+                "clr_summary",
+                target_path,
+                fmt_name,
+                arch_name,
+                asm_name,
+                clr.runtime_version,
+                clr.cor20_flags_summary,
+                md_rva_hex,
+                md_size_str,
+                clr_detail,
+            });
+            for (const ClrAssemblyRef& ar : clr.assembly_refs) {
+                const std::string tok_hex = std::format("0x{:08x}", ar.token);
+                const std::string ver_str = ar.version_string();
+                const std::string detail = std::format(
+                    "culture={};pkt={}",
+                    ar.culture.empty() ? "neutral" : ar.culture,
+                    ar.public_key_or_token_hex);
+                append_csv_row(out, {
+                    "clr_assembly_ref",
+                    target_path,
+                    fmt_name,
+                    arch_name,
+                    ar.name,
+                    "assembly_ref",
+                    ver_str,
+                    tok_hex,
+                    "0",
+                    detail,
+                });
+            }
+            for (const ClrPInvokeEntry& pi : clr.pinvoke_entries) {
+                const std::string tok_hex = std::format("0x{:08x}", pi.method_token);
+                const std::string detail = std::format("managed_method={}", pi.method_full_name);
+                const std::string flags_str = pi.flags_summary();
+                append_csv_row(out, {
+                    "clr_pinvoke",
+                    target_path,
+                    fmt_name,
+                    arch_name,
+                    pi.entry_point_name,
+                    pi.module_name,
+                    flags_str,
+                    tok_hex,
+                    "0",
+                    detail,
+                });
+            }
+        } else {
+            append_csv_row(out, {
+                "clr_summary",
+                target_path,
+                fmt_name,
+                arch_name,
+                "<none>",
+                "clr",
+                "absent",
+                "0x0",
+                "0",
+                report.clr_diagnostic,
+            });
+        }
+    }
+
+    return out;
+}
+
+std::string format_headless_report_text(const HeadlessAnalysisReport& report) {
+    const IBinaryImage* img = report.image.get();
+    const ICrashDumpSession* dump = report.crash_dump.get();
+    std::string out;
+    out.reserve(2048u);
+
+    out += std::format("Target: {}\n", report.binary_path.generic_string());
+    out += std::format("SHA-256: {}\n", report.sha256);
+    out += std::format("Size: {} bytes\n", report.file_size);
+    if (img != nullptr) {
+        out += std::format("Format: {} ({}, {}-bit, {})\n",
+                           to_string(img->format()),
+                           to_string(img->architecture()),
+                           img->is_64bit() ? 64 : 32,
+                           to_string(img->endianness()));
+        out += std::format("Entry Point: 0x{:X} | Image Base: 0x{:X}\n",
+                           img->entry_point(),
+                           img->image_base());
+        out += std::format("Sections: {} | Imports: {} | Exports: {} | Symbols: {}\n",
+                           img->sections().size(),
+                           img->imports().size(),
+                           img->exports().size(),
+                           img->symbols().size());
+    } else if (dump != nullptr) {
+        const CrashDumpSummary& cs = dump->crash_summary();
+        out += std::format("Format: CrashDump ({}, {})\n",
+                           to_string(cs.kind),
+                           to_string(cs.layout.architecture));
+    }
+    out += std::format("Security Findings: {} error(s), {} warning(s), {} note(s), {} pass\n",
+                       report.security.error_count,
+                       report.security.warning_count,
+                       report.security.note_count,
+                       report.security.pass_count);
+
+    if (report.clr_included) {
+        out += "\n[.NET / CLR Metadata]\n";
+        if (!report.clr_metadata.has_value()) {
+            out += std::format("  Status: unavailable ({})\n",
+                               report.clr_diagnostic.empty() ? "not a .NET image" : report.clr_diagnostic);
+        } else {
+            const ClrMetadata& clr = *report.clr_metadata;
+            out += std::format("  CLR Header Version: {}.{} | Flags: 0x{:08X} ({})\n",
+                               clr.cor20_major_runtime_version,
+                               clr.cor20_minor_runtime_version,
+                               clr.cor20_flags,
+                               clr.cor20_flags_summary);
+            out += std::format("  Metadata Runtime: {} ({} stream)\n",
+                               clr.runtime_version,
+                               clr.compressed_tables ? "#~" : "#-");
+            const std::string mod_name =
+                (clr.module.has_value() && !clr.module->name.empty()) ? clr.module->name : "<unnamed>";
+            const std::string mod_mvid =
+                (clr.module.has_value() && !clr.module->mvid_guid.empty()) ? clr.module->mvid_guid : "<none>";
+            out += std::format("  Module: {} (MVID: {})\n", mod_name, mod_mvid);
+            if (clr.assembly.has_value()) {
+                const ClrAssemblyInfo& asm_info = *clr.assembly;
+                out += std::format("  Assembly: {}, Version={}, Culture={}, PublicKey={}\n",
+                                   asm_info.name,
+                                   asm_info.version_string(),
+                                   asm_info.culture.empty() ? "neutral" : asm_info.culture,
+                                   asm_info.public_key_hex.empty() ? "null" : asm_info.public_key_hex);
+            } else {
+                out += "  Assembly: <module-only / no Assembly row>\n";
+            }
+            out += std::format("  Counts: TypeDefs={} | TypeRefs={} | MethodDefs={} | Fields={} | MemberRefs={} | #US={}\n",
+                               clr.type_defs.size(),
+                               clr.type_refs.size(),
+                               clr.methods.size(),
+                               clr.fields.size(),
+                               clr.member_refs.size(),
+                               clr.user_strings.size());
+            out += std::format("  AssemblyRefs ({}):\n", clr.assembly_refs.size());
+            for (const ClrAssemblyRef& ar : clr.assembly_refs) {
+                out += std::format("    - {} (Version={}, Culture={}, PKT={})\n",
+                                   ar.name,
+                                   ar.version_string(),
+                                   ar.culture.empty() ? "neutral" : ar.culture,
+                                   ar.public_key_or_token_hex.empty() ? "null" : ar.public_key_or_token_hex);
+            }
+            out += std::format("  P/Invoke Imports ({}):\n", clr.pinvoke_entries.size());
+            for (const ClrPInvokeEntry& pi : clr.pinvoke_entries) {
+                out += std::format("    - {}!{} -> {} (0x{:08X}, {})\n",
+                                   pi.module_name,
+                                   pi.entry_point_name,
+                                   pi.method_full_name,
+                                   pi.method_token,
+                                   pi.flags_summary());
+            }
+        }
+    }
+
     return out;
 }
 
@@ -3689,13 +3971,15 @@ std::optional<int> try_run_headless_or_help_cli(
             << "\nHeadless Options:\n"
             << "  --slice <index|arch>         Select Universal Mach-O slice by 0-based index or arch name\n"
             << "  --compare <other_binary>     Include static binary & relocation-tolerant function diff\n"
-            << "  --format <json|sarif|csv>    Output format (default: json; sarif emits SARIF 2.1.0; csv emits RFC 4180)\n"
+            << "  --format <json|sarif|csv|text>\n"
+            << "                               Output format (default: json; sarif emits SARIF 2.1.0; csv emits RFC 4180)\n"
             << "  --output <path>              Write report atomically to <path> (default: stdout)\n"
             << "  --search-root <dir>          Extra dependency search directory (repeatable)\n"
             << "  --rules <path>               Evaluate custom YARA-lite rule file (repeatable)\n"
             << "  --no-builtin-rules           Disable built-in YARA-lite starter rule pack\n"
             << "  --include-strings            Include extracted printable ASCII/UTF-16 strings\n"
             << "  --min-string-len <N>         Minimum character length for extracted strings (default: 4)\n"
+            << "  --clr                        Include .NET / CLR ECMA-335 metadata, AssemblyRefs & P/Invoke imports\n"
             << "  --fail-on <none|error|warning>\n"
             << "                               CI policy gate (exit 2 on security findings or missing deps)\n"
             << "  -V, --version                Print version (peelf_viewer " PEELF_VERSION_STRING ") and exit 0\n"
@@ -3762,8 +4046,10 @@ std::optional<int> try_run_headless_or_help_cli(
                 opts.format = HeadlessExportFormat::Sarif;
             } else if (low == "csv") {
                 opts.format = HeadlessExportFormat::Csv;
+            } else if (low == "text") {
+                opts.format = HeadlessExportFormat::Text;
             } else {
-                stderr_stream << "Error: unsupported --format '" << *val << "' (expected json, sarif, or csv)\n";
+                stderr_stream << "Error: unsupported --format '" << *val << "' (expected json, sarif, csv, or text)\n";
                 return 1;
             }
         } else if (a == "--output") {
@@ -3815,6 +4101,12 @@ std::optional<int> try_run_headless_or_help_cli(
                 stderr_stream << "Error: --summary does not take a value\n";
                 return 1;
             }
+        } else if (a == "--clr") {
+            if (inline_val.has_value()) {
+                stderr_stream << "Error: --clr does not take a value\n";
+                return 1;
+            }
+            opts.include_clr = true;
         } else if (a.starts_with('-')) {
             stderr_stream << "Error: unknown headless option '" << a << "'\n";
             return 1;
@@ -3848,6 +4140,9 @@ std::optional<int> try_run_headless_or_help_cli(
             break;
         case HeadlessExportFormat::Csv:
             serialized = format_headless_report_csv(*analysis);
+            break;
+        case HeadlessExportFormat::Text:
+            serialized = format_headless_report_text(*analysis);
             break;
     }
 

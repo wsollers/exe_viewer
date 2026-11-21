@@ -1,6 +1,7 @@
 #include "fuzz_targets.hpp"
 
 #include <peelf/binary_image.hpp>
+#include <peelf/clr_metadata.hpp>
 #include <peelf/executable_settings.hpp>
 #include <peelf/security_audit.hpp>
 #include <peelf/signatures.hpp>
@@ -121,6 +122,27 @@ void exercise_binary_image(const IBinaryImage& img,
     acc ^= img.macho_dylibs().size();
     acc ^= img.macho_rpaths().size();
     acc ^= img.macho_build_versions().size();
+
+    if (img.pe_clr_header() != nullptr) {
+        if (const auto clr_md = parse_clr_metadata(img, raw_bytes); clr_md.has_value()) {
+            acc ^= clr_md->type_defs.size() ^ clr_md->methods.size() ^
+                   clr_md->assembly_refs.size() ^ clr_md->pinvoke_entries.size() ^
+                   clr_md->user_strings.size();
+            std::size_t decoded_methods = 0u;
+            for (const ClrMethodDef& m : clr_md->methods) {
+                if (m.rva == 0u) {
+                    continue;
+                }
+                if (const auto body = disassemble_cil_method(img, raw_bytes, *clr_md, m);
+                    body.has_value()) {
+                    acc ^= body->instructions.size() ^ body->eh_clauses.size() ^ body->code_size;
+                }
+                if (++decoded_methods >= 16u) {
+                    break;
+                }
+            }
+        }
+    }
 
     const auto audit = audit_security(img, raw_bytes);
     acc ^= audit.findings.size() ^ audit.pass_count ^ audit.warning_count ^ audit.error_count;

@@ -63,9 +63,9 @@ TEST(WorkspaceLayoutTest, AllFivePresetsPassStructuralValidationAndCopyMoveClean
     }
 }
 
-TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll39Panels) {
-    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 12u);
-    EXPECT_EQ(kWorkspacePanelCount, 39u);
+TEST(WorkspaceLayoutTest, PanelWindowNameRoundTripsAcrossAll40Panels) {
+    EXPECT_EQ(kWorkspaceLayoutSchemaVersion, 13u);
+    EXPECT_EQ(kWorkspacePanelCount, 40u);
     const std::span<const WorkspacePanelId> panels = all_workspace_panels();
     EXPECT_EQ(panels.size(), kWorkspacePanelCount);
 

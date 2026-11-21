@@ -3,6 +3,7 @@
 #include <peelf/binary_diff.hpp>
 #include <peelf/binary_image.hpp>
 #include <peelf/capability_matrix.hpp>
+#include <peelf/clr_metadata.hpp>
 #include <peelf/crash_dump.hpp>
 #include <peelf/dependency_tree.hpp>
 #include <peelf/error.hpp>
@@ -118,6 +119,7 @@ enum class HeadlessExportFormat : std::uint8_t {
     Json = 0,
     Sarif = 1,
     Csv = 2,
+    Text = 3,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(HeadlessExportFormat fmt) noexcept {
@@ -125,6 +127,7 @@ enum class HeadlessExportFormat : std::uint8_t {
         case HeadlessExportFormat::Json:  return "json";
         case HeadlessExportFormat::Sarif: return "sarif";
         case HeadlessExportFormat::Csv:   return "csv";
+        case HeadlessExportFormat::Text:  return "text";
     }
     return "json";
 }
@@ -164,6 +167,7 @@ struct HeadlessCliOptions {
     HeadlessFailPolicy fail_on{HeadlessFailPolicy::None};
     bool include_builtin_rules{true};
     bool include_strings{false};
+    bool include_clr{false};
     std::size_t min_string_length{4};
     std::size_t max_strings{4096};
 };
@@ -189,6 +193,9 @@ struct HeadlessAnalysisReport {
     std::vector<SignatureRuleMatch> rule_matches{};
     bool strings_included{false};
     std::vector<HeadlessExtractedString> strings{};
+    bool clr_included{false};
+    std::optional<ClrMetadata> clr_metadata{};
+    std::string clr_diagnostic{};
     std::optional<BinaryDiffReport> comparison{};
 };
 
@@ -214,8 +221,12 @@ struct HeadlessAnalysisReport {
     const HeadlessAnalysisReport& report);
 
 /// Serializes `report` to RFC 4180 CSV summary rows (summary, sections, imports, exports,
-/// security findings, YARA-lite rule matches, and crypto/packer constant hits).
+/// security findings, YARA-lite rule matches, crypto/packer constant hits, and optional `--clr` rows).
 [[nodiscard]] std::string format_headless_report_csv(
+    const HeadlessAnalysisReport& report);
+
+/// Serializes `report` to deterministic human-readable plain text (including `.NET / CLR` summary when `--clr` is enabled).
+[[nodiscard]] std::string format_headless_report_text(
     const HeadlessAnalysisReport& report);
 
 /// Evaluates deterministic CI exit code (`0` = clean, `2` = policy violation triggered by `fail_on`).

@@ -48,6 +48,7 @@ constexpr std::array<WorkspacePanelId, kWorkspacePanelCount> kAllPanels{{
     WorkspacePanelId::PeHeaders,
     WorkspacePanelId::PeImports,
     WorkspacePanelId::PeExports,
+    WorkspacePanelId::ClrMetadata,
     WorkspacePanelId::Disassembly,
     WorkspacePanelId::FlowGraph,
     WorkspacePanelId::Log,
@@ -221,6 +222,7 @@ std::string_view workspace_panel_window_name(WorkspacePanelId panel) noexcept {
         case WorkspacePanelId::PeHeaders:          return "PE Headers";
         case WorkspacePanelId::PeImports:          return "PE Imports";
         case WorkspacePanelId::PeExports:          return "PE Exports";
+        case WorkspacePanelId::ClrMetadata:        return ".NET / CLR";
         case WorkspacePanelId::Disassembly:        return "Disassembly";
         case WorkspacePanelId::FlowGraph:          return "Flow Graph";
         case WorkspacePanelId::Log:                return "Log";
@@ -303,7 +305,7 @@ WorkspacePresetSpec build_workspace_preset(WorkspacePreset preset) {
             auto right = DockNodeSpec::make_leaf(
                 {P::Details, P::FileInfo, P::ExecutableSettings, P::TargetCapabilities,
                  P::StructureView, P::DataStructures, P::RuntimeAndFlags, P::Handlers,
-                 P::PeHeaders, P::PeImports, P::PeExports},
+                 P::PeHeaders, P::PeImports, P::PeExports, P::ClrMetadata},
                 P::Details);
             auto bottom = DockNodeSpec::make_leaf({P::Log}, P::Log);
 

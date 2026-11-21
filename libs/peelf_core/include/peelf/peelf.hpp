@@ -18,6 +18,7 @@
 #include <peelf/timeline_viewport.hpp>
 #include <peelf/pdb.hpp>
 #include <peelf/signatures.hpp>
+#include <peelf/clr_metadata.hpp>
 
 #include <pe/pe_definitions.h>
 #include <elf/elf_definitions.h>

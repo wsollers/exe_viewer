@@ -175,7 +175,16 @@ UiApp::UiApp(BinaryModel& model, VulkanManager& vulkan)
     , pe_headers_panel_(model)
     , pe_imports_panel_(model)
     , pe_exports_panel_(model)
+    , clr_panel_(
+          model,
+          current_selection_,
+          [this](std::uint64_t file_offset, std::size_t byte_length) {
+              pending_navigations_.enqueue_offset(file_offset, std::max<std::size_t>(byte_length, 1u));
+              hex_panel_.set_visible(true);
+              activate_panel(hex_panel_.name().c_str());
+          })
 {
+    clr_panel_.set_visible(false);
     references_panel_.set_visible(false);
     strings_panel_.set_visible(false);
     struct_view_panel_.set_visible(false);
@@ -1030,6 +1039,8 @@ void UiApp::render() {
     pe_headers_panel_.draw();
     pe_imports_panel_.draw();
     pe_exports_panel_.draw();
+    clr_panel_.set_code_font(code_font_);
+    clr_panel_.draw();
     log_panel_.draw();
 
     if (show_disassembly_panel_) {

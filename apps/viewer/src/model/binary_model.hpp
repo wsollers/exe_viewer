@@ -21,6 +21,7 @@
 
 #include <peelf/binary_image.hpp>
 #include <peelf/capability_matrix.hpp>
+#include <peelf/clr_metadata.hpp>
 #include <peelf/crash_dump.hpp>
 #include <peelf/debugger.hpp>
 #include <peelf/endian_reader.hpp>
@@ -553,6 +554,12 @@ namespace viewer {
         [[nodiscard]] const std::optional<peelf::PeRichHeader>& pe_rich_header() const noexcept {
             return pe_rich_header_;
         }
+        [[nodiscard]] const std::optional<peelf::ClrMetadata>& clr_metadata() const noexcept {
+            return clr_metadata_;
+        }
+        [[nodiscard]] const std::string& clr_metadata_error() const noexcept {
+            return clr_metadata_error_;
+        }
         [[nodiscard]] std::span<const peelf::CryptoSignatureHit> crypto_signatures() const noexcept {
             return crypto_hits_;
         }
@@ -660,6 +667,8 @@ namespace viewer {
         peelf::HandlersReport handlers_report_;
         peelf::SecurityAuditReport security_audit_;
         std::optional<peelf::PeRichHeader> pe_rich_header_{};
+        std::optional<peelf::ClrMetadata> clr_metadata_{};
+        std::string clr_metadata_error_{};
         std::vector<peelf::CryptoSignatureHit> crypto_hits_{};
         peelf::ExecutableSettingsReport executable_settings_{};
         peelf::EnvironmentRedactionPolicy environment_redaction_policy_{

@@ -99,6 +99,7 @@ add_executable(peelf_tests
   command_palette_test.cpp
   c_type_parser_test.cpp
   signatures_and_crypto_test.cpp
+  clr_metadata_test.cpp
   macho_core_and_dsym_test.cpp
   decompiler_contract_test.cpp
   golden_summary_and_debug_test.cpp

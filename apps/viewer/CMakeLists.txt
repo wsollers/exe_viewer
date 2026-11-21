@@ -102,6 +102,8 @@ add_library(peelf_gui SHARED
         src/ui/ui_panels_pe_headers.cpp
         src/ui/ui_panels_pe_imports.cpp
         src/ui/ui_panels_pe_exports.cpp
+        src/ui/ui_panels_clr.hpp
+        src/ui/ui_panels_clr.cpp
         src/ui/ui_panels_sections.cpp
         src/ui/ui_panels_structure.cpp
         src/ui/ui_panels_hex.cpp

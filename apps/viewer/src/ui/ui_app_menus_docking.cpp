@@ -213,6 +213,7 @@ void UiApp::set_workspace_panel_visible(WorkspacePanelId panel, bool visible) no
         case WorkspacePanelId::PeHeaders:          pe_headers_panel_.set_visible(visible); break;
         case WorkspacePanelId::PeImports:          pe_imports_panel_.set_visible(visible); break;
         case WorkspacePanelId::PeExports:          pe_exports_panel_.set_visible(visible); break;
+        case WorkspacePanelId::ClrMetadata:        clr_panel_.set_visible(visible); break;
         case WorkspacePanelId::Disassembly:        show_disassembly_panel_ = visible; break;
         case WorkspacePanelId::FlowGraph:          show_call_graph_panel_ = visible; break;
         case WorkspacePanelId::Log:                log_panel_.set_visible(visible); break;
@@ -257,6 +258,7 @@ bool UiApp::is_workspace_panel_visible(WorkspacePanelId panel) const noexcept {
         case WorkspacePanelId::PeHeaders:          return pe_headers_panel_.visible();
         case WorkspacePanelId::PeImports:          return pe_imports_panel_.visible();
         case WorkspacePanelId::PeExports:          return pe_exports_panel_.visible();
+        case WorkspacePanelId::ClrMetadata:        return clr_panel_.visible();
         case WorkspacePanelId::Disassembly:        return show_disassembly_panel_;
         case WorkspacePanelId::FlowGraph:          return show_call_graph_panel_;
         case WorkspacePanelId::Log:                return log_panel_.visible();
@@ -724,6 +726,12 @@ void UiApp::render_main_menu() {
         }
 
         {
+            bool v = clr_panel_.visible();
+            if (ImGui::MenuItem(clr_panel_.name().c_str(), nullptr, &v))
+                clr_panel_.set_visible(v);
+        }
+
+        {
             ImGui::MenuItem("Disassembly", nullptr, &show_disassembly_panel_);
         }
 
@@ -790,7 +798,7 @@ void UiApp::render_dockspace() {
     ImGui::Begin("MainDockSpaceHost", nullptr, window_flags);
     ImGui::PopStyleVar(3);
 
-    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV12");
+    const ImGuiID dockspace_id = ImGui::GetID("AnalysisWorkspaceV13");
     const ImGuiDockNodeFlags dock_flags = ImGuiDockNodeFlags_None;
     const bool compact = viewport->WorkSize.x < ImGui::GetFontSize() * 100.0f;
     const bool missing_dockspace = (ImGui::DockBuilderGetNode(dockspace_id) == nullptr);

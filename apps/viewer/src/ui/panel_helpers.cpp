@@ -1128,8 +1128,33 @@ std::vector<DetailPropertyRow> build_selection_detail_properties(
                 add_prop(rows, "Runtime Version",
                          std::format("{}.{}", clr.major_runtime_version, clr.minor_runtime_version));
                 add_prop(rows, "Metadata RVA", std::format("0x{:X} ({} bytes)", clr.metadata_rva, clr.metadata_size));
-                add_prop(rows, "Flags", std::format("0x{:08X}", clr.flags));
+                add_prop(rows, "Flags",
+                         std::format("0x{:08X} ({})", clr.flags, peelf::format_cor20_flags(clr.flags)));
                 add_prop(rows, "EntryPointToken", std::format("0x{:08X}", clr.entry_point_token_or_rva));
+                if (model.clr_metadata().has_value()) {
+                    const peelf::ClrMetadata& md = *model.clr_metadata();
+                    add_prop(rows, "Metadata Runtime",
+                             std::format("{} ({})", md.runtime_version, md.compressed_tables ? "#~" : "#-"));
+                    if (md.module.has_value() && !md.module->name.empty()) {
+                        add_prop(rows, "Module",
+                                 md.module->mvid_guid.empty()
+                                     ? md.module->name
+                                     : std::format("{} ({})", md.module->name, md.module->mvid_guid));
+                    }
+                    if (md.assembly.has_value()) {
+                        add_prop(rows, "Assembly",
+                                 std::format("{} v{}", md.assembly->name, md.assembly->version_string()));
+                    }
+                    add_prop(rows, "AssemblyRefs", std::format("{}", md.assembly_refs.size()));
+                    add_prop(rows, "TypeDefs / TypeRefs",
+                             std::format("{} / {}", md.type_defs.size(), md.type_refs.size()));
+                    add_prop(rows, "MethodDefs / Fields",
+                             std::format("{} / {}", md.methods.size(), md.fields.size()));
+                    add_prop(rows, "P/Invoke Imports", std::format("{}", md.pinvoke_entries.size()));
+                    add_prop(rows, "User Strings (#US)", std::format("{}", md.user_strings.size()));
+                } else if (!model.clr_metadata_error().empty()) {
+                    add_prop(rows, "Metadata Status", model.clr_metadata_error());
+                }
             }
             break;
         }

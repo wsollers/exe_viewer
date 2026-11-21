@@ -36,6 +36,7 @@
 #include "ui_panels_scripting.hpp"
 #include "ui_panels_memory_heatmap.hpp"
 #include "ui_panels_byte_viz.hpp"
+#include "ui_panels_clr.hpp"
 #include "decompile/decompile_controller.hpp"
 #include "disasm/disassembler.hpp"
 #include "disasm/linear_disassembly.hpp"
@@ -245,6 +246,7 @@ namespace viewer {
         PeHeadersPanel  pe_headers_panel_;
         PeImportsPanel  pe_imports_panel_;
         PeExportsPanel  pe_exports_panel_;
+        ClrMetadataPanel clr_panel_;
 
         std::function<void()> on_open_file_;
         std::function<void()> on_open_debug_symbols_;

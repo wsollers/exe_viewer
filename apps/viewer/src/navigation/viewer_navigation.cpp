@@ -202,6 +202,15 @@ void add_headers(const peelf::IBinaryImage& image, StructureNode& root) {
         dos.selection.size = 0x40;
         headers.children.push_back(std::move(dos));
         headers.children.push_back(selectable_node(SelectionKind::Header, "PE/COFF Headers", 2, PreferredView::Details));
+        if (const peelf::PeClrHeader* clr = image.pe_clr_header()) {
+            StructureNode clr_node = selectable_node(
+                SelectionKind::ClrHeader, "CLR / .NET Metadata", 0, PreferredView::Details);
+            clr_node.selection.file_offset = clr->file_offset;
+            clr_node.selection.virtual_address =
+                image.file_offset_to_virtual_address(clr->file_offset);
+            clr_node.selection.size = clr->size;
+            headers.children.push_back(std::move(clr_node));
+        }
     } else if (image.macho_header() != nullptr) {
         StructureNode mh = selectable_node(SelectionKind::Header, "Mach-O Header", 1, PreferredView::Details);
         mh.selection.file_offset = 0;

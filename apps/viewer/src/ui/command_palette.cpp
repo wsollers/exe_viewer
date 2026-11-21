@@ -1722,6 +1722,7 @@ constexpr std::array<BuiltinCommandSpec, 15> kBuiltinCommands{{
         case WorkspacePanelId::PeHeaders:          return "panel:pe_headers";
         case WorkspacePanelId::PeImports:          return "panel:pe_imports";
         case WorkspacePanelId::PeExports:          return "panel:pe_exports";
+        case WorkspacePanelId::ClrMetadata:        return "panel:clr_metadata";
         case WorkspacePanelId::Disassembly:        return "panel:disassembly";
         case WorkspacePanelId::FlowGraph:          return "panel:flow_graph";
         case WorkspacePanelId::Log:                return "panel:log";
