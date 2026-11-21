@@ -123,7 +123,7 @@ namespace {
     return std::format("Socket {}", to_string(delta.kind));
 }
 
-[[nodiscard]] constexpr bool is_snapshot_interval_non_continuous(
+[[nodiscard]] bool is_snapshot_interval_non_continuous(
     const SnapshotDiff& diff,
     const SnapshotTimelineIngestOptions& options) noexcept {
     if (diff.has_uncertainties()) {

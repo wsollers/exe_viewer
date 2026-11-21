@@ -17,7 +17,6 @@ namespace peelf {
 namespace {
 
 [[nodiscard]] bool find_executable_on_path(std::string_view tool_stem) {
-    const char* raw_path = nullptr;
 #ifdef _WIN32
     char* dup_buf = nullptr;
     std::size_t dup_len = 0u;
@@ -48,7 +47,7 @@ namespace {
     }
     return false;
 #else
-    raw_path = std::getenv("PATH");
+    const char* raw_path = std::getenv("PATH");
     if (raw_path == nullptr) {
         return false;
     }

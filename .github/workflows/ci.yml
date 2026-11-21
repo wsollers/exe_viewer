@@ -240,7 +240,7 @@ jobs:
           -DPEELF_WARNINGS_AS_ERRORS=ON
 
       - name: Build (${{ matrix.build_type }})
-        run: cmake --build out/build/msvc-${{ matrix.build_type }} --parallel
+        run: cmake --build out/build/msvc-${{ matrix.build_type }} --parallel -- -k 0
 
       - name: Run CTest suite (${{ matrix.build_type }})
         shell: pwsh
