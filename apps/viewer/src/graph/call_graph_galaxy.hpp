@@ -461,6 +461,10 @@ inline constexpr std::uint32_t kGalaxyNodeFlagDimmed      = 1u << 5u;
 inline constexpr std::uint32_t kGalaxyNodeFlagEntryPoint  = 1u << 6u;
 inline constexpr std::uint32_t kGalaxyNodeFlagExternal    = 1u << 7u;
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) GalaxyEdgeGpuInstance {
     float x0_px{0.0f};
     float y0_px{0.0f};
@@ -486,6 +490,9 @@ struct alignas(16) GalaxyNodeGpuInstance {
     std::uint32_t flags{0u};
     std::uint32_t node_index{0u};
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(GalaxyNodeGpuInstance) == 32u);
 static_assert(alignof(GalaxyNodeGpuInstance) == 16u);

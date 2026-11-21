@@ -10,7 +10,9 @@
 #include <span>
 #include <string_view>
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #endif
 

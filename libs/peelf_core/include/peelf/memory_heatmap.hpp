@@ -281,6 +281,10 @@ static_assert(hilbert_xy_to_index(16u, hilbert_index_to_xy(16u, 0xDEADBEEFull).x
 ///     - bits `[28..29]`: `MemoryCellResidency` (`0..3`)
 ///     - bit  `[30]`    : `newly_allocated` flag
 ///     - bit  `[31]`    : `hot_focus` flag (crashing/active thread IP/SP or entry point page)
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) MemoryHeatmapCell {
     std::uint64_t base_va{0};
     std::uint32_t span_and_perms{0};
@@ -473,6 +477,9 @@ struct alignas(16) MemoryHeatmapCell {
 
     constexpr auto operator<=>(const MemoryHeatmapCell&) const noexcept = default;
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(MemoryHeatmapCell) == 16u, "MemoryHeatmapCell must be 16 bytes (uvec4 SSBO)");
 static_assert(alignof(MemoryHeatmapCell) == 16u, "MemoryHeatmapCell must be 16-byte aligned");

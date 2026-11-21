@@ -35,6 +35,10 @@ struct WorldRect2D {
 // Subtracting double-precision (world - camera.center) on the CPU before casting to float32
 // preserves full 24-bit mantissa precision around the viewport center even at >= 1,000,000x
 // zoom over 64-bit virtual addresses or nanosecond execution timelines.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) CameraRelativeUniform2D {
     float viewport_width = 1.0f;
     float viewport_height = 1.0f;
@@ -75,6 +79,9 @@ struct alignas(16) CameraRelativeUniform2D {
         };
     }
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(CameraRelativeUniform2D) == 48,
               "CameraRelativeUniform2D must remain tightly packed for push constants / UBOs");

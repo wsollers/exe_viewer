@@ -9,6 +9,10 @@
 
 namespace viewer::shaders {
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) MemoryHeatmapPushConstants {
     CameraRelativeUniform2D camera{};            // offset 0..47
     std::uint32_t canvas_width = 0;              // offset 48
@@ -24,6 +28,9 @@ struct alignas(16) MemoryHeatmapPushConstants {
     float pulse_phase = 0.0f;                    // offset 88
     std::uint32_t flags = 1u;                    // offset 92 (bit 0 = show_grid)
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 static_assert(sizeof(MemoryHeatmapPushConstants) == 96,
               "MemoryHeatmapPushConstants must match 96-byte push_constant layout");
 static_assert(offsetof(MemoryHeatmapPushConstants, canvas_width) == 48);

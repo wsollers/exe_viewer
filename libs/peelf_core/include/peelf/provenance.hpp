@@ -306,7 +306,7 @@ struct Observed {
         evidence.push_back(std::move(ev));
     }
 
-    void mark_stale(std::string_view note = {}) {
+    void mark_stale(std::string_view stale_note = {}) {
         if (availability == CaptureAvailability::Complete ||
             availability == CaptureAvailability::Partial) {
             availability = CaptureAvailability::Stale;
@@ -315,11 +315,11 @@ struct Observed {
             stamp.availability == CaptureAvailability::Partial) {
             stamp.availability = CaptureAvailability::Stale;
         }
-        if (!note.empty()) {
+        if (!stale_note.empty()) {
             evidence.push_back(Evidence{
                 .tag = provenance,
                 .source = "revision_tracker",
-                .detail = std::string(note),
+                .detail = std::string(stale_note),
             });
         }
     }

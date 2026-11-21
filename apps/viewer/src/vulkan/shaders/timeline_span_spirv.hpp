@@ -8,6 +8,10 @@
 
 namespace viewer::shaders {
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)  // structure was padded due to alignment specifier
+#endif
 struct alignas(16) TimelineViewportPushConstants {
     float viewport_width = 1.0f;                   // offset 0
     float viewport_height = 1.0f;                  // offset 4
@@ -18,6 +22,9 @@ struct alignas(16) TimelineViewportPushConstants {
     float hatch_period_px = 8.0f;                  // offset 24
     float reserved = 0.0f;                         // offset 28
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(TimelineViewportPushConstants) == 32,
               "TimelineViewportPushConstants must match 32-byte push_constant layout");

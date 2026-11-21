@@ -145,5 +145,5 @@ if(MSVC)
 endif()
 
 if(WIN32)
-  target_link_libraries(peelf_core PRIVATE ws2_32 advapi32 wintrust crypt32)
+  target_link_libraries(peelf_core PRIVATE ws2_32 advapi32 wintrust crypt32 psapi)
 endif()

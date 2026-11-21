@@ -15,6 +15,10 @@ struct ByteVizPushFlagBits {
     static constexpr std::uint32_t kHasBrush = 1u << 1u;
 };
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) ByteVizPushConstants {
     CameraRelativeUniform2D camera{};             // offset 0..47
     std::uint32_t canvas_width = 0;               // offset 48
@@ -34,6 +38,9 @@ struct alignas(16) ByteVizPushConstants {
     std::uint32_t brush_end_lo = 0;               // offset 104
     std::uint32_t brush_end_hi = 0;               // offset 108
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 static_assert(sizeof(ByteVizPushConstants) == 112,
               "ByteVizPushConstants must match 112-byte push_constant layout");
 static_assert(sizeof(ByteVizPushConstants) <= 128,

@@ -364,6 +364,10 @@ struct TimelineInstanceFlags {
     }
 };
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) TimelineGpuInstance {
     float x0_px{0.0f};
     float y0_px{0.0f};
@@ -374,6 +378,9 @@ struct alignas(16) TimelineGpuInstance {
     std::uint32_t shape_and_flags{0u};
     std::uint32_t hit_id{kInvalidTimelineHitId};
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(TimelineGpuInstance) == 32, "TimelineGpuInstance must be exactly 32 bytes");
 static_assert(alignof(TimelineGpuInstance) == 16, "TimelineGpuInstance must be 16-byte aligned");

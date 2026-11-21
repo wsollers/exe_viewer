@@ -1,7 +1,9 @@
 #include "startup_branding.hpp"
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <objidl.h>
 #include <gdiplus.h>

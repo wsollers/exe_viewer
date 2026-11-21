@@ -178,10 +178,17 @@ TEST(FileMapping, UnicodePathRoundTrips) {
 
 namespace {
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) AlignedBlock {
     std::uint64_t lo;
     std::uint64_t hi;
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 struct MisalignedCountingBackend {
     static inline int open_calls = 0;

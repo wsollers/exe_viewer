@@ -15,6 +15,10 @@
 
 namespace viewer::shaders {
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) CallGalaxyPushConstants {
     float viewport_width{1.0f};
     float viewport_height{1.0f};
@@ -25,6 +29,9 @@ struct alignas(16) CallGalaxyPushConstants {
     std::uint32_t flags{0u};
     float reserved{0.0f};
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(CallGalaxyPushConstants) == 32u);
 static_assert(sizeof(CallGalaxyPushConstants) <= 128u);

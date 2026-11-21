@@ -130,6 +130,10 @@ struct SpirvValidationResult {
 
 namespace shaders {
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) SmokeClearPushConstants {
     std::array<float, 4> clear_color{0.0f, 0.0f, 0.0f, 1.0f};
     std::uint32_t width = 0;
@@ -137,6 +141,9 @@ struct alignas(16) SmokeClearPushConstants {
     std::uint32_t pad0 = 0;
     std::uint32_t pad1 = 0;
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 static_assert(sizeof(SmokeClearPushConstants) == 32);
 
 // Precompiled SPIR-V 1.0 for apps/viewer/src/vulkan/shaders/smoke_clear.comp.glsl

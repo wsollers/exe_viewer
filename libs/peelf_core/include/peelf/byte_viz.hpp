@@ -270,6 +270,10 @@ struct ByteSpanMetrics {
 //     bits [16..23]: `zero_u8`      (0..255 => 0%..100%)
 //     bits [24..31]: `high_bit_u8`  (0..255 => 0%..100%)
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4324)
+#endif
 struct alignas(16) ByteVizTile {
     std::array<std::uint32_t, 4> words{0u, 0u, 0u, 0u};
 
@@ -383,6 +387,9 @@ struct alignas(16) ByteVizTile {
 
     auto operator<=>(const ByteVizTile&) const = default;
 };
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 static_assert(sizeof(ByteVizTile) == 16, "ByteVizTile must be exactly 16 bytes (uvec4)");
 static_assert(alignof(ByteVizTile) == 16, "ByteVizTile must be 16-byte aligned for std430 SSBO");

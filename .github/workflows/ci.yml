@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -21,7 +24,7 @@ jobs:
         preset: [clang18-debug, clang18-release]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Clang 18 and GUI/Vulkan dependencies
         run: |
@@ -67,7 +70,7 @@ jobs:
       - name: Run CTest suite (${{ matrix.preset }})
         run: ctest --test-dir out/build/${{ matrix.preset }} --output-on-failure --parallel "$(nproc)"
 
-      - name: Verify headless CLI JSON & SARIF output
+      - name: Verify headless CLI JSON, SARIF & CSV output
         run: |
           ./out/build/${{ matrix.preset }}/apps/viewer/peelf_viewer \
             --headless tests/fixtures/hello.elf \
@@ -75,15 +78,19 @@ jobs:
           ./out/build/${{ matrix.preset }}/apps/viewer/peelf_viewer \
             --headless tests/fixtures/hello.elf \
             --format sarif --output /tmp/hello_report.sarif
+          ./out/build/${{ matrix.preset }}/apps/viewer/peelf_viewer \
+            --headless tests/fixtures/hello.elf \
+            --format csv --output /tmp/hello_report.csv
           test -s /tmp/hello_report.json
           test -s /tmp/hello_report.sarif
+          test -s /tmp/hello_report.csv
 
   linux-asan-ubsan:
     name: Linux Clang 18 (ASan + UBSan)
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Clang 18 sanitizer runtime and dependencies
         run: |
@@ -134,19 +141,96 @@ jobs:
         build_type: [Debug, Release]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Configure MSVC x64 Developer Prompt
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      - name: Setup LunarG Vulkan SDK
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
+      - name: Cache LunarG Vulkan SDK 1.3.296.0
+        id: cache-vulkan-sdk
+        uses: actions/cache@v4
         with:
-          vulkan-version: 1.3.296.0
-          vulkan-components: Vulkan-Headers, Vulkan-Loader
-          cache: true
+          path: C:/VulkanSDK/1.3.296.0
+          key: vulkan-sdk-win64-1.3.296.0
+
+      - name: Setup LunarG Vulkan SDK 1.3.296.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $vkRoot = 'C:/VulkanSDK/1.3.296.0'
+          $vkHeader = "$vkRoot/Include/vulkan/vulkan.h"
+          $vkLib = "$vkRoot/Lib/vulkan-1.lib"
+
+          if (-not ((Test-Path $vkHeader) -and (Test-Path $vkLib))) {
+            $installer = Join-Path $env:RUNNER_TEMP 'VulkanSDK-1.3.296.0-Installer.exe'
+            $url = 'https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe'
+            try {
+              Write-Host "Downloading LunarG Vulkan SDK 1.3.296.0 from $url..."
+              Invoke-WebRequest -Uri $url -OutFile $installer -MaximumRetryCount 3 -RetryIntervalSec 5
+              if ((Test-Path $installer) -and ((Get-Item $installer).Length -gt 10MB)) {
+                $proc = Start-Process -FilePath $installer -ArgumentList @(
+                  '--root', $vkRoot,
+                  '--accept-licenses',
+                  '--default-answer',
+                  '--confirm-command',
+                  'install',
+                  'com.lunarg.vulkan.core'
+                ) -Wait -PassThru
+                if (-not ((Test-Path $vkHeader) -and (Test-Path $vkLib))) {
+                  $proc = Start-Process -FilePath $installer -ArgumentList @(
+                    '--root', $vkRoot,
+                    '--accept-licenses',
+                    '--default-answer',
+                    '--confirm-command',
+                    'install'
+                  ) -Wait -PassThru
+                }
+              }
+            } catch {
+              Write-Warning "LunarG installer failed ($($_.Exception.Message)); falling back to Khronos sources."
+            } finally {
+              if (Test-Path $installer) {
+                Remove-Item -Force $installer -ErrorAction SilentlyContinue
+              }
+            }
+          }
+
+          if (-not ((Test-Path $vkHeader) -and (Test-Path $vkLib))) {
+            Write-Host 'Building Khronos Vulkan-Headers + Vulkan-Loader v1.3.296.0 fallback...'
+            $srcBase = Join-Path $env:RUNNER_TEMP 'vulkan-khronos-1.3.296.0'
+            if (Test-Path $srcBase) { Remove-Item -Recurse -Force $srcBase }
+            New-Item -ItemType Directory -Force -Path $srcBase | Out-Null
+
+            git clone --depth 1 --branch vulkan-sdk-1.3.296.0 https://github.com/KhronosGroup/Vulkan-Headers.git "$srcBase/Vulkan-Headers"
+            cmake -S "$srcBase/Vulkan-Headers" -B "$srcBase/build-headers" -G Ninja `
+              -DCMAKE_INSTALL_PREFIX="$vkRoot" `
+              -DCMAKE_INSTALL_INCLUDEDIR=Include
+            cmake --install "$srcBase/build-headers"
+
+            git clone --depth 1 --branch vulkan-sdk-1.3.296.0 https://github.com/KhronosGroup/Vulkan-Loader.git "$srcBase/Vulkan-Loader"
+            cmake -S "$srcBase/Vulkan-Loader" -B "$srcBase/build-loader" -G Ninja `
+              -DCMAKE_BUILD_TYPE=Release `
+              -DCMAKE_INSTALL_PREFIX="$vkRoot" `
+              -DCMAKE_PREFIX_PATH="$vkRoot" `
+              -DCMAKE_INSTALL_INCLUDEDIR=Include `
+              -DCMAKE_INSTALL_LIBDIR=Lib `
+              -DCMAKE_INSTALL_BINDIR=Bin `
+              -DVULKAN_HEADERS_INSTALL_DIR="$vkRoot" `
+              -DUSE_MASM=OFF `
+              -DBUILD_TESTS=OFF
+            cmake --build "$srcBase/build-loader" --parallel
+            cmake --install "$srcBase/build-loader"
+            Remove-Item -Recurse -Force $srcBase -ErrorAction SilentlyContinue
+          }
+
+          if (-not ((Test-Path $vkHeader) -and (Test-Path $vkLib))) {
+            throw "Vulkan SDK verification failed: expected $vkHeader and $vkLib"
+          }
+          "VULKAN_SDK=$vkRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vkRoot/Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Configure CMake (${{ matrix.build_type }})
         run: >
@@ -159,15 +243,19 @@ jobs:
         run: cmake --build out/build/msvc-${{ matrix.build_type }} --parallel
 
       - name: Run CTest suite (${{ matrix.build_type }})
-        run: ctest --test-dir out/build/msvc-${{ matrix.build_type }} --output-on-failure --parallel
+        shell: pwsh
+        run: ctest --test-dir out/build/msvc-${{ matrix.build_type }} --output-on-failure --parallel $env:NUMBER_OF_PROCESSORS
 
-      - name: Verify headless CLI JSON & SARIF output
+      - name: Verify headless CLI JSON, SARIF & CSV output
         shell: pwsh
         run: |
           $exe = "out/build/msvc-${{ matrix.build_type }}/apps/viewer/peelf_viewer.exe"
           $jsonOut = "out/build/msvc-${{ matrix.build_type }}/hello_report.json"
           $sarifOut = "out/build/msvc-${{ matrix.build_type }}/hello_report.sarif"
+          $csvOut = "out/build/msvc-${{ matrix.build_type }}/hello_report.csv"
           & $exe --headless tests/fixtures/hello.elf --format json --output $jsonOut
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $jsonOut)) { throw "Headless JSON failed" }
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $jsonOut) -or (Get-Item $jsonOut).Length -eq 0) { throw "Headless JSON failed" }
           & $exe --headless tests/fixtures/hello.elf --format sarif --output $sarifOut
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $sarifOut)) { throw "Headless SARIF failed" }
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $sarifOut) -or (Get-Item $sarifOut).Length -eq 0) { throw "Headless SARIF failed" }
+          & $exe --headless tests/fixtures/hello.elf --format csv --output $csvOut
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $csvOut) -or (Get-Item $csvOut).Length -eq 0) { throw "Headless CSV failed" }
