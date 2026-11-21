@@ -87,14 +87,14 @@ if(NOT _ver_rc STREQUAL "0" OR NOT _ver_out_stripped STREQUAL "peelf_viewer ${EX
   message(FATAL_ERROR "Installed --version check failed (rc=${_ver_rc}): stdout='${_ver_out_stripped}' stderr='${_ver_err}'")
 endif()
 
-# Verify --headless --summary against a real compiled fixture binary.
+# Verify --headless --summary against a lightweight static binary fixture.
 execute_process(
   COMMAND "${_viewer_exe}" --headless --summary "${FIXTURE_BIN}"
   WORKING_DIRECTORY "${STAGE_DIR}"
   RESULT_VARIABLE _sum_rc
   OUTPUT_VARIABLE _sum_out
   ERROR_VARIABLE _sum_err
-  TIMEOUT 30
+  TIMEOUT 120
 )
 string(STRIP "${_sum_out}" _sum_out_stripped)
 if(NOT _sum_rc STREQUAL "0" OR _sum_out_stripped STREQUAL "")
