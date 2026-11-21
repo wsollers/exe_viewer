@@ -1190,6 +1190,7 @@ void UiApp::process_deferred_gpu_work() {
         decompiler_thumb_ = completed->thumb;
         decompile_annotation_revision_ = annotations_.revision();
         decompile_symbol_revision_ = symbol_revision_;
+        decompile_override_revision_ = decompiler_overrides_.revision();
         decompiled_ = std::move(completed->unit);
     } else if (decompile_controller_.consume_stale_discard_notice()) {
         decompiled_ = DecompiledUnit{
@@ -1348,6 +1349,12 @@ void UiApp::process_deferred_gpu_work() {
         decompiled_root_.reset();
         selected_code_ranges_.clear();
         selected_code_address_.reset();
+        selected_decompiled_line_index_.reset();
+        decompiler_overrides_.clear();
+        decomp_modal_candidates_.clear();
+        decomp_modal_error_.clear();
+        open_decomp_rename_popup_ = false;
+        open_decomp_type_popup_ = false;
         annotations_.clear();
         debug_types_.clear();
         ++symbol_revision_;

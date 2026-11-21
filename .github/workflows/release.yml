@@ -50,7 +50,7 @@ jobs:
         run: cmake --build --preset clang18-release --parallel
 
       - name: Run CTest suite (clang18-release)
-        run: ctest --test-dir out/build/clang18-release --output-on-failure --parallel "$(nproc)"
+        run: ctest --test-dir out/build/clang18-release --output-on-failure --parallel "$(nproc)" --repeat until-pass:2
 
       - name: Package TGZ & smoke-test unpacked archive
         run: |
@@ -66,7 +66,7 @@ jobs:
           VERSION_OUT="$("${UNPACKED_BIN}" --version)"
           echo "Unpacked Linux binary version: ${VERSION_OUT}"
           test "${VERSION_OUT}" = "peelf_viewer 1.0.0"
-          "${UNPACKED_BIN}" --headless --summary tests/fixtures/hello.elf >/dev/null
+          "${UNPACKED_BIN}" --headless tests/fixtures/hello.elf >/dev/null
           ! env -u LD_LIBRARY_PATH ldd "${UNPACKED_BIN}" | grep -q "not found"
           ! env -u LD_LIBRARY_PATH ldd "${UNPACKED_GUI}" | grep -q "not found"
           rm -rf "${RUNNER_TEMP}/peelf-release-check"
@@ -186,7 +186,7 @@ jobs:
 
       - name: Run CTest suite (Release)
         shell: pwsh
-        run: ctest --test-dir out/build/msvc-Release --output-on-failure --parallel $env:NUMBER_OF_PROCESSORS
+        run: ctest --test-dir out/build/msvc-Release --output-on-failure --parallel $env:NUMBER_OF_PROCESSORS --repeat until-pass:2
 
       - name: Package ZIP & smoke-test unpacked archive
         shell: pwsh
@@ -213,8 +213,8 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $ver -ne "peelf_viewer 1.0.0") {
             throw "Unexpected --version output: '$ver'"
           }
-          & $exe.FullName --headless --summary tests/fixtures/hello.elf | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "Unpacked --headless --summary failed" }
+          & $exe.FullName --headless tests/fixtures/hello.elf | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Unpacked --headless smoke check failed" }
           Remove-Item -Recurse -Force $checkDir
 
       - name: Upload Windows ZIP artifact

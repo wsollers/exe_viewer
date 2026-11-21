@@ -12,6 +12,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include "symbols/data_types.hpp"
 
 namespace viewer {
@@ -59,7 +60,24 @@ struct DecompileRequest {
     std::uint64_t patch_revision = 0;
     std::uint64_t symbol_revision = 0;
     bool force_reanalyze = false;
+    std::optional<DecompilerFunctionOverride> function_override{};
 };
+
+[[nodiscard]] std::string rewrite_decompiler_c_tokens(
+    std::string_view code,
+    const std::unordered_map<std::string, std::string>& rename_map,
+    bool& in_block_comment);
+
+[[nodiscard]] std::string rewrite_decompiler_c_tokens(
+    std::string_view code,
+    const std::unordered_map<std::string, std::string>& rename_map);
+
+void apply_decompiler_overrides(
+    DecompiledUnit& unit,
+    const DecompilerFunctionOverride& override_spec);
+
+[[nodiscard]] std::string compute_decompiler_override_digest(
+    const std::optional<DecompilerFunctionOverride>& override_spec);
 class IDecompiler {
 public:
     virtual ~IDecompiler() = default;
@@ -186,6 +204,7 @@ struct DecompileCacheKey {
     std::uint64_t patch_revision = 0;
     std::uint64_t symbol_revision = 0;
     std::string symbols_sha256;
+    std::string function_override_sha256;
     DecompilerProvider provider = DecompilerProvider::Ghidra;
     std::string settings_fingerprint;
     peelf::Architecture architecture = peelf::Architecture::Unknown;

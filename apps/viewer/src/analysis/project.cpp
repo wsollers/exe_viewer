@@ -210,13 +210,12 @@ bool read_history_and_layout(std::istream& in, AnalysisProject& p, bool require_
     return in.eof();
 }
 
-bool read_custom_c_types_extension(std::istream& in, AnalysisProject& p) {
-    std::string ext_tag;
+bool read_custom_c_types_extension_body(std::istream& in, AnalysisProject& p) {
     int ext_ver = 0;
     std::uint32_t abi_u32 = 0;
     std::size_t rec_count = 0;
-    if (!(in >> ext_tag >> ext_ver >> abi_u32 >> std::quoted(p.custom_c_types_source) >> rec_count) ||
-        ext_tag != "CUSTOM_C_TYPES" || ext_ver != 1 || abi_u32 > 2u ||
+    if (!(in >> ext_ver >> abi_u32 >> std::quoted(p.custom_c_types_source) >> rec_count) ||
+        ext_ver != 1 || abi_u32 > 2u ||
         p.custom_c_types_source.size() > kMaxCTypeSourceBytes || rec_count > 16384u) {
         return false;
     }
@@ -272,7 +271,90 @@ bool read_custom_c_types_extension(std::istream& in, AnalysisProject& p) {
 
         p.custom_types.push_back(std::move(rec));
     }
-    in >> std::ws;
+    return true;
+}
+
+bool read_decompiler_overrides_extension_body(std::istream& in, AnalysisProject& p) {
+    int ext_ver = 0;
+    std::size_t fn_count = 0;
+    if (!(in >> ext_ver >> fn_count) || ext_ver != 1 || fn_count > 65536u) {
+        return false;
+    }
+    p.decompiler_overrides.reserve(fn_count);
+    for (std::size_t i = 0; i < fn_count; ++i) {
+        DecompilerFunctionOverride fn_ov{};
+        std::string raw_ret;
+        std::string raw_sig;
+        std::size_t var_count = 0;
+        if (!(in >> fn_ov.function_address >> std::quoted(raw_ret) >>
+              std::quoted(raw_sig) >> var_count) ||
+            var_count > 4096u) {
+            return false;
+        }
+        const auto norm_ret = normalize_decompiler_c_type(raw_ret);
+        const auto norm_sig = normalize_decompiler_signature_override(raw_sig);
+        if (!norm_ret.has_value() || !norm_sig.has_value()) {
+            return false;
+        }
+        fn_ov.return_type = *norm_ret;
+        fn_ov.signature_override = *norm_sig;
+        fn_ov.variables.reserve(var_count);
+        for (std::size_t v = 0; v < var_count; ++v) {
+            std::string orig_name;
+            std::string renamed_to;
+            std::string raw_type;
+            if (!(in >> std::quoted(orig_name) >> std::quoted(renamed_to) >>
+                  std::quoted(raw_type))) {
+                return false;
+            }
+            if (!is_valid_decompiler_original_name(orig_name)) {
+                return false;
+            }
+            if (!renamed_to.empty() && !is_valid_decompiler_c_identifier(renamed_to)) {
+                return false;
+            }
+            const auto norm_type = normalize_decompiler_c_type(raw_type);
+            if (!norm_type.has_value()) {
+                return false;
+            }
+            if (renamed_to.empty() && norm_type->empty()) {
+                continue;
+            }
+            fn_ov.variables.push_back(DecompilerVariableOverride{
+                .original_name = std::move(orig_name),
+                .renamed_to = std::move(renamed_to),
+                .c_type = *norm_type,
+            });
+        }
+        if (!fn_ov.empty()) {
+            p.decompiler_overrides.push_back(std::move(fn_ov));
+        }
+    }
+    return true;
+}
+
+bool read_trailing_v2_extensions(std::istream& in, AnalysisProject& p) {
+    bool saw_custom_types = false;
+    bool saw_decompiler_overrides = false;
+    while ((in >> std::ws) && !in.eof()) {
+        std::string ext_tag;
+        if (!(in >> ext_tag)) {
+            return false;
+        }
+        if (ext_tag == "CUSTOM_C_TYPES") {
+            if (saw_custom_types || !read_custom_c_types_extension_body(in, p)) {
+                return false;
+            }
+            saw_custom_types = true;
+        } else if (ext_tag == "DECOMPILER_OVERRIDES") {
+            if (saw_decompiler_overrides || !read_decompiler_overrides_extension_body(in, p)) {
+                return false;
+            }
+            saw_decompiler_overrides = true;
+        } else {
+            return false;
+        }
+    }
     return in.eof();
 }
 
@@ -334,7 +416,8 @@ AnalysisProject build_analysis_project(const BinaryModel& model,
                                        std::span<const ViewerSelection> history,
                                        std::size_t cursor,
                                        std::string layout,
-                                       bool thumb) {
+                                       bool thumb,
+                                       std::span<const DecompilerFunctionOverride> decompiler_overrides) {
     AnalysisProject p;
     p.schema_version = AnalysisProject::kCurrentSchemaVersion;
     std::error_code ec;
@@ -367,6 +450,7 @@ AnalysisProject build_analysis_project(const BinaryModel& model,
     p.custom_c_types_source = model.custom_c_types_source();
     p.custom_c_types_abi = static_cast<std::uint32_t>(model.custom_c_types_abi());
     p.custom_types.assign(model.custom_types().begin(), model.custom_types().end());
+    p.decompiler_overrides.assign(decompiler_overrides.begin(), decompiler_overrides.end());
     p.history.assign(history.begin(), history.end());
     p.cursor = p.history.empty() ? 0 : std::min(cursor, p.history.size() - 1);
     p.layout = std::move(layout);
@@ -453,6 +537,29 @@ std::string encode_project(const AnalysisProject& p) {
             }
         }
     }
+    if (!p.decompiler_overrides.empty()) {
+        std::vector<const DecompilerFunctionOverride*> non_empty;
+        non_empty.reserve(p.decompiler_overrides.size());
+        for (const DecompilerFunctionOverride& fn_ov : p.decompiler_overrides) {
+            if (!fn_ov.empty()) {
+                non_empty.push_back(&fn_ov);
+            }
+        }
+        if (!non_empty.empty()) {
+            out << "DECOMPILER_OVERRIDES 1 " << non_empty.size() << '\n';
+            for (const DecompilerFunctionOverride* fn_ov : non_empty) {
+                out << fn_ov->function_address << ' '
+                    << std::quoted(fn_ov->return_type) << ' '
+                    << std::quoted(fn_ov->signature_override) << ' '
+                    << fn_ov->variables.size() << '\n';
+                for (const DecompilerVariableOverride& var : fn_ov->variables) {
+                    out << std::quoted(var.original_name) << ' '
+                        << std::quoted(var.renamed_to) << ' '
+                        << std::quoted(var.c_type) << '\n';
+                }
+            }
+        }
+    }
     return out.str();
 }
 
@@ -532,8 +639,7 @@ peelf::Result<AnalysisProject> decode_project(std::string_view text) {
     }
 
     if (!read_history_and_layout(in, p, false)) return invalid();
-    in >> std::ws;
-    if (!in.eof() && !read_custom_c_types_extension(in, p)) {
+    if (!read_trailing_v2_extensions(in, p)) {
         return invalid();
     }
     return p;

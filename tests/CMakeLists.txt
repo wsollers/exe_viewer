@@ -102,6 +102,7 @@ add_executable(peelf_tests
   clr_metadata_test.cpp
   macho_core_and_dsym_test.cpp
   decompiler_contract_test.cpp
+  decompiler_overrides_test.cpp
   golden_summary_and_debug_test.cpp
   runtime_paths_and_version_test.cpp
   fuzz_corpus_regression_test.cpp

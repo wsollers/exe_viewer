@@ -19,6 +19,8 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -2635,11 +2637,67 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
         return make_status(DecompileStatus::Cancelled, "Decompilation cancelled");
     }
 
-    // Assemble final DecompiledUnit with signature, stack locals, body, and closing brace.
+    // Assemble final DecompiledUnit with signature, stack/register overrides, body, and closing brace.
     const bool arch_64 = is_64bit_arch(request.architecture);
     const std::string_view int_type = arch_64 ? "int64_t" : "int32_t";
     const std::uint64_t entry_addr = ir_blocks.front().start_va;
     const std::uint64_t entry_sz = ir_blocks.front().first_insn_size;
+
+    std::unordered_map<std::string, std::string> rename_map;
+    std::unordered_map<std::string_view, const DecompilerVariableOverride*> var_override_map;
+    std::unordered_set<std::string> signature_declared_idents;
+    std::string_view effective_return_type = int_type;
+    std::string header_line;
+
+    if (request.function_override.has_value() && !request.function_override->empty()) {
+        const DecompilerFunctionOverride& fn_ov = *request.function_override;
+        if (!fn_ov.return_type.empty()) {
+            effective_return_type = fn_ov.return_type;
+        }
+        for (const DecompilerVariableOverride& v : fn_ov.variables) {
+            var_override_map.emplace(v.original_name, &v);
+            if (!v.renamed_to.empty() && v.renamed_to != v.original_name) {
+                rename_map.emplace(v.original_name, v.renamed_to);
+            }
+        }
+        if (!fn_ov.signature_override.empty()) {
+            std::size_t idx = 0u;
+            while (idx < fn_ov.signature_override.size()) {
+                if (detail::is_override_ident_start(fn_ov.signature_override[idx])) {
+                    const std::size_t start = idx++;
+                    while (idx < fn_ov.signature_override.size() &&
+                           detail::is_override_ident_cont(fn_ov.signature_override[idx])) {
+                        ++idx;
+                    }
+                    signature_declared_idents.emplace(
+                        fn_ov.signature_override.substr(start, idx - start));
+                } else {
+                    ++idx;
+                }
+            }
+            if (fn_ov.signature_override.front() == '(') {
+                header_line = std::format(
+                    "{} {}{} {{", effective_return_type, func_name, fn_ov.signature_override);
+            } else {
+                header_line = std::format("{} {{", fn_ov.signature_override);
+            }
+        }
+    }
+    if (header_line.empty()) {
+        header_line = std::format("{} {}(void) {{", effective_return_type, func_name);
+    }
+
+    auto format_typed_decl = [](std::string_view c_type, std::string_view var_name) {
+        const std::size_t bracket = c_type.find('[');
+        if (bracket != std::string_view::npos && bracket > 0u) {
+            std::string_view base = c_type.substr(0, bracket);
+            while (!base.empty() && (base.back() == ' ' || base.back() == '\t')) {
+                base.remove_suffix(1u);
+            }
+            return std::format("{} {}{}", base, var_name, c_type.substr(bracket));
+        }
+        return std::format("{} {}", c_type, var_name);
+    };
 
     DecompiledUnit unit{
         .status = DecompileStatus::Ready,
@@ -2652,22 +2710,73 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
         .lines = {},
         .types = request.types,
     };
-    unit.lines.reserve(out_items.size() + stack_locals.size() + 4u);
+    unit.lines.reserve(out_items.size() + stack_locals.size() + 6u);
 
     unit.lines.push_back(DecompiledLine{
         .address = entry_addr,
-        .text = std::format("{} {}(void) {{", int_type, func_name),
+        .text = std::move(header_line),
         .ranges = {CodeRange{entry_addr, entry_sz}},
     });
 
+    std::unordered_set<std::string_view> emitted_locals;
+    bool emitted_any_local = false;
     for (const std::string& local_var : stack_locals) {
+        emitted_locals.insert(local_var);
+        const auto ov_it = var_override_map.find(local_var);
+        const DecompilerVariableOverride* ov =
+            ov_it != var_override_map.end() ? ov_it->second : nullptr;
+        const std::string_view var_type =
+            (ov != nullptr && !ov->c_type.empty()) ? std::string_view(ov->c_type) : int_type;
+        const std::string_view var_name =
+            (ov != nullptr && !ov->renamed_to.empty()) ? std::string_view(ov->renamed_to)
+                                                       : std::string_view(local_var);
+        if (signature_declared_idents.contains(std::string(var_name)) ||
+            signature_declared_idents.contains(local_var)) {
+            continue;
+        }
+        std::string decl_text = std::format("    {};", format_typed_decl(var_type, var_name));
+        if (ov != nullptr && !ov->renamed_to.empty() && ov->renamed_to != local_var) {
+            decl_text.append(std::format(" /* was {} */", local_var));
+        }
         unit.lines.push_back(DecompiledLine{
             .address = entry_addr,
-            .text = std::format("    {} {};", int_type, local_var),
+            .text = std::move(decl_text),
             .ranges = {CodeRange{entry_addr, entry_sz}},
         });
+        emitted_any_local = true;
     }
-    if (!stack_locals.empty()) {
+
+    if (request.function_override.has_value()) {
+        for (const DecompilerVariableOverride& v : request.function_override->variables) {
+            if (emitted_locals.contains(v.original_name)) {
+                continue;
+            }
+            const std::string_view var_name =
+                !v.renamed_to.empty() ? std::string_view(v.renamed_to)
+                                      : std::string_view(v.original_name);
+            if (signature_declared_idents.contains(std::string(var_name)) ||
+                signature_declared_idents.contains(v.original_name)) {
+                continue;
+            }
+            if (v.c_type.empty() && v.renamed_to.empty()) {
+                continue;
+            }
+            const std::string_view var_type =
+                !v.c_type.empty() ? std::string_view(v.c_type) : int_type;
+            std::string decl_text = std::format("    {};", format_typed_decl(var_type, var_name));
+            if (!v.renamed_to.empty() && v.renamed_to != v.original_name) {
+                decl_text.append(std::format(" /* was {} */", v.original_name));
+            }
+            unit.lines.push_back(DecompiledLine{
+                .address = entry_addr,
+                .text = std::move(decl_text),
+                .ranges = {CodeRange{entry_addr, entry_sz}},
+            });
+            emitted_any_local = true;
+        }
+    }
+
+    if (emitted_any_local) {
         unit.lines.push_back(DecompiledLine{
             .address = std::nullopt,
             .text = {},
@@ -2675,6 +2784,7 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
         });
     }
 
+    bool in_block_comment = false;
     for (const OutputItem& item : out_items) {
         const std::size_t clamped_indent = std::min<std::size_t>(item.indent, kMaxIndent);
         if (item.is_label_placeholder) {
@@ -2690,9 +2800,12 @@ DecompiledUnit StructuredPseudoCDecompiler::decompile(
             continue;
         }
         const std::string pad(clamped_indent * 4u, ' ');
+        const std::string body_text =
+            rename_map.empty() ? item.text
+                               : rewrite_decompiler_c_tokens(item.text, rename_map, in_block_comment);
         unit.lines.push_back(DecompiledLine{
             .address = item.address,
-            .text = pad + item.text,
+            .text = pad + body_text,
             .ranges = item.ranges,
         });
     }
@@ -2985,6 +3098,9 @@ DecompiledUnit RetDecDecompiler::decompile(
 
     if (unit.lines.empty()) {
         return failure(DecompileStatus::NoFunction, "RetDec produced empty output");
+    }
+    if (request.function_override.has_value() && !request.function_override->empty()) {
+        apply_decompiler_overrides(unit, *request.function_override);
     }
     return unit;
 }

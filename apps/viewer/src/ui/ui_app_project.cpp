@@ -37,6 +37,7 @@ void UiApp::mark_autosave_baseline() noexcept {
         annotations_.revision(),
         model_.bookmark_revision(),
         model_.structure_binding_revision(),
+        decompiler_overrides_.revision(),
     };
     last_autosave_check_ = std::chrono::steady_clock::now();
 }
@@ -54,7 +55,8 @@ void UiApp::poll_project_autosave(bool force_now) {
         model_.edit_revision(),
         annotations_.revision(),
         model_.bookmark_revision(),
-        model_.structure_binding_revision());
+        model_.structure_binding_revision(),
+        decompiler_overrides_.revision());
     if (current_revs == last_autosave_revisions_) {
         return;
     }
@@ -81,6 +83,7 @@ void UiApp::poll_project_autosave(bool force_now) {
     std::string layout_str = layout_ptr ? std::string(layout_ptr, layout_size) : std::string{};
     layout_str = stamp_workspace_layout_metadata(
         layout_str, active_workspace_preset_, kWorkspaceLayoutSchemaVersion);
+    const std::vector<DecompilerFunctionOverride> decomp_ov = decompiler_overrides_.to_vector();
     const AnalysisProject snapshot = build_analysis_project(
         model_,
         current_project_path_,
@@ -89,7 +92,8 @@ void UiApp::poll_project_autosave(bool force_now) {
         navigation_history_.entries(),
         navigation_history_.cursor(),
         std::move(layout_str),
-        thumb_mode_);
+        thumb_mode_,
+        decomp_ov);
     if (write_recovery_journal(snapshot, key)) {
         last_autosave_revisions_ = current_revs;
     }
@@ -134,6 +138,7 @@ void UiApp::apply_loaded_project_metadata(const AnalysisProject& project) {
     for (const auto& [address, note] : project.annotations) {
         annotations_.set(address, note.name, note.comment);
     }
+    decompiler_overrides_.restore(project.decompiler_overrides);
     navigation_history_.restore(project.history, project.cursor);
     if (!project.history.empty()) {
         current_selection_ = project.history[project.cursor];
@@ -197,6 +202,7 @@ peelf::Result<void> UiApp::save_project(const std::filesystem::path& path) {
     std::string layout_str = layout ? std::string(layout, size) : std::string{};
     layout_str = stamp_workspace_layout_metadata(
         layout_str, active_workspace_preset_, kWorkspaceLayoutSchemaVersion);
+    const std::vector<DecompilerFunctionOverride> decomp_ov = decompiler_overrides_.to_vector();
     const AnalysisProject project = build_analysis_project(
         model_,
         path,
@@ -205,7 +211,8 @@ peelf::Result<void> UiApp::save_project(const std::filesystem::path& path) {
         navigation_history_.entries(),
         navigation_history_.cursor(),
         std::move(layout_str),
-        thumb_mode_);
+        thumb_mode_,
+        decomp_ov);
     auto written = write_analysis_file(path, encode_project(project));
     if (written) {
         current_project_path_ = path;

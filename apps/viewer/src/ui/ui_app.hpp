@@ -156,7 +156,23 @@ namespace viewer {
         std::optional<SymbolRecord> decompiled_root_;
         std::vector<CodeRange> selected_code_ranges_;
         std::optional<std::uint64_t> selected_code_address_;
+        std::optional<std::size_t> selected_decompiled_line_index_{};
+        DecompilerOverrideStore decompiler_overrides_{};
         std::uint64_t decompile_annotation_revision_ = 0, symbol_revision_ = 0, decompile_symbol_revision_ = 0;
+        std::uint64_t decompile_override_revision_ = 0;
+        bool open_decomp_rename_popup_ = false;
+        bool open_decomp_type_popup_ = false;
+        int decomp_modal_target_idx_ = 0;
+        bool decomp_type_target_is_function_ = false;
+        std::vector<std::string> decomp_modal_candidates_{};
+        char decomp_target_orig_buf_[128] = {};
+        char decomp_rename_buf_[128] = {};
+        char decomp_type_buf_[128] = {};
+        char decomp_signature_buf_[256] = {};
+        std::string decomp_modal_error_{};
+        void open_decompiler_rename_modal(std::optional<std::string_view> preferred_original = std::nullopt);
+        void open_decompiler_type_modal(std::optional<std::string_view> preferred_original = std::nullopt,
+                                        bool force_function_prototype = false);
         char decompiler_python_[1024] = "python";
         char decompiler_retdec_[1024] = "retdec-decompiler";
         DecompiledUnit decompiled_;
@@ -288,7 +304,8 @@ namespace viewer {
         // .peproj v2 relocation, bookmarks, and autosave crash-recovery state
         std::filesystem::path current_project_path_;
         std::uint64_t current_project_saved_ms_ = 0;
-        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t> last_autosave_revisions_{0, 0, 0, 0};
+        std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t>
+            last_autosave_revisions_{0, 0, 0, 0, 0};
         std::chrono::steady_clock::time_point last_autosave_check_{};
         bool open_relocate_modal_next_frame_ = false;
         std::optional<AnalysisProject> pending_relocation_project_;

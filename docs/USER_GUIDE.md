@@ -77,7 +77,13 @@ ctest --preset clang18-asan-ubsan
 cmake --preset clang18-release
 cmake --build --preset clang18-release
 
-# 4. Headless CLI-only build (no Vulkan SDK, X11/Wayland, or GTK3 required)
+# 4. Opt-in Clang libFuzzer + ASan + UBSan parser harnesses (-DPEELF_ENABLE_FUZZERS=ON)
+cmake --preset clang18-fuzz
+cmake --build --preset clang18-fuzz
+ASAN_OPTIONS=detect_leaks=1:alloc_dealloc_mismatch=0:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+  ./out/build/clang18-fuzz/tests/fuzz/fuzz_binary_image -max_total_time=20 -rss_limit_mb=2048 -timeout=5
+
+# 5. Headless CLI-only build (no Vulkan SDK, X11/Wayland, or GTK3 required)
 cmake -S . -B out/build/headless-cli -G Ninja \
   -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
   -DCMAKE_BUILD_TYPE=Release -DPEELF_BUILD_GUI=OFF
@@ -111,6 +117,8 @@ cmake --install out/build/msvc-debug --config Release --prefix C:\Tools\peelf-ex
 C:\Tools\peelf-explorer\bin\peelf_viewer.exe --version
 cpack --config out/build/msvc-debug/CPackConfig.cmake -C Release -B dist
 ```
+
+Official `v1.0.0` (and tagged `v*`) releases automatically build, smoke-test, checksum (`SHA256SUMS.txt`), and publish `peelf-explorer-<ver>-linux-x86_64.tar.gz` and `peelf-explorer-<ver>-windows-x64.zip` via [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 #### Launch Interactive GUI or Headless CLI
 
@@ -191,6 +199,8 @@ flowchart LR
 | **`Alt+Right`** / **`Shift+Backspace`** | `Navigate > Forward` | Navigate forward in address selection history |
 | **`Ctrl+B`** | `Navigate > Bookmark selection` | Toggle a named bookmark at the active VA / file offset |
 | **`X`** | `Navigate > References & Notes` | Focus incoming/outgoing cross-references and inline notes for current VA |
+| **`N`** *(in Disasm / Decompiler)* | `Disassembly` / `Decompiler` | Rename the selected function or local/parameter variable (`DecompilerOverrideStore` / `annotations_`) |
+| **`Y`** *(in Decompiler)* | `Decompiler` | Set C type on a local/parameter variable or override the function return type / C prototype |
 | **`F5`** *(outside a debug session)* | `Navigate > Decompile selection` | Decompile the function containing the current selection |
 | **`F5`** *(debugger paused)* | `Inspect > Continue` | Resume execution in an active opt-in `IDebugSession` |
 | **`F9`** | `Inspect > Toggle Breakpoint at Selection` | Set or remove a software breakpoint at the selected VA |
@@ -210,7 +220,7 @@ flowchart LR
    - Choose **File > Save Analysis Project...** to write a `.peproj` v2 text session (headed `PEELF_PROJECT 2`, not JSON) containing:
      - Cryptographic target identity: **`source_sha256`** (64-hex SHA-256) + **`source_size`**,
      - Both `source` and **`relative_source`** (relative to the `.peproj` directory so projects can be moved across machines or git checkouts),
-     - User symbol renames, comments, bookmarks, custom C `struct`/`union`/`enum`/`#pragma pack` definitions, pinned **Structure View** bindings, and staged patch intervals.
+     - User symbol renames, comments, bookmarks, custom C `struct`/`union`/`enum`/`#pragma pack` definitions, per-function **Decompiler** variable/parameter renames & C-type/prototype overrides (`DECOMPILER_OVERRIDES 1`), pinned **Structure View** bindings, and staged patch intervals.
    - Atomic persistence writes `<name>.peproj.tmp` and renames it atomically to avoid replacing the saved project with a partially written file.
 3. **Moved or Changed Binaries**:
    - Projects record both absolute and relative source paths plus the original size and SHA-256. If the source cannot be found or its identity differs, **Relocate or Verify Project Binary** displays the problem.
@@ -223,7 +233,7 @@ Projects also preserve navigation history, ARM/Thumb mode, debug-symbol paths, a
 
 ### 2.4 Panel directory
 
-All 39 workspace panels are listed below (`kWorkspaceLayoutSchemaVersion = 12`). Open them through **View** or `Ctrl+K`; **Navigate > Symbols** opens **Functions & Names**, and **Navigate > Structure** opens the tree rather than the typed **Structure View**.
+All 40 workspace panels are listed below (`kWorkspaceLayoutSchemaVersion = 13`). Open them through **View** or `Ctrl+K`; **Navigate > Symbols** opens **Functions & Names**, and **Navigate > Structure** opens the tree rather than the typed **Structure View**.
 
 | Panel | What to use it for |
 |---|---|
@@ -303,6 +313,13 @@ On Windows and Linux hosts without external libraries, the built-in DWARF v2–v
   - `.gnu_debuglink` — locates sibling `<file>.debug`, `<dir>/.debug/<file>.debug`, or `/usr/lib/debug/<dir>/<file>.debug` and verifies its IEEE **CRC32** checksum.
   - `.note.gnu.build-id` — resolves `/usr/lib/debug/.build-id/<ab>/<cdef...>.debug` and cached `debuginfod` paths.
   - **macOS `.dSYM` Bundles (`LC_UUID`)** — searches `<binary>.dSYM/Contents/Resources/DWARF/<name>` and sibling `.dSYM` bundles, selects the matching architecture slice on Universal `.dSYM` companions, and enforces 16-byte **`LC_UUID`** identity verification (you can also pass either a `.dSYM` bundle directory or inner DWARF file to **File > Open Debug Symbols...**).
+
+### 3.4 `.NET / CLR` ECMA-335 Metadata & CIL Bytecode Inspector (`WU-47`)
+
+When a PE binary contains Data Directory 14 (`IMAGE_COR20_HEADER` + ECMA-335 `BSJB` metadata root), open **View > .NET / CLR** (or run `peelf_viewer --headless <assembly.exe> --clr`):
+
+- **Streams & Assembly Identity**: Displays CLR runtime version, `COMIMAGE_FLAGS_*` (`ILONLY`, `32BITREQUIRED`, `32BITPREFERRED`, `STRONGNAMESIGNED`, `NATIVE_ENTRYPOINT`), `BSJB` metadata streams (`#~`/`#-`, `#Strings`, `#US`, `#GUID`, `#Blob`), `Assembly` identity, and `AssemblyRef` versioned dependencies.
+- **Types, Methods, P/Invoke & `#US` Literals**: Browse `TypeDef` / `MethodDef` / `Field` tables with decoded `#Blob` signatures, `ImplMap` unmanaged P/Invoke DLL/symbol bindings, and UTF-16 `#US` user strings; click any RVA-backed method to inspect its Tiny or Fat header (`max_stack`, local-var token, EH clauses) and full **CIL bytecode disassembly** (single-byte + `0xFE` two-byte opcodes, resolved metadata tokens, and `switch` branch targets) synchronized with **Hex View**.
 
 ---
 
@@ -407,6 +424,11 @@ Select any function or instruction and press **`F5`** (**Navigate > Decompile se
 3. **Bidirectional Line <-> Disassembly Synchronization**:
    - Clicking a C statement in **Decompiler** highlights its originating instruction address in **Disassembly** and **Hex View**; clicking an instruction in **Disassembly** highlights the corresponding pseudo-C line(s).
    - Recovered parameter/struct types (`DataTypeRecord`) appear in the **Data Structures** drawer (**View > Data Structures**) and feed **Structure View**.
+4. **Interactive Variable/Parameter Renaming (`N`) & C-Type / Prototype Overrides (`Y`, `WU-48`)**:
+   - Select any line in **Decompiler** (including local declaration lines without an instruction VA) or right-click a row:
+     - Press **`N`** (**Rename (N)** / **Rename Function / Variable...**) to rename any discovered stack variable (`stack_var_10`, `local_18`), register/parameter (`rcx`, `rdi`, `param_1`, `uVar1`), or the enclosing function itself. Identifier validation enforces clean C syntax (`[A-Za-z_][A-Za-z0-9_]*`, rejecting C keywords), and C-token-boundary-safe rewriting updates declarations and expressions across **Structured Pseudo-C**, **Ghidra**, **Binary Ninja HLIL**, and **RetDec** without touching string literals, hex constants, `struct` member fields, or `/* was <orig> */` provenance comments.
+     - Press **`Y`** (**Set Type (Y)** / **Set C Type / Prototype...**) to assign a C type to a local/parameter variable or override the function's return type and custom parameter list, with clickable completion suggestions drawn from built-in C types (`const char*`, `size_t`, `uint32_t`, `void*`, ...) plus loaded PDB/DWARF and custom C `struct`/`union`/`enum` definitions.
+   - Expand **`Local Variables & Overrides (k)`** inside **Decompiler** to review active overrides for the current function with 1-click **Edit**, **Type**, and **Reset** buttons. All overrides invalidate only the affected function's `DecompileCache` entry and persist inside `.peproj` v2 (`DECOMPILER_OVERRIDES 1`) and autosave crash-recovery journals.
 
 ---
 

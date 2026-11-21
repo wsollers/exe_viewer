@@ -583,6 +583,11 @@ DecompiledUnit GhidraDecompiler::decompile(const DecompileRequest& request, std:
         unit.provider = "Ghidra";
         if (result.exit_code != 0 && unit.status == DecompileStatus::Ready)
             return {result, failure(DecompileStatus::Failed, "Ghidra exited unsuccessfully; output discarded")};
+        if (unit.status == DecompileStatus::Ready &&
+            request.function_override.has_value() &&
+            !request.function_override->empty()) {
+            apply_decompiler_overrides(unit, *request.function_override);
+        }
         return {result, std::move(unit)};
     };
 

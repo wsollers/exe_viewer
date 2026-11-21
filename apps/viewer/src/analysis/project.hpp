@@ -35,6 +35,7 @@ struct AnalysisProject {
     std::string custom_c_types_source;
     std::uint32_t custom_c_types_abi = 0;
     std::vector<DataTypeRecord> custom_types;
+    std::vector<DecompilerFunctionOverride> decompiler_overrides;
     std::vector<ViewerSelection> history;
     std::size_t cursor{};
     std::string layout;
@@ -69,7 +70,8 @@ struct ProjectBinaryResolution {
     std::span<const ViewerSelection> history = {},
     std::size_t cursor = 0,
     std::string layout = {},
-    bool thumb = false);
+    bool thumb = false,
+    std::span<const DecompilerFunctionOverride> decompiler_overrides = {});
 
 [[nodiscard]] std::string encode_project(const AnalysisProject&);
 [[nodiscard]] peelf::Result<AnalysisProject> decode_project(std::string_view);

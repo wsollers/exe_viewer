@@ -1047,7 +1047,556 @@ DecompiledUnit BinaryNinjaDecompiler::decompile(const DecompileRequest& request,
     if (process.exit_code != 0 && unit.status == DecompileStatus::Ready) {
         return failure(DecompileStatus::Failed, "Binary Ninja bridge exited abnormally after writing output");
     }
+    if (unit.status == DecompileStatus::Ready &&
+        request.function_override.has_value() &&
+        !request.function_override->empty()) {
+        apply_decompiler_overrides(unit, *request.function_override);
+    }
     return unit;
+}
+
+namespace {
+
+[[nodiscard]] std::string format_c_typed_variable_decl(
+    std::string_view c_type,
+    std::string_view var_name) {
+    c_type = trim_ascii(c_type);
+    const std::size_t bracket = c_type.find('[');
+    if (bracket != std::string_view::npos && bracket > 0u) {
+        const std::string_view base_type = trim_ascii(c_type.substr(0, bracket));
+        const std::string_view array_suffix = c_type.substr(bracket);
+        return std::format("{} {}{}", base_type, var_name, array_suffix);
+    }
+    return std::format("{} {}", c_type, var_name);
+}
+
+[[nodiscard]] bool is_non_type_statement_keyword(std::string_view word) noexcept {
+    return word == "return" || word == "goto" || word == "case" || word == "else" ||
+           word == "delete" || word == "sizeof" || word == "throw" || word == "co_return" ||
+           word == "if" || word == "while" || word == "for" || word == "switch" || word == "do";
+}
+
+[[nodiscard]] bool is_member_or_tag_context(std::string_view code, std::size_t tok_start) noexcept {
+    std::size_t back = tok_start;
+    while (back > 0u && (code[back - 1u] == ' ' || code[back - 1u] == '\t')) {
+        --back;
+    }
+    if (back >= 1u && code[back - 1u] == '.') {
+        const bool is_ellipsis =
+            back >= 3u && code[back - 2u] == '.' && code[back - 3u] == '.';
+        if (!is_ellipsis) {
+            return true;
+        }
+    }
+    if (back >= 2u && code[back - 2u] == '-' && code[back - 1u] == '>') {
+        return true;
+    }
+    if (back >= 2u && code[back - 2u] == ':' && code[back - 1u] == ':') {
+        return true;
+    }
+    if (back < tok_start && back > 0u && detail::is_override_ident_cont(code[back - 1u])) {
+        std::size_t kw_start = back;
+        while (kw_start > 0u && detail::is_override_ident_cont(code[kw_start - 1u])) {
+            --kw_start;
+        }
+        const std::string_view prev_word = code.substr(kw_start, back - kw_start);
+        if (prev_word == "struct" || prev_word == "union" || prev_word == "enum") {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::string rewrite_single_parameter_decl(
+    std::string_view param,
+    const std::unordered_map<std::string_view, const DecompilerVariableOverride*>& var_map,
+    const std::unordered_map<std::string, std::string>& rename_map) {
+    const std::string_view trimmed = trim_ascii(param);
+    if (trimmed.empty() || trimmed == "void" || trimmed == "...") {
+        return std::string(trimmed);
+    }
+
+    std::size_t end_pos = trimmed.size();
+    std::string_view array_suffix{};
+    if (trimmed.back() == ']') {
+        const std::size_t open_br = trimmed.rfind('[');
+        if (open_br != std::string_view::npos) {
+            array_suffix = trimmed.substr(open_br);
+            end_pos = open_br;
+            while (end_pos > 0u && (trimmed[end_pos - 1u] == ' ' || trimmed[end_pos - 1u] == '\t')) {
+                --end_pos;
+            }
+        }
+    }
+    std::size_t name_start = end_pos;
+    while (name_start > 0u && detail::is_override_ident_cont(trimmed[name_start - 1u])) {
+        --name_start;
+    }
+    if (name_start < end_pos && detail::is_override_ident_start(trimmed[name_start])) {
+        const std::string_view param_name = trimmed.substr(name_start, end_pos - name_start);
+        const std::string_view prefix_type = trim_ascii(trimmed.substr(0, name_start));
+        if (!prefix_type.empty()) {
+            if (const auto it = var_map.find(param_name); it != var_map.end()) {
+                const DecompilerVariableOverride* ov = it->second;
+                const std::string_view eff_name =
+                    !ov->renamed_to.empty() ? std::string_view(ov->renamed_to) : param_name;
+                if (!ov->c_type.empty()) {
+                    return format_c_typed_variable_decl(ov->c_type, eff_name);
+                }
+                return std::format("{} {}{}", prefix_type, eff_name, array_suffix);
+            }
+        }
+    }
+    return rewrite_decompiler_c_tokens(trimmed, rename_map);
+}
+
+[[nodiscard]] bool try_rewrite_function_header_line(
+    std::string& line,
+    const DecompilerFunctionOverride& ov,
+    const std::unordered_map<std::string_view, const DecompilerVariableOverride*>& var_map,
+    const std::unordered_map<std::string, std::string>& rename_map) {
+    std::size_t indent_len = 0u;
+    while (indent_len < line.size() && (line[indent_len] == ' ' || line[indent_len] == '\t')) {
+        ++indent_len;
+    }
+    const std::string indent = line.substr(0, indent_len);
+    const std::string_view rest = std::string_view(line).substr(indent_len);
+    const std::size_t open_paren = rest.find('(');
+    if (open_paren == std::string_view::npos || open_paren == 0u) {
+        return false;
+    }
+
+    int depth = 0;
+    std::size_t close_paren = std::string_view::npos;
+    for (std::size_t i = open_paren; i < rest.size(); ++i) {
+        if (rest[i] == '(') {
+            ++depth;
+        } else if (rest[i] == ')') {
+            --depth;
+            if (depth == 0) {
+                close_paren = i;
+                break;
+            }
+        }
+    }
+    if (close_paren == std::string_view::npos) {
+        return false;
+    }
+
+    const std::string tail_after_params(rest.substr(close_paren + 1u));
+    if (!ov.signature_override.empty() && ov.signature_override.front() != '(') {
+        line = std::format("{}{}{}", indent, ov.signature_override, tail_after_params);
+        return true;
+    }
+
+    std::size_t fn_end = open_paren;
+    while (fn_end > 0u && (rest[fn_end - 1u] == ' ' || rest[fn_end - 1u] == '\t')) {
+        --fn_end;
+    }
+    std::size_t fn_start = fn_end;
+    while (fn_start > 0u &&
+           (detail::is_override_ident_cont(rest[fn_start - 1u]) ||
+            rest[fn_start - 1u] == ':' || rest[fn_start - 1u] == '~')) {
+        --fn_start;
+    }
+    if (fn_start == fn_end) {
+        return false;
+    }
+    const std::string_view func_name = rest.substr(fn_start, fn_end - fn_start);
+    const std::string_view old_ret = trim_ascii(rest.substr(0, fn_start));
+    const std::string_view eff_ret =
+        !ov.return_type.empty() ? std::string_view(ov.return_type) : old_ret;
+
+    std::string param_list_str;
+    if (!ov.signature_override.empty() && ov.signature_override.front() == '(') {
+        param_list_str = ov.signature_override;
+    } else {
+        const std::string_view raw_params =
+            rest.substr(open_paren + 1u, close_paren - open_paren - 1u);
+        std::string rebuilt;
+        std::size_t start = 0u;
+        int p_depth = 0;
+        bool first = true;
+        for (std::size_t i = 0u; i <= raw_params.size(); ++i) {
+            const bool at_end = (i == raw_params.size());
+            if (!at_end) {
+                if (raw_params[i] == '(' || raw_params[i] == '[' || raw_params[i] == '<') {
+                    ++p_depth;
+                } else if (raw_params[i] == ')' || raw_params[i] == ']' || raw_params[i] == '>') {
+                    --p_depth;
+                }
+            }
+            if (at_end || (raw_params[i] == ',' && p_depth == 0)) {
+                const std::string_view part = raw_params.substr(start, i - start);
+                if (!first) {
+                    rebuilt.append(", ");
+                }
+                first = false;
+                rebuilt.append(rewrite_single_parameter_decl(part, var_map, rename_map));
+                start = i + 1u;
+            }
+        }
+        param_list_str = std::format("({})", rebuilt);
+    }
+
+    if (eff_ret.empty()) {
+        line = std::format("{}{}{}{}", indent, func_name, param_list_str, tail_after_params);
+    } else {
+        line = std::format("{}{} {}{}{}", indent, eff_ret, func_name, param_list_str, tail_after_params);
+    }
+    return true;
+}
+
+[[nodiscard]] bool try_rewrite_local_decl_line(
+    std::string& line,
+    const std::unordered_map<std::string_view, const DecompilerVariableOverride*>& var_map,
+    const std::unordered_map<std::string, std::string>& rename_map) {
+    std::size_t indent_len = 0u;
+    while (indent_len < line.size() && (line[indent_len] == ' ' || line[indent_len] == '\t')) {
+        ++indent_len;
+    }
+    const std::string indent = line.substr(0, indent_len);
+    const std::string_view body = std::string_view(line).substr(indent_len);
+    if (body.empty() || body.starts_with("//") || body.starts_with("/*") || body.starts_with('#')) {
+        return false;
+    }
+
+    std::size_t semi_pos = std::string_view::npos;
+    std::size_t eq_pos = std::string_view::npos;
+    bool in_str = false;
+    bool in_chr = false;
+    int paren_depth = 0;
+    for (std::size_t i = 0u; i < body.size(); ++i) {
+        const char ch = body[i];
+        if (in_str) {
+            if (ch == '\\' && i + 1u < body.size()) {
+                ++i;
+            } else if (ch == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (in_chr) {
+            if (ch == '\\' && i + 1u < body.size()) {
+                ++i;
+            } else if (ch == '\'') {
+                in_chr = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_str = true;
+            continue;
+        }
+        if (ch == '\'') {
+            in_chr = true;
+            continue;
+        }
+        if (ch == '/' && i + 1u < body.size() && (body[i + 1u] == '/' || body[i + 1u] == '*')) {
+            break;
+        }
+        if (ch == '(') {
+            ++paren_depth;
+        } else if (ch == ')') {
+            --paren_depth;
+        } else if (ch == '=' && paren_depth == 0 && eq_pos == std::string_view::npos) {
+            if (i + 1u < body.size() && body[i + 1u] == '=') {
+                ++i;
+                continue;
+            }
+            if (i > 0u && (body[i - 1u] == '!' || body[i - 1u] == '<' || body[i - 1u] == '>' ||
+                           body[i - 1u] == '+' || body[i - 1u] == '-' || body[i - 1u] == '*' ||
+                           body[i - 1u] == '/' || body[i - 1u] == '%' || body[i - 1u] == '&' ||
+                           body[i - 1u] == '|' || body[i - 1u] == '^')) {
+                continue;
+            }
+            eq_pos = i;
+        } else if (ch == ';' && paren_depth == 0) {
+            semi_pos = i;
+            break;
+        }
+    }
+    if (semi_pos == std::string_view::npos) {
+        return false;
+    }
+
+    const std::size_t lhs_end = (eq_pos != std::string_view::npos && eq_pos < semi_pos) ? eq_pos : semi_pos;
+    std::string_view lhs = trim_ascii(body.substr(0, lhs_end));
+    if (lhs.empty()) {
+        return false;
+    }
+    for (char ch : lhs) {
+        if (ch == '(' || ch == ')' || ch == '{' || ch == '}' || ch == ',') {
+            return false;
+        }
+    }
+
+    std::string_view array_suffix{};
+    if (lhs.back() == ']') {
+        const std::size_t open_br = lhs.rfind('[');
+        if (open_br == std::string_view::npos) {
+            return false;
+        }
+        array_suffix = lhs.substr(open_br);
+        lhs = trim_ascii(lhs.substr(0, open_br));
+    }
+
+    std::size_t name_start = lhs.size();
+    while (name_start > 0u && detail::is_override_ident_cont(lhs[name_start - 1u])) {
+        --name_start;
+    }
+    if (name_start == lhs.size() || !detail::is_override_ident_start(lhs[name_start])) {
+        return false;
+    }
+
+    const std::string_view var_name = lhs.substr(name_start);
+    const std::string_view type_part = trim_ascii(lhs.substr(0, name_start));
+    if (type_part.empty()) {
+        return false;
+    }
+
+    bool type_has_ident = false;
+    std::size_t first_word_end = 0u;
+    while (first_word_end < type_part.size() && detail::is_override_ident_cont(type_part[first_word_end])) {
+        type_has_ident = true;
+        ++first_word_end;
+    }
+    if (!type_has_ident) {
+        return false;
+    }
+    const std::string_view first_word = type_part.substr(0, first_word_end);
+    if (is_non_type_statement_keyword(first_word)) {
+        return false;
+    }
+
+    const auto it = var_map.find(var_name);
+    if (it == var_map.end()) {
+        return false;
+    }
+    const DecompilerVariableOverride* ov = it->second;
+    const std::string_view eff_name =
+        !ov->renamed_to.empty() ? std::string_view(ov->renamed_to) : var_name;
+
+    std::string decl_lhs;
+    if (!ov->c_type.empty()) {
+        if (ov->c_type.find('[') != std::string::npos || array_suffix.empty()) {
+            decl_lhs = format_c_typed_variable_decl(ov->c_type, eff_name);
+        } else {
+            decl_lhs = std::format("{} {}{}", ov->c_type, eff_name, array_suffix);
+        }
+    } else {
+        decl_lhs = std::format("{} {}{}", type_part, eff_name, array_suffix);
+    }
+
+    std::string init_part;
+    if (eq_pos != std::string_view::npos && eq_pos < semi_pos) {
+        const std::string_view raw_init = trim_ascii(body.substr(eq_pos + 1u, semi_pos - eq_pos - 1u));
+        init_part = std::format(" = {}", rewrite_decompiler_c_tokens(raw_init, rename_map));
+    }
+
+    const std::string_view trailing = body.substr(semi_pos + 1u);
+    std::string was_comment;
+    if (eff_name != var_name && trailing.find("was ") == std::string_view::npos) {
+        was_comment = std::format(" /* was {} */", var_name);
+    }
+    line = std::format("{}{}{};{}{}", indent, decl_lhs, init_part, was_comment, trailing);
+    return true;
+}
+
+} // namespace
+
+std::string rewrite_decompiler_c_tokens(
+    std::string_view code,
+    const std::unordered_map<std::string, std::string>& rename_map,
+    bool& in_block_comment) {
+    if (code.empty()) {
+        return {};
+    }
+
+    if (!in_block_comment) {
+        const std::string_view trimmed_line = trim_ascii(code);
+        if (trimmed_line.starts_with('#')) {
+            return std::string(code);
+        }
+    }
+
+    std::string out;
+    out.reserve(code.size() + 16u);
+    std::size_t i = 0u;
+    while (i < code.size()) {
+        if (in_block_comment) {
+            const std::size_t close_pos = code.find("*/", i);
+            if (close_pos == std::string_view::npos) {
+                out.append(code.substr(i));
+                return out;
+            }
+            out.append(code.substr(i, close_pos + 2u - i));
+            i = close_pos + 2u;
+            in_block_comment = false;
+            continue;
+        }
+
+        const char ch = code[i];
+        if (ch == '/' && i + 1u < code.size()) {
+            if (code[i + 1u] == '*') {
+                out.append("/*");
+                i += 2u;
+                in_block_comment = true;
+                continue;
+            }
+            if (code[i + 1u] == '/') {
+                const std::size_t nl = code.find('\n', i + 2u);
+                if (nl == std::string_view::npos) {
+                    out.append(code.substr(i));
+                    return out;
+                }
+                out.append(code.substr(i, nl - i));
+                i = nl;
+                continue;
+            }
+        }
+
+        if (ch == '"' || ch == '\'') {
+            const char quote = ch;
+            out.push_back(quote);
+            ++i;
+            while (i < code.size()) {
+                if (code[i] == '\\' && i + 1u < code.size()) {
+                    out.push_back(code[i]);
+                    out.push_back(code[i + 1u]);
+                    i += 2u;
+                } else if (code[i] == quote) {
+                    out.push_back(quote);
+                    ++i;
+                    break;
+                } else {
+                    out.push_back(code[i]);
+                    ++i;
+                }
+            }
+            continue;
+        }
+
+        if ((ch >= '0' && ch <= '9') ||
+            (ch == '.' && i + 1u < code.size() && code[i + 1u] >= '0' && code[i + 1u] <= '9')) {
+            out.push_back(ch);
+            ++i;
+            while (i < code.size()) {
+                const char nc = code[i];
+                if ((nc == 'e' || nc == 'E' || nc == 'p' || nc == 'P') &&
+                    i + 1u < code.size() && (code[i + 1u] == '+' || code[i + 1u] == '-')) {
+                    out.push_back(nc);
+                    out.push_back(code[i + 1u]);
+                    i += 2u;
+                } else if (detail::is_override_ident_cont(nc) || nc == '.') {
+                    out.push_back(nc);
+                    ++i;
+                } else {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (detail::is_override_ident_start(ch)) {
+            const std::size_t start = i;
+            ++i;
+            while (i < code.size() && detail::is_override_ident_cont(code[i])) {
+                ++i;
+            }
+            const std::string_view ident = code.substr(start, i - start);
+            if (!rename_map.empty() && !is_member_or_tag_context(code, start)) {
+                if (const auto it = rename_map.find(std::string(ident));
+                    it != rename_map.end() && !it->second.empty()) {
+                    out.append(it->second);
+                    continue;
+                }
+            }
+            out.append(ident);
+            continue;
+        }
+
+        out.push_back(ch);
+        ++i;
+    }
+    return out;
+}
+
+std::string rewrite_decompiler_c_tokens(
+    std::string_view code,
+    const std::unordered_map<std::string, std::string>& rename_map) {
+    bool in_block_comment = false;
+    return rewrite_decompiler_c_tokens(code, rename_map, in_block_comment);
+}
+
+void apply_decompiler_overrides(
+    DecompiledUnit& unit,
+    const DecompilerFunctionOverride& override_spec) {
+    if (unit.status != DecompileStatus::Ready || override_spec.empty() || unit.lines.empty()) {
+        return;
+    }
+
+    std::unordered_map<std::string, std::string> rename_map;
+    std::unordered_map<std::string_view, const DecompilerVariableOverride*> var_map;
+    rename_map.reserve(override_spec.variables.size());
+    var_map.reserve(override_spec.variables.size());
+    for (const DecompilerVariableOverride& v : override_spec.variables) {
+        var_map.emplace(v.original_name, &v);
+        if (!v.renamed_to.empty() && v.renamed_to != v.original_name) {
+            rename_map.emplace(v.original_name, v.renamed_to);
+        }
+    }
+
+    bool header_handled = false;
+    bool in_block_comment = false;
+    for (DecompiledLine& line : unit.lines) {
+        if (!header_handled && !in_block_comment) {
+            const std::string_view trimmed = trim_ascii(line.text);
+            if (!trimmed.empty() && !trimmed.starts_with("//") &&
+                !trimmed.starts_with("/*") && !trimmed.starts_with('#') &&
+                trimmed.find('(') != std::string_view::npos &&
+                trimmed.find(';') == std::string_view::npos) {
+                if (try_rewrite_function_header_line(line.text, override_spec, var_map, rename_map)) {
+                    header_handled = true;
+                    continue;
+                }
+            }
+        }
+        if (!in_block_comment && header_handled &&
+            try_rewrite_local_decl_line(line.text, var_map, rename_map)) {
+            continue;
+        }
+        line.text = rewrite_decompiler_c_tokens(line.text, rename_map, in_block_comment);
+    }
+}
+
+std::string compute_decompiler_override_digest(
+    const std::optional<DecompilerFunctionOverride>& override_spec) {
+    if (!override_spec.has_value() || override_spec->empty()) {
+        return {};
+    }
+    peelf::Sha256Hasher hasher;
+    const auto feed = [&hasher](std::string_view sv) {
+        hasher.update(sv);
+        hasher.update(std::string_view{"\0", 1});
+    };
+    feed(std::to_string(override_spec->function_address));
+    feed(override_spec->return_type);
+    feed(override_spec->signature_override);
+    std::vector<const DecompilerVariableOverride*> sorted_vars;
+    sorted_vars.reserve(override_spec->variables.size());
+    for (const auto& v : override_spec->variables) {
+        sorted_vars.push_back(&v);
+    }
+    std::ranges::sort(sorted_vars, [](const auto* a, const auto* b) {
+        return a->original_name < b->original_name;
+    });
+    for (const auto* v : sorted_vars) {
+        feed(v->original_name);
+        feed(v->renamed_to);
+        feed(v->c_type);
+    }
+    return hasher.finalize_hex();
 }
 
 std::string compute_decompiler_settings_fingerprint(const DecompilerSettings& settings) {
@@ -1087,6 +1636,7 @@ DecompileCacheKey make_decompile_cache_key(const DecompileRequest& request,
         .patch_revision = request.patch_revision,
         .symbol_revision = request.symbol_revision,
         .symbols_sha256 = compute_decompiler_symbols_digest(request.symbols, request.types),
+        .function_override_sha256 = compute_decompiler_override_digest(request.function_override),
         .provider = settings.provider,
         .settings_fingerprint = compute_decompiler_settings_fingerprint(settings),
         .architecture = request.architecture,

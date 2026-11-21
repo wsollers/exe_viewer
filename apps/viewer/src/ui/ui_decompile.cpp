@@ -1,15 +1,19 @@
 #include "ui_app.hpp"
 #include "decompile/structured_decompiler.hpp"
+#include "logger.hpp"
 #include "runtime_paths.hpp"
 #include <peelf/sha256.hpp>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstring>
 #include <format>
 #include <limits>
 #include <span>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace viewer {
 namespace {
@@ -31,6 +35,299 @@ void copy_cstr_buffer(std::span<char> dest, std::string_view src) noexcept {
     }
     dest[count] = '\0';
 }
+
+[[nodiscard]] bool icontains_type_filter(std::string_view hay, std::string_view needle) noexcept {
+    while (!needle.empty() && (needle.front() == ' ' || needle.front() == '\t')) {
+        needle.remove_prefix(1);
+    }
+    while (!needle.empty() && (needle.back() == ' ' || needle.back() == '\t')) {
+        needle.remove_suffix(1);
+    }
+    if (needle.empty()) {
+        return true;
+    }
+    if (needle.size() > hay.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool ok = true;
+        for (std::size_t j = 0; j < needle.size(); ++j) {
+            if (std::tolower(static_cast<unsigned char>(hay[i + j])) !=
+                std::tolower(static_cast<unsigned char>(needle[j]))) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool is_builtin_c_type_identifier(std::string_view ident) noexcept {
+    static constexpr std::string_view kBuiltinTypeIdents[] = {
+        "int8_t",     "uint8_t",    "int16_t",   "uint16_t",  "int32_t",
+        "uint32_t",   "int64_t",    "uint64_t",  "size_t",    "ssize_t",
+        "uintptr_t",  "intptr_t",   "ptrdiff_t", "undefined", "undefined1",
+        "undefined2", "undefined4", "undefined8","byte",      "word",
+        "dword",      "qword",      "uchar",     "ushort",    "uint",
+        "ulong",      "ulonglong",  "longlong",  "BOOL",      "BYTE",
+        "WORD",       "DWORD",      "QWORD",     "HANDLE",    "PVOID",
+        "LPVOID",     "LPCSTR",     "LPSTR",     "LPCWSTR",   "LPWSTR",
+        "NTSTATUS",   "HRESULT",    "ULONG",     "LONG",      "UINT",
+        "SIZE_T",     "NULL",
+    };
+    for (const std::string_view t : kBuiltinTypeIdents) {
+        if (ident == t) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void scan_line_candidate_identifiers(
+    std::string_view line,
+    bool is_header_line,
+    std::string_view enclosing_func_name,
+    const std::unordered_map<std::string_view, std::string_view>& renamed_to_original,
+    const std::unordered_set<std::string_view>& known_type_names,
+    std::vector<std::string>& out,
+    std::unordered_set<std::string>& seen) {
+    std::string_view trimmed = line;
+    while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t')) {
+        trimmed.remove_prefix(1);
+    }
+    if (trimmed.empty() || trimmed.starts_with('#')) {
+        return;
+    }
+
+    std::size_t i = 0u;
+    while (i < line.size()) {
+        const char ch = line[i];
+        if (ch == '/' && i + 1u < line.size()) {
+            if (line[i + 1u] == '/') {
+                break;
+            }
+            if (line[i + 1u] == '*') {
+                const std::size_t end_c = line.find("*/", i + 2u);
+                if (end_c == std::string_view::npos) {
+                    break;
+                }
+                i = end_c + 2u;
+                continue;
+            }
+        }
+        if (ch == '"' || ch == '\'') {
+            const char q = ch;
+            ++i;
+            while (i < line.size()) {
+                if (line[i] == '\\' && i + 1u < line.size()) {
+                    i += 2u;
+                } else if (line[i] == q) {
+                    ++i;
+                    break;
+                } else {
+                    ++i;
+                }
+            }
+            continue;
+        }
+        if (ch >= '0' && ch <= '9') {
+            ++i;
+            while (i < line.size() && (detail::is_override_ident_cont(line[i]) || line[i] == '.')) {
+                ++i;
+            }
+            continue;
+        }
+        if (detail::is_override_ident_start(ch)) {
+            const std::size_t start = i++;
+            while (i < line.size() && detail::is_override_ident_cont(line[i])) {
+                ++i;
+            }
+            std::string_view ident = line.substr(start, i - start);
+
+            std::size_t back = start;
+            while (back > 0u && (line[back - 1u] == ' ' || line[back - 1u] == '\t')) {
+                --back;
+            }
+            if ((back >= 1u && line[back - 1u] == '.') ||
+                (back >= 2u && line[back - 2u] == '-' && line[back - 1u] == '>') ||
+                (back >= 2u && line[back - 2u] == ':' && line[back - 1u] == ':')) {
+                continue;
+            }
+
+            std::size_t fwd = i;
+            while (fwd < line.size() && (line[fwd] == ' ' || line[fwd] == '\t')) {
+                ++fwd;
+            }
+            if (!is_header_line && fwd < line.size() && (line[fwd] == '(' || line[fwd] == ':')) {
+                continue;
+            }
+            if (is_header_line && fwd < line.size() && line[fwd] == '(') {
+                continue;
+            }
+
+            if (const auto alias_it = renamed_to_original.find(ident);
+                alias_it != renamed_to_original.end()) {
+                ident = alias_it->second;
+            }
+
+            if (ident == enclosing_func_name ||
+                !is_valid_decompiler_c_identifier(ident) ||
+                is_builtin_c_type_identifier(ident) ||
+                known_type_names.contains(ident) ||
+                ident.starts_with("block_") ||
+                ident.starts_with("LAB_") ||
+                ident.starts_with("sub_")) {
+                continue;
+            }
+
+            std::string owned(ident);
+            if (seen.insert(owned).second) {
+                out.push_back(std::move(owned));
+            }
+            continue;
+        }
+        ++i;
+    }
+}
+
+[[nodiscard]] std::vector<std::string> collect_decompiler_variable_candidates(
+    const DecompiledUnit& unit,
+    std::optional<std::size_t> priority_line_idx,
+    std::string_view enclosing_func_name,
+    const DecompilerFunctionOverride* fn_ov,
+    std::span<const DataTypeRecord> custom_types,
+    std::span<const DataTypeRecord> debug_types) {
+    std::unordered_map<std::string_view, std::string_view> renamed_to_original;
+    if (fn_ov != nullptr) {
+        for (const DecompilerVariableOverride& v : fn_ov->variables) {
+            if (!v.renamed_to.empty()) {
+                renamed_to_original.emplace(v.renamed_to, v.original_name);
+            }
+        }
+    }
+
+    std::unordered_set<std::string_view> known_type_names;
+    for (const DataTypeRecord& t : custom_types) {
+        known_type_names.insert(t.name);
+        for (const std::string& a : t.aliases) {
+            known_type_names.insert(a);
+        }
+    }
+    for (const DataTypeRecord& t : debug_types) {
+        known_type_names.insert(t.name);
+        for (const std::string& a : t.aliases) {
+            known_type_names.insert(a);
+        }
+    }
+    for (const DataTypeRecord& t : unit.types) {
+        known_type_names.insert(t.name);
+    }
+
+    std::vector<std::string> candidates;
+    std::unordered_set<std::string> seen;
+
+    if (priority_line_idx.has_value() && *priority_line_idx < unit.lines.size()) {
+        scan_line_candidate_identifiers(
+            unit.lines[*priority_line_idx].text,
+            *priority_line_idx == 0u,
+            enclosing_func_name,
+            renamed_to_original,
+            known_type_names,
+            candidates,
+            seen);
+    }
+
+    if (fn_ov != nullptr) {
+        for (const DecompilerVariableOverride& v : fn_ov->variables) {
+            if (seen.insert(v.original_name).second) {
+                candidates.push_back(v.original_name);
+            }
+        }
+    }
+
+    for (std::size_t idx = 0u; idx < unit.lines.size(); ++idx) {
+        if (priority_line_idx.has_value() && idx == *priority_line_idx) {
+            continue;
+        }
+        scan_line_candidate_identifiers(
+            unit.lines[idx].text,
+            idx == 0u,
+            enclosing_func_name,
+            renamed_to_original,
+            known_type_names,
+            candidates,
+            seen);
+    }
+
+    return candidates;
+}
+
+[[nodiscard]] std::vector<std::string> collect_c_type_suggestions(
+    std::span<const DataTypeRecord> custom_types,
+    std::span<const DataTypeRecord> debug_types,
+    std::span<const DataTypeRecord> unit_types,
+    std::string_view filter) {
+    static constexpr std::string_view kBuiltinTypes[] = {
+        "uint8_t",      "uint16_t",     "uint32_t",   "uint64_t",
+        "int8_t",       "int16_t",      "int32_t",    "int64_t",
+        "size_t",       "ssize_t",      "uintptr_t",  "intptr_t",
+        "const char*",  "char*",        "void*",      "const void*",
+        "uint8_t*",     "const uint8_t*","uint32_t*", "uint64_t*",
+        "bool",         "char",         "void",       "float",
+        "double",
+    };
+
+    std::vector<std::string> out;
+    std::unordered_set<std::string> seen;
+    const auto add_candidate = [&](std::string cand) {
+        if (cand.empty() || !normalize_decompiler_c_type(cand).has_value()) {
+            return;
+        }
+        if (!icontains_type_filter(cand, filter)) {
+            return;
+        }
+        if (seen.insert(cand).second) {
+            out.push_back(std::move(cand));
+        }
+    };
+
+    for (const std::string_view builtin : kBuiltinTypes) {
+        add_candidate(std::string(builtin));
+    }
+
+    const auto append_records = [&](std::span<const DataTypeRecord> records) {
+        for (const DataTypeRecord& rec : records) {
+            if (out.size() >= 64u) {
+                break;
+            }
+            const char* tag_kw = rec.is_enum ? "enum" : (rec.is_union ? "union" : "struct");
+            add_candidate(rec.name);
+            if (!rec.is_enum) {
+                add_candidate(rec.name + "*");
+            }
+            add_candidate(std::format("{} {}", tag_kw, rec.name));
+            if (!rec.is_enum) {
+                add_candidate(std::format("{} {}*", tag_kw, rec.name));
+            }
+            for (const std::string& alias : rec.aliases) {
+                add_candidate(alias);
+                if (!rec.is_enum) {
+                    add_candidate(alias + "*");
+                }
+            }
+        }
+    };
+    append_records(custom_types);
+    append_records(debug_types);
+    append_records(unit_types);
+    if (out.size() > 48u) {
+        out.resize(48u);
+    }
+    return out;
+}
 } // namespace
 
 DecompileValidationStamp UiApp::current_decompile_stamp() const {
@@ -46,6 +343,7 @@ DecompileValidationStamp UiApp::current_decompile_stamp() const {
     }
     const std::uint64_t snapshot_rev =
         symbol_revision_ ^ (annotations_.revision() * 0x9E3779B97F4A7C15ULL) ^
+        (decompiler_overrides_.revision() * 0xBF58476D1CE4E5B9ULL) ^
         (model_.demangle_symbols() ? 0xD3A461E5ULL : 0ULL) ^
         (thumb_mode_ ? 0x517CC1B727220A95ULL : 0ULL);
     return DecompileValidationStamp{
@@ -125,6 +423,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
     request.patch_revision = model_.edit_revision();
     request.symbol_revision =
         symbol_revision_ ^ (annotations_.revision() * 0x9E3779B97F4A7C15ULL) ^
+        (decompiler_overrides_.revision() * 0xBF58476D1CE4E5B9ULL) ^
         (model_.demangle_symbols() ? 0xD3A461E5ULL : 0ULL);
     request.force_reanalyze = force_reanalyze;
     selected_code_ranges_.clear();
@@ -193,6 +492,20 @@ void UiApp::request_decompile(bool force_reanalyze) {
             request.symbols.push_back(std::move(symbol));
         }
         request.types = debug_types_;
+        if (const auto* fn_ov = decompiler_overrides_.find(request.address); fn_ov != nullptr) {
+            request.function_override = *fn_ov;
+        } else if (root->virtual_address.has_value()) {
+            if (const auto* alt_ov = decompiler_overrides_.find(*root->virtual_address);
+                alt_ov != nullptr) {
+                request.function_override = *alt_ov;
+            }
+        }
+        if (root->virtual_address.has_value()) {
+            if (const auto* note = annotations_.find(*root->virtual_address);
+                note != nullptr && !note->name.empty()) {
+                root->name = note->name;
+            }
+        }
         resolved_root = root;
         request.thumb = image->architecture() == peelf::Architecture::ARM && thumb_mode_;
 
@@ -219,6 +532,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
             decompiler_thumb_ = thumb_mode_;
             decompile_annotation_revision_ = annotations_.revision();
             decompile_symbol_revision_ = symbol_revision_;
+            decompile_override_revision_ = decompiler_overrides_.revision();
             decompiled_ = std::move(*cached);
             return;
         }
@@ -271,6 +585,9 @@ void UiApp::request_decompile(bool force_reanalyze) {
         request.architecture = model_.architecture();
         request.endianness = model_.endianness();
         request.thumb = request.architecture == peelf::Architecture::ARM && thumb_mode_;
+        if (const auto* fn_ov = decompiler_overrides_.find(selected_va); fn_ov != nullptr) {
+            request.function_override = *fn_ov;
+        }
         const auto recs = symbol_index_.records();
         request.symbols.assign(recs.begin(), recs.end());
         request.fallback_graph = build_function_cfg_call_graph(
@@ -301,6 +618,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
             decompiler_thumb_ = thumb_mode_;
             decompile_annotation_revision_ = annotations_.revision();
             decompile_symbol_revision_ = symbol_revision_;
+            decompile_override_revision_ = decompiler_overrides_.revision();
             decompiled_ = std::move(*cached);
             return;
         }
@@ -318,6 +636,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
     decompiler_thumb_ = thumb_mode_;
     decompile_annotation_revision_ = annotations_.revision();
     decompile_symbol_revision_ = symbol_revision_;
+    decompile_override_revision_ = decompiler_overrides_.revision();
     decompiled_ = make_decompile_message(DecompileStatus::Ready, "Analyzing selected function...");
 
     (void)decompile_controller_.submit(DecompileJobSpec{
@@ -329,6 +648,152 @@ void UiApp::request_decompile(bool force_reanalyze) {
         .root_symbol = std::move(resolved_root),
     });
 }
+void UiApp::open_decompiler_rename_modal(std::optional<std::string_view> preferred_original) {
+    decomp_modal_error_.clear();
+    const std::optional<std::uint64_t> fn_va =
+        (decompiled_root_ && decompiled_root_->virtual_address)
+            ? decompiled_root_->virtual_address
+            : std::nullopt;
+    if (!fn_va.has_value()) {
+        return;
+    }
+
+    const DecompilerFunctionOverride* fn_ov = decompiler_overrides_.find(*fn_va);
+    const std::string_view fn_name =
+        decompiled_root_ ? std::string_view(decompiled_root_->name) : std::string_view{};
+    decomp_modal_candidates_ = collect_decompiler_variable_candidates(
+        decompiled_,
+        selected_decompiled_line_index_,
+        fn_name,
+        fn_ov,
+        model_.custom_types(),
+        debug_types_);
+
+    decomp_modal_target_idx_ = 0;
+    if (preferred_original.has_value() && !preferred_original->empty()) {
+        bool found = false;
+        for (std::size_t i = 0u; i < decomp_modal_candidates_.size(); ++i) {
+            if (decomp_modal_candidates_[i] == *preferred_original) {
+                decomp_modal_target_idx_ = static_cast<int>(i + 1u);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            decomp_modal_candidates_.insert(
+                decomp_modal_candidates_.begin(), std::string(*preferred_original));
+            decomp_modal_target_idx_ = 1;
+        }
+    } else if (!decomp_modal_candidates_.empty()) {
+        const bool header_selected =
+            selected_decompiled_line_index_.has_value() && *selected_decompiled_line_index_ == 0u;
+        if (!header_selected) {
+            decomp_modal_target_idx_ = 1;
+        } else {
+            // Check whether line 0 itself had a parameter candidate.
+            std::vector<std::string> line0_only = collect_decompiler_variable_candidates(
+                decompiled_,
+                std::size_t{0u},
+                fn_name,
+                nullptr,
+                model_.custom_types(),
+                debug_types_);
+            decomp_modal_target_idx_ = 0;
+            (void)line0_only;
+        }
+    }
+
+    if (decomp_modal_target_idx_ == 0) {
+        copy_cstr_buffer(decomp_target_orig_buf_, fn_name);
+        const auto* note = annotations_.find(*fn_va);
+        copy_cstr_buffer(
+            decomp_rename_buf_,
+            (note != nullptr && !note->name.empty()) ? std::string_view(note->name) : fn_name);
+    } else {
+        const std::string& orig =
+            decomp_modal_candidates_[static_cast<std::size_t>(decomp_modal_target_idx_ - 1)];
+        copy_cstr_buffer(decomp_target_orig_buf_, orig);
+        const auto* var_ov = decompiler_overrides_.find_variable(*fn_va, orig);
+        copy_cstr_buffer(
+            decomp_rename_buf_,
+            (var_ov != nullptr && !var_ov->renamed_to.empty())
+                ? std::string_view(var_ov->renamed_to)
+                : std::string_view(orig));
+    }
+    open_decomp_rename_popup_ = true;
+}
+
+void UiApp::open_decompiler_type_modal(std::optional<std::string_view> preferred_original,
+                                       bool force_function_prototype) {
+    decomp_modal_error_.clear();
+    const std::optional<std::uint64_t> fn_va =
+        (decompiled_root_ && decompiled_root_->virtual_address)
+            ? decompiled_root_->virtual_address
+            : std::nullopt;
+    if (!fn_va.has_value()) {
+        return;
+    }
+
+    const DecompilerFunctionOverride* fn_ov = decompiler_overrides_.find(*fn_va);
+    const std::string_view fn_name =
+        decompiled_root_ ? std::string_view(decompiled_root_->name) : std::string_view{};
+    decomp_modal_candidates_ = collect_decompiler_variable_candidates(
+        decompiled_,
+        selected_decompiled_line_index_,
+        fn_name,
+        fn_ov,
+        model_.custom_types(),
+        debug_types_);
+
+    const bool header_selected =
+        selected_decompiled_line_index_.has_value() && *selected_decompiled_line_index_ == 0u;
+    if (force_function_prototype ||
+        (!preferred_original.has_value() && (header_selected || decomp_modal_candidates_.empty()))) {
+        decomp_type_target_is_function_ = true;
+        decomp_modal_target_idx_ = 0;
+        copy_cstr_buffer(
+            decomp_type_buf_,
+            fn_ov != nullptr ? std::string_view(fn_ov->return_type) : std::string_view{});
+        copy_cstr_buffer(
+            decomp_signature_buf_,
+            fn_ov != nullptr ? std::string_view(fn_ov->signature_override) : std::string_view{});
+    } else {
+        decomp_type_target_is_function_ = false;
+        decomp_modal_target_idx_ = 1;
+        if (preferred_original.has_value() && !preferred_original->empty()) {
+            bool found = false;
+            for (std::size_t i = 0u; i < decomp_modal_candidates_.size(); ++i) {
+                if (decomp_modal_candidates_[i] == *preferred_original) {
+                    decomp_modal_target_idx_ = static_cast<int>(i + 1u);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                decomp_modal_candidates_.insert(
+                    decomp_modal_candidates_.begin(), std::string(*preferred_original));
+                decomp_modal_target_idx_ = 1;
+            }
+        }
+        if (!decomp_modal_candidates_.empty()) {
+            const std::string& orig =
+                decomp_modal_candidates_[static_cast<std::size_t>(decomp_modal_target_idx_ - 1)];
+            copy_cstr_buffer(decomp_target_orig_buf_, orig);
+            const auto* var_ov = decompiler_overrides_.find_variable(*fn_va, orig);
+            copy_cstr_buffer(
+                decomp_type_buf_,
+                var_ov != nullptr ? std::string_view(var_ov->c_type) : std::string_view{});
+        } else {
+            decomp_target_orig_buf_[0] = '\0';
+            decomp_type_buf_[0] = '\0';
+        }
+        copy_cstr_buffer(
+            decomp_signature_buf_,
+            fn_ov != nullptr ? std::string_view(fn_ov->signature_override) : std::string_view{});
+    }
+    open_decomp_type_popup_ = true;
+}
+
 void UiApp::render_decompiler() {
     if (focus_decompiler_) { ImGui::SetNextWindowFocus(); focus_decompiler_ = false; }
     if (!ImGui::Begin("Decompiler",&show_decompiler_)) { ImGui::End(); return; }
@@ -419,6 +884,15 @@ void UiApp::render_decompiler() {
         ImGui::TextWrapped("%s", decompiler_settings_status_.c_str());
     }
     ImGui::EndDisabled();
+
+    const std::optional<std::uint64_t> active_fn_va =
+        (decompiled_root_ && decompiled_root_->virtual_address)
+            ? decompiled_root_->virtual_address
+            : std::nullopt;
+    const bool can_edit_overrides =
+        !job_busy && active_fn_va.has_value() && decompiled_.status == DecompileStatus::Ready &&
+        !decompiled_.lines.empty();
+
     if (ImGui::Button("Analyze selection (F5)")) request_decompile(false);
     ImGui::SameLine();
     if (ImGui::Button("Re-analyze")) request_decompile(true);
@@ -430,6 +904,22 @@ void UiApp::render_decompiler() {
     if (ImGui::Checkbox("Demangle", &demangle_decompile)) {
         model_.set_demangle_symbols(demangle_decompile);
         ++symbol_revision_;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!can_edit_overrides);
+    if (ImGui::Button("Rename (N)")) {
+        open_decompiler_rename_modal();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Rename function or variable on selected line (Shortcut: N)");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Set Type (Y)")) {
+        open_decompiler_type_modal();
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Set variable C type or function prototype (Shortcut: Y)");
     }
     ImGui::EndDisabled();
     if (job_busy) {
@@ -449,9 +939,126 @@ void UiApp::render_decompiler() {
             request_decompile();
         }
     }
+
+    if (active_fn_va.has_value()) {
+        const DecompilerFunctionOverride* active_ov = decompiler_overrides_.find(*active_fn_va);
+        const std::size_t proto_count =
+            (active_ov != nullptr &&
+             (!active_ov->return_type.empty() || !active_ov->signature_override.empty()))
+                ? 1u
+                : 0u;
+        const std::size_t var_count = active_ov != nullptr ? active_ov->variables.size() : 0u;
+        const std::size_t total_ov_count = proto_count + var_count;
+        const std::string drawer_label =
+            std::format("Local Variables & Overrides ({})###DecompOverridesDrawer", total_ov_count);
+        if (ImGui::CollapsingHeader(drawer_label.c_str())) {
+            if (total_ov_count == 0u) {
+                ImGui::TextDisabled(
+                    "No overrides for 0x%" PRIX64 ". Select a line and press N to rename or Y to set C type / prototype.",
+                    *active_fn_va);
+            } else {
+                bool refresh_after_drawer_action = false;
+                if (ImGui::SmallButton("Reset All Overrides")) {
+                    if (decompiler_overrides_.clear_function(*active_fn_va)) {
+                        refresh_after_drawer_action = true;
+                    }
+                }
+                if (active_ov != nullptr &&
+                    (!active_ov->return_type.empty() || !active_ov->signature_override.empty())) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("| Prototype:");
+                    ImGui::SameLine();
+                    ImGui::Text(
+                        "%s%s%s",
+                        active_ov->return_type.empty() ? "(default ret)" : active_ov->return_type.c_str(),
+                        active_ov->signature_override.empty() ? "" : " ",
+                        active_ov->signature_override.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Edit##ProtoOv")) {
+                        open_decompiler_type_modal(std::nullopt, true);
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Reset##ProtoOv")) {
+                        (void)decompiler_overrides_.set_function_prototype(*active_fn_va, "", "");
+                        refresh_after_drawer_action = true;
+                    }
+                }
+                if (active_ov != nullptr && !active_ov->variables.empty()) {
+                    const std::vector<DecompilerVariableOverride> vars_snapshot =
+                        active_ov->variables;
+                    if (ImGui::BeginTable(
+                            "decomp_overrides_table",
+                            4,
+                            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                                ImGuiTableFlags_SizingStretchProp)) {
+                        ImGui::TableSetupColumn("Original", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        ImGui::TableSetupColumn("Renamed To", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+                        ImGui::TableSetupColumn("C Type", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+                        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                        ImGui::TableHeadersRow();
+                        for (std::size_t vi = 0u; vi < vars_snapshot.size(); ++vi) {
+                            const auto& v = vars_snapshot[vi];
+                            ImGui::PushID(static_cast<int>(vi));
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0);
+                            ImGui::TextUnformatted(v.original_name.c_str());
+                            ImGui::TableSetColumnIndex(1);
+                            ImGui::TextUnformatted(
+                                v.renamed_to.empty() ? "—" : v.renamed_to.c_str());
+                            ImGui::TableSetColumnIndex(2);
+                            ImGui::TextUnformatted(v.c_type.empty() ? "—" : v.c_type.c_str());
+                            ImGui::TableSetColumnIndex(3);
+                            if (ImGui::SmallButton("Edit")) {
+                                if (!v.renamed_to.empty() || v.c_type.empty()) {
+                                    open_decompiler_rename_modal(v.original_name);
+                                } else {
+                                    open_decompiler_type_modal(v.original_name, false);
+                                }
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton("Type")) {
+                                open_decompiler_type_modal(v.original_name, false);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::SmallButton("Reset")) {
+                                if (decompiler_overrides_.remove_variable(
+                                        *active_fn_va, v.original_name)) {
+                                    refresh_after_drawer_action = true;
+                                }
+                            }
+                            ImGui::PopID();
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+                if (refresh_after_drawer_action && !job_busy) {
+                    request_decompile(false);
+                }
+            }
+        }
+    }
+
     const bool stale = decompile_revision_ != model_.edit_revision() || decompiler_thumb_ != thumb_mode_ ||
-        decompile_annotation_revision_ != annotations_.revision() || decompile_symbol_revision_ != symbol_revision_;
+        decompile_annotation_revision_ != annotations_.revision() ||
+        decompile_symbol_revision_ != symbol_revision_ ||
+        decompile_override_revision_ != decompiler_overrides_.revision();
     if (stale) ImGui::TextWrapped("Bytes or symbols changed. Analyze again to refresh this snapshot.");
+
+    const bool any_decomp_popup_open =
+        ImGui::IsPopupOpen("DecompRenamePopup") || ImGui::IsPopupOpen("DecompTypePopup");
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::GetIO().WantTextInput && !any_decomp_popup_open) {
+        const ImGuiIO& io = ImGui::GetIO();
+        const bool no_mods = !io.KeyCtrl && !io.KeySuper && !io.KeyAlt;
+        if (no_mods && can_edit_overrides && ImGui::IsKeyPressed(ImGuiKey_N)) {
+            open_decompiler_rename_modal();
+        } else if (no_mods && can_edit_overrides && ImGui::IsKeyPressed(ImGuiKey_Y)) {
+            open_decompiler_type_modal();
+        } else if (no_mods && !job_busy && ImGui::IsKeyPressed(ImGuiKey_F5)) {
+            request_decompile(false);
+        }
+    }
+
     std::optional<std::size_t> navigate;
     if (code_font_) ImGui::PushFont(code_font_);
     if (ImGui::BeginTable("decompiled_lines",2,ImGuiTableFlags_ScrollY|ImGuiTableFlags_ScrollX|ImGuiTableFlags_RowBg|ImGuiTableFlags_BordersInnerV|ImGuiTableFlags_Resizable)) {
@@ -460,26 +1067,354 @@ void UiApp::render_decompiler() {
         ImGui::TableSetupScrollFreeze(1,1); ImGui::TableHeadersRow();
         ImGuiListClipper clipper; clipper.Begin(static_cast<int>(decompiled_.lines.size()));
         while (clipper.Step()) for(int i=clipper.DisplayStart;i<clipper.DisplayEnd;++i) {
-            const auto& line=decompiled_.lines[static_cast<std::size_t>(i)]; ImGui::PushID(i);
+            const auto row_idx = static_cast<std::size_t>(i);
+            const auto& line=decompiled_.lines[row_idx]; ImGui::PushID(i);
             ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+            bool selected = selected_decompiled_line_index_.has_value() &&
+                            *selected_decompiled_line_index_ == row_idx;
             if (line.address) {
-                const auto label=std::format("{:016X}",*line.address);
-                bool selected=current_selection_.virtual_address==line.address;
-                for (const auto& range : line.ranges) if (current_selection_.virtual_address && *current_selection_.virtual_address>=range.address &&
-                    *current_selection_.virtual_address-range.address<range.size) selected=true;
-                if (ImGui::Selectable(label.c_str(),selected,ImGuiSelectableFlags_SpanAllColumns) && !stale) navigate=static_cast<std::size_t>(i);
-                if (ImGui::IsItemHovered()) {
-                    if (const SourceLineMapping* src = model_.find_source_line(*line.address, 32)) {
-                        ImGui::SetTooltip("Source: %s:%u", src->file_path.c_str(), src->line);
+                if (current_selection_.virtual_address == line.address) selected = true;
+                for (const auto& range : line.ranges) {
+                    if (current_selection_.virtual_address &&
+                        *current_selection_.virtual_address >= range.address &&
+                        *current_selection_.virtual_address - range.address < range.size) {
+                        selected = true;
                     }
                 }
-            } else ImGui::TextDisabled("—");
+            }
+            const std::string addr_label =
+                line.address ? std::format("{:016X}", *line.address) : std::string("—");
+            if (ImGui::Selectable(addr_label.c_str(), selected, ImGuiSelectableFlags_SpanAllColumns)) {
+                selected_decompiled_line_index_ = row_idx;
+                if (line.address && !stale) {
+                    navigate = row_idx;
+                }
+            }
+            if (line.address && ImGui::IsItemHovered()) {
+                if (const SourceLineMapping* src = model_.find_source_line(*line.address, 32)) {
+                    ImGui::SetTooltip("Source: %s:%u", src->file_path.c_str(), src->line);
+                }
+            }
+            if (ImGui::BeginPopupContextItem("DecompLineCtx")) {
+                selected_decompiled_line_index_ = row_idx;
+                if (ImGui::MenuItem("Rename Function / Variable... (N)", nullptr, false, can_edit_overrides)) {
+                    open_decompiler_rename_modal();
+                }
+                if (ImGui::MenuItem("Set C Type / Prototype... (Y)", nullptr, false, can_edit_overrides)) {
+                    open_decompiler_type_modal();
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Copy Line")) {
+                    ImGui::SetClipboardText(line.text.c_str());
+                }
+                if (line.address.has_value() && ImGui::MenuItem("Go to Disassembly")) {
+                    (void)navigate_to_address(*line.address, PreferredView::Disassembly);
+                }
+                ImGui::EndPopup();
+            }
             ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(line.text.c_str());
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
     if (code_font_) ImGui::PopFont();
+
+    if (open_decomp_rename_popup_) {
+        ImGui::OpenPopup("DecompRenamePopup");
+        open_decomp_rename_popup_ = false;
+    }
+    if (ImGui::BeginPopup("DecompRenamePopup")) {
+        ImGui::TextUnformatted("Rename Function / Variable (N)");
+        ImGui::Separator();
+        if (active_fn_va.has_value()) {
+            const std::string fn_disp = std::format(
+                "Function: {} (0x{:X})",
+                decompiled_root_ ? decompiled_root_->name : std::string("sub"),
+                *active_fn_va);
+            const DecompilerFunctionOverride* cur_ov = decompiler_overrides_.find(*active_fn_va);
+
+            const auto preview_label_for = [&](int idx) -> std::string {
+                if (idx <= 0 || static_cast<std::size_t>(idx - 1) >= decomp_modal_candidates_.size()) {
+                    return std::string{fn_disp};
+                }
+                const std::string& orig = decomp_modal_candidates_[static_cast<std::size_t>(idx - 1)];
+                const auto* vov =
+                    cur_ov != nullptr ? decompiler_overrides_.find_variable(*active_fn_va, orig) : nullptr;
+                if (vov != nullptr && !vov->renamed_to.empty()) {
+                    return std::format("Variable: {} (currently {})", orig, vov->renamed_to);
+                }
+                return std::format("Variable: {}", orig);
+            };
+
+            const std::string current_preview = preview_label_for(decomp_modal_target_idx_);
+            ImGui::TextUnformatted("Target:");
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
+            if (ImGui::BeginCombo("##DecompRenameTarget", current_preview.c_str())) {
+                if (ImGui::Selectable(fn_disp.c_str(), decomp_modal_target_idx_ == 0)) {
+                    decomp_modal_target_idx_ = 0;
+                    const auto* note = annotations_.find(*active_fn_va);
+                    copy_cstr_buffer(
+                        decomp_rename_buf_,
+                        (note != nullptr && !note->name.empty())
+                            ? std::string_view(note->name)
+                            : (decompiled_root_ ? std::string_view(decompiled_root_->name)
+                                                : std::string_view{}));
+                    decomp_modal_error_.clear();
+                }
+                for (std::size_t ci = 0u; ci < decomp_modal_candidates_.size(); ++ci) {
+                    const int item_idx = static_cast<int>(ci + 1u);
+                    const std::string lbl = preview_label_for(item_idx);
+                    if (ImGui::Selectable(lbl.c_str(), decomp_modal_target_idx_ == item_idx)) {
+                        decomp_modal_target_idx_ = item_idx;
+                        const std::string& orig = decomp_modal_candidates_[ci];
+                        copy_cstr_buffer(decomp_target_orig_buf_, orig);
+                        const auto* vov = decompiler_overrides_.find_variable(*active_fn_va, orig);
+                        copy_cstr_buffer(
+                            decomp_rename_buf_,
+                            (vov != nullptr && !vov->renamed_to.empty())
+                                ? std::string_view(vov->renamed_to)
+                                : std::string_view(orig));
+                        decomp_modal_error_.clear();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            if (decomp_modal_target_idx_ > 0) {
+                ImGui::TextUnformatted("Original variable / parameter:");
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
+                ImGui::InputTextWithHint(
+                    "##DecompOrigVar",
+                    "e.g. stack_var_10, rcx, local_18, param_1",
+                    decomp_target_orig_buf_,
+                    sizeof(decomp_target_orig_buf_));
+            }
+
+            ImGui::TextUnformatted("New C identifier:");
+            if (ImGui::IsWindowAppearing()) {
+                ImGui::SetKeyboardFocusHere();
+            }
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 26.0f);
+            const bool submitted = ImGui::InputTextWithHint(
+                "##DecompNewIdent",
+                decomp_modal_target_idx_ == 0
+                    ? "Function name (leave empty to clear user label)"
+                    : "Valid C identifier (leave empty to reset rename)",
+                decomp_rename_buf_,
+                sizeof(decomp_rename_buf_),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+
+            if (submitted || ImGui::Button("Apply")) {
+                if (decomp_modal_target_idx_ == 0) {
+                    const std::string_view trimmed_fn = detail::trim_override_ascii(decomp_rename_buf_);
+                    if (!trimmed_fn.empty() && !is_valid_decompiler_c_identifier(trimmed_fn)) {
+                        decomp_modal_error_ =
+                            "Function label must be a valid C identifier ([A-Za-z_][A-Za-z0-9_]*).";
+                    } else {
+                        const auto* existing = annotations_.find(*active_fn_va);
+                        const std::string keep_comment =
+                            existing != nullptr ? existing->comment : std::string{};
+                        annotations_.set(*active_fn_va, std::string(trimmed_fn), keep_comment);
+                        ++annotation_revision_;
+                        ++symbol_revision_;
+                        model_.bump_annotation_revision();
+                        request_decompile(false);
+                        ImGui::CloseCurrentPopup();
+                    }
+                } else {
+                    const auto res = decompiler_overrides_.set_variable_rename(
+                        *active_fn_va, decomp_target_orig_buf_, decomp_rename_buf_);
+                    if (!res) {
+                        decomp_modal_error_ = res.error().message;
+                    } else {
+                        request_decompile(false);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+            }
+            ImGui::SameLine();
+            if (decomp_modal_target_idx_ > 0 && ImGui::Button("Reset Variable")) {
+                (void)decompiler_overrides_.set_variable_rename(
+                    *active_fn_va, decomp_target_orig_buf_, "");
+                request_decompile(false);
+                ImGui::CloseCurrentPopup();
+            }
+            if (decomp_modal_target_idx_ > 0) {
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            if (!decomp_modal_error_.empty()) {
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.45f, 0.40f, 1.0f), "%s", decomp_modal_error_.c_str());
+            }
+        }
+        ImGui::EndPopup();
+    }
+
+    if (open_decomp_type_popup_) {
+        ImGui::OpenPopup("DecompTypePopup");
+        open_decomp_type_popup_ = false;
+    }
+    if (ImGui::BeginPopup("DecompTypePopup")) {
+        ImGui::TextUnformatted("Set C Type / Function Prototype (Y)");
+        ImGui::Separator();
+        if (active_fn_va.has_value()) {
+            const DecompilerFunctionOverride* cur_ov = decompiler_overrides_.find(*active_fn_va);
+            if (ImGui::RadioButton("Variable / Parameter", !decomp_type_target_is_function_)) {
+                decomp_type_target_is_function_ = false;
+                if (!decomp_modal_candidates_.empty() && decomp_modal_target_idx_ <= 0) {
+                    decomp_modal_target_idx_ = 1;
+                    copy_cstr_buffer(decomp_target_orig_buf_, decomp_modal_candidates_[0]);
+                }
+                const auto* vov = decompiler_overrides_.find_variable(
+                    *active_fn_va, decomp_target_orig_buf_);
+                copy_cstr_buffer(
+                    decomp_type_buf_,
+                    vov != nullptr ? std::string_view(vov->c_type) : std::string_view{});
+                decomp_modal_error_.clear();
+            }
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Function Return Type / Prototype", decomp_type_target_is_function_)) {
+                decomp_type_target_is_function_ = true;
+                copy_cstr_buffer(
+                    decomp_type_buf_,
+                    cur_ov != nullptr ? std::string_view(cur_ov->return_type) : std::string_view{});
+                copy_cstr_buffer(
+                    decomp_signature_buf_,
+                    cur_ov != nullptr ? std::string_view(cur_ov->signature_override)
+                                      : std::string_view{});
+                decomp_modal_error_.clear();
+            }
+
+            if (!decomp_type_target_is_function_) {
+                if (!decomp_modal_candidates_.empty()) {
+                    const int cur_var_idx = std::clamp(
+                        decomp_modal_target_idx_ - 1,
+                        0,
+                        static_cast<int>(decomp_modal_candidates_.size()) - 1);
+                    const std::string& cur_orig =
+                        decomp_modal_candidates_[static_cast<std::size_t>(cur_var_idx)];
+                    ImGui::TextUnformatted("Select discovered variable:");
+                    ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28.0f);
+                    if (ImGui::BeginCombo("##DecompTypeVarCombo", cur_orig.c_str())) {
+                        for (std::size_t ci = 0u; ci < decomp_modal_candidates_.size(); ++ci) {
+                            const std::string& cand = decomp_modal_candidates_[ci];
+                            const auto* vov =
+                                decompiler_overrides_.find_variable(*active_fn_va, cand);
+                            const std::string lbl =
+                                (vov != nullptr && !vov->c_type.empty())
+                                    ? std::format("{}  [{}]", cand, vov->c_type)
+                                    : cand;
+                            if (ImGui::Selectable(lbl.c_str(), static_cast<int>(ci) == cur_var_idx)) {
+                                decomp_modal_target_idx_ = static_cast<int>(ci + 1u);
+                                copy_cstr_buffer(decomp_target_orig_buf_, cand);
+                                copy_cstr_buffer(
+                                    decomp_type_buf_,
+                                    vov != nullptr ? std::string_view(vov->c_type)
+                                                   : std::string_view{});
+                                decomp_modal_error_.clear();
+                            }
+                        }
+                        ImGui::EndCombo();
+                    }
+                }
+                ImGui::TextUnformatted("Variable identifier:");
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28.0f);
+                ImGui::InputTextWithHint(
+                    "##DecompTypeOrig",
+                    "e.g. stack_var_10, rdi, local_18, param_1",
+                    decomp_target_orig_buf_,
+                    sizeof(decomp_target_orig_buf_));
+                ImGui::TextUnformatted("C Type:");
+            } else {
+                ImGui::Text("Function @ 0x%" PRIX64 " return C type:", *active_fn_va);
+            }
+
+            if (ImGui::IsWindowAppearing()) {
+                ImGui::SetKeyboardFocusHere();
+            }
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28.0f);
+            bool submitted = ImGui::InputTextWithHint(
+                "##DecompCTypeInput",
+                "e.g. const char*, size_t, uint32_t, struct PacketHeader*",
+                decomp_type_buf_,
+                sizeof(decomp_type_buf_),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+
+            if (decomp_type_target_is_function_) {
+                ImGui::TextUnformatted("Optional custom parameter list or full C prototype:");
+                ImGui::SetNextItemWidth(ImGui::GetFontSize() * 28.0f);
+                if (ImGui::InputTextWithHint(
+                        "##DecompSigInput",
+                        "e.g. (const char* buf, size_t len) or int parse(const uint8_t* p, size_t n)",
+                        decomp_signature_buf_,
+                        sizeof(decomp_signature_buf_),
+                        ImGuiInputTextFlags_EnterReturnsTrue)) {
+                    submitted = true;
+                }
+            }
+
+            const std::vector<std::string> suggestions = collect_c_type_suggestions(
+                model_.custom_types(),
+                debug_types_,
+                decompiled_.types,
+                decomp_type_buf_);
+            if (!suggestions.empty()) {
+                ImGui::TextDisabled("Type completions (click to fill):");
+                ImGui::BeginChild(
+                    "##DecompTypeSuggestions",
+                    ImVec2(ImGui::GetFontSize() * 28.0f, ImGui::GetFontSize() * 6.5f),
+                    ImGuiChildFlags_Borders);
+                for (const std::string& sug : suggestions) {
+                    if (ImGui::Selectable(sug.c_str(), sug == decomp_type_buf_)) {
+                        copy_cstr_buffer(decomp_type_buf_, sug);
+                        decomp_modal_error_.clear();
+                    }
+                }
+                ImGui::EndChild();
+            }
+
+            if (submitted || ImGui::Button("Apply")) {
+                peelf::Result<void> res{};
+                if (decomp_type_target_is_function_) {
+                    res = decompiler_overrides_.set_function_prototype(
+                        *active_fn_va, decomp_type_buf_, decomp_signature_buf_);
+                } else {
+                    res = decompiler_overrides_.set_variable_type(
+                        *active_fn_va, decomp_target_orig_buf_, decomp_type_buf_);
+                }
+                if (!res) {
+                    decomp_modal_error_ = res.error().message;
+                } else {
+                    request_decompile(false);
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Clear Type")) {
+                if (decomp_type_target_is_function_) {
+                    (void)decompiler_overrides_.set_function_prototype(*active_fn_va, "", "");
+                } else {
+                    (void)decompiler_overrides_.set_variable_type(
+                        *active_fn_va, decomp_target_orig_buf_, "");
+                }
+                request_decompile(false);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            if (!decomp_modal_error_.empty()) {
+                ImGui::TextColored(
+                    ImVec4(0.95f, 0.45f, 0.40f, 1.0f), "%s", decomp_modal_error_.c_str());
+            }
+        }
+        ImGui::EndPopup();
+    }
+
     ImGui::End();
     if (navigate) select_decompiled_line(*navigate);
 }
