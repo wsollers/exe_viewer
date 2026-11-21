@@ -195,6 +195,21 @@ cmake --build --preset msvc-debug --config Debug
 ctest --test-dir out/build/msvc-debug -C Debug --output-on-failure
 ```
 
+### Install & Portable CPack Archives
+
+Install a relocatable runtime prefix (`bin/`, `lib/` on POSIX, runtime decompiler/theme `resources/`, and documentation) or build a portable distribution archive (`TGZ` on Linux/macOS, `ZIP` on Windows):
+
+```bash
+# Stage a relocatable install prefix and verify CLI version
+cmake --install out/build/clang18-release --prefix /tmp/peelf-explorer
+/tmp/peelf-explorer/bin/peelf_viewer --version
+
+# Produce peelf-explorer-1.0.0-linux-x86_64.tar.gz (or -windows-x64.zip on MSVC)
+cpack --config out/build/clang18-release/CPackConfig.cmake -B dist
+```
+
+Tagged `v*` pushes (and manual `workflow_dispatch` runs) build, smoke-test, checksum (`SHA256SUMS.txt`), and publish Linux `TGZ` + Windows `ZIP` archives via [`.github/workflows/release.yml`](.github/workflows/release.yml).
+
 ### Clang Docker image
 
 The repository includes a Clang 18 build image with Graphviz and cross compilers
@@ -253,6 +268,7 @@ These CMake options are defined in the top-level `CMakeLists.txt`:
 | `PEELF_ENABLE_ASMTK` | `ON` | Fetch and build pinned AsmJit + AsmTK sources for in-process x86/x86_64 assembly |
 | `PEELF_ENABLE_GRAPHVIZ` | `OFF` | Fetch optional Graphviz source and expose Graphviz feature macros through `peelf::graphviz` |
 | `PEELF_ENABLE_CLANG_TIDY` | `OFF` | Run `clang-tidy` on `peelf_core`, `peelf_gui`, `peelf_viewer`, and `peelf_tests` (Ninja/Makefile generators) |
+| `PEELF_INSTALL_DIA_REDIST` | `OFF` | Opt-in installation of `msdia140.dll` next to `peelf_viewer.exe` on Windows (subject to Microsoft DIA redistributable license; native cross-platform `.pdb` parsing works without DIA) |
 | `PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST` | `OFF` | Register an opt-in CTest test that refreshes `bin-matrix/` with Docker and runs the focused matrix test |
 
 ## Running

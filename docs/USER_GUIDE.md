@@ -93,6 +93,25 @@ ctest --test-dir out/build/msvc-debug -C Debug --output-on-failure
 .\out\build\msvc-debug\apps\viewer\Debug\peelf_viewer.exe
 ```
 
+#### Relocatable Installation & Portable `CPack` Archives
+
+`cmake --install` stages a self-contained runtime tree (`INSTALL_RPATH` configured with `$ORIGIN` on Linux; `peelf_gui.dll` and `resources/` beside `peelf_viewer.exe` on Windows), and `cpack` packages single-archive portable distributions (`TGZ` on Linux/macOS, `ZIP` on Windows):
+
+```bash
+# Linux / WSL2 Release install + portable .tar.gz archive
+cmake --install out/build/clang18-release --prefix /opt/peelf-explorer
+/opt/peelf-explorer/bin/peelf_viewer --version
+cpack --config out/build/clang18-release/CPackConfig.cmake -B dist
+```
+
+```powershell
+# Windows x64 Release install + portable .zip archive
+cmake --build --preset msvc-release
+cmake --install out/build/msvc-debug --config Release --prefix C:\Tools\peelf-explorer
+C:\Tools\peelf-explorer\bin\peelf_viewer.exe --version
+cpack --config out/build/msvc-debug/CPackConfig.cmake -C Release -B dist
+```
+
 #### Launch Interactive GUI or Headless CLI
 
 ```bash
@@ -810,6 +829,7 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | `--include-strings` | Extract and embed printable ASCII/UTF-8/UTF-16 strings in the JSON report |
 | `--min-string-len <N>` | Minimum character length for `--include-strings` (default `4`) |
 | `--fail-on <none\|error\|warning>` | CI policy gate (`none` default):<br/>• `error`: exits `2` on any security `Error` finding, missing library, arch mismatch, or unresolved symbol<br/>• `warning`: exits `2` on those dependency errors or any security `Error` **or** `Warning` finding |
+| `-V`, `--version` | Print deterministic version string (`peelf_viewer 1.0.0`) and exit `0` |
 | `-h`, `--help` | Print CLI usage and exit `0` |
 
 **Exit Codes**:

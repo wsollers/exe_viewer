@@ -17,8 +17,10 @@ FetchContent_Declare(
   GIT_SHALLOW    TRUE
 )
 
-# Keep MSVC from mismatching the C runtime against the rest of the project.
+# Keep MSVC from mismatching the C runtime against the rest of the project,
+# and prevent GoogleTest from polluting cmake --install / CPack archives.
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(googletest)
 
@@ -100,7 +102,9 @@ add_executable(peelf_tests
   macho_core_and_dsym_test.cpp
   decompiler_contract_test.cpp
   golden_summary_and_debug_test.cpp
+  runtime_paths_and_version_test.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/headless_cli.cpp
+  ${CMAKE_SOURCE_DIR}/apps/viewer/src/runtime_paths.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/disasm/linear_disassembly.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/vulkan/viewport_camera_2d.cpp
   ${CMAKE_SOURCE_DIR}/apps/viewer/src/navigation/viewer_navigation.cpp
@@ -188,6 +192,9 @@ endif()
 
 # Absolute path to the test fixtures directory, available to the test code.
 target_compile_definitions(peelf_tests PRIVATE
+  PEELF_VERSION_STRING="${PROJECT_VERSION}"
+  PEELF_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}"
+  PEELF_INSTALL_DATADIR="${CMAKE_INSTALL_DATADIR}"
   PEELF_TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
   PEELF_BIN_MATRIX_DIR="${CMAKE_SOURCE_DIR}/bin-matrix"
   PEELF_VIEWER_RESOURCES_DIR="${CMAKE_SOURCE_DIR}/apps/viewer/resources"
@@ -273,6 +280,7 @@ if(TARGET peelf_viewer)
   endif()
   add_test(NAME Startup.Headless COMMAND $<TARGET_FILE:peelf_viewer> --headless)
   add_test(NAME Startup.Help COMMAND $<TARGET_FILE:peelf_viewer> --help)
+  add_test(NAME Startup.Version COMMAND $<TARGET_FILE:peelf_viewer> --version)
   add_test(NAME Headless.FixtureJson
     COMMAND $<TARGET_FILE:peelf_viewer> --headless $<TARGET_FILE:peelf_callgraph_fixture> --format json --output ${CMAKE_CURRENT_BINARY_DIR}/headless_fixture_$<CONFIG>.json)
   add_test(NAME Headless.FixtureSarif
@@ -282,4 +290,16 @@ if(TARGET peelf_viewer)
     ${_peelf_isolated_core_dll_arg}
     -DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/launcher-isolated-$<CONFIG>
     -P ${CMAKE_CURRENT_SOURCE_DIR}/startup_without_gui.cmake)
+  add_test(NAME InstallLayout.Smoke COMMAND ${CMAKE_COMMAND}
+    -DBUILD_DIR=${CMAKE_BINARY_DIR}
+    -DBUILD_CONFIG=$<CONFIG>
+    -DSTAGE_DIR=${CMAKE_CURRENT_BINARY_DIR}/install-smoke-$<CONFIG>
+    -DFIXTURE_BIN=$<TARGET_FILE:peelf_callgraph_fixture>
+    -DEXPECT_VERSION=${PROJECT_VERSION}
+    -DEXPECT_GUI=$<BOOL:${PEELF_BUILD_GUI}>
+    -DEXPECT_SHARED_CORE=$<BOOL:${PEELF_BUILD_SHARED}>
+    -DINSTALL_LIBDIR=${CMAKE_INSTALL_LIBDIR}
+    -DINSTALL_DATADIR=${CMAKE_INSTALL_DATADIR}
+    -DINSTALL_DOCDIR=${CMAKE_INSTALL_DOCDIR}
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/install_layout_smoke.cmake)
 endif()

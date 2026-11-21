@@ -5,6 +5,7 @@
 #include <peelf/demangle.hpp>
 #include <peelf/endian_reader.hpp>
 #include <peelf/macho_image.hpp>
+#include <peelf/peelf.hpp>
 #include <peelf/sha256.hpp>
 
 #include <algorithm>
@@ -3202,7 +3203,7 @@ std::string format_headless_report_sarif(const HeadlessAnalysisReport& report) {
     out += "      \"tool\": {\n";
     out += "        \"driver\": {\n";
     out += "          \"name\": \"peelf_viewer\",\n";
-    out += "          \"version\": \"0.0.1\",\n";
+    out += "          "; key("version"); append_json_escaped(out, PEELF_VERSION_STRING); out += ",\n";
     out += "          \"informationUri\": \"https://github.com/wsollers/exe_viewer\",\n";
     out += "          \"rules\": [";
     for (std::size_t i = 0; i < active_rules.size(); ++i) {
@@ -3671,9 +3672,11 @@ std::optional<int> try_run_headless_or_help_cli(
     std::ostream& stderr_stream) {
     bool headless = false;
     bool help = false;
+    bool version = false;
     for (std::string_view arg : args) {
         if (arg == "--headless") headless = true;
         if (arg == "--help" || arg == "-h") help = true;
+        if (arg == "--version" || arg == "-V") version = true;
     }
 
     if (help) {
@@ -3695,7 +3698,14 @@ std::optional<int> try_run_headless_or_help_cli(
             << "  --min-string-len <N>         Minimum character length for extracted strings (default: 4)\n"
             << "  --fail-on <none|error|warning>\n"
             << "                               CI policy gate (exit 2 on security findings or missing deps)\n"
-            << "  --help                       Show this help\n";
+            << "  -V, --version                Print version (peelf_viewer " PEELF_VERSION_STRING ") and exit 0\n"
+            << "  -h, --help                   Show this help\n";
+        return 0;
+    }
+
+    if (version) {
+        stdout_stream << "peelf_viewer " << PEELF_VERSION_STRING << '\n';
+        stdout_stream.flush();
         return 0;
     }
 
@@ -3798,6 +3808,11 @@ std::optional<int> try_run_headless_or_help_cli(
                 opts.fail_on = HeadlessFailPolicy::Warning;
             } else {
                 stderr_stream << "Error: unsupported --fail-on '" << *val << "' (expected none, error, or warning)\n";
+                return 1;
+            }
+        } else if (a == "--summary") {
+            if (inline_val.has_value()) {
+                stderr_stream << "Error: --summary does not take a value\n";
                 return 1;
             }
         } else if (a.starts_with('-')) {

@@ -22,6 +22,10 @@
 #include <utility>
 #include <vector>
 
+#ifndef PEELF_VERSION_STRING
+#define PEELF_VERSION_STRING "1.0.0"
+#endif
+
 namespace viewer {
 namespace {
 using detail::activate_panel;
@@ -750,7 +754,7 @@ void UiApp::render_main_menu() {
         show_about_ = false;
     }
     if (ImGui::BeginPopupModal("About PE/ELF Explorer", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted("PE/ELF Explorer");
+        ImGui::TextUnformatted("PE/ELF Explorer v" PEELF_VERSION_STRING);
         ImGui::Separator();
         ImGui::TextUnformatted("Inspect binaries, resolve symbols, and stage byte patches.");
         ImGui::Spacing();

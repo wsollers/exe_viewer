@@ -17,6 +17,8 @@ add_executable(peelf_viewer
   src/launcher.cpp
   src/headless_cli.hpp
   src/headless_cli.cpp
+  src/runtime_paths.hpp
+  src/runtime_paths.cpp
 )
 target_include_directories(peelf_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(WIN32)
@@ -25,8 +27,26 @@ if(WIN32)
   target_include_directories(peelf_viewer PRIVATE resources)
 endif()
 target_compile_features(peelf_viewer PRIVATE cxx_std_23)
+target_compile_definitions(peelf_viewer PRIVATE
+  PEELF_VERSION_STRING="${PROJECT_VERSION}"
+  PEELF_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}"
+  PEELF_INSTALL_DATADIR="${CMAKE_INSTALL_DATADIR}"
+)
 peelf_apply_project_warnings(peelf_viewer)
 target_link_libraries(peelf_viewer PRIVATE peelf::core ${CMAKE_DL_LIBS})
+if(UNIX AND NOT APPLE)
+  set(_peelf_viewer_rpaths
+    "$ORIGIN"
+    "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+    "$ORIGIN/../lib"
+    "$ORIGIN/../lib64"
+  )
+  list(REMOVE_DUPLICATES _peelf_viewer_rpaths)
+  set_target_properties(peelf_viewer PROPERTIES
+    INSTALL_RPATH "${_peelf_viewer_rpaths}"
+    BUILD_WITH_INSTALL_RPATH OFF
+  )
+endif()
 if(WIN32 AND PEELF_BUILD_SHARED)
   add_custom_command(TARGET peelf_viewer POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -34,10 +54,15 @@ if(WIN32 AND PEELF_BUILD_SHARED)
       $<TARGET_FILE_DIR:peelf_viewer>
   )
 endif()
+install(TARGETS peelf_viewer
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+)
 if(NOT PEELF_BUILD_GUI)
   return()
 endif()
 add_library(peelf_gui SHARED
+  src/runtime_paths.hpp
+  src/runtime_paths.cpp
   src/ui/startup_branding.cpp
   src/gui_entry.cpp
         src/crash/crash_handler.hpp
@@ -177,6 +202,17 @@ target_include_directories(peelf_gui PRIVATE
 )
 
 target_compile_features(peelf_gui PRIVATE cxx_std_23)
+target_compile_definitions(peelf_gui PRIVATE
+  PEELF_VERSION_STRING="${PROJECT_VERSION}"
+  PEELF_INSTALL_LIBDIR="${CMAKE_INSTALL_LIBDIR}"
+  PEELF_INSTALL_DATADIR="${CMAKE_INSTALL_DATADIR}"
+)
+if(UNIX AND NOT APPLE)
+  set_target_properties(peelf_gui PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
+    BUILD_WITH_INSTALL_RPATH OFF
+  )
+endif()
 peelf_apply_project_warnings(peelf_gui)
 add_dependencies(peelf_viewer peelf_gui)
 add_custom_target(peelf_viewer_resources ALL
@@ -231,6 +267,39 @@ if(MSVC)
     if(PEELF_DIA_DLL)
       file(TO_CMAKE_PATH "${PEELF_DIA_DLL}" PEELF_DIA_DLL_NORMALIZED)
       target_compile_definitions(peelf_gui PRIVATE PEELF_DIA_DLL_PATH="${PEELF_DIA_DLL_NORMALIZED}")
+      if(PEELF_INSTALL_DIA_REDIST)
+        install(FILES "${PEELF_DIA_DLL}"
+          DESTINATION ${CMAKE_INSTALL_BINDIR}
+          COMPONENT runtime
+        )
+      endif()
     endif()
   endif()
 endif()
+
+install(TARGETS peelf_gui
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT development EXCLUDE_FROM_ALL
+)
+
+if(WIN32)
+  set(_peelf_viewer_resources_install_dir "${CMAKE_INSTALL_BINDIR}/resources")
+else()
+  set(_peelf_viewer_resources_install_dir "${CMAKE_INSTALL_DATADIR}/peelf_explorer/resources")
+endif()
+
+install(FILES
+  resources/theme.ini
+  resources/PeelfDecompile.java
+  resources/viewer.ico
+  resources/splash.png
+  DESTINATION ${_peelf_viewer_resources_install_dir}
+  COMPONENT runtime
+)
+
+install(PROGRAMS
+  resources/bn_decompile.py
+  DESTINATION ${_peelf_viewer_resources_install_dir}
+  COMPONENT runtime
+)

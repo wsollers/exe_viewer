@@ -51,7 +51,7 @@ struct HeadlessScriptRunReport {
 [[nodiscard]] std::string format_headless_script_report_json(
     const HeadlessScriptRunReport& report);
 
-/// Handles `--help` / `-h` and `--headless` CLI invocations for `peelf_viewer`.
+/// Handles `--help` / `-h`, `--version` / `-V`, and `--headless` CLI invocations for `peelf_viewer`.
 /// Supports `--headless <binary> --script <file.lua>` (with `--slice`,
 /// `--script-allow-mutations`, `--allow-modified-binary`, `--output-binary`,
 /// `--project`, `--script-max-instructions`, `--script-timeout-ms`,

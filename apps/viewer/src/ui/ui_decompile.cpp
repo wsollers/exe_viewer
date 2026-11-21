@@ -1,5 +1,6 @@
 #include "ui_app.hpp"
 #include "decompile/structured_decompiler.hpp"
+#include "runtime_paths.hpp"
 #include <peelf/sha256.hpp>
 #include <algorithm>
 #include <array>
@@ -9,12 +10,6 @@
 #include <limits>
 #include <span>
 #include <string_view>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
 
 namespace viewer {
 namespace {
@@ -62,16 +57,7 @@ DecompileValidationStamp UiApp::current_decompile_stamp() const {
 }
 
 void UiApp::initialize_decompiler() {
-#ifdef _WIN32
-    wchar_t executable[32768]{}; GetModuleFileNameW(nullptr, executable, 32768);
-    decompiler_directory_ = std::filesystem::path(executable).parent_path();
-#else
-    std::error_code ec;
-    const auto exe_path = std::filesystem::weakly_canonical("/proc/self/exe", ec);
-    decompiler_directory_ = (ec || exe_path.empty())
-                                ? std::filesystem::current_path(ec)
-                                : exe_path.parent_path();
-#endif
+    decompiler_directory_ = viewer::current_executable_directory();
     auto settings = discover_decompilers(decompiler_directory_);
     const auto path = decompiler_directory_ / "decompiler.ini";
     if (std::filesystem::exists(path)) {
@@ -102,9 +88,11 @@ void UiApp::refresh_binary_ninja_capabilities(bool run_python_probe) {
     settings.timeout_seconds = std::clamp(decompiler_timeout_, 5, 15);
     if (run_python_probe) {
         BackendRunner runner;
+        const auto resources_dir =
+            viewer::resolve_viewer_resources_directory(decompiler_directory_);
         binary_ninja_status_ = probe_binary_ninja_capabilities(
             settings,
-            decompiler_directory_ / "resources" / "bn_decompile.py",
+            resources_dir / "bn_decompile.py",
             runner);
     } else {
         binary_ninja_status_ = discover_binary_ninja(settings);
@@ -335,7 +323,7 @@ void UiApp::request_decompile(bool force_reanalyze) {
     (void)decompile_controller_.submit(DecompileJobSpec{
         .request = std::move(request),
         .settings = std::move(settings),
-        .resources_directory = decompiler_directory_ / "resources",
+        .resources_directory = viewer::resolve_viewer_resources_directory(decompiler_directory_),
         .stamp = std::move(stamp),
         .cache_key = std::move(resolved_cache_key),
         .root_symbol = std::move(resolved_root),

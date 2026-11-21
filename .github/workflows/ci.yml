@@ -85,6 +85,34 @@ jobs:
           test -s /tmp/hello_report.sarif
           test -s /tmp/hello_report.csv
 
+      - name: Verify CMake install & portable CPack archive
+        run: |
+          STAGE_DIR="${RUNNER_TEMP}/peelf-install-${{ matrix.preset }}"
+          rm -rf "${STAGE_DIR}"
+          cmake --install "out/build/${{ matrix.preset }}" --prefix "${STAGE_DIR}"
+          test "$("${STAGE_DIR}/bin/peelf_viewer" --version)" = "peelf_viewer 1.0.0"
+          "${STAGE_DIR}/bin/peelf_viewer" --headless --summary tests/fixtures/hello.elf >/dev/null
+          test -f "${STAGE_DIR}/share/peelf_explorer/resources/theme.ini"
+          test -f "${STAGE_DIR}/share/peelf_explorer/resources/bn_decompile.py"
+          test -f "${STAGE_DIR}/share/peelf_explorer/resources/PeelfDecompile.java"
+          ! env -u LD_LIBRARY_PATH ldd "${STAGE_DIR}/bin/peelf_viewer" | grep -q "not found"
+          if [ "${{ matrix.preset }}" = "clang18-release" ]; then
+            CPACK_DIR="${RUNNER_TEMP}/peelf-cpack"
+            UNPACK_DIR="${RUNNER_TEMP}/peelf-unpacked"
+            rm -rf "${CPACK_DIR}" "${UNPACK_DIR}"
+            cpack --config "out/build/${{ matrix.preset }}/CPackConfig.cmake" -B "${CPACK_DIR}"
+            TARBALL="$(ls "${CPACK_DIR}"/peelf-explorer-*.tar.gz)"
+            mkdir -p "${UNPACK_DIR}"
+            tar -xzf "${TARBALL}" -C "${UNPACK_DIR}"
+            UNPACKED_BIN="$(find "${UNPACK_DIR}" -path '*/bin/peelf_viewer' -type f | head -n 1)"
+            test -x "${UNPACKED_BIN}"
+            test "$("${UNPACKED_BIN}" --version)" = "peelf_viewer 1.0.0"
+            "${UNPACKED_BIN}" --headless --summary tests/fixtures/hello.elf >/dev/null
+            ! env -u LD_LIBRARY_PATH ldd "${UNPACKED_BIN}" | grep -q "not found"
+            rm -rf "${CPACK_DIR}" "${UNPACK_DIR}"
+          fi
+          rm -rf "${STAGE_DIR}"
+
   linux-asan-ubsan:
     name: Linux Clang 18 (ASan + UBSan)
     runs-on: ubuntu-24.04
@@ -259,3 +287,46 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $sarifOut) -or (Get-Item $sarifOut).Length -eq 0) { throw "Headless SARIF failed" }
           & $exe --headless tests/fixtures/hello.elf --format csv --output $csvOut
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path $csvOut) -or (Get-Item $csvOut).Length -eq 0) { throw "Headless CSV failed" }
+
+      - name: Verify CMake install & portable CPack archive (${{ matrix.build_type }})
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildDir = "out/build/msvc-${{ matrix.build_type }}"
+          $stageDir = Join-Path $env:RUNNER_TEMP "peelf-install-${{ matrix.build_type }}"
+          if (Test-Path $stageDir) { Remove-Item -Recurse -Force $stageDir }
+          cmake --install $buildDir --prefix $stageDir
+          if ($LASTEXITCODE -ne 0) { throw "cmake --install failed" }
+          $exe = Join-Path $stageDir "bin/peelf_viewer.exe"
+          $ver = (& $exe --version).Trim()
+          if ($LASTEXITCODE -ne 0 -or $ver -ne "peelf_viewer 1.0.0") {
+            throw "Unexpected --version output: '$ver'"
+          }
+          & $exe --headless --summary tests/fixtures/hello.elf | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Installed --headless --summary failed" }
+          foreach ($rel in @("bin/peelf_gui.dll", "bin/resources/theme.ini", "bin/resources/bn_decompile.py", "bin/resources/PeelfDecompile.java")) {
+            if (-not (Test-Path (Join-Path $stageDir $rel))) {
+              throw "Missing installed runtime file: $rel"
+            }
+          }
+          if ("${{ matrix.build_type }}" -eq "Release") {
+            $cpackDir = Join-Path $env:RUNNER_TEMP "peelf-cpack"
+            $unpackDir = Join-Path $env:RUNNER_TEMP "peelf-unpacked"
+            if (Test-Path $cpackDir) { Remove-Item -Recurse -Force $cpackDir }
+            if (Test-Path $unpackDir) { Remove-Item -Recurse -Force $unpackDir }
+            cpack --config "$buildDir/CPackConfig.cmake" -B $cpackDir
+            if ($LASTEXITCODE -ne 0) { throw "cpack failed" }
+            $zip = Get-ChildItem -Path $cpackDir -Filter "peelf-explorer-*.zip" | Select-Object -First 1
+            if (-not $zip) { throw "CPack ZIP archive not generated" }
+            Expand-Archive -Path $zip.FullName -DestinationPath $unpackDir -Force
+            $unpackedExe = Get-ChildItem -Path $unpackDir -Recurse -Filter "peelf_viewer.exe" | Select-Object -First 1
+            if (-not $unpackedExe) { throw "Unpacked peelf_viewer.exe not found" }
+            $unpackedVer = (& $unpackedExe.FullName --version).Trim()
+            if ($LASTEXITCODE -ne 0 -or $unpackedVer -ne "peelf_viewer 1.0.0") {
+              throw "Unexpected unpacked --version output: '$unpackedVer'"
+            }
+            & $unpackedExe.FullName --headless --summary tests/fixtures/hello.elf | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Unpacked --headless --summary failed" }
+            Remove-Item -Recurse -Force $cpackDir, $unpackDir
+          }
+          Remove-Item -Recurse -Force $stageDir

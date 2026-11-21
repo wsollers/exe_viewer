@@ -137,6 +137,7 @@ if(PEELF_BUILD_SHARED)
 endif()
 
 target_compile_definitions(peelf_core PUBLIC
+  PEELF_VERSION_STRING="${PROJECT_VERSION}"
   $<$<BOOL:${PEELF_BUILD_SHARED}>:PEELF_CORE_SHARED=1>
 )
 
@@ -147,3 +148,20 @@ endif()
 if(WIN32)
   target_link_libraries(peelf_core PRIVATE ws2_32 advapi32 wintrust crypt32 psapi)
 endif()
+
+if(PEELF_BUILD_SHARED)
+  install(TARGETS peelf_core
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT development EXCLUDE_FROM_ALL
+  )
+endif()
+
+install(DIRECTORY include/
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+  COMPONENT development
+  EXCLUDE_FROM_ALL
+  FILES_MATCHING
+    PATTERN "*.h"
+    PATTERN "*.hpp"
+)

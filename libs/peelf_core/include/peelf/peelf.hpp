@@ -23,7 +23,13 @@
 #include <elf/elf_definitions.h>
 
 
+#ifndef PEELF_VERSION_STRING
+#define PEELF_VERSION_STRING "1.0.0"
+#endif
+
 namespace peelf {
+
+inline constexpr std::string_view kVersionString = PEELF_VERSION_STRING;
 
 // An endian-aware byte reader will be reintroduced with the unified binary model
 // (see ToDo.md P1-4). The previous IByteReader/byte_reader/make_reader trio was

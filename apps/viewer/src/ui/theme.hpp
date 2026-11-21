@@ -1,22 +1,12 @@
 #pragma once
 #include <imgui.h>
+#include "runtime_paths.hpp"
 #include "theme_resource.hpp"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <cmath>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#define PEELF_THEME_UNDEF_NOMINMAX
-#endif
-#include <windows.h>
-#ifdef PEELF_THEME_UNDEF_NOMINMAX
-#undef NOMINMAX
-#undef PEELF_THEME_UNDEF_NOMINMAX
-#endif
-#endif
 namespace viewer::ui {
 inline void load_theme(float content_scale = 0.0f) {
     const float font_scale = ImGui::GetStyle().FontScaleMain;
@@ -33,18 +23,9 @@ inline void load_theme(float content_scale = 0.0f) {
     style.FrameRounding = 2;
     style.TabRounding = 2;
     style.ScrollbarSize = 11;
-#ifdef _WIN32
-    wchar_t executable[32768]{};
-    GetModuleFileNameW(nullptr, executable, 32768);
-    const auto directory = std::filesystem::path(executable).parent_path();
-#else
-    std::error_code ec;
-    const auto exe_path = std::filesystem::weakly_canonical("/proc/self/exe", ec);
-    const auto directory = (ec || exe_path.empty())
-                               ? std::filesystem::current_path(ec)
-                               : exe_path.parent_path();
-#endif
-    std::ifstream input(directory / "resources" / "theme.ini");
+    const auto resources_dir =
+        viewer::resolve_viewer_resources_directory(viewer::current_executable_directory());
+    std::ifstream input(resources_dir / "theme.ini");
     const auto resource = read_theme(input);
     for (int i = 0; i < ImGuiCol_COUNT; ++i) {
         if (const auto found = resource.colors.find(ImGui::GetStyleColorName(i)); found != resource.colors.end()) {

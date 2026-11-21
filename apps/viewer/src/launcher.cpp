@@ -1,4 +1,5 @@
 #include "headless_cli.hpp"
+#include "runtime_paths.hpp"
 
 #include <cstdio>
 #include <filesystem>
@@ -25,10 +26,13 @@ int main(int argc, char** argv) {
         return *cli_exit;
     }
 
+    const auto executable = viewer::current_executable_path();
+    if (!executable.has_value()) {
+        std::fputs("GUI location unavailable; headless startup completed.\n", stderr);
+        return 0;
+    }
+    const auto module_path = viewer::resolve_gui_module_path(executable->parent_path());
 #ifdef _WIN32
-    wchar_t executable[32768]{};
-    GetModuleFileNameW(nullptr, executable, 32768);
-    const auto module_path = std::filesystem::path(executable).parent_path() / "peelf_gui.dll";
     DWORD previous_error_mode{};
     SetThreadErrorMode(SEM_FAILCRITICALERRORS, &previous_error_mode);
     const auto module = LoadLibraryExW(module_path.c_str(), nullptr,
@@ -36,13 +40,6 @@ int main(int argc, char** argv) {
     SetThreadErrorMode(previous_error_mode, nullptr);
     const auto run = module ? reinterpret_cast<int(*)()>(GetProcAddress(module, "peelf_run_gui")) : nullptr;
 #else
-    std::error_code error;
-    const auto executable = std::filesystem::canonical("/proc/self/exe", error);
-    if (error) {
-        std::fputs("GUI location unavailable; headless startup completed.\n", stderr);
-        return 0;
-    }
-    const auto module_path = executable.parent_path() / "libpeelf_gui.so";
     const auto module = dlopen(module_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     const auto run = module ? reinterpret_cast<int(*)()>(dlsym(module, "peelf_run_gui")) : nullptr;
 #endif

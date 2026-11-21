@@ -1,4 +1,5 @@
 #include "symbols/debug_symbols.hpp"
+#include "runtime_paths.hpp"
 
 #include <peelf/dwarf.hpp>
 #include <peelf/pdb.hpp>
@@ -469,11 +470,40 @@ private:
 [[nodiscard]] bool create_dia_source_from_dll(ComPtr<IDiaDataSource>& source,
                                               ScopedDiaModule& module,
                                               std::string& diagnostic) {
+#ifdef PEELF_HAS_DIA
+    std::vector<std::filesystem::path> candidates{};
+    candidates.push_back(viewer::current_executable_directory() / "msdia140.dll");
 #ifdef PEELF_DIA_DLL_PATH
-    const std::filesystem::path dll_path(PEELF_DIA_DLL_PATH);
-    ScopedDiaModule loaded(LoadLibraryW(dll_path.wstring().c_str()));
+    candidates.emplace_back(PEELF_DIA_DLL_PATH);
+#endif
+
+    ScopedDiaModule loaded{};
+    std::filesystem::path loaded_path{};
+    for (const std::filesystem::path& dll_path : candidates) {
+        std::error_code ec{};
+        if (!std::filesystem::is_regular_file(dll_path, ec) || ec) {
+            continue;
+        }
+        std::filesystem::path native_path = std::filesystem::absolute(dll_path, ec);
+        if (ec || native_path.empty()) {
+            native_path = dll_path;
+        }
+        native_path.make_preferred();
+        ScopedDiaModule attempt(LoadLibraryExW(
+            native_path.c_str(),
+            nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS));
+        if (attempt) {
+            loaded = std::move(attempt);
+            loaded_path = std::move(native_path);
+            break;
+        }
+        diagnostic = last_error_message("LoadLibraryExW(" + native_path.string() + ")");
+    }
     if (!loaded) {
-        diagnostic = last_error_message("LoadLibraryW(" + dll_path.string() + ")");
+        if (diagnostic.empty()) {
+            diagnostic = "msdia140.dll was not found beside executable or configured DIA SDK path";
+        }
         return false;
     }
 
@@ -499,12 +529,12 @@ private:
     }
 
     module = std::move(loaded);
-    diagnostic = "loaded DIA from " + dll_path.string();
+    diagnostic = "loaded DIA from " + loaded_path.string();
     return true;
 #else
     (void)source;
     (void)module;
-    diagnostic = "PEELF_DIA_DLL_PATH was not configured";
+    diagnostic = "DIA SDK support was not enabled at build time";
     return false;
 #endif
 }

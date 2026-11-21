@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.25)
 
 project(peelf_explorer
-  VERSION 0.0.1
+  VERSION 1.0.0
   DESCRIPTION "PE/ELF executable viewer (core parser + Vulkan/GLFW/ImGui GUI)"
   LANGUAGES C CXX
 )
@@ -48,6 +48,7 @@ option(PEELF_ENABLE_CLANG_TIDY "Run clang-tidy on peelf targets during build (Ni
 option(PEELF_ENABLE_BIN_MATRIX_DOCKER_TEST "Register the Docker-backed bin-matrix refresh test with CTest" OFF)
 option(PEELF_ENABLE_BINARY_NINJA_SDK "Experimental opt-in check for local Binary Ninja C++ SDK headers/core library (never required)" OFF)
 option(PEELF_ENABLE_BINARY_NINJA_TESTS "Register opt-in Binary Ninja integration CTests when Binary Ninja is installed (never required in CI)" OFF)
+option(PEELF_INSTALL_DIA_REDIST "Opt-in installation of msdia140.dll alongside Windows viewer runtime (subject to Microsoft DIA redistributable license)" OFF)
 
 if(PEELF_ENABLE_BINARY_NINJA_SDK)
   set(BN_SDK_DIR "" CACHE PATH "Optional path to Vector 35 binaryninja-api C++ SDK checkout")
@@ -209,3 +210,43 @@ if(PEELF_CLANG_FORMAT_EXE)
         COMMENT "clang-format: checking formatting (no changes)"
         VERBATIM)
 endif()
+
+# ---------------------------------------------------------------------------
+# Installation & CPack portable distribution archives (WU-45).
+# ---------------------------------------------------------------------------
+install(FILES
+  "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+  "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+  "${CMAKE_CURRENT_SOURCE_DIR}/docs/USER_GUIDE.md"
+  "${CMAKE_CURRENT_SOURCE_DIR}/docs/ARCHITECTURE.md"
+  DESTINATION "${CMAKE_INSTALL_DOCDIR}"
+  COMPONENT runtime
+)
+
+set(CPACK_PACKAGE_NAME "peelf-explorer")
+set(CPACK_PACKAGE_VENDOR "wsollers")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "${PROJECT_DESCRIPTION}")
+set(CPACK_PACKAGE_VERSION "${PROJECT_VERSION}")
+set(CPACK_PACKAGE_VERSION_MAJOR "${PROJECT_VERSION_MAJOR}")
+set(CPACK_PACKAGE_VERSION_MINOR "${PROJECT_VERSION_MINOR}")
+set(CPACK_PACKAGE_VERSION_PATCH "${PROJECT_VERSION_PATCH}")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL OFF)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+if(WIN32)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(CPACK_SYSTEM_NAME "windows-x64")
+  else()
+    set(CPACK_SYSTEM_NAME "windows-x86")
+  endif()
+  set(CPACK_GENERATOR "ZIP")
+elseif(APPLE)
+  set(CPACK_SYSTEM_NAME "macos-${CMAKE_SYSTEM_PROCESSOR}")
+  set(CPACK_GENERATOR "TGZ")
+else()
+  string(TOLOWER "${CMAKE_SYSTEM_NAME}" _peelf_os_lower)
+  set(CPACK_SYSTEM_NAME "${_peelf_os_lower}-${CMAKE_SYSTEM_PROCESSOR}")
+  set(CPACK_GENERATOR "TGZ")
+endif()
+include(CPack)

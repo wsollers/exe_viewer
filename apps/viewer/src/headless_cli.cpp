@@ -42,6 +42,10 @@
 #include <unistd.h>
 #endif
 
+#ifndef PEELF_VERSION_STRING
+#define PEELF_VERSION_STRING "1.0.0"
+#endif
+
 namespace viewer {
 namespace {
 
@@ -830,7 +834,8 @@ void print_help_usage(std::ostream& stdout_stream) {
         << "  --project <workspace.peproj> Load/save PEELF_PROJECT v2 annotations, bookmarks & byte patches\n"
         << "  --script-max-instructions <N> Override Lua VM instruction quota (default: 1000000)\n"
         << "  --script-timeout-ms <ms>     Override Lua script wall-clock timeout in ms (default: 5000)\n"
-        << "  --help                       Show this help\n";
+        << "  -V, --version                Print version (peelf_viewer " PEELF_VERSION_STRING ") and exit 0\n"
+        << "  -h, --help                   Show this help\n";
 }
 
 } // namespace
@@ -1179,6 +1184,7 @@ std::optional<int> try_run_headless_or_help_cli(
     std::ostream& stderr_stream) {
     bool headless = false;
     bool help = false;
+    bool version = false;
     bool has_script_flag = false;
 
     for (const std::string_view arg : args) {
@@ -1186,6 +1192,8 @@ std::optional<int> try_run_headless_or_help_cli(
             headless = true;
         } else if (arg == "--help" || arg == "-h") {
             help = true;
+        } else if (arg == "--version" || arg == "-V") {
+            version = true;
         } else if (arg == "--script" || arg.starts_with("--script=") ||
                    arg == "--script-allow-mutations" ||
                    arg.starts_with("--script-allow-mutations=") ||
@@ -1201,6 +1209,12 @@ std::optional<int> try_run_headless_or_help_cli(
 
     if (help) {
         print_help_usage(stdout_stream);
+        return 0;
+    }
+
+    if (version) {
+        stdout_stream << "peelf_viewer " << PEELF_VERSION_STRING << '\n';
+        stdout_stream.flush();
         return 0;
     }
 

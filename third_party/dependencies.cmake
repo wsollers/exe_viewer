@@ -66,6 +66,7 @@ FetchContent_Declare(
         GIT_TAG        v1.2.1
         GIT_SHALLOW    TRUE
 )
+set(NFD_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(nfd)
 
 target_link_libraries(imgui PUBLIC glfw Vulkan::Vulkan)
@@ -78,6 +79,7 @@ FetchContent_Declare(
         GIT_TAG        5.0.6
         GIT_SHALLOW    TRUE
 )
+set(CAPSTONE_INSTALL OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
 set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
