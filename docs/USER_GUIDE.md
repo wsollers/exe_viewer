@@ -409,6 +409,8 @@ Open **Flow Graph** (**Analyze > Call graph** or press **`Space`** inside **Disa
    - **Left-Drag on a Node**: Pin and reposition a node interactively (`GPU Galaxy` keeps pinned nodes anchored while neighboring clusters relax around them; Graphviz mode reroutes splines live).
    - **Search, Double-Click & Context Menu**: Filter functions via **Find node**, hover for a rich tooltip (demangled name, VA, size, in/out degree, reachability, security/diff badges), **double-click** a node to jump **Disassembly** / **Hex View** / **Decompiler**, or **right-click** any node to open the universal `InspectableEntity` context menu.
 
+> **Headless CLI Export**: Static `entry`, symbol `fanout`, and intra-procedural `cfg` graphs can also be exported without a GPU or display server via `peelf_viewer --headless <binary> --graph <entry|fanout|cfg>` in `dot`, `svg`, `png`, or `json` formats (see [Section 14](#14-headless-cli-and-automation)).
+
 ![Flow graph](screenshots/flow-graph.png)
 
 ### 5.4 Decompilation (`F5`) — Built-In Pseudo-C vs. Persistent Headless Ghidra
@@ -816,16 +818,18 @@ Open **View > Signatures & Crypto** (or pass `--rules <file_or_dir>` to `--headl
 ```mermaid
 flowchart LR
     cli["peelf_viewer --headless <binary><br/>(Zero Vulkan / Zero GUI Deps)"] --> parse["IBinaryImage + DependencyGraph<br/>+ SecurityAudit (+ BinaryDiff)"]
+    cli --> graph["CallGraph Builder<br/>(--graph entry | fanout | cfg)"]
     parse --> fmt{"--format"}
     fmt -->|json| json["Deterministic JSON Report<br/>(Summary · Deps · Security · Diff)"]
     fmt -->|sarif| sarif["OASIS SARIF 2.1.0<br/>(GitHub Code Scanning Upload)"]
     fmt -->|csv| csv["RFC 4180 CSV Summary<br/>(Findings · Sections · Imports · Exports)"]
+    graph --> gfmt["--graph-format<br/>DOT · SVG · PNG · JSON"]
     parse --> gate{"--fail-on<br/>none | error | warning"}
     gate -->|Pass| e0["Exit Code 0"]
     gate -->|Policy Violation| e2["Exit Code 2"]
 ```
 
-`peelf_viewer --headless` runs completely inside `peelf_viewer` + `peelf_core` without loading `peelf_gui`, initializing GLFW, or requiring a GPU/display server.
+`peelf_viewer --headless` runs completely inside `peelf_viewer` + `peelf_core` (plus headless Capstone/Graphviz graph builders for `--graph`) without loading `peelf_gui`, initializing GLFW, or requiring a GPU/display server.
 
 ### 14.1 CLI Synopsis, Options & Exit Codes
 
@@ -841,7 +845,12 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 | `--rules <path>` | Repeatable `.yar`/`.yara` file or directory of YARA-lite rules; matches are emitted in `--format json` (`signatures.yara_matches`) and `--format sarif`, and participate in `--fail-on` policy gates |
 | `--compare <other_binary>` | Run structural, function, and byte-hunk `BinaryDiff` against `<other_binary>` (static binaries only; matches Universal Mach-O slices automatically or via `--slice`) |
 | `--format <json\|sarif\|csv\|text>` | Output format: structured `json` (default for audits), **OASIS SARIF 2.1.0** (`sarif`), **RFC 4180 CSV** (`csv`, emitting properly quoted `summary`, `section`, `import`, `export`, `finding`, `yara_match`, `crypto_packer`, and `diff` rows), or human-readable `text` for scripts. Audits accept `json` (default), `sarif`, or `csv`; scripts accept `text` (default) or `json` |
-| `--output <path>` | Write report or script output to `<path>` instead of `stdout` |
+| `--output <path>` | Write audit report, `--graph` artifact, or `--script` output atomically to `<path>` instead of `stdout` |
+| `--graph <entry\|fanout\|cfg>` | Export a static code-flow graph:<br/>• `entry`: entry-point reachability call graph (resolving PE CRT->`main`/`WinMain` and ELF `_start -> __libc_start_main -> main` chains plus multi-hop callees)<br/>• `fanout`: caller/callee neighborhood slice (1-hop incoming callers + multi-hop outgoing callees) centered on `--symbol`<br/>• `cfg`: intra-procedural basic-block control-flow graph for `--symbol` with conditional/fallthrough/jump-table edges and resolved call targets |
+| `--symbol <name_or_addr>` | Target function selector (required for `--graph fanout` and `--graph cfg`; alias `--function`): accepts `0x...` hex VA (synthesizing `sub_<VA>` on stripped executable bytes), exact mangled/unversioned/demangled name, C++ qualified/unqualified base name, or unique substring (hydrating local DWARF/`.debug` and CodeView `.pdb` symbols; exits `1` with candidates if ambiguous) |
+| `--graph-depth <N>` | Outgoing BFS call-graph traversal depth for `--graph entry` and `--graph fanout` (`1..64`, default `3`) |
+| `--graph-max-nodes <N>` | Maximum nodes emitted in the exported graph (`1..8192`, default `64`; edges to trimmed nodes are pruned deterministically) |
+| `--graph-format <dot\|svg\|png\|json>` | Graph export format (alias `--format` in `--graph` mode). When omitted, inferred from `--output` extension (`.dot`/`.gv`, `.svg`, `.png`, `.json`; defaults to `svg` for other `--output` paths and `dot` on `stdout`). `svg` and `png` invoke Graphviz `dot` (`$PEELF_DOT_EXECUTABLE` or `PATH`) |
 | `--script <file.lua>` | Execute a sandboxed Lua 5.4 script (`peelf.*` API) against `<binary_or_dump>` in **read-only mode by default** |
 | `--script-allow-mutations` | Explicitly permit `--script` to stage and `peelf.commit()` byte patches and workspace annotations on static binaries |
 | `--output-binary <path>` | Write committed `--script` byte patches to `<path>` (requires `--script-allow-mutations` and `peelf.commit()`; never overwrites input by default) |
@@ -858,11 +867,11 @@ peelf_viewer --headless [<binary_or_dump>] [options]
 
 **Exit Codes**:
 
-- **`0`** — Analysis or `--script` succeeded and `--fail-on` policy passed.
-- **`1`** — Invalid CLI arguments, unreadable/malformed input, or Lua `--script` syntax/runtime/quota/mutation-permission failure.
+- **`0`** — Analysis, `--graph` export, or `--script` execution succeeded and `--fail-on` policy passed.
+- **`1`** — Invalid CLI arguments, unreadable/malformed input, unresolved/ambiguous `--symbol` or unavailable Graphviz `dot` for `--graph`, or Lua `--script` syntax/runtime/quota/mutation-permission failure.
 - **`2`** — Analysis succeeded, but one or more findings violated `--fail-on error` or `--fail-on warning`.
 
-Audit options (`--compare`, `--search-root`, `--include-strings`, `--min-string-len`, and `--fail-on`) cannot be combined with script mode. Both modes accept `--slice`, `--format`, and `--output`. Scripts require an input file. Mutation permission permits staging; a successful `peelf.commit()` is also required to persist changes.
+Audit options (`--compare`, `--search-root`, `--include-strings`, `--min-string-len`, `--rules`, `--clr`, and `--fail-on`), `--graph` options (`--graph`, `--symbol`, `--graph-depth`, `--graph-max-nodes`, `--graph-format`), and `--script` options are mutually exclusive modes. All three modes accept `--slice` and `--output` (`--format` is also accepted as an alias for `--graph-format` in `--graph` mode). `--graph` and `--script` require an input binary path. Mutation permission permits staging; a successful `peelf.commit()` is also required to persist changes.
 
 ### 14.2 Common Headless Recipes
 
@@ -898,6 +907,16 @@ peelf_viewer --headless ./firmware.elf \
 peelf_viewer --headless ./suspect_sample.exe \
   --rules ./rules/packers_and_crypto.yar \
   --format sarif --output signatures.sarif --fail-on warning
+
+# 7. Export entry reachability call graph (SVG) & symbol neighborhood fan-out (JSON)
+peelf_viewer --headless ./build/my_service \
+  --graph entry --graph-depth 4 --graph-max-nodes 96 --output entry_calls.svg
+peelf_viewer --headless ./build/my_service \
+  --graph fanout --symbol parse_header --graph-format json --output fanout.json
+
+# 8. Export intra-procedural function CFG by symbol name or stripped hex VA (DOT / PNG)
+peelf_viewer --headless ./build/my_service \
+  --graph cfg --symbol 0x4012a0 --graph-format dot --output sub_4012a0.dot
 ```
 
 ### 14.3 GitHub Actions workflow example
