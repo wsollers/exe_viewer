@@ -13,6 +13,9 @@
 #include <gtest/gtest.h>
 
 #include "graph/call_graph.hpp"
+#include "headless_cli.hpp"
+#include <cstdlib>
+#include <sstream>
 #include "navigation/viewer_navigation.hpp"
 #include "symbols/debug_symbols.hpp"
 #include "ui/panel_helpers.hpp"
@@ -2250,4 +2253,227 @@ TEST(CallGraph, GraphNodeClickSelectionRoundTripsThroughNavigationRequestQueue) 
               std::optional<std::uint64_t>{0x140001100ULL});
 }
 
+
+namespace {
+
+void set_test_env(const char* key, const char* value) {
+#ifdef _WIN32
+    _putenv_s(key, value != nullptr ? value : "");
+#else
+    if (value != nullptr) {
+        ::setenv(key, value, 1);
+    } else {
+        ::unsetenv(key);
+    }
+#endif
+}
+
+} // namespace
+
+TEST(HeadlessGraphCli, HelpListsGraphFlagsAndFormatInferenceFollowsContract) {
+    std::ostringstream out_ss;
+    std::ostringstream err_ss;
+    const std::array<std::string_view, 1> help_args{"--help"};
+    const auto help_rc = viewer::try_run_headless_or_help_cli(help_args, out_ss, err_ss);
+    ASSERT_TRUE(help_rc.has_value());
+    EXPECT_EQ(*help_rc, 0);
+    EXPECT_NE(out_ss.str().find("--graph <entry|fanout|cfg>"), std::string::npos);
+    EXPECT_NE(out_ss.str().find("--symbol <name-or-va>"), std::string::npos);
+    EXPECT_NE(out_ss.str().find("--graph-depth <N>"), std::string::npos);
+    EXPECT_NE(out_ss.str().find("--graph-max-nodes <N>"), std::string::npos);
+    EXPECT_NE(out_ss.str().find("--graph-format <dot|svg|png|json>"), std::string::npos);
+
+    viewer::HeadlessOptions opts{};
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Dot);
+
+    opts.output_path = std::filesystem::path("flow.svg");
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Svg);
+
+    opts.output_path = std::filesystem::path("flow.dot");
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Dot);
+
+    opts.output_path = std::filesystem::path("flow.png");
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Png);
+
+    opts.output_path = std::filesystem::path("flow.json");
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Json);
+
+    opts.output_path = std::filesystem::path("flow.unknown");
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Svg);
+
+    opts.graph_format = viewer::HeadlessGraphFormat::Json;
+    EXPECT_EQ(viewer::resolve_headless_graph_format(opts), viewer::HeadlessGraphFormat::Json);
+}
+
+TEST(HeadlessGraphCli, ExportsEntryFanoutAndCfgWithDemangledHexAndSubstringLookup) {
+    const std::filesystem::path hello_path =
+        std::filesystem::path(PEELF_TEST_FIXTURES_DIR) / "hello.elf";
+    const std::string hello_str = hello_path.string();
+
+    // 1. Entry graph to stdout defaults to DOT
+    {
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::array<std::string_view, 4> args{
+            "--headless", hello_str, "--graph", "entry"};
+        const auto rc = viewer::try_run_headless_or_help_cli(args, out_ss, err_ss);
+        ASSERT_TRUE(rc.has_value());
+        EXPECT_EQ(*rc, 0) << err_ss.str();
+        EXPECT_NE(out_ss.str().find("digraph"), std::string::npos);
+        EXPECT_NE(out_ss.str().find("main"), std::string::npos);
+    }
+
+    // 2. Fanout on `add` discovers caller `main` and emits valid deterministic JSON
+    {
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::array<std::string_view, 8> args{
+            "--headless", hello_str,
+            "--graph", "fanout",
+            "--symbol", "add",
+            "--graph-format", "json"};
+        const auto rc = viewer::try_run_headless_or_help_cli(args, out_ss, err_ss);
+        ASSERT_TRUE(rc.has_value());
+        EXPECT_EQ(*rc, 0) << err_ss.str();
+        const std::string json = out_ss.str();
+        EXPECT_NE(json.find("\"kind\": \"fanout\""), std::string::npos);
+        EXPECT_NE(json.find("\"root\": \"add\""), std::string::npos);
+        EXPECT_NE(json.find("\"label\": \"main\""), std::string::npos);
+        EXPECT_NE(json.find("\"label\": \"caller\""), std::string::npos);
+    }
+
+    // 3. CFG on `main` via hex VA (0x1161) resolves basic blocks + call targets (`add`, `printf`)
+    {
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::array<std::string_view, 8> args{
+            "--headless", hello_str,
+            "--graph", "cfg",
+            "--symbol", "0x1161",
+            "--graph-format", "json"};
+        const auto rc = viewer::try_run_headless_or_help_cli(args, out_ss, err_ss);
+        ASSERT_TRUE(rc.has_value());
+        EXPECT_EQ(*rc, 0) << err_ss.str();
+        const std::string json = out_ss.str();
+        EXPECT_NE(json.find("\"kind\": \"cfg\""), std::string::npos);
+        EXPECT_NE(json.find("\"kind\": \"basic_block\""), std::string::npos);
+        EXPECT_NE(json.find("add"), std::string::npos);
+    }
+
+    // 4. C++ Itanium mangled symbol (`_Z14handle_requesti`) resolved by base name `handle_request`
+    //    and by unique substring `handle_req`
+    {
+        std::vector<std::uint8_t> mangled_elf = read_fixture("hello.elf");
+        const std::string_view old_sym = "__do_global_dtors_aux";
+        const std::string_view new_sym = "_Z10handle_reqi";
+        ASSERT_LT(new_sym.size(), old_sym.size());
+        const auto pos = std::search(
+            mangled_elf.begin(), mangled_elf.end(), old_sym.begin(), old_sym.end());
+        ASSERT_NE(pos, mangled_elf.end());
+        std::fill(pos, pos + static_cast<std::ptrdiff_t>(old_sym.size()), std::uint8_t{0});
+        std::copy(new_sym.begin(), new_sym.end(), pos);
+
+        const std::filesystem::path tmp_elf =
+            std::filesystem::current_path() / "headless_mangled_test_fixture.elf";
+        {
+            std::ofstream ofs(tmp_elf, std::ios::binary);
+            ASSERT_TRUE(ofs);
+            ofs.write(
+                reinterpret_cast<const char*>(mangled_elf.data()),
+                static_cast<std::streamsize>(mangled_elf.size()));
+        }
+
+        const std::string tmp_elf_str = tmp_elf.string();
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::array<std::string_view, 8> base_args{
+            "--headless", tmp_elf_str,
+            "--graph", "fanout",
+            "--symbol", "handle_req",
+            "--graph-format", "json"};
+        const auto rc1 = viewer::try_run_headless_or_help_cli(base_args, out_ss, err_ss);
+        ASSERT_TRUE(rc1.has_value());
+        EXPECT_EQ(*rc1, 0) << err_ss.str();
+        EXPECT_NE(out_ss.str().find("handle_req(int)"), std::string::npos);
+
+        out_ss.str("");
+        err_ss.str("");
+        const std::array<std::string_view, 8> sub_args{
+            "--headless", tmp_elf_str,
+            "--graph", "cfg",
+            "--symbol", "ndle_re",
+            "--graph-format", "dot"};
+        const auto rc2 = viewer::try_run_headless_or_help_cli(sub_args, out_ss, err_ss);
+        ASSERT_TRUE(rc2.has_value());
+        EXPECT_EQ(*rc2, 0) << err_ss.str();
+        EXPECT_NE(out_ss.str().find("handle_req(int)"), std::string::npos);
+
+        std::error_code ec{};
+        std::filesystem::remove(tmp_elf, ec);
+    }
+}
+
+TEST(HeadlessGraphCli, RendersWithRunnerCleansSidecarAndFailsClearlyWhenDotMissing) {
+    const std::filesystem::path hello_path =
+        std::filesystem::path(PEELF_TEST_FIXTURES_DIR) / "hello.elf";
+    const std::filesystem::path out_svg =
+        std::filesystem::current_path() / "headless_graph_cli_test_out.svg";
+    const std::filesystem::path sidecar_dot = out_svg.string() + ".dot";
+    std::error_code ec{};
+    std::filesystem::remove(out_svg, ec);
+    std::filesystem::remove(sidecar_dot, ec);
+
+    // Injected FakeProcessRunner exercises SVG render + sidecar DOT cleanup deterministically
+    {
+        FakeProcessRunner fake{};
+        viewer::HeadlessOptions opts{};
+        opts.binary_path = hello_path;
+        opts.graph_kind = viewer::HeadlessGraphKind::Entry;
+        opts.output_path = out_svg;
+        std::ostringstream out_ss;
+        const auto res = viewer::export_headless_graph(opts, out_ss, &fake);
+        ASSERT_TRUE(res.has_value()) << res.error().message;
+        EXPECT_FALSE(fake.arguments_.empty());
+        EXPECT_FALSE(std::filesystem::exists(sidecar_dot));
+    }
+
+    // Missing Graphviz `dot` returns non-zero with clear diagnostic
+    {
+        set_test_env("PEELF_DOT_EXECUTABLE", "/nonexistent_dir/missing_dot_binary");
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::string hello_str = hello_path.string();
+        const std::string out_svg_str = out_svg.string();
+        const std::array<std::string_view, 6> args{
+            "--headless", hello_str, "--graph", "entry", "--output", out_svg_str};
+        const auto rc = viewer::try_run_headless_or_help_cli(args, out_ss, err_ss);
+        set_test_env("PEELF_DOT_EXECUTABLE", nullptr);
+
+        ASSERT_TRUE(rc.has_value());
+        EXPECT_NE(*rc, 0);
+        EXPECT_NE(err_ss.str().find("Graphviz 'dot'"), std::string::npos);
+    }
+
+    // CLI validation errors (missing --headless, missing --symbol for cfg)
+    {
+        std::ostringstream out_ss;
+        std::ostringstream err_ss;
+        const std::string hello_str = hello_path.string();
+        const std::array<std::string_view, 3> no_headless{hello_str, "--graph", "entry"};
+        const auto rc1 = viewer::try_run_headless_or_help_cli(no_headless, out_ss, err_ss);
+        ASSERT_TRUE(rc1.has_value());
+        EXPECT_NE(*rc1, 0);
+
+        out_ss.str("");
+        err_ss.str("");
+        const std::array<std::string_view, 4> no_sym{"--headless", hello_str, "--graph", "cfg"};
+        const auto rc2 = viewer::try_run_headless_or_help_cli(no_sym, out_ss, err_ss);
+        ASSERT_TRUE(rc2.has_value());
+        EXPECT_NE(*rc2, 0);
+        EXPECT_NE(err_ss.str().find("--symbol"), std::string::npos);
+    }
+
+    std::filesystem::remove(out_svg, ec);
+    std::filesystem::remove(sidecar_dot, ec);
+}
 

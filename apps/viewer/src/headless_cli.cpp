@@ -1,6 +1,11 @@
 #include "headless_cli.hpp"
+#include "graph/call_graph_internal.hpp"
+#include "symbols/debug_symbols.hpp"
+#include "symbols/symbol_index.hpp"
 
 #include <peelf/binary_image.hpp>
+#include <peelf/demangle.hpp>
+#include <peelf/subprocess.hpp>
 #include <peelf/crash_dump.hpp>
 #include <peelf/patching.hpp>
 #include <peelf/process.hpp>
@@ -14,6 +19,8 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -827,6 +834,13 @@ void print_help_usage(std::ostream& stdout_stream) {
         << "  --clr                        Include .NET / CLR ECMA-335 metadata, AssemblyRefs & P/Invoke imports\n"
         << "  --fail-on <none|error|warning>\n"
         << "                               CI policy gate (exit 2 on security findings or missing deps)\n"
+        << "\nHeadless Code-Flow Graph Options (--graph):\n"
+        << "  --graph <entry|fanout|cfg>   Export entry call graph, symbol fan-out, or function CFG\n"
+        << "  --symbol <name-or-va>        Target function name (demangled, mangled, substring) or hex VA (0x...)\n"
+        << "  --graph-depth <N>            Call-graph traversal depth for entry/fanout (default: 3)\n"
+        << "  --graph-max-nodes <N>        Maximum nodes emitted in exported graph (default: 64)\n"
+        << "  --graph-format <dot|svg|png|json>\n"
+        << "                               Graph export format (default: from --output ext, svg with --output, dot to stdout)\n"
         << "\nHeadless Lua Scripting Options (--script):\n"
         << "  --script <file.lua>          Execute sandboxed Lua 5.4 script against <binary> (read-only default)\n"
         << "  --script-allow-mutations     Allow script to stage/commit patches, labels, comments & bookmarks\n"
@@ -1179,6 +1193,1174 @@ std::string format_headless_script_report_json(const HeadlessScriptRunReport& re
     return out;
 }
 
+
+// ---------------------------------------------------------------------------
+// Headless Code-Flow Graph Export (--graph entry|fanout|cfg)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+[[nodiscard]] std::string_view node_kind_json_name(CallGraphNodeKind kind) noexcept {
+    switch (kind) {
+        case CallGraphNodeKind::Function:    return "function";
+        case CallGraphNodeKind::BasicBlock:  return "basic_block";
+        case CallGraphNodeKind::Instruction: return "instruction";
+        case CallGraphNodeKind::Import:      return "import";
+        case CallGraphNodeKind::External:    return "external";
+        case CallGraphNodeKind::Unknown:     return "unknown";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] std::string_view edge_kind_json_name(CallGraphEdgeKind kind) noexcept {
+    switch (kind) {
+        case CallGraphEdgeKind::Call:                return "call";
+        case CallGraphEdgeKind::ConditionalBranch:   return "conditional_branch";
+        case CallGraphEdgeKind::UnconditionalBranch: return "unconditional_branch";
+        case CallGraphEdgeKind::Fallthrough:         return "fallthrough";
+        case CallGraphEdgeKind::Return:              return "return";
+        case CallGraphEdgeKind::DataReference:       return "data_reference";
+        case CallGraphEdgeKind::Unknown:             return "unknown";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] std::optional<HeadlessGraphKind> parse_headless_graph_kind(std::string_view raw) noexcept {
+    const std::string low = lower_ascii(raw);
+    if (low == "entry") return HeadlessGraphKind::Entry;
+    if (low == "fanout" || low == "fan-out") return HeadlessGraphKind::Fanout;
+    if (low == "cfg") return HeadlessGraphKind::Cfg;
+    return std::nullopt;
+}
+
+[[nodiscard]] std::optional<HeadlessGraphFormat> parse_headless_graph_format(std::string_view raw) noexcept {
+    const std::string low = lower_ascii(raw);
+    if (low == "dot" || low == "gv") return HeadlessGraphFormat::Dot;
+    if (low == "svg") return HeadlessGraphFormat::Svg;
+    if (low == "png") return HeadlessGraphFormat::Png;
+    if (low == "json") return HeadlessGraphFormat::Json;
+    return std::nullopt;
+}
+
+[[nodiscard]] std::string_view strip_elf_symbol_version(std::string_view sym) noexcept {
+    if (sym.empty() || sym.front() == '?') {
+        return sym;
+    }
+    const std::size_t at = sym.find('@');
+    if (at != std::string_view::npos && at > 0u) {
+        return sym.substr(0u, at);
+    }
+    return sym;
+}
+
+struct DemangledNameParts {
+    std::string qualified{};
+    std::string unqualified{};
+};
+
+[[nodiscard]] DemangledNameParts split_demangled_function_parts(std::string_view text) {
+    std::string_view work = strip_elf_symbol_version(text);
+    int angle_depth = 0;
+    std::size_t paren_pos = std::string_view::npos;
+    for (std::size_t i = 0u; i < work.size(); ++i) {
+        const char ch = work[i];
+        if (ch == '<') {
+            ++angle_depth;
+        } else if (ch == '>' && angle_depth > 0) {
+            --angle_depth;
+        } else if (ch == '(' && angle_depth == 0) {
+            paren_pos = i;
+            break;
+        }
+    }
+    if (paren_pos != std::string_view::npos) {
+        work = work.substr(0u, paren_pos);
+    }
+    while (!work.empty() && std::isspace(static_cast<unsigned char>(work.back())) != 0) {
+        work.remove_suffix(1u);
+    }
+    angle_depth = 0;
+    std::size_t last_space = std::string_view::npos;
+    for (std::size_t i = 0u; i < work.size(); ++i) {
+        const char ch = work[i];
+        if (ch == '<') {
+            ++angle_depth;
+        } else if (ch == '>' && angle_depth > 0) {
+            --angle_depth;
+        } else if ((std::isspace(static_cast<unsigned char>(ch)) != 0 || ch == '*' || ch == '&') &&
+                   angle_depth == 0) {
+            if (work.substr(0u, i).ends_with("operator")) {
+                continue;
+            }
+            last_space = i;
+        }
+    }
+    if (last_space != std::string_view::npos && (last_space + 1u) < work.size()) {
+        work = work.substr(last_space + 1u);
+    }
+
+    std::string qualified(work);
+    angle_depth = 0;
+    std::size_t tmpl_pos = std::string::npos;
+    for (std::size_t i = 0u; i < qualified.size(); ++i) {
+        if (qualified[i] == '<') {
+            if (angle_depth == 0) tmpl_pos = i;
+            ++angle_depth;
+        } else if (qualified[i] == '>' && angle_depth > 0) {
+            --angle_depth;
+        }
+    }
+    std::string qualified_no_tmpl =
+        (tmpl_pos != std::string::npos && tmpl_pos > 0u) ? qualified.substr(0u, tmpl_pos) : qualified;
+
+    std::string unqualified = qualified_no_tmpl;
+    if (const std::size_t sep = unqualified.rfind("::"); sep != std::string::npos) {
+        unqualified = unqualified.substr(sep + 2u);
+    }
+    return DemangledNameParts{
+        .qualified = std::move(qualified_no_tmpl),
+        .unqualified = std::move(unqualified),
+    };
+}
+
+[[nodiscard]] int score_symbol_record(
+    const peelf::IBinaryImage& image,
+    const SymbolRecord& rec) noexcept {
+    int score = 0;
+    if (symbol_has_code(image, rec)) score += 100;
+    if (!rec.external && rec.source != SymbolSource::Import) score += 40;
+    if (rec.function.value_or(false)) score += 20;
+    if (rec.size > 0u) score += 15;
+    if (!rec.demangled_name.empty()) score += 5;
+    if (!rec.dynamic) score += 3;
+    return score;
+}
+
+[[nodiscard]] SymbolRecord enrich_symbol_display(const SymbolRecord& rec) {
+    SymbolRecord copy = rec;
+    if (copy.demangled_name.empty() && !copy.raw_name.empty()) {
+        copy.demangled_name = peelf::demangle_symbol(copy.raw_name).demangled;
+    } else if (copy.demangled_name.empty() && !copy.name.empty()) {
+        copy.demangled_name = peelf::demangle_symbol(copy.name).demangled;
+    }
+    if (!copy.demangled_name.empty()) {
+        copy.name = copy.demangled_name;
+    }
+    return copy;
+}
+
+[[nodiscard]] std::vector<SymbolRecord> deduplicate_candidates_by_va(
+    const peelf::IBinaryImage& image,
+    const std::vector<const SymbolRecord*>& matches) {
+    std::vector<SymbolRecord> out{};
+    std::map<std::string, std::size_t> key_to_idx{};
+    for (const SymbolRecord* ptr : matches) {
+        if (ptr == nullptr) continue;
+        const std::string key =
+            (ptr->virtual_address.has_value() && *ptr->virtual_address != 0u)
+                ? std::format("va:{:X}", *ptr->virtual_address)
+                : std::format("sym:{}", !ptr->raw_name.empty() ? ptr->raw_name : ptr->name);
+        const auto it = key_to_idx.find(key);
+        if (it == key_to_idx.end()) {
+            key_to_idx.emplace(key, out.size());
+            out.push_back(enrich_symbol_display(*ptr));
+        } else {
+            SymbolRecord& existing = out[it->second];
+            if (score_symbol_record(image, *ptr) > score_symbol_record(image, existing)) {
+                SymbolRecord best = enrich_symbol_display(*ptr);
+                if (best.size == 0u && existing.size > 0u) best.size = existing.size;
+                existing = std::move(best);
+            } else if (existing.size == 0u && ptr->size > 0u) {
+                existing.size = ptr->size;
+            }
+        }
+    }
+    return out;
+}
+
+[[nodiscard]] bool address_in_executable_region(
+    const peelf::IBinaryImage& image,
+    std::uint64_t file_offset) noexcept {
+    for (const auto& sec : image.sections()) {
+        if (sec.executable && file_offset >= sec.file_offset &&
+            (file_offset - sec.file_offset) < sec.file_size) {
+            return true;
+        }
+    }
+    for (const auto& seg : image.segments()) {
+        if (seg.executable && file_offset >= seg.file_offset &&
+            (file_offset - seg.file_offset) < seg.file_size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] std::string format_ambiguous_candidates(
+    std::string_view query,
+    const std::vector<SymbolRecord>& candidates) {
+    std::string msg = std::format("Ambiguous --symbol '{}' matches {} functions: ",
+                                  query,
+                                  candidates.size());
+    const std::size_t limit = std::min<std::size_t>(candidates.size(), 6u);
+    for (std::size_t i = 0u; i < limit; ++i) {
+        if (i > 0u) msg += ", ";
+        const SymbolRecord& c = candidates[i];
+        if (c.virtual_address.has_value()) {
+            msg += std::format("'{}' (0x{:X})", c.display_name(true), *c.virtual_address);
+        } else {
+            msg += std::format("'{}'", c.display_name(true));
+        }
+    }
+    if (candidates.size() > limit) {
+        msg += ", ...";
+    }
+    return msg;
+}
+[[nodiscard]] peelf::Result<SymbolRecord> resolve_headless_graph_symbol(
+    const peelf::IBinaryImage& image,
+    const SymbolIndex& symbol_index,
+    std::string_view query,
+    bool require_code,
+    const std::filesystem::path& binary_path) {
+    if (query.empty()) {
+        return peelf::make_error("--symbol must not be empty");
+    }
+
+    if (query.starts_with("0x") || query.starts_with("0X")) {
+        const std::string_view hex_digits = query.substr(2u);
+        std::uint64_t va = 0u;
+        const auto [ptr, ec] =
+            std::from_chars(hex_digits.data(), hex_digits.data() + hex_digits.size(), va, 16);
+        if (hex_digits.empty() || ec != std::errc{} || ptr != hex_digits.data() + hex_digits.size()) {
+            return peelf::make_error(std::format("Invalid hex address for --symbol: '{}'", query));
+        }
+        std::vector<const SymbolRecord*> exact_va{};
+        for (const SymbolRecord& rec : symbol_index.records()) {
+            if (rec.virtual_address.has_value() && *rec.virtual_address == va) {
+                exact_va.push_back(&rec);
+            }
+        }
+        if (!exact_va.empty()) {
+            auto dedup = deduplicate_candidates_by_va(image, exact_va);
+            return dedup.front();
+        }
+        if (const SymbolRecord* containing = symbol_index.find_containing_address(va)) {
+            if (containing->virtual_address.has_value() && *containing->virtual_address == va) {
+                return enrich_symbol_display(*containing);
+            }
+        }
+        if (const auto mapped = image.virtual_address_to_file_offset(va);
+            mapped.has_value() && address_in_executable_region(image, *mapped)) {
+            const std::string synth_name = std::format("sub_{:X}", va);
+            return SymbolRecord{
+                .name = synth_name,
+                .raw_name = synth_name,
+                .demangled_name = {},
+                .source = SymbolSource::ImageSymbol,
+                .source_index = 0u,
+                .virtual_address = va,
+                .file_offset = *mapped,
+                .size = 0u,
+                .function = true,
+            };
+        }
+        if (const SymbolRecord* containing = symbol_index.find_containing_address(va)) {
+            return enrich_symbol_display(*containing);
+        }
+        return peelf::make_error(std::format(
+            "Address 0x{:X} does not map to a symbol or executable region in '{}'",
+            va,
+            binary_path.string()));
+    }
+
+    const auto filter_preferred = [&](const std::vector<const SymbolRecord*>& raw) {
+        std::vector<const SymbolRecord*> code_only{};
+        for (const SymbolRecord* r : raw) {
+            if (r != nullptr && symbol_has_code(image, *r)) {
+                code_only.push_back(r);
+            }
+        }
+        if (!code_only.empty()) {
+            return deduplicate_candidates_by_va(image, code_only);
+        }
+        if (require_code) {
+            return std::vector<SymbolRecord>{};
+        }
+        return deduplicate_candidates_by_va(image, raw);
+    };
+
+    {
+        std::vector<const SymbolRecord*> exact{};
+        for (const SymbolRecord& rec : symbol_index.records()) {
+            const std::string_view raw = !rec.raw_name.empty() ? std::string_view{rec.raw_name}
+                                                               : std::string_view{rec.name};
+            const std::string demangled = !rec.demangled_name.empty()
+                                              ? rec.demangled_name
+                                              : peelf::demangle_symbol(raw).demangled;
+            if (rec.name == query || rec.raw_name == query ||
+                strip_elf_symbol_version(rec.name) == query ||
+                strip_elf_symbol_version(raw) == query ||
+                (!demangled.empty() && demangled == query)) {
+                exact.push_back(&rec);
+            }
+        }
+        auto preferred = filter_preferred(exact);
+        if (preferred.size() == 1u) {
+            return preferred.front();
+        }
+        if (preferred.size() > 1u) {
+            std::ranges::sort(preferred, [&](const SymbolRecord& a, const SymbolRecord& b) {
+                return score_symbol_record(image, a) > score_symbol_record(image, b);
+            });
+            return preferred.front();
+        }
+        if (!exact.empty() && require_code) {
+            return peelf::make_error(std::format(
+                "Symbol '{}' in '{}' is an external/non-code symbol without a function body",
+                query,
+                binary_path.string()));
+        }
+    }
+
+    {
+        std::vector<const SymbolRecord*> base_matches{};
+        for (const SymbolRecord& rec : symbol_index.records()) {
+            const std::string_view raw = !rec.raw_name.empty() ? std::string_view{rec.raw_name}
+                                                               : std::string_view{rec.name};
+            const std::string demangled = !rec.demangled_name.empty()
+                                              ? rec.demangled_name
+                                              : peelf::demangle_symbol(raw).demangled;
+            const std::string_view target_str =
+                !demangled.empty() ? std::string_view{demangled} : std::string_view{rec.name};
+            const DemangledNameParts parts = split_demangled_function_parts(target_str);
+            if (parts.qualified == query || parts.unqualified == query) {
+                base_matches.push_back(&rec);
+            }
+        }
+        auto preferred = filter_preferred(base_matches);
+        if (preferred.size() == 1u) {
+            return preferred.front();
+        }
+        if (preferred.size() > 1u) {
+            return peelf::make_error(format_ambiguous_candidates(query, preferred));
+        }
+    }
+
+    {
+        std::vector<const SymbolRecord*> sub_matches{};
+        for (const SymbolRecord& rec : symbol_index.records()) {
+            const std::string_view raw = !rec.raw_name.empty() ? std::string_view{rec.raw_name}
+                                                               : std::string_view{rec.name};
+            const std::string demangled = !rec.demangled_name.empty()
+                                              ? rec.demangled_name
+                                              : peelf::demangle_symbol(raw).demangled;
+            if (symbol_name_matches(rec.name, query) ||
+                (!rec.raw_name.empty() && symbol_name_matches(rec.raw_name, query)) ||
+                (!demangled.empty() && symbol_name_matches(demangled, query))) {
+                sub_matches.push_back(&rec);
+            }
+        }
+        auto preferred = filter_preferred(sub_matches);
+        if (preferred.size() == 1u) {
+            return preferred.front();
+        }
+        if (preferred.size() > 1u) {
+            return peelf::make_error(format_ambiguous_candidates(query, preferred));
+        }
+    }
+
+    return peelf::make_error(std::format(
+        "Symbol '{}' not found in '{}'", query, binary_path.string()));
+}
+
+void hydrate_symbol_index_with_debug_info(
+    const peelf::IBinaryImage& image,
+    std::span<const std::uint8_t> raw_bytes,
+    const std::filesystem::path& binary_path,
+    SymbolIndex& symbol_index) {
+    if (image.format() == peelf::Format::ELF) {
+        DebugSymbolLoadResult dwarf =
+            load_dwarf_debug_symbols_from_image(image, raw_bytes, image, binary_path.string());
+        if (dwarf.status != DebugSymbolLoadStatus::Loaded) {
+            if (const auto ext_dbg = find_local_elf_debug_file(image, binary_path)) {
+                dwarf = load_dwarf_debug_symbols(*ext_dbg, image);
+            }
+        }
+        if (dwarf.status == DebugSymbolLoadStatus::Loaded && !dwarf.symbols.empty()) {
+            symbol_index.add_debug_symbols(image, dwarf.symbols);
+        }
+    } else if (image.format() == peelf::Format::PE) {
+        if (const auto pdb = find_local_codeview_pdb(image, binary_path)) {
+            const DebugSymbolLoadResult dbg = load_pdb_debug_symbols(*pdb, image);
+            if (dbg.status == DebugSymbolLoadStatus::Loaded && !dbg.symbols.empty()) {
+                symbol_index.add_debug_symbols(image, dbg.symbols);
+            }
+        }
+    }
+}
+
+[[nodiscard]] std::string canonical_node_key(const CallGraphNode& node) {
+    if (node.symbol.has_value() && !node.symbol->name.empty() &&
+        (node.kind == CallGraphNodeKind::External || node.kind == CallGraphNodeKind::Import)) {
+        return "ext:" + std::string(strip_elf_symbol_version(node.symbol->name));
+    }
+    if (node.bytes.start.virtual_address.has_value() && *node.bytes.start.virtual_address != 0u) {
+        return std::format("va:{:X}", *node.bytes.start.virtual_address);
+    }
+    if (node.symbol.has_value() && !node.symbol->name.empty()) {
+        return "sym:" + node.symbol->name;
+    }
+    return "lbl:" + node.label;
+}
+
+[[nodiscard]] CallGraphNode make_symbol_graph_node(
+    const SymbolRecord& sym,
+    std::string id) {
+    const SymbolRecord enriched = enrich_symbol_display(sym);
+    const bool external = enriched.external || enriched.source == SymbolSource::Import;
+    return CallGraphNode{
+        .id = std::move(id),
+        .label = enriched.display_name(true),
+        .kind = external ? CallGraphNodeKind::Import : CallGraphNodeKind::Function,
+        .bytes = GraphByteRange{
+            .start = GraphAddress{
+                .virtual_address = enriched.virtual_address,
+                .file_offset = enriched.file_offset,
+            },
+            .size = enriched.size,
+        },
+        .symbol = GraphSymbolRef{
+            .name = !enriched.raw_name.empty() ? enriched.raw_name : enriched.name,
+            .demangled_name = enriched.demangled_name,
+            .symbol_index = enriched.source_index,
+            .dynamic = enriched.dynamic,
+        },
+    };
+}
+
+void add_unique_edge(CallGraph& graph, CallGraphEdge edge) {
+    const bool exists = std::ranges::any_of(graph.edges, [&](const CallGraphEdge& e) {
+        return e.from_node_id == edge.from_node_id &&
+               e.to_node_id == edge.to_node_id &&
+               e.kind == edge.kind &&
+               e.label == edge.label;
+    });
+    if (!exists) {
+        graph.edges.push_back(std::move(edge));
+    }
+}
+
+void trim_graph_to_max_nodes(CallGraph& graph, std::size_t max_nodes) {
+    if (graph.nodes.size() <= max_nodes) {
+        return;
+    }
+    graph.nodes.resize(max_nodes);
+    std::set<std::string> keep{};
+    for (const CallGraphNode& n : graph.nodes) {
+        keep.insert(n.id);
+    }
+    std::erase_if(graph.edges, [&](const CallGraphEdge& e) {
+        return !keep.contains(e.from_node_id) || !keep.contains(e.to_node_id);
+    });
+}
+void expand_callees_bfs(
+    const peelf::IBinaryImage& image,
+    std::span<const std::uint8_t> raw_bytes,
+    const SymbolIndex& symbol_index,
+    CallGraph& graph,
+    std::map<std::string, std::string>& key_to_node_id,
+    std::deque<std::tuple<std::string, SymbolRecord, std::size_t>>& queue,
+    std::size_t max_depth,
+    std::size_t max_nodes) {
+    std::set<std::string> expanded_node_ids{};
+    std::size_t next_id = 0u;
+
+    while (!queue.empty()) {
+        auto [from_id, cur_sym, cur_depth] = std::move(queue.front());
+        queue.pop_front();
+        if (cur_depth >= max_depth || !expanded_node_ids.insert(from_id).second) {
+            continue;
+        }
+        if (!symbol_has_code(image, cur_sym)) {
+            continue;
+        }
+
+        const CallGraph step =
+            build_symbol_fanout_call_graph(image, raw_bytes, symbol_index, cur_sym);
+        std::map<std::string, const CallGraphNode*> step_nodes{};
+        for (const CallGraphNode& n : step.nodes) {
+            step_nodes.emplace(n.id, &n);
+        }
+
+        for (const CallGraphEdge& e : step.edges) {
+            if (e.from_node_id != "root" || e.to_node_id == "no_calls") {
+                continue;
+            }
+            const auto nit = step_nodes.find(e.to_node_id);
+            if (nit == step_nodes.end()) {
+                continue;
+            }
+            CallGraphNode cand = *nit->second;
+            if (cand.symbol.has_value() && !cand.symbol->demangled_name.empty()) {
+                cand.label = cand.symbol->demangled_name;
+            } else if (cand.symbol.has_value() && !cand.symbol->name.empty()) {
+                const std::string dem = peelf::demangle_symbol(cand.symbol->name).demangled;
+                if (!dem.empty()) {
+                    cand.symbol->demangled_name = dem;
+                    cand.label = dem;
+                }
+            }
+
+            const std::string key = canonical_node_key(cand);
+            std::string target_id{};
+            if (const auto kit = key_to_node_id.find(key); kit != key_to_node_id.end()) {
+                target_id = kit->second;
+            } else {
+                if (graph.nodes.size() >= max_nodes) {
+                    continue;
+                }
+                target_id = std::format("fn_{}", next_id++);
+                cand.id = target_id;
+                key_to_node_id.emplace(key, target_id);
+                graph.nodes.push_back(std::move(cand));
+            }
+
+            add_unique_edge(graph, CallGraphEdge{
+                .from_node_id = from_id,
+                .to_node_id = target_id,
+                .kind = e.kind,
+                .label = e.label,
+            });
+
+            if ((cur_depth + 1u) < max_depth) {
+                const CallGraphNode& placed = *std::ranges::find_if(
+                    graph.nodes, [&](const CallGraphNode& n) { return n.id == target_id; });
+                if (placed.bytes.start.virtual_address.has_value()) {
+                    const std::uint64_t callee_va = *placed.bytes.start.virtual_address;
+                    std::vector<const SymbolRecord*> va_recs{};
+                    for (const SymbolRecord& r : symbol_index.records()) {
+                        if (r.virtual_address.has_value() && *r.virtual_address == callee_va &&
+                            symbol_has_code(image, r)) {
+                            va_recs.push_back(&r);
+                        }
+                    }
+                    auto best = deduplicate_candidates_by_va(image, va_recs);
+                    if (!best.empty()) {
+                        queue.emplace_back(target_id, std::move(best.front()), cur_depth + 1u);
+                    }
+                }
+            }
+        }
+    }
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> find_executable_in_path(
+    std::string_view exe_name) {
+    if (exe_name.empty()) {
+        return std::nullopt;
+    }
+    const std::filesystem::path direct(exe_name);
+    std::error_code ec{};
+    if (direct.has_parent_path() || direct.is_absolute()) {
+        if (std::filesystem::is_regular_file(direct, ec) && !ec) {
+            return direct;
+        }
+        return std::nullopt;
+    }
+
+    const char* raw_path = std::getenv("PATH");
+    if (raw_path != nullptr && *raw_path != '\0') {
+#ifdef _WIN32
+        constexpr char kPathSep = ';';
+#else
+        constexpr char kPathSep = ':';
+#endif
+        std::string_view rem(raw_path);
+        while (!rem.empty()) {
+            const std::size_t pos = rem.find(kPathSep);
+            const std::string_view dir =
+                (pos == std::string_view::npos) ? rem : rem.substr(0u, pos);
+            if (!dir.empty()) {
+                std::filesystem::path cand = std::filesystem::path(dir) / direct;
+                if (std::filesystem::is_regular_file(cand, ec) && !ec) {
+                    return cand;
+                }
+#ifdef _WIN32
+                if (!cand.has_extension()) {
+                    std::filesystem::path cand_exe = cand;
+                    cand_exe += ".exe";
+                    if (std::filesystem::is_regular_file(cand_exe, ec) && !ec) {
+                        return cand_exe;
+                    }
+                }
+#endif
+            }
+            if (pos == std::string_view::npos) {
+                break;
+            }
+            rem.remove_prefix(pos + 1u);
+        }
+    }
+
+#if defined(PEELF_GRAPHVIZ_DOT_AVAILABLE) && PEELF_GRAPHVIZ_DOT_AVAILABLE
+    const std::filesystem::path baked(PEELF_GRAPHVIZ_DOT_EXECUTABLE);
+    if (std::filesystem::is_regular_file(baked, ec) && !ec) {
+        return baked;
+    }
+#endif
+    return std::nullopt;
+}
+
+class HeadlessDotProcessRunner final : public IProcessRunner {
+public:
+    explicit HeadlessDotProcessRunner(std::filesystem::path resolved_dot)
+        : resolved_dot_(std::move(resolved_dot)) {}
+
+    [[nodiscard]] GraphRenderResult run(
+        std::string_view /*executable*/,
+        std::span<const std::string> arguments) const override {
+        peelf::SubprocessOptions opts{};
+        opts.timeout = std::chrono::milliseconds{30000};
+        opts.search_path = false;
+        const peelf::SubprocessResult sub =
+            peelf::run_subprocess_bounded(resolved_dot_, arguments, opts);
+        if (sub.timed_out) {
+            return GraphRenderResult{
+                .success = false,
+                .exit_code = -1,
+                .diagnostic = "Graphviz 'dot' timed out",
+            };
+        }
+        if (!sub.launched) {
+            return GraphRenderResult{
+                .success = false,
+                .exit_code = -1,
+                .diagnostic = sub.launch_error.empty()
+                                  ? "Failed to launch Graphviz 'dot'"
+                                  : sub.launch_error,
+            };
+        }
+        if (sub.exit_code != 0) {
+            std::string diag = sub.stderr_text;
+            while (!diag.empty() && (diag.back() == '\n' || diag.back() == '\r')) {
+                diag.pop_back();
+            }
+            return GraphRenderResult{
+                .success = false,
+                .exit_code = static_cast<std::int32_t>(sub.exit_code),
+                .diagnostic = diag.empty() ? "Graphviz 'dot' exited with error" : std::move(diag),
+            };
+        }
+        return GraphRenderResult{.success = true, .exit_code = 0, .diagnostic = {}};
+    }
+
+private:
+    std::filesystem::path resolved_dot_{};
+};
+
+} // namespace
+
+HeadlessGraphFormat resolve_headless_graph_format(const HeadlessOptions& options) noexcept {
+    if (options.graph_format.has_value()) {
+        return *options.graph_format;
+    }
+    if (options.output_path.has_value()) {
+        std::string ext = lower_ascii(options.output_path->extension().string());
+        if (ext == ".dot" || ext == ".gv") return HeadlessGraphFormat::Dot;
+        if (ext == ".svg") return HeadlessGraphFormat::Svg;
+        if (ext == ".png") return HeadlessGraphFormat::Png;
+        if (ext == ".json") return HeadlessGraphFormat::Json;
+        return HeadlessGraphFormat::Svg;
+    }
+    return HeadlessGraphFormat::Dot;
+}
+peelf::Result<HeadlessGraphRunReport> build_headless_graph(const HeadlessOptions& options) {
+    if (options.binary_path.empty()) {
+        return peelf::make_error("No input binary path specified for --graph");
+    }
+    if (options.graph_depth == 0u) {
+        return peelf::make_error("--graph-depth must be at least 1");
+    }
+    if (options.graph_max_nodes == 0u) {
+        return peelf::make_error("--graph-max-nodes must be at least 1");
+    }
+    if ((options.graph_kind == HeadlessGraphKind::Fanout ||
+         options.graph_kind == HeadlessGraphKind::Cfg) &&
+        (!options.symbol.has_value() || options.symbol->empty())) {
+        return peelf::make_error(std::format(
+            "--symbol <name-or-va> is required for --graph {}",
+            to_string(options.graph_kind)));
+    }
+
+    auto raw_bytes = read_binary_file(options.binary_path);
+    if (!raw_bytes.has_value()) {
+        return std::unexpected(raw_bytes.error());
+    }
+    auto open_opts = parse_slice_selector_options(options.slice_selector);
+    if (!open_opts.has_value()) {
+        return std::unexpected(open_opts.error());
+    }
+    auto parsed_image = peelf::open_binary_image(*raw_bytes, *open_opts);
+    if (!parsed_image.has_value()) {
+        return peelf::make_error(std::format(
+            "Failed to parse '{}': {}",
+            options.binary_path.string(),
+            parsed_image.error().message));
+    }
+    const peelf::IBinaryImage& image = **parsed_image;
+
+    SymbolIndex symbol_index = SymbolIndex::build(image);
+    hydrate_symbol_index_with_debug_info(image, *raw_bytes, options.binary_path, symbol_index);
+
+    HeadlessGraphRunReport report{};
+    report.kind = options.graph_kind;
+
+    if (options.graph_kind == HeadlessGraphKind::Entry) {
+        CallGraph graph = build_entry_call_graph(image, symbol_index);
+        report.root = detail::format_hex(image.entry_point());
+        for (const CallGraphNode& n : graph.nodes) {
+            if (n.id == "user_entry" || n.id == "entry_symbol") {
+                report.root = n.label.empty() ? n.id : n.label;
+                if (n.id == "user_entry") break;
+            }
+        }
+
+        if (options.graph_depth > 1u && graph.nodes.size() < options.graph_max_nodes) {
+            std::map<std::string, std::string> key_to_id{};
+            std::deque<std::tuple<std::string, SymbolRecord, std::size_t>> queue{};
+            for (const CallGraphNode& n : graph.nodes) {
+                key_to_id.emplace(canonical_node_key(n), n.id);
+            }
+            for (const CallGraphNode& n : graph.nodes) {
+                if ((n.id == "user_entry" || n.id == "entry_symbol") &&
+                    n.bytes.start.virtual_address.has_value()) {
+                    const std::uint64_t va = *n.bytes.start.virtual_address;
+                    std::vector<const SymbolRecord*> recs{};
+                    for (const SymbolRecord& r : symbol_index.records()) {
+                        if (r.virtual_address.has_value() && *r.virtual_address == va &&
+                            symbol_has_code(image, r)) {
+                            recs.push_back(&r);
+                        }
+                    }
+                    auto best = deduplicate_candidates_by_va(image, recs);
+                    if (!best.empty()) {
+                        queue.emplace_back(n.id, std::move(best.front()), 0u);
+                    }
+                }
+            }
+            expand_callees_bfs(
+                image,
+                *raw_bytes,
+                symbol_index,
+                graph,
+                key_to_id,
+                queue,
+                options.graph_depth,
+                options.graph_max_nodes);
+        }
+        trim_graph_to_max_nodes(graph, options.graph_max_nodes);
+        report.graph = std::move(graph);
+        return report;
+    }
+
+    if (options.graph_kind == HeadlessGraphKind::Fanout) {
+        auto root_sym = resolve_headless_graph_symbol(
+            image, symbol_index, *options.symbol, false, options.binary_path);
+        if (!root_sym.has_value()) {
+            return std::unexpected(root_sym.error());
+        }
+        const std::string root_label = root_sym->display_name(true);
+        report.root = root_label;
+
+        CallGraph graph{};
+        graph.id = "symbol_fanout";
+        graph.label = root_label + " fan-out";
+        graph.architecture = image.architecture();
+        graph.endianness = image.endianness();
+
+        CallGraphNode root_node = make_symbol_graph_node(*root_sym, "root");
+        std::map<std::string, std::string> key_to_id{};
+        key_to_id.emplace(canonical_node_key(root_node), "root");
+        graph.nodes.push_back(std::move(root_node));
+
+        if (root_sym->virtual_address.has_value() && graph.nodes.size() < options.graph_max_nodes) {
+            const std::uint64_t target_va = *root_sym->virtual_address;
+            std::vector<const SymbolRecord*> code_ptrs{};
+            code_ptrs.reserve(symbol_index.records().size());
+            for (const SymbolRecord& r : symbol_index.records()) {
+                if (r.virtual_address.has_value() && *r.virtual_address != target_va &&
+                    symbol_has_code(image, r) && r.size <= 32768u) {
+                    code_ptrs.push_back(&r);
+                }
+            }
+            auto candidates = deduplicate_candidates_by_va(image, code_ptrs);
+            std::ranges::sort(candidates, [&](const SymbolRecord& a, const SymbolRecord& b) {
+                const std::uint64_t va_a = a.virtual_address.value_or(0u);
+                const std::uint64_t va_b = b.virtual_address.value_or(0u);
+                const std::uint64_t da = (va_a > target_va) ? (va_a - target_va) : (target_va - va_a);
+                const std::uint64_t db = (va_b > target_va) ? (va_b - target_va) : (target_va - va_b);
+                return da < db;
+            });
+            const std::size_t max_scan = std::min<std::size_t>(candidates.size(), 256u);
+            std::size_t caller_idx = 0u;
+            for (std::size_t i = 0u; i < max_scan && graph.nodes.size() < options.graph_max_nodes; ++i) {
+                const SymbolRecord& cand = candidates[i];
+                const CallGraph cand_fanout =
+                    build_symbol_fanout_call_graph(image, *raw_bytes, symbol_index, cand);
+                bool calls_root = false;
+                for (const CallGraphNode& n : cand_fanout.nodes) {
+                    if (n.id != "root" && n.bytes.start.virtual_address.has_value() &&
+                        *n.bytes.start.virtual_address == target_va) {
+                        calls_root = true;
+                        break;
+                    }
+                }
+                if (calls_root) {
+                    CallGraphNode caller_node =
+                        make_symbol_graph_node(cand, std::format("caller_{}", caller_idx++));
+                    const std::string ckey = canonical_node_key(caller_node);
+                    std::string cid{};
+                    if (const auto it = key_to_id.find(ckey); it != key_to_id.end()) {
+                        cid = it->second;
+                    } else {
+                        cid = caller_node.id;
+                        key_to_id.emplace(ckey, cid);
+                        graph.nodes.push_back(std::move(caller_node));
+                    }
+                    add_unique_edge(graph, CallGraphEdge{
+                        .from_node_id = cid,
+                        .to_node_id = "root",
+                        .kind = CallGraphEdgeKind::Call,
+                        .label = "caller",
+                    });
+                }
+            }
+        }
+
+        std::deque<std::tuple<std::string, SymbolRecord, std::size_t>> queue{};
+        queue.emplace_back("root", *root_sym, 0u);
+        expand_callees_bfs(
+            image,
+            *raw_bytes,
+            symbol_index,
+            graph,
+            key_to_id,
+            queue,
+            options.graph_depth,
+            options.graph_max_nodes);
+
+        trim_graph_to_max_nodes(graph, options.graph_max_nodes);
+        report.graph = std::move(graph);
+        return report;
+    }
+
+    auto root_sym = resolve_headless_graph_symbol(
+        image, symbol_index, *options.symbol, true, options.binary_path);
+    if (!root_sym.has_value()) {
+        return std::unexpected(root_sym.error());
+    }
+    const std::string root_label = root_sym->display_name(true);
+    report.root = root_label;
+
+    const auto extent =
+        discover_function_extent(image, symbol_index, *root_sym, raw_bytes->size(), 65536u);
+    if (!extent.has_value() || extent->size == 0u ||
+        extent->file_offset >= raw_bytes->size()) {
+        return peelf::make_error(std::format(
+            "Unable to discover mapped executable bytes for symbol '{}' in '{}'",
+            root_label,
+            options.binary_path.string()));
+    }
+
+    const std::size_t slice_len = std::min<std::size_t>(
+        static_cast<std::size_t>(extent->size),
+        raw_bytes->size() - static_cast<std::size_t>(extent->file_offset));
+    const std::span<const std::uint8_t> fn_bytes(
+        raw_bytes->data() + static_cast<std::ptrdiff_t>(extent->file_offset),
+        slice_len);
+
+    const GraphByteReader va_reader = [&](std::uint64_t va, std::size_t size) {
+        const auto off = image.virtual_address_to_file_offset(va);
+        if (!off.has_value() || *off >= raw_bytes->size() || size == 0u) {
+            return std::vector<std::uint8_t>{};
+        }
+        const std::size_t avail = std::min<std::size_t>(
+            size, raw_bytes->size() - static_cast<std::size_t>(*off));
+        return std::vector<std::uint8_t>(
+            raw_bytes->begin() + static_cast<std::ptrdiff_t>(*off),
+            raw_bytes->begin() + static_cast<std::ptrdiff_t>(*off + avail));
+    };
+
+    const bool thumb = image.architecture() == peelf::Architecture::ARM &&
+                       root_sym->virtual_address.has_value() &&
+                       ((*root_sym->virtual_address & 1ULL) != 0ULL);
+
+    CallGraph cfg = build_function_cfg_call_graph(
+        fn_bytes,
+        extent->virtual_address,
+        image.architecture(),
+        image.endianness(),
+        extent->file_offset,
+        root_label,
+        thumb,
+        false,
+        va_reader);
+
+    trim_graph_to_max_nodes(cfg, options.graph_max_nodes);
+
+    std::map<std::string, std::string> callee_key_to_id{};
+    std::vector<CallGraphNode> extra_callees{};
+    std::size_t callee_counter = 0u;
+
+    for (CallGraphNode& bb : cfg.nodes) {
+        if (bb.kind != CallGraphNodeKind::BasicBlock) {
+            continue;
+        }
+        for (GraphInstruction& ins : bb.instructions) {
+            const bool is_call =
+                ins.mnemonic == "call" || ins.mnemonic == "bl" ||
+                ins.mnemonic == "blx" || ins.mnemonic == "jal" || ins.mnemonic == "bal";
+            if (!is_call || !ins.branch_target.has_value()) {
+                continue;
+            }
+            const SymbolRecord* target_sym = resolve_call_target_for_address(
+                image, *raw_bytes, symbol_index, *ins.branch_target);
+            if (target_sym == nullptr) {
+                continue;
+            }
+            const SymbolRecord enriched = enrich_symbol_display(*target_sym);
+            const std::string sym_disp = enriched.display_name(true);
+            if (!sym_disp.empty()) {
+                ins.operands += " ; " + sym_disp;
+            }
+            CallGraphNode callee_node =
+                make_symbol_graph_node(enriched, std::format("call_{}", callee_counter));
+            const std::string ckey = canonical_node_key(callee_node);
+            std::string cid{};
+            if (const auto it = callee_key_to_id.find(ckey); it != callee_key_to_id.end()) {
+                cid = it->second;
+            } else if ((cfg.nodes.size() + extra_callees.size()) < options.graph_max_nodes) {
+                cid = std::format("call_{}", callee_counter++);
+                callee_node.id = cid;
+                callee_key_to_id.emplace(ckey, cid);
+                extra_callees.push_back(std::move(callee_node));
+            }
+            if (!cid.empty()) {
+                add_unique_edge(cfg, CallGraphEdge{
+                    .from_node_id = bb.id,
+                    .to_node_id = cid,
+                    .kind = CallGraphEdgeKind::Call,
+                    .label = "call",
+                });
+            }
+        }
+    }
+    for (CallGraphNode& c : extra_callees) {
+        cfg.nodes.push_back(std::move(c));
+    }
+
+    report.graph = std::move(cfg);
+    return report;
+}
+std::string format_headless_graph_json(
+    HeadlessGraphKind kind,
+    std::string_view root,
+    const CallGraph& graph) {
+    std::string out{};
+    out.reserve(1024u + graph.nodes.size() * 256u + graph.edges.size() * 128u);
+
+    auto key = [&out](std::string_view k) {
+        append_json_escaped(out, k);
+        out += ": ";
+    };
+
+    out += "{\n";
+    out += "  "; key("kind"); append_json_escaped(out, to_string(kind)); out += ",\n";
+    out += "  "; key("root"); append_json_escaped(out, root); out += ",\n";
+    out += "  "; key("graph_id"); append_json_escaped(out, graph.id); out += ",\n";
+    out += "  "; key("label"); append_json_escaped(out, graph.label); out += ",\n";
+    out += "  "; key("architecture"); append_json_escaped(out, peelf::to_string(graph.architecture)); out += ",\n";
+
+    out += "  \"nodes\": [";
+    for (std::size_t i = 0u; i < graph.nodes.size(); ++i) {
+        const CallGraphNode& node = graph.nodes[i];
+        out += (i == 0u) ? "\n" : ",\n";
+        out += "    {\n";
+        out += "      "; key("id"); append_json_escaped(out, node.id); out += ",\n";
+        out += "      "; key("label"); append_json_escaped(out, node.label); out += ",\n";
+        out += "      "; key("kind"); append_json_escaped(out, node_kind_json_name(node.kind)); out += ",\n";
+        out += "      "; key("virtual_address");
+        if (node.bytes.start.virtual_address.has_value()) {
+            append_json_escaped(out, detail::format_hex(*node.bytes.start.virtual_address));
+        } else {
+            out += "null";
+        }
+        out += ",\n";
+        out += "      "; key("file_offset");
+        if (node.bytes.start.file_offset.has_value()) {
+            append_json_escaped(out, detail::format_hex(*node.bytes.start.file_offset));
+        } else {
+            out += "null";
+        }
+        out += ",\n";
+        out += std::format("      \"size\": {},\n", node.bytes.size);
+        out += "      "; key("symbol");
+        if (node.symbol.has_value() && !node.symbol->name.empty()) {
+            append_json_escaped(out, node.symbol->name);
+        } else {
+            out += "null";
+        }
+        out += ",\n";
+        out += std::format("      \"instruction_count\": {},\n", node.instruction_count);
+        out += "      \"instructions\": [";
+        for (std::size_t j = 0u; j < node.instructions.size(); ++j) {
+            const GraphInstruction& ins = node.instructions[j];
+            out += (j == 0u) ? "\n" : ",\n";
+            out += "        { ";
+            key("address"); append_json_escaped(out, detail::format_hex(ins.address)); out += ", ";
+            key("mnemonic"); append_json_escaped(out, ins.mnemonic); out += ", ";
+            key("operands"); append_json_escaped(out, ins.operands); out += ", ";
+            key("branch_target");
+            if (ins.branch_target.has_value()) {
+                append_json_escaped(out, detail::format_hex(*ins.branch_target));
+            } else {
+                out += "null";
+            }
+            out += " }";
+        }
+        if (!node.instructions.empty()) {
+            out += "\n      ";
+        }
+        out += "]\n";
+        out += "    }";
+    }
+    if (!graph.nodes.empty()) {
+        out += "\n  ";
+    }
+    out += "],\n";
+
+    out += "  \"edges\": [";
+    for (std::size_t i = 0u; i < graph.edges.size(); ++i) {
+        const CallGraphEdge& edge = graph.edges[i];
+        out += (i == 0u) ? "\n" : ",\n";
+        out += "    { ";
+        key("from"); append_json_escaped(out, edge.from_node_id); out += ", ";
+        key("to"); append_json_escaped(out, edge.to_node_id); out += ", ";
+        key("kind"); append_json_escaped(out, edge_kind_json_name(edge.kind)); out += ", ";
+        key("label"); append_json_escaped(out, edge.label);
+        out += " }";
+    }
+    if (!graph.edges.empty()) {
+        out += "\n  ";
+    }
+    out += "]\n";
+    out += "}\n";
+    return out;
+}
+
+peelf::Result<void> export_headless_graph(
+    const HeadlessOptions& options,
+    std::ostream& stdout_stream,
+    const IProcessRunner* runner_override) {
+    const HeadlessGraphFormat fmt = resolve_headless_graph_format(options);
+
+    std::optional<HeadlessDotProcessRunner> default_dot_runner{};
+    const IProcessRunner* active_runner = runner_override;
+    if ((fmt == HeadlessGraphFormat::Svg || fmt == HeadlessGraphFormat::Png) &&
+        active_runner == nullptr) {
+        const char* env_dot = std::getenv("PEELF_DOT_EXECUTABLE");
+        const std::string_view dot_query =
+            (env_dot != nullptr && *env_dot != '\0') ? std::string_view{env_dot}
+                                                     : std::string_view{"dot"};
+        auto resolved_dot = find_executable_in_path(dot_query);
+        if (!resolved_dot.has_value()) {
+            return peelf::make_error(std::format(
+                "Graphviz 'dot' executable ('{}') is not available; install Graphviz or use --graph-format dot|json",
+                dot_query));
+        }
+        default_dot_runner.emplace(std::move(*resolved_dot));
+        active_runner = &*default_dot_runner;
+    }
+
+    auto built = build_headless_graph(options);
+    if (!built.has_value()) {
+        return std::unexpected(built.error());
+    }
+
+    if (fmt == HeadlessGraphFormat::Dot || fmt == HeadlessGraphFormat::Json) {
+        const std::string payload =
+            (fmt == HeadlessGraphFormat::Dot)
+                ? to_dot(built->graph)
+                : format_headless_graph_json(built->kind, built->root, built->graph);
+        if (options.output_path.has_value()) {
+            return write_text_file_atomically(*options.output_path, payload);
+        }
+        stdout_stream << payload;
+        stdout_stream.flush();
+        return {};
+    }
+
+    const GraphRenderFormat gv_fmt =
+        (fmt == HeadlessGraphFormat::Png) ? GraphRenderFormat::Png : GraphRenderFormat::Svg;
+
+    std::error_code fs_ec{};
+    const bool stream_to_stdout = !options.output_path.has_value();
+    std::filesystem::path target_path{};
+    if (options.output_path.has_value()) {
+        target_path = *options.output_path;
+        const std::filesystem::path parent = target_path.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, fs_ec);
+            if (fs_ec) {
+                return peelf::make_error(std::format(
+                    "Failed to create parent directory '{}': {}",
+                    parent.string(),
+                    fs_ec.message()));
+            }
+        }
+    } else {
+        static std::atomic<std::uint64_t> seq{0u};
+        const std::filesystem::path cwd = std::filesystem::current_path(fs_ec);
+        if (fs_ec) {
+            return peelf::make_error("Failed to determine working directory for Graphviz output");
+        }
+        target_path = cwd / std::format(
+            ".peelf_graph_{}_{}.{}",
+            std::chrono::steady_clock::now().time_since_epoch().count(),
+            seq.fetch_add(1u, std::memory_order_relaxed) + 1u,
+            to_string(fmt));
+    }
+
+    const std::filesystem::path sidecar_dot = target_path.string() + ".dot";
+    const GraphRenderResult rendered =
+        render_graph_with_graphviz(built->graph, target_path, gv_fmt, *active_runner);
+    std::filesystem::remove(sidecar_dot, fs_ec);
+
+    if (!rendered.success) {
+        if (stream_to_stdout) {
+            std::filesystem::remove(target_path, fs_ec);
+        }
+        return peelf::make_error(std::format(
+            "Graphviz '{}' rendering failed: {}",
+            to_string(fmt),
+            rendered.diagnostic.empty() ? "unknown error" : rendered.diagnostic));
+    }
+
+    if (stream_to_stdout) {
+        auto rendered_bytes = read_binary_file(target_path);
+        std::filesystem::remove(target_path, fs_ec);
+        if (!rendered_bytes.has_value()) {
+            return std::unexpected(rendered_bytes.error());
+        }
+        stdout_stream.write(
+            reinterpret_cast<const char*>(rendered_bytes->data()),
+            static_cast<std::streamsize>(rendered_bytes->size()));
+        stdout_stream.flush();
+    }
+    return {};
+}
+
 std::optional<int> try_run_headless_or_help_cli(
     std::span<const std::string_view> args,
     std::ostream& stdout_stream,
@@ -1187,6 +2369,7 @@ std::optional<int> try_run_headless_or_help_cli(
     bool help = false;
     bool version = false;
     bool has_script_flag = false;
+    bool has_graph_flag = false;
 
     for (const std::string_view arg : args) {
         if (arg == "--headless") {
@@ -1205,6 +2388,13 @@ std::optional<int> try_run_headless_or_help_cli(
                    arg == "--script-max-instructions" || arg.starts_with("--script-max-instructions=") ||
                    arg == "--script-timeout-ms" || arg.starts_with("--script-timeout-ms=")) {
             has_script_flag = true;
+        } else if (arg == "--graph" || arg.starts_with("--graph=") ||
+                   arg == "--symbol" || arg.starts_with("--symbol=") ||
+                   arg == "--function" || arg.starts_with("--function=") ||
+                   arg == "--graph-depth" || arg.starts_with("--graph-depth=") ||
+                   arg == "--graph-max-nodes" || arg.starts_with("--graph-max-nodes=") ||
+                   arg == "--graph-format" || arg.starts_with("--graph-format=")) {
+            has_graph_flag = true;
         }
     }
 
@@ -1224,7 +2414,151 @@ std::optional<int> try_run_headless_or_help_cli(
             stderr_stream << "Error: --script options require --headless\n";
             return 1;
         }
+        if (has_graph_flag) {
+            stderr_stream << "Error: --graph options require --headless\n";
+            return 1;
+        }
         return std::nullopt;
+    }
+
+    if (has_script_flag && has_graph_flag) {
+        stderr_stream << "Error: --graph and --script options cannot be combined\n";
+        return 1;
+    }
+
+    if (has_graph_flag) {
+        HeadlessOptions gopts{};
+        bool has_positional_binary = false;
+        bool saw_graph_kind = false;
+
+        for (std::size_t i = 0u; i < args.size(); ++i) {
+            const std::string_view raw_arg = args[i];
+            if (raw_arg == "--headless") {
+                continue;
+            }
+            std::string_view flag = raw_arg;
+            std::optional<std::string_view> inline_val{};
+            if (raw_arg.starts_with("--")) {
+                if (const std::size_t eq = raw_arg.find('='); eq != std::string_view::npos) {
+                    flag = raw_arg.substr(0u, eq);
+                    inline_val = raw_arg.substr(eq + 1u);
+                }
+            }
+
+            auto require_next = [&](std::string_view name) -> std::optional<std::string_view> {
+                if (inline_val.has_value()) {
+                    return *inline_val;
+                }
+                if ((i + 1u) >= args.size()) {
+                    stderr_stream << "Error: missing value after " << name << "\n";
+                    return std::nullopt;
+                }
+                return args[++i];
+            };
+
+            if (flag == "--graph") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                auto parsed_kind = parse_headless_graph_kind(*val);
+                if (!parsed_kind.has_value()) {
+                    stderr_stream << "Error: unsupported --graph '" << *val
+                                  << "' (expected entry, fanout, or cfg)\n";
+                    return 1;
+                }
+                gopts.graph_kind = *parsed_kind;
+                saw_graph_kind = true;
+            } else if (flag == "--symbol" || flag == "--function") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                if (val->empty()) {
+                    stderr_stream << "Error: " << flag << " requires a symbol name or hex VA\n";
+                    return 1;
+                }
+                gopts.symbol = std::string(*val);
+            } else if (flag == "--graph-depth") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                if (val->starts_with('-')) {
+                    stderr_stream << "Error: invalid --graph-depth '" << *val
+                                  << "' (expected positive integer)\n";
+                    return 1;
+                }
+                std::size_t parsed = 0u;
+                const auto [ptr, ec] = std::from_chars(val->data(), val->data() + val->size(), parsed);
+                if (ec != std::errc{} || ptr != val->data() + val->size() || parsed == 0u || parsed > 64u) {
+                    stderr_stream << "Error: invalid --graph-depth '" << *val
+                                  << "' (expected integer in 1..64)\n";
+                    return 1;
+                }
+                gopts.graph_depth = parsed;
+            } else if (flag == "--graph-max-nodes") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                if (val->starts_with('-')) {
+                    stderr_stream << "Error: invalid --graph-max-nodes '" << *val
+                                  << "' (expected positive integer)\n";
+                    return 1;
+                }
+                std::size_t parsed = 0u;
+                const auto [ptr, ec] = std::from_chars(val->data(), val->data() + val->size(), parsed);
+                if (ec != std::errc{} || ptr != val->data() + val->size() || parsed == 0u || parsed > 8192u) {
+                    stderr_stream << "Error: invalid --graph-max-nodes '" << *val
+                                  << "' (expected integer in 1..8192)\n";
+                    return 1;
+                }
+                gopts.graph_max_nodes = parsed;
+            } else if (flag == "--graph-format" || flag == "--format") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                auto parsed_fmt = parse_headless_graph_format(*val);
+                if (!parsed_fmt.has_value()) {
+                    stderr_stream << "Error: unsupported " << flag << " '" << *val
+                                  << "' (expected dot, svg, png, or json)\n";
+                    return 1;
+                }
+                gopts.graph_format = *parsed_fmt;
+            } else if (flag == "--slice") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                if (val->empty()) {
+                    stderr_stream << "Error: --slice requires a slice index or architecture name\n";
+                    return 1;
+                }
+                gopts.slice_selector = std::string(*val);
+            } else if (flag == "--output") {
+                auto val = require_next(flag);
+                if (!val.has_value()) return 1;
+                if (val->empty()) {
+                    stderr_stream << "Error: --output requires a file path\n";
+                    return 1;
+                }
+                gopts.output_path = std::filesystem::path(*val);
+            } else if (flag.starts_with('-')) {
+                stderr_stream << "Error: unknown or incompatible --graph option '" << flag << "'\n";
+                return 1;
+            } else if (!has_positional_binary) {
+                gopts.binary_path = std::filesystem::path(raw_arg);
+                has_positional_binary = true;
+            } else {
+                stderr_stream << "Error: unexpected extra positional argument '" << raw_arg << "'\n";
+                return 1;
+            }
+        }
+
+        if (!saw_graph_kind) {
+            stderr_stream << "Error: --graph <entry|fanout|cfg> is required when using graph options\n";
+            return 1;
+        }
+        if (!has_positional_binary) {
+            stderr_stream << "Error: missing target <binary> path for --headless --graph\n";
+            return 1;
+        }
+
+        if (auto res = export_headless_graph(gopts, stdout_stream); !res.has_value()) {
+            stderr_stream << "Error: " << res.error().message << "\n";
+            return 1;
+        }
+        return 0;
     }
 
     if (!has_script_flag) {

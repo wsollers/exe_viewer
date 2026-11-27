@@ -209,6 +209,11 @@ using GraphByteReader = std::function<std::vector<std::uint8_t>(std::uint64_t of
 [[nodiscard]] std::optional<GraphLayout> parse_graphviz_plain_layout(std::string_view plain);
 [[nodiscard]] std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage& image,
                                                                     std::uint64_t virtual_address);
+[[nodiscard]] const SymbolRecord* resolve_call_target_for_address(
+    const peelf::IBinaryImage& image,
+    std::span<const std::uint8_t> image_bytes,
+    const SymbolIndex& symbol_index,
+    std::uint64_t target_virtual_address);
 [[nodiscard]] GraphRenderCommand make_graphviz_render_command(const std::filesystem::path& dot_path,
                                                               const std::filesystem::path& output_path,
                                                               GraphRenderFormat format,

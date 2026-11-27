@@ -19,6 +19,16 @@ add_executable(peelf_viewer
   src/headless_cli.cpp
   src/runtime_paths.hpp
   src/runtime_paths.cpp
+  src/graph/call_graph.hpp
+  src/graph/call_graph_internal.hpp
+  src/graph/call_graph_dot.cpp
+  src/graph/call_graph_build.cpp
+  src/graph/call_graph_cfg.cpp
+  src/symbols/symbol_index.hpp
+  src/symbols/symbol_index.cpp
+  src/symbols/debug_symbols.hpp
+  src/symbols/debug_symbols.cpp
+  src/disasm/disassembler.hpp
 )
 target_include_directories(peelf_viewer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 if(WIN32)
@@ -33,7 +43,15 @@ target_compile_definitions(peelf_viewer PRIVATE
   PEELF_INSTALL_DATADIR="${CMAKE_INSTALL_DATADIR}"
 )
 peelf_apply_project_warnings(peelf_viewer)
-target_link_libraries(peelf_viewer PRIVATE peelf::core ${CMAKE_DL_LIBS})
+target_link_libraries(peelf_viewer PRIVATE
+  peelf::core
+  capstone
+  peelf::graphviz
+  ${CMAKE_DL_LIBS}
+)
+if(MSVC)
+  target_link_libraries(peelf_viewer PRIVATE Dbghelp)
+endif()
 if(UNIX AND NOT APPLE)
   set(_peelf_viewer_rpaths
     "$ORIGIN"

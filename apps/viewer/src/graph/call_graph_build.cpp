@@ -1612,4 +1612,31 @@ std::optional<GraphSymbolRef> find_symbol_for_address(const peelf::IBinaryImage&
     return std::nullopt;
 }
 
+const SymbolRecord* resolve_call_target_for_address(
+    const peelf::IBinaryImage& image,
+    std::span<const std::uint8_t> image_bytes,
+    const SymbolIndex& symbol_index,
+    std::uint64_t target_virtual_address) {
+    const GraphByteReader reader = [image_bytes](std::uint64_t offset, std::size_t size) {
+        if (offset >= image_bytes.size() || size == 0u) {
+            return std::vector<std::uint8_t>{};
+        }
+        const std::size_t avail = std::min<std::size_t>(
+            size, static_cast<std::size_t>(image_bytes.size() - offset));
+        return std::vector<std::uint8_t>(
+            image_bytes.begin() + static_cast<std::ptrdiff_t>(offset),
+            image_bytes.begin() + static_cast<std::ptrdiff_t>(offset + avail));
+    };
+    const std::optional<Architecture> arch = to_disassembler_architecture(image.architecture());
+    if (!arch) {
+        return symbol_index.find_containing_address(target_virtual_address);
+    }
+    Disassembler disasm{};
+    if (!disasm.init(*arch, to_disassembler_endianness(image.endianness()))) {
+        return symbol_index.find_containing_address(target_virtual_address);
+    }
+    return resolve_call_target_symbol(
+        image, reader, disasm, symbol_index, target_virtual_address);
+}
+
 } // namespace viewer
